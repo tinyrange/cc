@@ -21,6 +21,38 @@ func addLinuxRuntimeIdentityFiles(overlay *imagefs.Overlay, uid, gid int) {
 	addLinuxRuntimeIdentityFilesForUser(overlay, identity)
 }
 
+func resolveLinuxRuntimeExecUser(runtimeName, user string) (string, error) {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		uid := os.Getuid()
+		gid := os.Getgid()
+		if uid <= 0 {
+			return "0:0", nil
+		}
+		return strconv.Itoa(uid) + ":" + strconv.Itoa(gid), nil
+	}
+	if user == "root" || user == "0" || user == "0:0" {
+		return "0:0", nil
+	}
+	uidPart, gidPart, hasGID := strings.Cut(user, ":")
+	if uidPart == "" {
+		return "", fmt.Errorf("invalid user %q", user)
+	}
+	if _, err := strconv.ParseUint(uidPart, 10, 32); err != nil {
+		return "", fmt.Errorf("%s runtime supports numeric users only: %q", runtimeName, user)
+	}
+	if hasGID {
+		if gidPart == "" {
+			return "", fmt.Errorf("invalid user %q", user)
+		}
+		if _, err := strconv.ParseUint(gidPart, 10, 32); err != nil {
+			return "", fmt.Errorf("%s runtime supports numeric users only: %q", runtimeName, user)
+		}
+		return uidPart + ":" + gidPart, nil
+	}
+	return uidPart + ":" + uidPart, nil
+}
+
 type linuxRuntimeIdentity struct {
 	Name   string
 	UID    int

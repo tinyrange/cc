@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package vm
 
@@ -10,55 +10,34 @@ import (
 )
 
 func (i *linuxInstance) Flush(ctx context.Context) error {
-	if i == nil || i.session == nil {
+	if i == nil || i.managedInstance == nil {
 		return fmt.Errorf("instance is not running")
 	}
-	return i.session.Flush(ctx)
+	return i.managedInstance.Flush(ctx)
 }
 
 func (i *linuxInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
-	if i.defaultRootDir != "" {
-		snapshotter, ok := i.rootFS.(interface {
-			RootSnapshotAt(string) (imagefs.Directory, error)
-		})
-		if !ok {
-			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-		}
-		return snapshotter.RootSnapshotAt(i.defaultRootDir)
+	if i.managedInstance == nil {
+		return nil, fmt.Errorf("instance is not running")
 	}
-	snapshotter, ok := i.rootFS.(interface {
-		RootSnapshot() (imagefs.Directory, error)
-	})
-	if !ok {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-	}
-	return snapshotter.RootSnapshot()
+	return managedRootSnapshotWithCapabilities("Linux", i.caps, i.rootFS, i.defaultRootDir)
 }
 
 func (i *linuxInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
+	if i.managedInstance == nil {
+		return nil, fmt.Errorf("instance is not running")
+	}
 	if i.image != nil && i.image.Name == imageName {
 		if i.defaultRootDir != "" {
-			snapshotter, ok := i.rootFS.(interface {
-				RootSnapshotAt(string) (imagefs.Directory, error)
-			})
-			if !ok {
-				return nil, fmt.Errorf("image mount %q cannot be snapshotted", imageName)
-			}
-			return snapshotter.RootSnapshotAt(i.defaultRootDir)
+			return managedRootSnapshotWithCapabilities("Linux", i.caps, i.rootFS, i.defaultRootDir)
 		}
 		return i.RootSnapshot()
 	}
-	snapshotter, ok := i.rootFS.(interface {
-		RootSnapshotAt(string) (imagefs.Directory, error)
-	})
-	if !ok {
-		return nil, fmt.Errorf("image mount %q cannot be snapshotted", imageName)
-	}
-	return snapshotter.RootSnapshotAt(linuxImageMountPath(imageName))
+	return managedImageSnapshotWithCapabilities("Linux", i.caps, i.rootFS, imageName, linuxImageMountPath(imageName))
 }

@@ -1,0 +1,133 @@
+//go:build linux
+
+package vm
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"j5.nz/cc/client"
+	"j5.nz/cc/internal/imagefs"
+	managedsession "j5.nz/cc/internal/managed/session"
+)
+
+type managedInstance struct {
+	osName         string
+	session        managedsession.Session
+	closeRuntime   func() error
+	root           imagefs.Directory
+	baseEnv        []string
+	defaultRootDir string
+	workDir        string
+	network        *linuxNetworkRuntime
+	caps           guestCapabilities
+	env            func(base, overrides []string, replace bool) []string
+	user           func(string) (string, error)
+	missingRootErr string
+	netOnce        sync.Once
+}
+
+func (i *managedInstance) core() *managedInstanceCore {
+	if i == nil {
+		return nil
+	}
+	return &managedInstanceCore{
+		osName:         i.osName,
+		session:        i.session,
+		root:           i.root,
+		baseEnv:        i.baseEnv,
+		defaultRootDir: i.defaultRootDir,
+		workDir:        i.workDir,
+		caps:           i.caps,
+		env:            i.env,
+		user:           i.user,
+		missingRootErr: i.missingRootErr,
+	}
+}
+
+func (i *managedInstance) ManagedCapabilities() guestCapabilities {
+	return i.core().ManagedCapabilities()
+}
+
+func (i *managedInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
+	return i.core().Exec(ctx, req)
+}
+
+func (i *managedInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return i.core().ExecStream(ctx, req, inputs, onEvent)
+}
+
+func (i *managedInstance) execRequest(req client.ExecRequest) (client.ExecRequest, error) {
+	return i.core().execRequest(req)
+}
+
+func (i *managedInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	return i.core().AddShare(ctx, share)
+}
+
+func (i *managedInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	return i.core().AddPortForward(ctx, forward)
+}
+
+func (i *managedInstance) Flush(ctx context.Context) error {
+	return i.core().Flush(ctx)
+}
+
+func (i *managedInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	return i.core().ConsoleHistory(ctx)
+}
+
+func (i *managedInstance) Wait() error {
+	if i == nil {
+		return nil
+	}
+	defer i.closeNetwork()
+	return waitManagedSession(i.session)
+}
+
+func (i *managedInstance) Close() error {
+	if i == nil {
+		return nil
+	}
+	return closeManagedSession(i.session, func() error {
+		i.closeNetwork()
+		return nil
+	}, i.closeRuntime)
+}
+
+func (i *managedInstance) NetworkIPv4() string {
+	if i == nil {
+		return ""
+	}
+	return networkGuestAddress(i.network)
+}
+
+func (i *managedInstance) RootSnapshot() (imagefs.Directory, error) {
+	if i == nil {
+		return nil, fmt.Errorf("instance is not running")
+	}
+	if !i.caps.RootSnapshot {
+		return nil, i.unsupported("root snapshots")
+	}
+	if i.root == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return i.root, nil
+}
+
+func (i *managedInstance) closeNetwork() {
+	if i == nil {
+		return
+	}
+	i.netOnce.Do(func() {
+		if i.network != nil {
+			_ = i.network.Close()
+			i.network = nil
+		}
+	})
+}
+
+func (i *managedInstance) unsupported(feature string) error {
+	return i.core().unsupported(feature)
+}

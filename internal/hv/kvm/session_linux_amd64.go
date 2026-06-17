@@ -13,6 +13,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	managedagent "j5.nz/cc/internal/managed/agent"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -20,7 +21,7 @@ import (
 
 type ManagedSession struct {
 	cancel     context.CancelFunc
-	doneCh     chan error
+	done       *sessionDone
 	control    io.ReadWriteCloser
 	listener   io.Closer
 	vsock      *virtio.Vsock
@@ -127,10 +128,10 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
-	doneCh := make(chan error, 1)
+	done := newSessionDone()
 	go func() {
 		defer vm.Close()
-		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		done.finish(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut))
 	}()
 
 	var control virtio.VsockConn
@@ -145,7 +146,8 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	case conn := <-connCh:
 		control = conn
-	case err := <-doneCh:
+	case <-done.done():
+		err := done.result()
 		cancel()
 		_ = listener.Close()
 		vsock.Close()
@@ -198,7 +200,7 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 
 	return &ManagedSession{
 		cancel:     cancel,
-		doneCh:     doneCh,
+		done:       done,
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
@@ -216,12 +218,12 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	err := sendManagedExec(s.control, id, req)
+	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
 	if err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -244,10 +246,10 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 func (s *ManagedSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
-	if err := s.sendExecMessage(vmruntime.ManagedExecRequest{Kind: "sync", ID: id}); err != nil {
+	if err := s.sendExecMessage(managedagent.SyncRequest(id)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -272,10 +274,10 @@ func (s *ManagedSession) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (s *ManagedSession) Wait() error {
-	if s == nil || s.doneCh == nil {
+	if s == nil || s.done == nil {
 		return nil
 	}
-	return <-s.doneCh
+	return s.done.wait()
 }
 
 func (s *ManagedSession) Close() error {

@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"path"
 	"strings"
-	"sync"
 	"time"
 
 	"j5.nz/cc/client"
@@ -17,6 +16,11 @@ import (
 	"j5.nz/cc/internal/hv/whp"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
+	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/machine"
+	"j5.nz/cc/internal/managed/rootartifact"
+	managedruntime "j5.nz/cc/internal/managed/runtime"
+	managedsession "j5.nz/cc/internal/managed/session"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -74,7 +78,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		Image:  image,
-		Shares: convertWindowsShareMounts(req.Shares),
+		Shares: convertShareMounts(req.Shares),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -96,19 +100,29 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := whp.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile: managedguest.LinuxProfile,
+		Host:    whp.Host{},
+		Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+		Artifact: rootartifact.Artifact{
+			Kernel: kernel,
+			Initrd: initrd,
+		},
+		Attachments: whp.LinuxManagedAttachments{
+			FSDevices: fsdevs,
+			NetDevice: windowsNetworkDevice(network),
+		},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
 	return &windowsInstance{
-		session: session,
-		image:   image,
-		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
-		workDir: workDir,
-		rootFS:  rootFS,
-		fsdevs:  fsdevs,
-		network: network,
-		dmesg:   req.Dmesg,
+		managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
+		image:               image,
+		rootFS:              rootFS,
+		fsdevs:              fsdevs,
+		network:             network,
+		dmesg:               req.Dmesg,
 	}, nil
 }
 
@@ -162,18 +176,28 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := whp.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile: managedguest.LinuxProfile,
+		Host:    whp.Host{},
+		Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+		Artifact: rootartifact.Artifact{
+			Kernel: kernel,
+			Initrd: initrd,
+		},
+		Attachments: whp.LinuxManagedAttachments{
+			FSDevices: fsdevs,
+			NetDevice: windowsNetworkDevice(network),
+		},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
 	return &windowsInstance{
-		session: session,
-		baseEnv: vmruntime.WithDefaultEnv(nil),
-		workDir: "/",
-		rootFS:  rootFS,
-		fsdevs:  fsdevs,
-		network: network,
-		dmesg:   req.Dmesg,
+		managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(nil), "/"),
+		rootFS:              rootFS,
+		fsdevs:              fsdevs,
+		network:             network,
+		dmesg:               req.Dmesg,
 	}, nil
 }
 
@@ -214,7 +238,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		}
 		devs, _, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 			Image:  image,
-			Shares: convertWindowsShareMounts(req.Shares),
+			Shares: convertShareMounts(req.Shares),
 		}, nil)
 		if err != nil {
 			return client.ExecResponse{}, err
@@ -318,21 +342,12 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, client.ExecRequest{
-			Command:    append([]string(nil), req.Command...),
-			Env:        append([]string(nil), req.Env...),
-			RootDir:    req.RootDir,
-			ReplaceEnv: req.ReplaceEnv,
-			WorkDir:    req.WorkDir,
-			User:       req.User,
-			Stdin:      append([]byte(nil), req.Stdin...),
-			TTY:        req.TTY,
-			ControlFD:  req.ControlFD,
-			Cols:       req.Cols,
-			Rows:       req.Rows,
-		})
+		return inst.Exec(ctx, runExecRequest(req))
 	}
 
+	if err := checkAlternateImageExec(inst); err != nil {
+		return client.ExecResponse{}, err
+	}
 	session, ok := inst.(*windowsInstance)
 	if !ok {
 		return client.ExecResponse{}, fmt.Errorf("running instance does not support image mounts")
@@ -349,40 +364,20 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 	}
 	image = withWindowsRuntimeMountDirs(image)
 	mountPath := windowsImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return client.ExecResponse{}, err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return client.ExecResponse{}, err
 	}
 
-	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
+		root:           image.RootFS,
+		baseEnv:        image.Config.Env,
+		defaultWorkDir: image.Config.WorkingDir,
+		env:            mergeImageRunEnv,
+	})
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.Exec(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
+	return inst.Exec(ctx, execReq)
 }
 
 func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -394,6 +389,9 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
 
+	if err := checkAlternateImageExec(inst); err != nil {
+		return err
+	}
 	session, ok := inst.(*windowsInstance)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
@@ -410,40 +408,20 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 	}
 	image = withWindowsRuntimeMountDirs(image)
 	mountPath := windowsImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return err
 	}
 
-	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
+		root:           image.RootFS,
+		baseEnv:        image.Config.Env,
+		defaultWorkDir: image.Config.WorkingDir,
+		env:            mergeImageRunEnv,
+	})
 	if err != nil {
 		return err
 	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.ExecStream(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, inputs, onEvent)
+	return inst.ExecStream(ctx, execReq, inputs, onEvent)
 }
 
 func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -452,6 +430,9 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	if targetImage == "" || targetImage == runningImage {
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
+	if err := checkAlternateImageExec(inst); err != nil {
+		return err
+	}
 	session, ok := inst.(*windowsInstance)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
@@ -468,7 +449,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	}
 	image = withWindowsRuntimeMountDirs(image)
 	mountPath := windowsImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
 		return err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
@@ -491,259 +472,133 @@ func ensureWindowsAMD64Image(image *oci.Image) error {
 }
 
 type windowsInstance struct {
-	session     *whp.ManagedSession
-	image       *oci.Image
-	baseEnv     []string
-	workDir     string
-	rootFS      virtio.ShareMounter
-	fsdevs      []*virtio.FS
-	dmesg       bool
-	network     *windowsNetworkRuntime
-	shareMu     sync.Mutex
-	shares      map[string]client.ShareMount
-	imageMounts map[string]string
+	*managedInstanceCore
+	image   *oci.Image
+	rootFS  virtio.ShareMounter
+	fsdevs  []*virtio.FS
+	dmesg   bool
+	network *windowsNetworkRuntime
+	mounts  managedMountState
+}
+
+func (i *windowsInstance) ManagedCapabilities() guestCapabilities {
+	return managedguest.LinuxProfile.Caps
+}
+
+func newWindowsManagedCore(session managedsession.Session, image *oci.Image, baseEnv []string, workDir string) *managedInstanceCore {
+	var root imagefs.Directory
+	if image != nil {
+		root = image.RootFS
+	}
+	return &managedInstanceCore{
+		osName:         "Linux",
+		session:        session,
+		root:           root,
+		baseEnv:        baseEnv,
+		workDir:        workDir,
+		caps:           managedguest.LinuxProfile.Caps,
+		env:            windowsEffectiveExecEnv,
+		missingRootErr: "running instance does not have a default image root filesystem",
+	}
+}
+
+func (i *windowsInstance) core() *managedInstanceCore {
+	if i == nil {
+		return nil
+	}
+	return i.managedInstanceCore
+}
+
+func windowsLinuxMachineSpec(memoryMB uint64, cpus int, dmesg bool) machine.Spec {
+	return machine.Spec{
+		Guest:    "Linux",
+		Arch:     "amd64",
+		MemoryMB: memoryMB,
+		CPUs:     cpus,
+		Dmesg:    dmesg,
+		Boot:     machine.BootSpec{Kind: "linux"},
+		Control:  machine.ControlSpec{Kind: "vsock", Port: vmruntime.ControlPort},
+	}
 }
 
 func (i *windowsInstance) VirtioFSStats() []virtio.FSStats {
-	if i == nil || len(i.fsdevs) == 0 {
+	if i == nil {
 		return nil
 	}
-	out := make([]virtio.FSStats, 0, len(i.fsdevs))
-	for _, fsdev := range i.fsdevs {
-		if fsdev == nil {
-			continue
-		}
-		out = append(out, fsdev.Stats())
-	}
-	return out
+	return virtioFSStats(i.fsdevs)
 }
 
 func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	if i == nil || i.session == nil {
-		return client.ExecResponse{}, fmt.Errorf("instance is not running")
-	}
-	env := windowsEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.image == nil || i.image.RootFS == nil {
-			return client.ExecResponse{}, fmt.Errorf("running instance does not have a default image root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
-		if err != nil {
-			return client.ExecResponse{}, err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
-	}
-	return i.session.Exec(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
+	return i.core().Exec(ctx, req)
 }
 
 func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if i == nil || i.session == nil {
-		return fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = i.workDir
-		}
-		return i.session.ExecStream(ctx, client.ExecRequest{
-			Kind:      req.Kind,
-			RootDir:   req.RootDir,
-			Path:      req.Path,
-			Directory: req.Directory,
-			WorkDir:   workDir,
-			User:      req.User,
-			Stdin:     append([]byte(nil), req.Stdin...),
-		}, inputs, onEvent)
-	}
-	env := windowsEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.image == nil || i.image.RootFS == nil {
-			return fmt.Errorf("running instance does not have a default image root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
-		if err != nil {
-			return err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return fmt.Errorf("workdir must be absolute")
-	}
-	return i.session.ExecStream(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, inputs, onEvent)
+	return i.core().ExecStream(ctx, req, inputs, onEvent)
+}
+
+func (i *windowsInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
+	return i.core().execRequest(req)
 }
 
 func (i *windowsInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.session == nil {
-		return "", nil
-	}
-	return i.session.ConsoleHistory(ctx)
+	return i.core().ConsoleHistory(ctx)
 }
 
 func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support shares")
+		return addRuntimeShareMount(nil, nil, nil, share, "shares", nil)
 	}
-	key := strings.TrimSpace(share.Mount)
-	if key == "" {
-		return fmt.Errorf("share mount path is required")
-	}
-	i.shareMu.Lock()
-	if existing, ok := i.shares[key]; ok {
-		i.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
-			return nil
-		}
-		return fmt.Errorf("share mount %q already exists", key)
-	}
-	i.shareMu.Unlock()
-	mount, err := amd64vm.BuildShareMount(0, vmruntime.DirectoryShare{
-		Source:   share.Source,
-		Mount:    share.Mount,
-		Writable: share.Writable,
-		MapOwner: share.MapOwner,
-		OwnerUID: share.OwnerUID,
-		OwnerGID: share.OwnerGID,
-		Cache:    share.Cache,
+	return i.mounts.AddShare(i.rootFS, share, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+		return buildRuntimeDirectoryShare(share, amd64vm.BuildShareMount)
 	})
-	if err != nil {
-		return err
-	}
-	if err := i.rootFS.AddShare(mount); err != nil {
-		return err
-	}
-	i.shareMu.Lock()
-	if i.shares == nil {
-		i.shares = make(map[string]client.ShareMount)
-	}
-	i.shares[key] = share
-	i.shareMu.Unlock()
-	return nil
 }
 
 func (i *windowsInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_ = ctx
 	if i == nil || i.network == nil {
-		return fmt.Errorf("instance network is not enabled")
+		return addManagedNetworkPortForward(ctx, nil, forward)
 	}
-	return i.network.AddPortForward(forward)
+	return addManagedNetworkPortForward(ctx, i.network.networkRuntime, forward)
 }
 
 func (i *windowsInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
-	_ = ctx
 	if i == nil || i.network == nil {
-		return fmt.Errorf("instance network is not enabled")
+		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return i.network.AllowServiceProxyPort(port)
+	return allowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
 }
 
 func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
-	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support image mounts")
+	if i == nil {
+		return addImageMount(nil, nil, nil, mountPath, image, nil)
 	}
-	if strings.TrimSpace(mountPath) == "" || !strings.HasPrefix(mountPath, "/") {
-		return fmt.Errorf("image mount path must be absolute")
-	}
-	if image == nil || image.RootFS == nil {
-		return fmt.Errorf("image root filesystem is not available")
-	}
-	i.shareMu.Lock()
-	if existing, ok := i.imageMounts[mountPath]; ok {
-		i.shareMu.Unlock()
-		if existing == image.Name {
-			return nil
-		}
-		return fmt.Errorf("image mount %q already exists", mountPath)
-	}
-	i.shareMu.Unlock()
-	if err := i.rootFS.AddShare(virtio.ShareMount{
-		GuestPath: mountPath,
-		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
-		Writable:  true,
-		CacheMode: "aggressive",
-	}); err != nil {
-		return err
-	}
-	i.shareMu.Lock()
-	if i.imageMounts == nil {
-		i.imageMounts = make(map[string]string)
-	}
-	i.imageMounts[mountPath] = image.Name
-	i.shareMu.Unlock()
-	return nil
+	return i.mounts.AddImage(i.rootFS, mountPath, image, imageFSBackend(image))
 }
 
 func (i *windowsInstance) Wait() error {
-	if i == nil || i.session == nil {
+	if i == nil {
 		return nil
 	}
-	return i.session.Wait()
+	return i.core().Wait()
 }
 
 func (i *windowsInstance) Close() error {
-	if i == nil || i.session == nil {
+	if i == nil {
 		return nil
 	}
-	err := i.session.Close()
-	if i.network != nil {
-		if netErr := i.network.Close(); err == nil {
-			err = netErr
-		}
+	var session managedsession.Session
+	if core := i.core(); core != nil {
+		session = core.session
 	}
-	return err
+	return closeManagedSessionWithNetwork(session, i.network)
 }
 
 func (i *windowsInstance) NetworkIPv4() string {
 	if i == nil || i.network == nil {
 		return ""
 	}
-	return windowsNetworkGuestAddress(i.network)
+	return managedNetworkIPv4(i.network.networkRuntime, "")
 }
 
 func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
@@ -816,23 +671,4 @@ func windowsEffectiveExecEnv(base, overrides []string, replace bool) []string {
 		return vmruntime.WithDefaultEnv(overrides)
 	}
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
-}
-
-func convertWindowsShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
-	if len(shares) == 0 {
-		return nil
-	}
-	out := make([]vmruntime.DirectoryShare, 0, len(shares))
-	for _, share := range shares {
-		out = append(out, vmruntime.DirectoryShare{
-			Source:   share.Source,
-			Mount:    share.Mount,
-			Writable: share.Writable,
-			MapOwner: share.MapOwner,
-			OwnerUID: share.OwnerUID,
-			OwnerGID: share.OwnerGID,
-			Cache:    share.Cache,
-		})
-	}
-	return out
 }

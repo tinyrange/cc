@@ -20,6 +20,8 @@ import (
 	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/imagefs"
+	managedagent "j5.nz/cc/internal/managed/agent"
+	managedsession "j5.nz/cc/internal/managed/session"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/timing"
@@ -133,7 +135,6 @@ const (
 	commandBeginMarker    = vmruntime.CommandBeginMarker
 	commandOutputMarker   = vmruntime.CommandOutputMarker
 	commandErrorMarker    = vmruntime.CommandErrorMarker
-	commandControlMarker  = vmruntime.CommandControlMarker
 	commandExitMarkerPref = vmruntime.CommandExitMarkerPref
 	arm64VirtualTimerPPI  = 27
 )
@@ -178,6 +179,27 @@ type ContainerSession struct {
 	activeExecs *atomic.Int32
 }
 
+type ManagedMetadata struct {
+	Root    imagefs.Directory
+	BaseEnv []string
+	WorkDir string
+}
+
+func (s *ContainerSession) ManagedMetadata() ManagedMetadata {
+	if s == nil {
+		return ManagedMetadata{}
+	}
+	var root imagefs.Directory
+	if s.image != nil {
+		root = s.image.RootFS
+	}
+	return ManagedMetadata{
+		Root:    root,
+		BaseEnv: append([]string(nil), s.baseEnv...),
+		WorkDir: s.workDir,
+	}
+}
+
 type readyResult struct {
 	conn virtio.VsockConn
 	err  error
@@ -213,13 +235,11 @@ func parseExecTimingMarkers(text, id string) map[string]int {
 }
 
 func hasManagedExecBegin(text, id string) bool {
-	return strings.Contains(text, commandBeginMarker+id)
+	return vmruntime.HasManagedExecBegin(text, id)
 }
 
 func hasManagedExecFirstByte(text, id string) bool {
-	return strings.Contains(text, commandOutputMarker+id+":") ||
-		strings.Contains(text, commandErrorMarker+id+":") ||
-		strings.Contains(text, commandExitMarkerPref+id+":")
+	return vmruntime.HasManagedExecFirstByte(text, id)
 }
 
 func validateGuestUser(user string) error {
@@ -249,26 +269,6 @@ func isUint32String(value string) bool {
 		}
 	}
 	return value != ""
-}
-
-type guestExecRequest struct {
-	ID          string   `json:"id"`
-	Command     []string `json:"command"`
-	Env         []string `json:"env,omitempty"`
-	RootDir     string   `json:"root_dir,omitempty"`
-	Path        string   `json:"path,omitempty"`
-	Directory   bool     `json:"directory,omitempty"`
-	ReplaceEnv  bool     `json:"replace_env,omitempty"`
-	SkipResolve bool     `json:"skip_resolve,omitempty"`
-	WorkDir     string   `json:"workdir,omitempty"`
-	User        string   `json:"user,omitempty"`
-	Stdin       []byte   `json:"stdin,omitempty"`
-	TTY         bool     `json:"tty,omitempty"`
-	ControlFD   bool     `json:"control_fd,omitempty"`
-	Kind        string   `json:"kind,omitempty"`
-	Signal      string   `json:"signal,omitempty"`
-	Cols        int      `json:"cols,omitempty"`
-	Rows        int      `json:"rows,omitempty"`
 }
 
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
@@ -464,40 +464,21 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 
-	payload, err := json.Marshal(guestExecRequest{
-		Kind:        "exec",
-		ID:          id,
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        user,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
-	if err != nil {
-		return client.ExecResponse{}, fmt.Errorf("marshal exec request: %w", err)
-	}
+	execReq := req
+	execReq.Kind = "exec"
+	execReq.Command = command
+	execReq.Env = env
+	execReq.WorkDir = workDir
+	execReq.User = user
 
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	err = s.writeControlPayload(append(payload, '\n'))
+	err := managedagent.SendExec(s.controlWriter(), id, execReq)
 	s.sendMu.Unlock()
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
 	timingLog("session.Exec writeControlPayload took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
-	if len(req.Stdin) == 0 {
-		if err := s.sendStdinClose(id); err != nil {
-			return client.ExecResponse{}, err
-		}
-		timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
-	}
 
 	beginSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecBegin(text, id)
@@ -543,13 +524,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 
 func (s *ContainerSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
-	payload, err := json.Marshal(guestExecRequest{Kind: "sync", ID: id})
-	if err != nil {
-		return fmt.Errorf("marshal sync request: %w", err)
-	}
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	err = s.writeControlPayload(append(payload, '\n'))
+	err := managedagent.Send(s.controlWriter(), managedagent.SyncRequest(id))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
@@ -643,33 +620,18 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start = time.Now()
-	payload, err := json.Marshal(guestExecRequest{
-		Kind:        kind,
-		ID:          id,
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		Path:        req.Path,
-		Directory:   req.Directory,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        user,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal exec request: %w", err)
-	}
+	execReq := req
+	execReq.Kind = kind
+	execReq.Command = command
+	execReq.Env = env
+	execReq.WorkDir = workDir
+	execReq.User = user
 	timing.Since(ctx, "exec.marshal_request", start)
 
 	transcriptStart := s.transcript.Len()
 	writeStart := time.Now()
 	s.sendMu.Lock()
-	err = s.writeControlPayload(append(payload, '\n'))
+	err := managedagent.Send(s.controlWriter(), managedagent.ExecRequest(id, execReq))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
@@ -694,127 +656,59 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 }
 
 func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
-	stdinClosed := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case input, ok := <-inputs:
-			if !ok {
-				if !stdinClosed {
-					_ = s.sendStdinClose(id)
-				}
-				return
-			}
-			msg := guestExecRequest{ID: id, Kind: input.Kind}
-			switch input.Kind {
-			case "stdin":
-				if stdinClosed {
-					continue
-				}
-				if len(input.Data) > 0 {
-					msg.Stdin = append([]byte(nil), input.Data...)
-				} else if input.Input != "" {
-					msg.Stdin = []byte(input.Input)
-				}
-			case "stdin_close":
-				if stdinClosed {
-					continue
-				}
-				stdinClosed = true
-			case "signal":
-				msg.Signal = input.Signal
-			case "resize":
-				msg.Cols = input.Cols
-				msg.Rows = input.Rows
-			}
-			payload, err := json.Marshal(msg)
-			if err != nil {
-				return
-			}
-			s.sendMu.Lock()
-			_ = s.writeControlPayload(append(payload, '\n'))
-			s.sendMu.Unlock()
-		}
-	}
+	managedagent.ForwardInputs(ctx, id, inputs, s.sendExecMessage)
 }
 
 func (s *ContainerSession) sendStdinClose(id string) error {
-	payload, err := json.Marshal(guestExecRequest{ID: id, Kind: "stdin_close"})
-	if err != nil {
-		return fmt.Errorf("marshal stdin close request: %w", err)
-	}
+	return s.sendExecMessage(managedagent.StdinCloseRequest(id))
+}
+
+func (s *ContainerSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	return s.writeControlPayload(append(payload, '\n'))
+	return managedagent.Send(s.controlWriter(), msg)
 }
 
 func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, execStart time.Time, onEvent func(client.ExecEvent) error) error {
-	totalStart := time.Now()
-	offset := start
-	var pending string
-	var loops, reads, lines, matched, ignored, sleeps int
 	guestPhases := map[string]int{}
-	for {
-		loops++
-		readStart := time.Now()
-		text := s.transcript.String()
-		timing.Since(ctx, "exec.stream_events.transcript_string", readStart)
-		if offset < len(text) {
-			reads++
-			appendStart := time.Now()
-			pending += text[offset:]
-			offset = len(text)
-			timing.Since(ctx, "exec.stream_events.append_pending", appendStart)
-			for {
-				lineEnd := strings.IndexByte(pending, '\n')
-				if lineEnd < 0 {
-					break
-				}
-				lines++
-				lineStart := time.Now()
-				line := strings.TrimSpace(pending[:lineEnd])
-				pending = pending[lineEnd+1:]
-				timing.Since(ctx, "exec.stream_events.next_line", lineStart)
-				if phase, ms, ok := recordExecTimingLine(ctx, line, id); ok {
+	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
+		Transcript: s.transcript,
+		Start:      start,
+		ID:         id,
+		OnEvent:    onEvent,
+		OnCallbackFail: func() {
+			s.terminateExecAndWait(id, start)
+		},
+		OnContextDone: func() {
+			s.terminateExecAndWait(id, start)
+		},
+		OnObserve: func(obs managedsession.StreamExecObservation) {
+			switch obs.Kind {
+			case "transcript_string":
+				timing.Record(ctx, "exec.stream_events.transcript_string", obs.Duration)
+			case "append_pending":
+				timing.Record(ctx, "exec.stream_events.append_pending", obs.Duration)
+			case "line":
+				timing.Record(ctx, "exec.stream_events.next_line", obs.Duration)
+				if phase, ms, ok := recordExecTimingLine(ctx, obs.Line, id); ok {
 					recordExecObservedTiming(ctx, phase, ms, execStart, guestPhases)
 				}
-				parseStart := time.Now()
-				event, done, ok, err := parseManagedExecEventLine(line, id)
-				timing.Since(ctx, "exec.stream_events.parse_line", parseStart)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					ignored++
-					continue
-				}
-				matched++
-				if onEvent != nil {
-					callbackStart := time.Now()
-					if err := onEvent(event); err != nil {
-						s.terminateExecAndWait(id, start)
-						return err
-					}
-					timing.Since(ctx, "exec.stream_events.callback", callbackStart)
-				}
-				if done {
-					recordExecStreamCounts(ctx, loops, reads, lines, matched, ignored, sleeps)
-					timing.Since(ctx, "exec.stream_events.until_done", totalStart)
-					return nil
-				}
+			case "parse":
+				timing.Record(ctx, "exec.stream_events.parse_line", obs.Duration)
+			case "callback":
+				timing.Record(ctx, "exec.stream_events.callback", obs.Duration)
+			case "wait":
+				timing.Record(ctx, "exec.stream_events.sleep", obs.Duration)
+			case "done":
+				recordExecStreamCounts(ctx, obs.Stats)
+				timing.Record(ctx, "exec.stream_events.until_done", obs.Duration)
 			}
-			continue
-		}
-		if ctx.Err() != nil {
-			s.terminateExecAndWait(id, start)
-			return ctx.Err()
-		}
-		sleeps++
-		sleepStart := time.Now()
-		time.Sleep(5 * time.Millisecond)
-		timing.Since(ctx, "exec.stream_events.sleep", sleepStart)
-	}
+		},
+		Wait: func(context.Context) error {
+			time.Sleep(5 * time.Millisecond)
+			return nil
+		},
+	})
 }
 
 func (s *ContainerSession) terminateExecAndWait(id string, start int) {
@@ -827,13 +721,11 @@ func (s *ContainerSession) terminateExecAndWait(id string, start int) {
 }
 
 func (s *ContainerSession) sendExecSignal(id, name string) error {
-	payload, err := json.Marshal(guestExecRequest{ID: id, Kind: "signal", Signal: name})
-	if err != nil {
-		return fmt.Errorf("marshal signal request: %w", err)
+	msg, ok := managedagent.InputRequest(id, client.ExecInput{Kind: "signal", Signal: name})
+	if !ok {
+		return nil
 	}
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return s.writeControlPayload(append(payload, '\n'))
+	return s.sendExecMessage(msg)
 }
 
 func (s *ContainerSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
@@ -903,17 +795,17 @@ func previousExecPhase(phase string) (string, bool) {
 	}
 }
 
-func recordExecStreamCounts(ctx context.Context, loops, reads, lines, matched, ignored, sleeps int) {
+func recordExecStreamCounts(ctx context.Context, stats managedsession.StreamExecStats) {
 	recorder := timing.FromContext(ctx)
 	if recorder == nil {
 		return
 	}
-	recordCount(recorder, "exec.stream_events.loop", loops)
-	recordCount(recorder, "exec.stream_events.read", reads)
-	recordCount(recorder, "exec.stream_events.line", lines)
-	recordCount(recorder, "exec.stream_events.matched_line", matched)
-	recordCount(recorder, "exec.stream_events.ignored_line", ignored)
-	recordCount(recorder, "exec.stream_events.sleep_count", sleeps)
+	recordCount(recorder, "exec.stream_events.loop", stats.Loops)
+	recordCount(recorder, "exec.stream_events.read", stats.Reads)
+	recordCount(recorder, "exec.stream_events.line", stats.Lines)
+	recordCount(recorder, "exec.stream_events.matched_line", stats.Matched)
+	recordCount(recorder, "exec.stream_events.ignored_line", stats.Ignored)
+	recordCount(recorder, "exec.stream_events.sleep_count", stats.Waits)
 }
 
 func recordCount(recorder *timing.Recorder, name string, count int) {
@@ -951,6 +843,24 @@ func (s *ContainerSession) writeControlPayload(payload []byte) error {
 		return fmt.Errorf("control channel is not available")
 	}
 	return s.uart.InjectRXBytes(payload)
+}
+
+func (s *ContainerSession) controlWriter() io.Writer {
+	return containerControlWriter{session: s}
+}
+
+type containerControlWriter struct {
+	session *ContainerSession
+}
+
+func (w containerControlWriter) Write(payload []byte) (int, error) {
+	if w.session == nil {
+		return 0, fmt.Errorf("container session is nil")
+	}
+	if err := w.session.writeControlPayload(payload); err != nil {
+		return 0, err
+	}
+	return len(payload), nil
 }
 
 func writeFull(w io.Writer, payload []byte) error {
@@ -2215,45 +2125,6 @@ func extractManagedExecResult(serial, id string, dmesg bool) (int, string, bool)
 		}
 	}
 	return 0, "", false
-}
-
-func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, error) {
-	beginMarker := commandBeginMarker + id
-	stdoutPrefix := commandOutputMarker + id + ":"
-	stderrPrefix := commandErrorMarker + id + ":"
-	controlPrefix := commandControlMarker + id + ":"
-	exitPrefix := commandExitMarkerPref + id + ":"
-
-	switch {
-	case line == beginMarker:
-		return client.ExecEvent{}, false, false, nil
-	case strings.HasPrefix(line, stdoutPrefix):
-		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stdoutPrefix))
-		if err != nil {
-			return client.ExecEvent{}, false, false, nil
-		}
-		return client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: string(data), Data: data}, false, true, nil
-	case strings.HasPrefix(line, stderrPrefix):
-		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stderrPrefix))
-		if err != nil {
-			return client.ExecEvent{}, false, false, nil
-		}
-		return client.ExecEvent{Kind: "stderr", Stream: "stderr", Output: string(data), Data: data}, false, true, nil
-	case strings.HasPrefix(line, controlPrefix):
-		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, controlPrefix))
-		if err != nil {
-			return client.ExecEvent{}, false, false, nil
-		}
-		return client.ExecEvent{Kind: "control", Output: string(data), Data: data}, false, true, nil
-	case strings.HasPrefix(line, exitPrefix):
-		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))
-		if err != nil {
-			return client.ExecEvent{}, false, false, err
-		}
-		return client.ExecEvent{Kind: "exit", ExitCode: code}, true, true, nil
-	default:
-		return client.ExecEvent{}, false, false, nil
-	}
 }
 
 func effectiveExecEnv(base, overrides []string, replace bool) []string {

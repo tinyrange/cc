@@ -1,0 +1,930 @@
+package guestagent
+
+import (
+	"archive/tar"
+	"bufio"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"j5.nz/cc/internal/managed/protocol"
+)
+
+const (
+	ReadyMarker         = protocol.ReadyMarker
+	BeginMarkerPrefix   = protocol.BeginMarkerPrefix
+	OutputMarkerPrefix  = protocol.OutputMarkerPrefix
+	ErrorMarkerPrefix   = protocol.ErrorMarkerPrefix
+	ControlMarkerPrefix = protocol.ControlMarkerPrefix
+	UsageMarkerPrefix   = protocol.UsageMarkerPrefix
+	ExitMarkerPrefix    = protocol.ExitMarkerPrefix
+	TimingMarkerPrefix  = protocol.TimingMarkerPrefix
+)
+
+type Options struct {
+	Name         string
+	DialAddr     string
+	ConnectTries int
+	PTY          PTY
+}
+
+type PTY interface {
+	Open(cols, rows int) (master, slave *os.File, err error)
+	Resize(master *os.File, cols, rows int) error
+}
+
+type Protocol struct {
+	BeginMarkerPrefix   string
+	OutputMarkerPrefix  string
+	ErrorMarkerPrefix   string
+	ControlMarkerPrefix string
+	UsageMarkerPrefix   string
+	ExitMarkerPrefix    string
+	TimingMarkerPrefix  string
+}
+
+type ExecReporter struct {
+	Protocol Protocol
+	Control  io.Writer
+	ID       string
+	Start    time.Time
+}
+
+func DefaultProtocol() Protocol {
+	return Protocol{
+		BeginMarkerPrefix:   BeginMarkerPrefix,
+		OutputMarkerPrefix:  OutputMarkerPrefix,
+		ErrorMarkerPrefix:   ErrorMarkerPrefix,
+		ControlMarkerPrefix: ControlMarkerPrefix,
+		UsageMarkerPrefix:   UsageMarkerPrefix,
+		ExitMarkerPrefix:    ExitMarkerPrefix,
+		TimingMarkerPrefix:  TimingMarkerPrefix,
+	}
+}
+
+func NewExecReporter(proto Protocol, control io.Writer, id string, start time.Time) ExecReporter {
+	return ExecReporter{
+		Protocol: proto,
+		Control:  control,
+		ID:       id,
+		Start:    start,
+	}
+}
+
+func (r ExecReporter) Begin() {
+	r.Protocol.WriteBegin(r.Control, r.ID)
+}
+
+func (r ExecReporter) Stdout(data []byte) {
+	r.Protocol.WriteStdout(r.Control, r.ID, data)
+}
+
+func (r ExecReporter) Stderr(data []byte) {
+	r.Protocol.WriteStderr(r.Control, r.ID, data)
+}
+
+func (r ExecReporter) ControlBytes(data []byte) {
+	r.Protocol.WriteControl(r.Control, r.ID, data)
+}
+
+func (r ExecReporter) Usage(encodedUsage string) {
+	r.Protocol.WriteUsage(r.Control, r.ID, encodedUsage)
+}
+
+func (r ExecReporter) Exit(code int) {
+	r.Protocol.WriteExit(r.Control, r.ID, code)
+}
+
+func (r ExecReporter) Timing(phase string) {
+	r.Protocol.WriteTiming(r.Control, r.ID, phase, r.Start)
+}
+
+func (r ExecReporter) HasExitMarker() bool {
+	return r.Protocol.ExitMarkerPrefix != "" && r.ID != ""
+}
+
+func (p Protocol) WriteBegin(w io.Writer, id string) {
+	if p.BeginMarkerPrefix == "" || id == "" {
+		return
+	}
+	WriteProtocolLine(w, p.BeginMarkerPrefix+id)
+}
+
+func (p Protocol) WriteStdout(w io.Writer, id string, data []byte) {
+	WriteProtocolBytes(w, p.OutputMarkerPrefix, id, data)
+}
+
+func (p Protocol) WriteStderr(w io.Writer, id string, data []byte) {
+	WriteProtocolBytes(w, p.ErrorMarkerPrefix, id, data)
+}
+
+func (p Protocol) WriteControl(w io.Writer, id string, data []byte) {
+	WriteProtocolBytes(w, p.ControlMarkerPrefix, id, data)
+}
+
+func (p Protocol) WriteUsage(w io.Writer, id string, encodedUsage string) {
+	if p.UsageMarkerPrefix == "" || id == "" || encodedUsage == "" {
+		return
+	}
+	WriteProtocolLine(w, p.UsageMarkerPrefix+id+":"+encodedUsage)
+}
+
+func EncodeJSONBase64(value any) string {
+	buf, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
+func (p Protocol) WriteExit(w io.Writer, id string, code int) {
+	if p.ExitMarkerPrefix == "" || id == "" {
+		return
+	}
+	WriteProtocolLine(w, p.ExitMarkerPrefix+id+":"+itoa(code))
+}
+
+func (p Protocol) WriteTiming(w io.Writer, id, phase string, start time.Time) {
+	if p.TimingMarkerPrefix == "" || id == "" || phase == "" {
+		return
+	}
+	WriteProtocolLine(w, p.TimingMarkerPrefix+id+":"+phase+":"+itoa(int(time.Since(start).Milliseconds())))
+}
+
+type request = protocol.ManagedExecRequest
+
+type managedExec struct {
+	mu      sync.Mutex
+	stdin   io.WriteCloser
+	process *os.Process
+	pty     *os.File
+	ptyImpl PTY
+}
+
+func Run(opts Options) error {
+	opts = normalizeOptions(opts)
+	_ = os.Chdir("/")
+	conn, err := connectControl(opts)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	WriteProtocolLine(conn, ReadyMarker)
+	return commandLoop(opts, conn)
+}
+
+func WriteConsole(s string) {
+	writeConsole(s)
+}
+
+func normalizeOptions(opts Options) Options {
+	if strings.TrimSpace(opts.Name) == "" {
+		opts.Name = "guest"
+	}
+	if strings.TrimSpace(opts.DialAddr) == "" {
+		opts.DialAddr = "10.42.0.1:10777"
+	}
+	if opts.ConnectTries <= 0 {
+		opts.ConnectTries = 80
+	}
+	return opts
+}
+
+func connectControl(opts Options) (net.Conn, error) {
+	var last error
+	for i := 0; i < opts.ConnectTries; i++ {
+		conn, err := net.DialTimeout("tcp4", opts.DialAddr, time.Second)
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("connect control: %w", last)
+}
+
+func commandLoop(opts Options, control net.Conn) error {
+	reader := bufio.NewReader(control)
+	active := NewActiveExecSet()
+	pending := NewPendingRequests[request]()
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return fmt.Errorf("read request: %w", err)
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var req request
+		if err := json.Unmarshal(line, &req); err != nil {
+			writeConsole("ccx3-" + opts.Name + "-init: decode request: " + err.Error() + "\n")
+			continue
+		}
+		if req.Kind == "" {
+			req.Kind = "exec"
+		}
+		switch req.Kind {
+		case "exec":
+			if req.ID == "" || len(req.Command) == 0 {
+				continue
+			}
+			if len(req.Stdin) != 0 {
+				startExecWithReader(opts, control, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil, func() {})
+				continue
+			}
+			if req.TTY || req.ControlFD {
+				stdinR, stdinW := io.Pipe()
+				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
+				active.Add(req.ID, managed)
+				go runExec(opts, control, req, stdinR, managed, func() {
+					_ = managed.close()
+					active.Delete(req.ID)
+				})
+				continue
+			}
+			pending.Put(req.ID, req)
+		case "sync":
+			go runSync(control, req.ID)
+		case "fs_mkdir":
+			go runMkdir(opts, control, req)
+		case "fs_write":
+			go runWrite(opts, control, req)
+		case "fs_extract":
+			if len(req.Stdin) > 0 {
+				go runExtract(opts, control, req, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
+				continue
+			}
+			stdinR, stdinW := io.Pipe()
+			managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
+			active.Add(req.ID, managed)
+			go runExtract(opts, control, req, stdinR, func() {
+				_ = managed.close()
+				active.Delete(req.ID)
+			})
+		case "fs_archive":
+			go runArchive(opts, control, req)
+		case "stdin":
+			pendingReq, pendingOK := pending.Take(req.ID)
+			if pendingOK {
+				stdinR, stdinW := io.Pipe()
+				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
+				active.Add(req.ID, managed)
+				go runExec(opts, control, pendingReq, stdinR, managed, func() {
+					_ = managed.close()
+					active.Delete(req.ID)
+				})
+				_ = managed.write(req.Stdin)
+				continue
+			}
+			_ = HandleActiveControl(active, ActiveControlRequest{
+				Kind:  req.Kind,
+				ID:    req.ID,
+				Stdin: req.Stdin,
+			})
+		case "stdin_close":
+			pendingReq, pendingOK := pending.Take(req.ID)
+			if pendingOK {
+				startExecWithReader(opts, control, pendingReq, io.NopCloser(bytes.NewReader(nil)), nil, func() {})
+				continue
+			}
+			_ = HandleActiveControl(active, ActiveControlRequest{
+				Kind: req.Kind,
+				ID:   req.ID,
+			})
+		case "signal":
+			_ = HandleActiveControl(active, ActiveControlRequest{
+				Kind:   req.Kind,
+				ID:     req.ID,
+				Signal: req.Signal,
+			})
+		case "resize":
+			_ = HandleActiveControl(active, ActiveControlRequest{
+				Kind: req.Kind,
+				ID:   req.ID,
+				Cols: req.Cols,
+				Rows: req.Rows,
+			})
+		}
+	}
+}
+
+func (m *managedExec) write(data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stdin == nil {
+		return fmt.Errorf("stdin is closed")
+	}
+	_, err := m.stdin.Write(data)
+	return err
+}
+
+func (m *managedExec) close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stdin == nil {
+		return nil
+	}
+	err := m.stdin.Close()
+	m.stdin = nil
+	return err
+}
+
+func (m *managedExec) setProcess(p *os.Process) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.process = p
+}
+
+func (m *managedExec) setPTY(pty *os.File) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pty = pty
+}
+
+func (m *managedExec) resize(cols, rows int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ptyImpl == nil {
+		return nil
+	}
+	if m.pty == nil {
+		return fmt.Errorf("exec has no tty")
+	}
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("invalid tty size %dx%d", cols, rows)
+	}
+	return m.ptyImpl.Resize(m.pty, cols, rows)
+}
+
+func (m *managedExec) WriteStdin(data []byte) error {
+	return m.write(data)
+}
+
+func (m *managedExec) CloseStdin() error {
+	return m.close()
+}
+
+func (m *managedExec) Signal(name string) error {
+	return m.signal(name)
+}
+
+func (m *managedExec) Resize(cols, rows int) error {
+	return m.resize(cols, rows)
+}
+
+func (m *managedExec) signal(name string) error {
+	sig, err := parseSignal(name)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.process == nil {
+		return fmt.Errorf("process is not started")
+	}
+	if m.process.Pid > 0 {
+		if err := syscall.Kill(-m.process.Pid, sig); err == nil || errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+	}
+	return m.process.Signal(sig)
+}
+
+func startExecWithReader(opts Options, control net.Conn, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
+	go runExec(opts, control, req, stdin, managed, cleanup)
+}
+
+func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
+	defer cleanup()
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, req.ID)
+	cmd := exec.Command(req.Command[0], req.Command[1:]...)
+	if req.WorkDir != "" {
+		cmd.Dir = rootPath(req.RootDir, req.WorkDir)
+	}
+	if len(req.Env) != 0 {
+		cmd.Env = req.Env
+	}
+	var controlR, controlW *os.File
+	if req.ControlFD {
+		var err error
+		controlR, controlW, err = os.Pipe()
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			writeErr(opts, control, req.ID, fmt.Errorf("open control fd: %w", err))
+			proto.WriteExit(control, req.ID, 126)
+			return
+		}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
+	}
+	var wg sync.WaitGroup
+	var stdoutW, stderrW *io.PipeWriter
+	var ptyMaster, ptySlave *os.File
+	if req.TTY && opts.PTY != nil {
+		var err error
+		ptyMaster, ptySlave, err = opts.PTY.Open(req.Cols, req.Rows)
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			if controlR != nil {
+				_ = controlR.Close()
+			}
+			if controlW != nil {
+				_ = controlW.Close()
+			}
+			writeErr(opts, control, req.ID, fmt.Errorf("open pty: %w", err))
+			proto.WriteExit(control, req.ID, 126)
+			return
+		}
+		if managed != nil {
+			managed.setPTY(ptyMaster)
+		}
+		cmd.Stdin = ptySlave
+		cmd.Stdout = ptySlave
+		cmd.Stderr = ptySlave
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0,
+		}
+		wg.Add(1)
+		go copyMarked(&wg, control, proto.OutputMarkerPrefix, req.ID, ptyMaster)
+		if stdin != nil {
+			wg.Add(1)
+			go copyPTYStdin(&wg, stdin, ptyMaster)
+		}
+	} else {
+		cmd.Stdin = stdin
+		stdoutR, stdoutPipeW := io.Pipe()
+		stderrR, stderrPipeW := io.Pipe()
+		stdoutW = stdoutPipeW
+		stderrW = stderrPipeW
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		wg.Add(2)
+		go copyMarked(&wg, control, proto.OutputMarkerPrefix, req.ID, stdoutR)
+		go copyMarked(&wg, control, proto.ErrorMarkerPrefix, req.ID, stderrR)
+	}
+	if controlR != nil {
+		wg.Add(1)
+		go copyMarked(&wg, control, proto.ControlMarkerPrefix, req.ID, controlR)
+	}
+	if err := cmd.Start(); err != nil {
+		if managed != nil {
+			_ = managed.close()
+		}
+		if controlR != nil {
+			_ = controlR.Close()
+		}
+		if controlW != nil {
+			_ = controlW.Close()
+		}
+		if stdoutW != nil {
+			_ = stdoutW.Close()
+		}
+		if stderrW != nil {
+			_ = stderrW.Close()
+		}
+		if ptyMaster != nil {
+			_ = ptyMaster.Close()
+		}
+		if ptySlave != nil {
+			_ = ptySlave.Close()
+		}
+		wg.Wait()
+		writeErr(opts, control, req.ID, err)
+		proto.WriteExit(control, req.ID, 126)
+		return
+	}
+	if controlW != nil {
+		_ = controlW.Close()
+	}
+	if managed != nil {
+		managed.setProcess(cmd.Process)
+	}
+	waitErr := cmd.Wait()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdoutW != nil {
+		_ = stdoutW.Close()
+	}
+	if stderrW != nil {
+		_ = stderrW.Close()
+	}
+	if ptySlave != nil {
+		_ = ptySlave.Close()
+	}
+	if ptyMaster != nil {
+		_ = ptyMaster.Close()
+	}
+	wg.Wait()
+	if controlR != nil {
+		_ = controlR.Close()
+	}
+	code := 0
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			writeErr(opts, control, req.ID, waitErr)
+			code = 126
+		}
+	}
+	proto.WriteExit(control, req.ID, code)
+}
+
+func runSync(control io.Writer, id string) {
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, id)
+	syscall.Sync()
+	proto.WriteExit(control, id, 0)
+}
+
+func runMkdir(opts Options, control io.Writer, req request) {
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, req.ID)
+	code := 0
+	target := rootPath(req.RootDir, firstNonEmpty(req.Path, "."))
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		writeErr(opts, control, req.ID, err)
+		code = 1
+	}
+	proto.WriteExit(control, req.ID, code)
+}
+
+func runWrite(opts Options, control io.Writer, req request) {
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, req.ID)
+	code := 0
+	if strings.TrimSpace(req.Path) == "" {
+		writeErr(opts, control, req.ID, fmt.Errorf("destination path is required"))
+		code = 1
+	} else {
+		target := rootPath(req.RootDir, req.Path)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			writeErr(opts, control, req.ID, err)
+			code = 1
+		} else if err := os.WriteFile(target, req.Stdin, 0o644); err != nil {
+			writeErr(opts, control, req.ID, err)
+			code = 1
+		}
+	}
+	proto.WriteExit(control, req.ID, code)
+}
+
+func runExtract(opts Options, control io.Writer, req request, r io.ReadCloser, cleanup func()) {
+	defer cleanup()
+	defer r.Close()
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, req.ID)
+	code := 0
+	if err := extractTarToPath(r, req.RootDir, req.Path, req.Directory); err != nil {
+		writeErr(opts, control, req.ID, err)
+		code = 1
+	}
+	proto.WriteExit(control, req.ID, code)
+}
+
+func runArchive(opts Options, control io.Writer, req request) {
+	proto := DefaultProtocol()
+	proto.WriteBegin(control, req.ID)
+	code := 0
+	if err := archivePath(control, req.ID, req.RootDir, req.Path); err != nil {
+		writeErr(opts, control, req.ID, err)
+		code = 1
+	}
+	proto.WriteExit(control, req.ID, code)
+}
+
+func archivePath(control io.Writer, id, rootDir, src string) error {
+	if strings.TrimSpace(src) == "" {
+		return fmt.Errorf("source path is required")
+	}
+	src = rootPath(rootDir, src)
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		err := WritePathTar(pw, src, filepath.Base(src), info)
+		_ = pw.CloseWithError(err)
+	}()
+	var buf [32768]byte
+	for {
+		n, err := pr.Read(buf[:])
+		if n > 0 {
+			DefaultProtocol().WriteStdout(control, id, buf[:n])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(filePath)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(filepath.Dir(src), filePath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			rel = rootName
+			info = rootInfo
+		}
+		link := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(filePath)
+			if err != nil {
+				return err
+			}
+		}
+		header, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(tw, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
+	return ExtractTarToPath(r, rootDir, dst, dstDir)
+}
+
+func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
+	if strings.TrimSpace(dst) == "" {
+		return fmt.Errorf("destination path is required")
+	}
+	dst = rootPath(rootDir, dst)
+	if info, err := os.Stat(dst); err == nil && info.IsDir() {
+		dstDir = true
+	}
+	tr := tar.NewReader(r)
+	sawEntry := false
+	var dirs []tarDirMtime
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			if !sawEntry {
+				return fmt.Errorf("archive is empty")
+			}
+			return restoreTarDirMtimes(dirs)
+		}
+		if err != nil {
+			return err
+		}
+		sawEntry = true
+		target, err := tarTarget(dst, dstDir, header.Name)
+		if err != nil {
+			return err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+				return err
+			}
+			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
+			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(file, tr)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			perm := os.FileMode(header.Mode).Perm()
+			if err := os.Chmod(target, perm); err != nil {
+				return err
+			}
+			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func tarTarget(dst string, dstDir bool, name string) (string, error) {
+	cleanName := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(name, "/")))
+	if cleanName == "." || cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe tar path %q", name)
+	}
+	if dstDir {
+		return filepath.Join(dst, cleanName), nil
+	}
+	parts := strings.SplitN(cleanName, string(filepath.Separator), 2)
+	if len(parts) == 1 {
+		return dst, nil
+	}
+	return filepath.Join(dst, parts[1]), nil
+}
+
+type tarDirMtime struct {
+	path  string
+	mtime time.Time
+}
+
+func restoreTarDirMtimes(dirs []tarDirMtime) error {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		if dir.mtime.IsZero() {
+			continue
+		}
+		if err := os.Chtimes(dir.path, dir.mtime, dir.mtime); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyMarked(wg *sync.WaitGroup, control io.Writer, marker, id string, r io.Reader) {
+	defer wg.Done()
+	var buf [4096]byte
+	for {
+		n, err := r.Read(buf[:])
+		if n > 0 {
+			WriteProtocolBytes(control, marker, id, buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func copyPTYStdin(wg *sync.WaitGroup, stdin io.ReadCloser, ptyMaster *os.File) {
+	defer wg.Done()
+	defer stdin.Close()
+	var buf [4096]byte
+	for {
+		n, err := stdin.Read(buf[:])
+		if n > 0 {
+			if _, writeErr := ptyMaster.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_, _ = ptyMaster.Write([]byte{4})
+			}
+			return
+		}
+	}
+}
+
+func writeErr(opts Options, control io.Writer, id string, err error) {
+	DefaultProtocol().WriteStderr(control, id, []byte("ccx3-"+opts.Name+"-init: "+err.Error()+"\n"))
+}
+
+func WriteProtocolBytes(control io.Writer, marker, id string, data []byte) {
+	if marker == "" || id == "" || len(data) == 0 {
+		return
+	}
+	WriteProtocolLine(control, marker+id+":"+base64.StdEncoding.EncodeToString(data))
+}
+
+var protocolMu sync.Mutex
+
+func WriteProtocolLine(w io.Writer, line string) {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	_, _ = io.WriteString(w, strings.TrimRight(line, "\n")+"\n")
+}
+
+func writeConsole(s string) {
+	if console, err := os.OpenFile("/dev/console", os.O_RDWR, 0); err == nil {
+		defer console.Close()
+		_, _ = console.WriteString(s)
+		return
+	}
+	_, _ = os.Stderr.WriteString(s)
+}
+
+func rootPath(rootDir, name string) string {
+	cleanRoot := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(rootDir), "/"))
+	if cleanRoot == "/" {
+		cleanRoot = ""
+	}
+	cleanName := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(name), "/"))
+	return filepath.Join(cleanRoot, cleanName)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseSignal(name string) (syscall.Signal, error) {
+	return ParseSignal(name)
+}
+
+func ParseSignal(name string) (syscall.Signal, error) {
+	switch strings.ToUpper(strings.TrimPrefix(strings.TrimSpace(name), "SIG")) {
+	case "HUP":
+		return syscall.SIGHUP, nil
+	case "INT":
+		return syscall.SIGINT, nil
+	case "QUIT":
+		return syscall.SIGQUIT, nil
+	case "", "TERM":
+		return syscall.SIGTERM, nil
+	case "KILL":
+		return syscall.SIGKILL, nil
+	case "USR1":
+		return syscall.SIGUSR1, nil
+	case "USR2":
+		return syscall.SIGUSR2, nil
+	case "WINCH":
+		return syscall.SIGWINCH, nil
+	default:
+		return 0, fmt.Errorf("unsupported signal %q", name)
+	}
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}

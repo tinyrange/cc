@@ -3,7 +3,6 @@ package vm
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
+	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -112,7 +112,7 @@ func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstan
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, shares: map[string]client.ShareMount{}, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
 }
 
 func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
@@ -135,7 +135,7 @@ func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartIn
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, shares: map[string]client.ShareMount{}, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
 }
 
 func (h *sidecarVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -198,6 +198,9 @@ func (h *sidecarVMHost) prepareExecInInstance(ctx context.Context, inst *sidecar
 	if targetImage == "" || targetImage == runningImage {
 		return req, nil
 	}
+	if err := checkAlternateImageExec(inst); err != nil {
+		return client.ExecRequest{}, err
+	}
 	if h.images == nil {
 		return client.ExecRequest{}, fmt.Errorf("sidecar image store is not configured")
 	}
@@ -207,7 +210,7 @@ func (h *sidecarVMHost) prepareExecInInstance(ctx context.Context, inst *sidecar
 	}
 	image = sidecarWithRuntimeMountDirs(image)
 	mountPath := sidecarImageMountPath(targetImage)
-	if err := inst.addCoordinatorImageMount(mountPath, virtio.NewImageFS(image.RootFS, image.RootFSDir)); err != nil {
+	if err := inst.AddImage(ctx, mountPath, image); err != nil {
 		return client.ExecRequest{}, err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
@@ -228,7 +231,10 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecRequest{}, err
 		}
-		return sidecarExecRequestFromRun(req), nil
+		return runExecRequest(req), nil
+	}
+	if err := checkAlternateImageExec(inst); err != nil {
+		return client.ExecRequest{}, err
 	}
 	if h.images == nil {
 		return client.ExecRequest{}, fmt.Errorf("sidecar image store is not configured")
@@ -239,38 +245,15 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 	}
 	image = sidecarWithRuntimeMountDirs(image)
 	mountPath := sidecarImageMountPath(targetImage)
-	if err := inst.addCoordinatorImageMount(mountPath, virtio.NewImageFS(image.RootFS, image.RootFSDir)); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, inst, mountPath, image, req.Shares); err != nil {
 		return client.ExecRequest{}, err
 	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
-		return client.ExecRequest{}, err
-	}
-	env := sidecarEffectiveExecEnv(image.Config.Env, req.Env, req.ReplaceEnv)
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
-	if err != nil {
-		return client.ExecRequest{}, err
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	return client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, nil
+	return resolveRunExecRequest(req, mountPath, managedExecResolver{
+		root:           image.RootFS,
+		baseEnv:        image.Config.Env,
+		defaultWorkDir: image.Config.WorkingDir,
+		env:            sidecarEffectiveExecEnv,
+	})
 }
 
 type sidecarStartResources struct {
@@ -300,6 +283,42 @@ func (r sidecarStartResources) closeAll() {
 	}
 }
 
+func combineSidecarResources(resources ...sidecarStartResources) sidecarStartResources {
+	var combined sidecarStartResources
+	for _, resource := range resources {
+		combined.env = append(combined.env, resource.env...)
+		if resource.remote {
+			combined.remote = true
+		}
+		if combined.rootFS == nil && resource.rootFS != nil {
+			combined.rootFS = resource.rootFS
+		}
+		if combined.resolver == nil && resource.resolver != nil {
+			combined.resolver = resource.resolver
+		}
+		if combined.networkIPv4 == "" && resource.networkIPv4 != "" {
+			combined.networkIPv4 = resource.networkIPv4
+		}
+		if combined.network == nil && resource.network != nil {
+			combined.network = resource.network
+		}
+		if resource.close != nil {
+			combined.close = appendSidecarClose(combined.close, resource.close)
+		}
+	}
+	return combined
+}
+
+func appendSidecarClose(existing, next func()) func() {
+	if existing == nil {
+		return next
+	}
+	return func() {
+		existing()
+		next()
+	}
+}
+
 func (h *sidecarVMHost) prepareCreateResources(ctx context.Context, req client.CreateInstanceRequest) (sidecarStartResources, error) {
 	return prepareSidecarCreateResources(h, ctx, req)
 }
@@ -317,12 +336,7 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 	if err != nil {
 		return nil, err
 	}
-	args := sidecarLaunchArgs()
-	args = append(args, "-worker", "-cache-dir", h.cacheDir)
-	cmd := exec.Command(exe, args...)
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), sidecarDisableEnv+"=1", sidecarControlEnv+"="+controlSocket)
-	cmd.Env = append(cmd.Env, env...)
+	cmd := sidecarLaunchCommand(exe, h.cacheDir, controlSocket, env)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("prepare sidecar stdout: %w", err)
@@ -333,8 +347,7 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 	started := true
 	defer func() {
 		if !started && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+			_ = killSidecarCommand(cmd)
 		}
 	}()
 	select {
@@ -343,19 +356,10 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 		return nil, ctx.Err()
 	default:
 	}
-	var hello client.ServerHello
-	if err := json.NewDecoder(stdout).Decode(&hello); err != nil {
+	hello, err := readSidecarStartupHello(stdout)
+	if err != nil {
 		started = false
-		return nil, fmt.Errorf("read sidecar startup banner: %w", err)
-	}
-	if hello.Error != "" || hello.Kind == "error" {
-		started = false
-		detail := firstNonEmpty(hello.Detail, hello.Error, "unknown startup error")
-		return nil, fmt.Errorf("sidecar ccvm failed to start: %s", detail)
-	}
-	if strings.TrimSpace(hello.Addr) == "" {
-		started = false
-		return nil, fmt.Errorf("sidecar ccvm did not report an address")
+		return nil, err
 	}
 	worker, err := dialSidecarWorker(ctx, hello.Addr)
 	if err != nil {
@@ -363,6 +367,21 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 		return nil, err
 	}
 	return &sidecarDaemon{cmd: cmd, worker: worker, stdout: stdout, cleanups: []func(){sidecarControlCleanup(controlSocket)}}, nil
+}
+
+func readSidecarStartupHello(r io.Reader) (client.ServerHello, error) {
+	var hello client.ServerHello
+	if err := json.NewDecoder(r).Decode(&hello); err != nil {
+		return client.ServerHello{}, fmt.Errorf("read sidecar startup banner: %w", err)
+	}
+	if hello.Error != "" || hello.Kind == "error" {
+		detail := firstNonEmpty(hello.Detail, hello.Error, "unknown startup error")
+		return client.ServerHello{}, fmt.Errorf("sidecar ccvm failed to start: %s", detail)
+	}
+	if strings.TrimSpace(hello.Addr) == "" {
+		return client.ServerHello{}, fmt.Errorf("sidecar ccvm did not report an address")
+	}
+	return hello, nil
 }
 
 func (h *sidecarVMHost) sidecarControlSocketPath() (string, error) {
@@ -378,6 +397,55 @@ func (h *sidecarVMHost) sidecarControlSocketPath() (string, error) {
 	return socketPath, nil
 }
 
+func prepareSidecarUnixListener(cacheDir, prefix string) (string, net.Listener, func(), error) {
+	socketDir := filepath.Join(cacheDir, "_worker-sockets")
+	if err := os.MkdirAll(socketDir, 0o700); err != nil {
+		return "", nil, nil, err
+	}
+	socketPath := filepath.Join(socketDir, fmt.Sprintf("%s-%d-%d.sock", prefix, os.Getpid(), time.Now().UnixNano()))
+	_ = os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	cleanup := func() {
+		_ = ln.Close()
+		_ = os.Remove(socketPath)
+	}
+	return socketPath, ln, cleanup, nil
+}
+
+func serveSidecarUnixOnce(cacheDir, prefix string, serve func(net.Conn) error) (string, func(), error) {
+	return serveSidecarUnixOnceConn(cacheDir, prefix, true, serve)
+}
+
+func serveSidecarUnixOnceConn(cacheDir, prefix string, closeConn bool, serve func(net.Conn) error) (string, func(), error) {
+	socketPath, ln, cleanupListener, err := prepareSidecarUnixListener(cacheDir, prefix)
+	if err != nil {
+		return "", nil, err
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		if closeConn {
+			defer conn.Close()
+		}
+		done <- serve(conn)
+	}()
+	closeFn := func() {
+		cleanupListener()
+		select {
+		case <-done:
+		default:
+		}
+	}
+	return socketPath, closeFn, nil
+}
+
 func sidecarControlCleanup(address string) func() {
 	return func() {
 		if strings.HasPrefix(address, "tcp://") {
@@ -385,6 +453,16 @@ func sidecarControlCleanup(address string) func() {
 		}
 		_ = os.Remove(address)
 	}
+}
+
+func sidecarLaunchCommand(exe, cacheDir, controlSocket string, env []string) *exec.Cmd {
+	args := sidecarLaunchArgs()
+	args = append(args, "-worker", "-cache-dir", cacheDir)
+	cmd := exec.Command(exe, args...)
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), sidecarDisableEnv+"=1", sidecarControlEnv+"="+controlSocket)
+	cmd.Env = append(cmd.Env, env...)
+	return cmd
 }
 
 func sidecarLaunchArgs() []string {
@@ -413,46 +491,97 @@ func (d *sidecarDaemon) Close() error {
 		if d.stdout != nil {
 			_ = d.stdout.Close()
 		}
-		for i := len(d.cleanups) - 1; i >= 0; i-- {
-			if d.cleanups[i] != nil {
-				d.cleanups[i]()
-			}
-		}
+		closeSidecarCleanups(d.cleanups)
 		if d.cmd != nil {
-			done := make(chan error, 1)
-			go func() {
-				done <- d.cmd.Wait()
-			}()
-			select {
-			case err := <-done:
-				if d.err == nil && err != nil {
-					d.err = err
-				}
-			case <-time.After(5 * time.Second):
-				if d.cmd.Process != nil {
-					_ = d.cmd.Process.Kill()
-				}
-				if err := <-done; d.err == nil && err != nil {
-					d.err = err
-				}
+			if err := waitSidecarCommand(d.cmd, 5*time.Second); d.err == nil && err != nil {
+				d.err = err
 			}
 		}
 	})
 	return d.err
 }
 
+func waitSidecarCommand(cmd *exec.Cmd, timeout time.Duration) error {
+	if cmd == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return <-done
+	}
+}
+
+func killSidecarCommand(cmd *exec.Cmd) error {
+	if cmd == nil {
+		return nil
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	return cmd.Wait()
+}
+
+func closeSidecarCleanups(cleanups []func()) {
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		if cleanups[i] != nil {
+			cleanups[i]()
+		}
+	}
+}
+
 type sidecarInstance struct {
+	*managedInstanceCore
 	id          string
 	sidecar     *sidecarDaemon
 	rootFS      sidecarRootFS
 	imageName   string
 	resolver    *sidecarCommandResolver
-	imageMu     sync.Mutex
-	shareMu     sync.Mutex
-	shares      map[string]client.ShareMount
-	imageMounts map[string]virtio.FSBackend
+	mounts      managedMountState
 	networkIPv4 string
 	network     *networkRuntime
+}
+
+func newSidecarInstance(id string, sidecar *sidecarDaemon, imageName string, resources sidecarStartResources) *sidecarInstance {
+	inst := &sidecarInstance{
+		id:          id,
+		sidecar:     sidecar,
+		rootFS:      resources.rootFS,
+		imageName:   imageName,
+		resolver:    resources.resolver,
+		networkIPv4: resources.networkIPv4,
+		network:     resources.network,
+	}
+	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources.resolver)
+	return inst
+}
+
+func newSidecarManagedCore(session *sidecarManagedSession, resolver *sidecarCommandResolver) *managedInstanceCore {
+	core := &managedInstanceCore{
+		osName:       "sidecar",
+		session:      session,
+		caps:         managedguest.LinuxProfile.Caps,
+		env:          sidecarEffectiveExecEnv,
+		markResolved: true,
+	}
+	if resolver != nil {
+		core.root = resolver.root
+		core.baseEnv = append([]string(nil), resolver.baseEnv...)
+		core.workDir = resolver.workDir
+	}
+	return core
+}
+
+func (i *sidecarInstance) ManagedCapabilities() guestCapabilities {
+	return i.managedCore().ManagedCapabilities()
 }
 
 type sidecarRootFS interface {
@@ -485,14 +614,17 @@ func (r *sidecarCommandResolver) resolve(req client.ExecRequest) (client.ExecReq
 	if r == nil || req.SkipResolve {
 		return req, nil
 	}
-	env := sidecarEffectiveExecEnv(r.baseEnv, req.Env, req.ReplaceEnv)
-	command, err := imagefs.ResolveCommand(r.root, req.Command, env)
+	resolved, err := resolveManagedExecRequest(req, managedExecResolver{
+		root:           r.root,
+		baseEnv:        r.baseEnv,
+		defaultWorkDir: r.workDir,
+		env:            sidecarEffectiveExecEnv,
+	})
 	if err != nil {
 		return client.ExecRequest{}, err
 	}
-	req.Command = command
-	req.SkipResolve = true
-	return req, nil
+	resolved.SkipResolve = true
+	return resolved, nil
 }
 
 func sidecarEffectiveExecEnv(base, overrides []string, replace bool) []string {
@@ -502,57 +634,15 @@ func sidecarEffectiveExecEnv(base, overrides []string, replace bool) []string {
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
 
-func sidecarExecRequestFromRun(req client.RunRequest) client.ExecRequest {
-	return client.ExecRequest{
-		Command:    append([]string(nil), req.Command...),
-		Env:        append([]string(nil), req.Env...),
-		RootDir:    req.RootDir,
-		ReplaceEnv: req.ReplaceEnv,
-		WorkDir:    req.WorkDir,
-		User:       req.User,
-		Stdin:      append([]byte(nil), req.Stdin...),
-		TTY:        req.TTY,
-		ControlFD:  req.ControlFD,
-		Cols:       req.Cols,
-		Rows:       req.Rows,
-	}
-}
-
 func (i *sidecarInstance) addCoordinatorShare(share client.ShareMount) error {
 	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support runtime shares")
+		return addRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
 	}
 	mounter, ok := i.rootFS.(virtio.ShareMounter)
 	if !ok {
-		return fmt.Errorf("instance rootfs does not support runtime shares")
+		return addRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
 	}
-	key := strings.TrimSpace(share.Mount)
-	if key == "" {
-		return fmt.Errorf("share mount path is required")
-	}
-	i.shareMu.Lock()
-	if existing, ok := i.shares[key]; ok {
-		i.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
-			return nil
-		}
-		return fmt.Errorf("share mount %q already exists", key)
-	}
-	i.shareMu.Unlock()
-	mount, err := sidecarRuntimeShareMount(share)
-	if err != nil {
-		return err
-	}
-	if err := mounter.AddShare(mount); err != nil {
-		return err
-	}
-	i.shareMu.Lock()
-	if i.shares == nil {
-		i.shares = make(map[string]client.ShareMount)
-	}
-	i.shares[key] = share
-	i.shareMu.Unlock()
-	return nil
+	return i.mounts.AddShare(mounter, share, "runtime shares", sidecarRuntimeShareMount)
 }
 
 func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -560,141 +650,122 @@ func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount)
 	return i.addCoordinatorShare(share)
 }
 
-func (i *sidecarInstance) addCoordinatorImageMount(mountPath string, backend virtio.FSBackend) error {
+func (i *sidecarInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
+	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support image mounts")
-	}
-	if strings.TrimSpace(mountPath) == "" {
-		return fmt.Errorf("image mount path is required")
+		return addImageMount(nil, nil, nil, mountPath, image, imageFSBackend(image))
 	}
 	mounter, ok := i.rootFS.(virtio.ShareMounter)
 	if !ok {
-		return fmt.Errorf("instance rootfs does not support image mounts")
+		return addImageMount(nil, nil, nil, mountPath, image, imageFSBackend(image))
 	}
-	i.imageMu.Lock()
-	if i.imageMounts == nil {
-		i.imageMounts = make(map[string]virtio.FSBackend)
-	}
-	if existing := i.imageMounts[mountPath]; existing != nil {
-		i.imageMu.Unlock()
-		return nil
-	}
-	i.imageMounts[mountPath] = backend
-	i.imageMu.Unlock()
-	if err := mounter.AddShare(virtio.ShareMount{
-		GuestPath: mountPath,
-		Backend:   backend,
-		Writable:  true,
-		CacheMode: "aggressive",
-	}); err != nil {
-		if strings.Contains(err.Error(), fmt.Sprintf("mount path %q is already in use", mountPath)) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return i.mounts.AddImage(mounter, mountPath, image, imageFSBackend(image))
 }
 
 func (i *sidecarInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_ = ctx
-	if i.network != nil {
-		return i.network.AddPortForward(forward)
+	if i == nil {
+		return addManagedNetworkPortForward(ctx, nil, forward)
 	}
-	return fmt.Errorf("sidecar network is not enabled")
+	return addManagedNetworkPortForward(ctx, i.network, forward)
 }
 
 func (i *sidecarInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
-	_ = ctx
-	if i.network != nil {
-		return i.network.AllowServiceProxyPort(port)
+	if i == nil {
+		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return fmt.Errorf("sidecar network is not enabled")
+	return allowManagedNetworkServiceProxyPort(ctx, i.network, port)
 }
 
 func (i *sidecarInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
-	if i == nil || i.resolver == nil {
+	core := i.managedCore()
+	if sidecarShouldPassthroughToWorker(core, req) {
 		return req, nil
 	}
-	return i.resolver.resolve(req)
+	resolved, err := core.execRequest(req)
+	if err != nil {
+		return client.ExecRequest{}, err
+	}
+	return resolved, nil
+}
+
+func (i *sidecarInstance) managedSession() *sidecarManagedSession {
+	if i == nil || i.sidecar == nil {
+		return &sidecarManagedSession{}
+	}
+	return &sidecarManagedSession{worker: i.sidecar.worker, id: i.id}
+}
+
+func (i *sidecarInstance) managedCore() *managedInstanceCore {
+	if i == nil {
+		return nil
+	}
+	if i.managedInstanceCore != nil {
+		return i.managedInstanceCore
+	}
+	return newSidecarManagedCore(i.managedSession(), i.resolver)
+}
+
+func sidecarShouldPassthroughToWorker(core *managedInstanceCore, req client.ExecRequest) bool {
+	return core == nil || (req.Kind == "" && !req.SkipResolve && core.root == nil)
 }
 
 func (i *sidecarInstance) Flush(ctx context.Context) error {
-	return i.sidecar.worker.Flush(ctx, i.id)
+	return i.managedCore().Flush(ctx)
 }
 
 func (i *sidecarInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.sidecar == nil || i.sidecar.worker == nil {
-		return "", fmt.Errorf("sidecar worker is not connected")
-	}
-	return i.sidecar.worker.ConsoleHistory(ctx, i.id)
+	return i.managedCore().ConsoleHistory(ctx)
 }
 
 func (i *sidecarInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return managedRootSnapshot(nil, "")
 	}
-	return i.rootFS.RootSnapshot()
+	return managedRootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
 }
 
 func (i *sidecarInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return managedRootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
 		return i.RootSnapshot()
 	}
-	return i.rootFS.RootSnapshotAt(sidecarImageMountPath(imageName))
+	return managedImageSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
 }
 
 func (i *sidecarInstance) NetworkIPv4() string {
 	if i == nil {
 		return ""
 	}
-	return i.networkIPv4
+	return managedNetworkIPv4(i.network, i.networkIPv4)
 }
 
 func (i *sidecarInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	resolved, err := i.resolveExecRequest(req)
-	if err != nil {
-		return client.ExecResponse{}, err
+	core := i.managedCore()
+	if sidecarShouldPassthroughToWorker(core, req) {
+		return i.managedSession().Exec(ctx, req)
 	}
-	req = resolved
-	events, err := i.sidecar.worker.Exec(ctx, i.id, req)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	var resp client.ExecResponse
-	for _, event := range events {
-		if event.Kind == "stdout" || event.Kind == "stderr" {
-			resp.Output += event.Output
-		}
-		if event.Kind == "exit" {
-			resp.ExitCode = event.ExitCode
-		}
-	}
-	return resp, ctx.Err()
+	return core.Exec(ctx, req)
 }
 
 func (i *sidecarInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	resolved, err := i.resolveExecRequest(req)
-	if err != nil {
-		return err
+	core := i.managedCore()
+	if sidecarShouldPassthroughToWorker(core, req) {
+		return i.managedSession().ExecStream(ctx, req, inputs, onEvent)
 	}
-	req = resolved
-	return i.sidecar.worker.ExecStream(ctx, i.id, req, inputs, onEvent)
+	return core.ExecStream(ctx, req, inputs, onEvent)
 }
 
 func (i *sidecarInstance) Wait() error {
-	return i.sidecar.worker.Wait(context.Background(), i.id)
+	return i.managedCore().Wait()
 }
 
 func (i *sidecarInstance) Close() error {
-	shutdownErr := i.sidecar.worker.Stop(context.Background(), i.id)
-	closeErr := i.sidecar.Close()
-	if shutdownErr != nil && !strings.Contains(shutdownErr.Error(), "no VM") {
-		return errors.Join(shutdownErr, closeErr)
+	if i == nil || i.sidecar == nil {
+		return nil
 	}
-	return closeErr
+	return closeManagedSession(i.managedSession(), i.sidecar.Close)
 }
 
 type sidecarWorkerClient struct {
@@ -708,12 +779,7 @@ type sidecarWorkerClient struct {
 func dialSidecarWorker(ctx context.Context, socketPath string) (*sidecarWorkerClient, error) {
 	var conn net.Conn
 	var err error
-	network := "unix"
-	address := socketPath
-	if strings.HasPrefix(socketPath, "tcp://") {
-		network = "tcp"
-		address = strings.TrimPrefix(socketPath, "tcp://")
-	}
+	network, address := sidecarWorkerDialTarget(socketPath)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		conn, err = net.Dial(network, address)
@@ -740,6 +806,13 @@ func dialSidecarWorker(ctx context.Context, socketPath string) (*sidecarWorkerCl
 		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
 	}
 	return client, nil
+}
+
+func sidecarWorkerDialTarget(address string) (string, string) {
+	if strings.HasPrefix(address, "tcp://") {
+		return "tcp", strings.TrimPrefix(address, "tcp://")
+	}
+	return "unix", address
 }
 
 func (c *sidecarWorkerClient) Close() error {

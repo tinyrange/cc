@@ -13,6 +13,7 @@ import (
 
 	"github.com/ulikunitz/xz"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/managed/machine"
 )
 
 func TestExtractKernelFromFreeBSDReleaseSet(t *testing.T) {
@@ -94,22 +95,38 @@ func TestBuildManagedRootFromFreeBSDBaseSetUsesGuestIPv4(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\n"), "10.42.0.8")
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\n"), machine.NetworkSpec{
+		GuestIPv4:   "10.42.0.8",
+		GatewayIPv4: "10.42.0.9",
+		DNSIPv4:     "10.42.0.10",
+		Hostname:    "test-freebsd",
+		Interface:   "vtnet1",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeRoot()
 	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vtnet0 inet 10.42.0.8 ") {
+	if !strings.Contains(initScript, "ifconfig vtnet1 inet 10.42.0.8 ") {
 		t.Fatalf("init script does not configure leased IP: %q", initScript)
 	}
+	if !strings.Contains(initScript, "route add default 10.42.0.9") {
+		t.Fatalf("init script does not configure gateway: %q", initScript)
+	}
 	rcConf := readRootFile(t, root, "/etc/rc.conf")
-	if !strings.Contains(rcConf, `ifconfig_vtnet0="inet 10.42.0.8 netmask 255.255.255.0"`) {
+	if !strings.Contains(rcConf, `ifconfig_vtnet1="inet 10.42.0.8 netmask 255.255.255.0"`) {
 		t.Fatalf("rc.conf does not contain leased IP: %q", rcConf)
 	}
+	if !strings.Contains(rcConf, `hostname="test-freebsd"`) || !strings.Contains(rcConf, `defaultrouter="10.42.0.9"`) {
+		t.Fatalf("rc.conf does not contain structured network identity: %q", rcConf)
+	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.8 cc-freebsd") {
+	if !strings.Contains(hosts, "10.42.0.8 test-freebsd") {
 		t.Fatalf("hosts does not contain leased IP: %q", hosts)
+	}
+	resolv := readRootFile(t, root, "/etc/resolv.conf")
+	if !strings.Contains(resolv, "nameserver 10.42.0.10") {
+		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
 }
 

@@ -4,44 +4,96 @@ package vm
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/imagefs"
+	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 type darwinInstance struct {
+	*managedInstanceCore
 	session   *hvf.ContainerSession
 	network   *darwinNetworkRuntime
 	imageName string
 }
 
+func newDarwinInstance(session *hvf.ContainerSession, network *darwinNetworkRuntime, imageName string) *darwinInstance {
+	inst := &darwinInstance{
+		session:   session,
+		network:   network,
+		imageName: imageName,
+	}
+	inst.managedInstanceCore = newDarwinManagedCore(session)
+	return inst
+}
+
+func newDarwinManagedCore(session *hvf.ContainerSession) *managedInstanceCore {
+	if session == nil {
+		return nil
+	}
+	metadata := session.ManagedMetadata()
+	return &managedInstanceCore{
+		osName:         "Linux",
+		session:        session,
+		root:           metadata.Root,
+		baseEnv:        metadata.BaseEnv,
+		workDir:        metadata.WorkDir,
+		caps:           managedguest.LinuxProfile.Caps,
+		env:            mergeDarwinManagedEnv,
+		missingRootErr: "running instance does not have a default image root filesystem",
+		markResolved:   true,
+	}
+}
+
+func (i *darwinInstance) ManagedCapabilities() guestCapabilities {
+	return i.managedCore().ManagedCapabilities()
+}
+
+func (i *darwinInstance) managedCore() *managedInstanceCore {
+	if i == nil {
+		return nil
+	}
+	if i.managedInstanceCore != nil {
+		return i.managedInstanceCore
+	}
+	return newDarwinManagedCore(i.session)
+}
+
 func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) error {
-	return i.session.AddShare(ctx, share)
+	if i == nil {
+		return addDelegatedRuntimeShare(ctx, nil, share, "runtime shares")
+	}
+	return addDelegatedRuntimeShare(ctx, i.session, share, "runtime shares")
 }
 
 func (i *darwinInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
-	return i.session.AddImage(ctx, mountPath, image)
+	if i == nil {
+		return addDelegatedRuntimeImage(ctx, nil, mountPath, image)
+	}
+	return addDelegatedRuntimeImage(ctx, i.session, mountPath, image)
 }
 
 func (i *darwinInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_ = ctx
-	if i == nil || i.network == nil {
-		return i.session.AddPortForward(ctx, forward)
+	if i == nil {
+		return addManagedNetworkPortForwardWithFallback(ctx, nil, forward, nil)
 	}
-	return i.network.AddPortForward(forward)
+	var runtime *networkRuntime
+	if i.network != nil {
+		runtime = i.network.networkRuntime
+	}
+	return addManagedNetworkPortForwardWithFallback(ctx, runtime, forward, i.session)
 }
 
 func (i *darwinInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
-	_ = ctx
 	if i == nil || i.network == nil {
-		return fmt.Errorf("instance network is not enabled")
+		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return i.network.AllowServiceProxyPort(port)
+	return allowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
 }
 
 func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
@@ -52,7 +104,7 @@ func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
 }
 
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	return i.session.Exec(ctx, req)
+	return i.managedCore().Exec(ctx, req)
 }
 
 func (i *darwinInstance) ExecStream(
@@ -61,62 +113,53 @@ func (i *darwinInstance) ExecStream(
 	inputs <-chan client.ExecInput,
 	onEvent func(client.ExecEvent) error,
 ) error {
-	return i.session.ExecStream(ctx, req, inputs, onEvent)
+	return i.managedCore().ExecStream(ctx, req, inputs, onEvent)
 }
 
 func (i *darwinInstance) Flush(ctx context.Context) error {
-	if i == nil || i.session == nil {
-		return fmt.Errorf("instance is not running")
-	}
-	return i.session.Flush(ctx)
+	return i.managedCore().Flush(ctx)
 }
 
 func (i *darwinInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.session == nil {
-		return "", nil
-	}
-	return i.session.ConsoleHistory(ctx)
+	return i.managedCore().ConsoleHistory(ctx)
 }
 
 func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return managedRootSnapshot(nil, "")
 	}
-	return i.session.RootSnapshot()
+	return managedRootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
 }
 
 func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return managedRootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
 		return i.RootSnapshot()
 	}
-	return i.session.RootSnapshotAt(imageMountPath(imageName))
+	return managedImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, imageName, imageMountPath(imageName))
 }
 
 func (i *darwinInstance) Wait() error {
-	return i.session.Wait()
+	if i == nil {
+		return nil
+	}
+	return i.managedCore().Wait()
 }
 
 func (i *darwinInstance) Close() error {
-	var err error
-	if i.session != nil {
-		err = i.session.Close()
+	if i == nil {
+		return nil
 	}
-	if i.network != nil {
-		if networkErr := i.network.Close(); err == nil {
-			err = networkErr
-		}
-	}
-	return err
+	return closeManagedSessionWithNetwork(i.session, i.network)
 }
 
 func (i *darwinInstance) NetworkIPv4() string {
 	if i == nil || i.network == nil {
 		return ""
 	}
-	return darwinNetworkGuestAddress(i.network)
+	return managedNetworkIPv4(i.network.networkRuntime, "")
 }
 
 func darwinContainerSession(inst Instance) (*hvf.ContainerSession, bool) {
@@ -134,4 +177,11 @@ func networkDeviceDarwin(network *darwinNetworkRuntime) *virtio.Net {
 		return nil
 	}
 	return network.dev
+}
+
+func mergeDarwinManagedEnv(base, overrides []string, replace bool) []string {
+	if replace {
+		return vmruntime.WithDefaultEnv(overrides)
+	}
+	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }

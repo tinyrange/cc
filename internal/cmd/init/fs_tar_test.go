@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"j5.nz/cc/internal/managed/guestagent"
 )
 
 func TestFSTarRoundTripPreservesMetadataAndSymlink(t *testing.T) {
@@ -41,13 +43,13 @@ func TestFSTarRoundTripPreservesMetadataAndSymlink(t *testing.T) {
 		t.Fatalf("lstat src: %v", err)
 	}
 	var archive bytes.Buffer
-	if err := writePathTar(&archive, src, filepath.Base(src), info); err != nil {
+	if err := guestagent.WritePathTar(&archive, src, filepath.Base(src), info); err != nil {
 		t.Fatalf("write tar: %v", err)
 	}
 	assertTarSymlink(t, archive.Bytes(), "src/script-link", "script.sh")
 
 	dst := filepath.Join(parent, "dst")
-	if err := extractTarToPath(bytes.NewReader(archive.Bytes()), "", dst, false); err != nil {
+	if err := guestagent.ExtractTarToPath(bytes.NewReader(archive.Bytes()), "", dst, false); err != nil {
 		t.Fatalf("extract tar: %v", err)
 	}
 	copied := filepath.Join(dst, "script.sh")

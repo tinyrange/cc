@@ -8,20 +8,20 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
-	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/hv/kvm"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
+	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/machine"
+	"j5.nz/cc/internal/managed/rootartifact"
+	managedruntime "j5.nz/cc/internal/managed/runtime"
 	"j5.nz/cc/internal/oci"
-	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -43,11 +43,8 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if openbsdrootfs.IsBuiltInImage(req.Image) {
-		return b.startOpenBSDStream(ctx, req, onEvent)
-	}
-	if freebsdrootfs.IsBuiltInImage(req.Image) {
-		return b.startFreeBSDStream(ctx, req, onEvent)
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
 	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
@@ -81,7 +78,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: linuxRuntimeImageFS(image),
-		Shares: convertLinuxShareMounts(req.Shares),
+		Shares: convertShareMounts(req.Shares),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -102,15 +99,33 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile:  managedguest.LinuxProfile,
+		Host:     kvm.Host{},
+		Spec:     linuxManagedMachineSpec(req.ID, req.MemoryMB, req.CPUs, req.Dmesg, network),
+		Artifact: rootartifact.Artifact{Kernel: kernel, Initrd: initrd},
+		Attachments: kvm.LinuxManagedAttachments{
+			FSDevices: fsdevs,
+			NetDevice: networkDevice(network),
+		},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
 	return &linuxInstance{
-		session: session,
+		managedInstance: &managedInstance{
+			osName:         "Linux",
+			session:        started.Session,
+			root:           image.RootFS,
+			baseEnv:        vmruntime.WithDefaultEnv(image.Config.Env),
+			workDir:        workDir,
+			network:        network,
+			caps:           managedguest.LinuxProfile.Caps,
+			env:            linuxEffectiveExecEnv,
+			user:           linuxResolveExecUser,
+			missingRootErr: "running instance does not have a default image root filesystem",
+		},
 		image:   image,
-		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
-		workDir: workDir,
 		rootFS:  rootFS,
 		fsdevs:  fsdevs,
 		network: network,
@@ -123,35 +138,8 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if openbsdrootfs.IsBuiltInImage(req.Image) {
-		return b.startOpenBSDStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          openbsdrootfs.BuiltInImageName,
-			InitSystem:     req.InitSystem,
-			Kernel:         req.Kernel,
-			Network:        req.Network,
-			KernelModules:  append([]string(nil), req.KernelModules...),
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			NestedVirt:     req.NestedVirt,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
-		}, onEvent)
-	}
-	if freebsdrootfs.IsBuiltInImage(req.Image) {
-		return b.startFreeBSDStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          freebsdrootfs.BuiltInImageName,
-			InitSystem:     req.InitSystem,
-			Kernel:         req.Kernel,
-			Network:        req.Network,
-			KernelModules:  append([]string(nil), req.KernelModules...),
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			NestedVirt:     req.NestedVirt,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
-		}, onEvent)
+	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
 	}
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
@@ -221,14 +209,31 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile:  managedguest.LinuxProfile,
+		Host:     kvm.Host{},
+		Spec:     linuxManagedMachineSpec(req.ID, req.MemoryMB, req.CPUs, req.Dmesg, network),
+		Artifact: rootartifact.Artifact{Kernel: kernel, Initrd: initrd},
+		Attachments: kvm.LinuxManagedAttachments{
+			FSDevices: fsdevs,
+			NetDevice: networkDevice(network),
+		},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
 	inst := &linuxInstance{
-		session: session,
-		baseEnv: vmruntime.WithDefaultEnv(nil),
-		workDir: "/",
+		managedInstance: &managedInstance{
+			osName:         "Linux",
+			session:        started.Session,
+			baseEnv:        vmruntime.WithDefaultEnv(nil),
+			workDir:        "/",
+			network:        network,
+			caps:           managedguest.LinuxProfile.Caps,
+			env:            linuxEffectiveExecEnv,
+			user:           linuxResolveExecUser,
+			missingRootErr: "running instance does not have a default image root filesystem",
+		},
 		rootFS:  rootFS,
 		fsdevs:  fsdevs,
 		network: network,
@@ -237,11 +242,13 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if image != nil {
 		mountPath := linuxImageMountPath(imageName)
 		if err := inst.AddImage(ctx, mountPath, image); err != nil {
-			_ = session.Close()
+			_ = started.Session.Close()
 			return nil, err
 		}
 		inst.image = image
+		inst.root = image.RootFS
 		inst.defaultRootDir = mountPath
+		inst.managedInstance.defaultRootDir = mountPath
 		inst.baseEnv = vmruntime.WithDefaultEnv(image.Config.Env)
 		if image.Config.WorkingDir != "" {
 			inst.workDir = image.Config.WorkingDir
@@ -251,35 +258,21 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	if openbsdrootfs.IsBuiltInImage(req.Image) {
-		inst, err := b.startOpenBSDStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          openbsdrootfs.BuiltInImageName,
-			InitSystem:     req.InitSystem,
-			Network:        req.Network,
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
-		}, nil)
-		if err != nil {
-			return client.ExecResponse{}, err
-		}
-		defer inst.Close()
-		if len(req.Command) == 0 {
-			output, _ := inst.(*openbsdInstance).ConsoleHistory(ctx)
-			return client.ExecResponse{ExitCode: 0, Output: output}, nil
-		}
-		return inst.Exec(ctx, runExecRequest(req))
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
 	}
-	if freebsdrootfs.IsBuiltInImage(req.Image) {
-		inst, err := b.startFreeBSDStream(ctx, client.CreateInstanceRequest{
+	if len(req.Command) != 0 && !linuxRootFSImageEnabled() {
+		inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
 			ID:             req.ID,
-			Image:          freebsdrootfs.BuiltInImageName,
+			Image:          req.Image,
 			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Shares:         append([]client.ShareMount(nil), req.Shares...),
 			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
 			MemoryMB:       req.MemoryMB,
 			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
 			Dmesg:          req.Dmesg,
 			TimeoutSeconds: req.TimeoutSeconds,
 		}, nil)
@@ -287,10 +280,6 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		defer inst.Close()
-		if len(req.Command) == 0 {
-			output, _ := inst.(*freebsdInstance).ConsoleHistory(ctx)
-			return client.ExecResponse{ExitCode: 0, Output: output}, nil
-		}
 		return inst.Exec(ctx, runExecRequest(req))
 	}
 	if b == nil || b.kernel == nil {
@@ -334,7 +323,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		} else {
 			devs, _, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 				RootFS: linuxRuntimeImageFS(image),
-				Shares: convertLinuxShareMounts(req.Shares),
+				Shares: convertShareMounts(req.Shares),
 			}, nil)
 			if err != nil {
 				return client.ExecResponse{}, err
@@ -459,22 +448,13 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		if err := addRuntimeShares(ctx, inst, shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, client.ExecRequest{
-			Command:    append([]string(nil), req.Command...),
-			Env:        append([]string(nil), req.Env...),
-			RootDir:    req.RootDir,
-			ReplaceEnv: req.ReplaceEnv,
-			WorkDir:    req.WorkDir,
-			User:       req.User,
-			Stdin:      append([]byte(nil), req.Stdin...),
-			TTY:        req.TTY,
-			ControlFD:  req.ControlFD,
-			Cols:       req.Cols,
-			Rows:       req.Rows,
-		})
+		return inst.Exec(ctx, runExecRequest(req))
 	}
-	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) || freebsdrootfs.IsBuiltInImage(runningImage) || freebsdrootfs.IsBuiltInImage(targetImage) {
-		return client.ExecResponse{}, fmt.Errorf("BSD instances do not support executing commands from alternate images yet")
+	if err := checkAlternateImageExec(inst); err != nil {
+		return client.ExecResponse{}, err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return client.ExecResponse{}, fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 
 	session, ok := inst.(*linuxInstance)
@@ -493,40 +473,20 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 	}
 	image = withLinuxRuntimeMountDirs(image)
 	mountPath := linuxImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return client.ExecResponse{}, err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return client.ExecResponse{}, err
 	}
 
-	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
+		root:           image.RootFS,
+		baseEnv:        image.Config.Env,
+		defaultWorkDir: image.Config.WorkingDir,
+		env:            mergeImageRunEnv,
+	})
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.Exec(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
+	return inst.Exec(ctx, execReq)
 }
 
 func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -541,8 +501,11 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
-	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) || freebsdrootfs.IsBuiltInImage(runningImage) || freebsdrootfs.IsBuiltInImage(targetImage) {
-		return fmt.Errorf("BSD instances do not support executing commands from alternate images yet")
+	if err := checkAlternateImageExec(inst); err != nil {
+		return err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 
 	session, ok := inst.(*linuxInstance)
@@ -561,40 +524,20 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 	}
 	image = withLinuxRuntimeMountDirs(image)
 	mountPath := linuxImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return err
 	}
 
-	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
+		root:           image.RootFS,
+		baseEnv:        image.Config.Env,
+		defaultWorkDir: image.Config.WorkingDir,
+		env:            mergeImageRunEnv,
+	})
 	if err != nil {
 		return err
 	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.ExecStream(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, inputs, onEvent)
+	return inst.ExecStream(ctx, execReq, inputs, onEvent)
 }
 
 func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -603,8 +546,11 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	if targetImage == "" || targetImage == runningImage {
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
-	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) || freebsdrootfs.IsBuiltInImage(runningImage) || freebsdrootfs.IsBuiltInImage(targetImage) {
-		return fmt.Errorf("BSD instances do not support executing commands from alternate images yet")
+	if err := checkAlternateImageExec(inst); err != nil {
+		return err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 	session, ok := inst.(*linuxInstance)
 	if !ok {
@@ -622,463 +568,11 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	}
 	image = withLinuxRuntimeMountDirs(image)
 	mountPath := linuxImageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
+	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
 		return err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
 	return inst.ExecStream(ctx, req, inputs, onEvent)
-}
-
-func (b *runtimeBackend) startOpenBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if b == nil {
-		return nil, fmt.Errorf("runtime backend is not configured")
-	}
-	if len(req.Shares) != 0 {
-		return nil, fmt.Errorf("OpenBSD runtime does not support filesystem shares yet")
-	}
-	if req.Network != nil && !req.Network.Enabled {
-		return nil, fmt.Errorf("OpenBSD runtime requires virtio-net for the managed control channel")
-	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("OpenBSD runtime currently supports one vCPU")
-	}
-	if req.NestedVirt {
-		return nil, fmt.Errorf("OpenBSD runtime does not support nested virtualization")
-	}
-	network, err := newLinuxPCINetworkRuntime(req.ID, managedBSDNetworkConfig(req.Network))
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil && network != nil {
-			_ = network.Close()
-		}
-	}()
-	rootCfg := openBSDRuntimeConfig(b.guestInitCache)
-	rootCfg.GuestIPv4 = network.GuestAddress()
-	runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, rootCfg)
-	if err != nil {
-		return nil, err
-	}
-	session, err := kvm.StartOpenBSDManagedSession(ctx, kvm.OpenBSDManagedConfig{
-		Kernel:    runtime.Kernel,
-		Root:      runtime.Root,
-		MemoryMB:  req.MemoryMB,
-		Dmesg:     req.Dmesg,
-		GuestIPv4: network.ip,
-		GuestMAC:  network.mac,
-		NetDevice: network.Device(),
-		NetStack:  network.stack,
-	}, onEvent)
-	if err != nil {
-		_ = runtime.Close()
-		return nil, err
-	}
-	return &openbsdInstance{
-		session: session,
-		runtime: runtime,
-		root:    runtime.RootFS,
-		baseEnv: openBSDEffectiveExecEnv(nil, nil, false),
-		workDir: "/",
-		dmesg:   req.Dmesg,
-		network: network,
-	}, nil
-}
-
-func openBSDRuntimeConfig(guestInitCache string) openbsdrootfs.Config {
-	cacheDir := guestInitCache
-	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "cc-openbsd")
-	} else {
-		cacheDir = filepath.Join(filepath.Dir(cacheDir), "openbsd")
-	}
-	return openbsdrootfs.Config{CacheDir: cacheDir}
-}
-
-func managedBSDNetworkConfig(cfg *client.NetworkConfig) *client.NetworkConfig {
-	if cfg == nil {
-		return &client.NetworkConfig{Enabled: true, AllowInternet: true}
-	}
-	copyCfg := *cfg
-	return &copyCfg
-}
-
-type openbsdInstance struct {
-	session *kvm.ManagedSession
-	runtime *openbsdrootfs.Runtime
-	root    imagefs.Directory
-	baseEnv []string
-	workDir string
-	dmesg   bool
-	network *linuxNetworkRuntime
-	netOnce sync.Once
-}
-
-func (i *openbsdInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	if i == nil || i.session == nil {
-		return client.ExecResponse{}, fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		return i.session.Exec(ctx, req)
-	}
-	execReq, err := i.openBSDExecRequest(req)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	return i.session.Exec(ctx, execReq)
-}
-
-func (i *openbsdInstance) AddShare(context.Context, client.ShareMount) error {
-	return fmt.Errorf("OpenBSD runtime does not support filesystem shares yet")
-}
-
-func (i *openbsdInstance) AddPortForward(context.Context, client.PortForward) error {
-	return fmt.Errorf("OpenBSD runtime does not support port forwards yet")
-}
-
-func (i *openbsdInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if i == nil || i.session == nil {
-		return fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = i.workDir
-		}
-		req.WorkDir = workDir
-		return i.session.ExecStream(ctx, req, inputs, onEvent)
-	}
-	execReq, err := i.openBSDExecRequest(req)
-	if err != nil {
-		return err
-	}
-	return i.session.ExecStream(ctx, execReq, inputs, onEvent)
-}
-
-func (i *openbsdInstance) openBSDExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
-	env := openBSDEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.root == nil {
-			return client.ExecRequest{}, fmt.Errorf("running OpenBSD instance does not have a root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.root, req.Command, env)
-		if err != nil {
-			return client.ExecRequest{}, err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return client.ExecRequest{}, fmt.Errorf("workdir must be absolute")
-	}
-	return client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, nil
-}
-
-func (i *openbsdInstance) Flush(ctx context.Context) error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	return i.session.Flush(ctx)
-}
-
-func (i *openbsdInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.session == nil {
-		return "", nil
-	}
-	return i.session.ConsoleHistory(ctx)
-}
-
-func (i *openbsdInstance) Wait() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	defer i.closeNetwork()
-	return i.session.Wait()
-}
-
-func (i *openbsdInstance) Close() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	err := i.session.Close()
-	i.closeNetwork()
-	if closeErr := i.runtime.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func (i *openbsdInstance) closeNetwork() {
-	if i == nil {
-		return
-	}
-	i.netOnce.Do(func() {
-		if i.network != nil {
-			_ = i.network.Close()
-			i.network = nil
-		}
-	})
-}
-
-func (i *openbsdInstance) NetworkIPv4() string {
-	if i == nil {
-		return ""
-	}
-	return networkGuestAddress(i.network)
-}
-
-func openBSDEffectiveExecEnv(base, overrides []string, replace bool) []string {
-	defaults := []string{
-		"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-		"HOME=/root",
-		"TERM=xterm",
-	}
-	if replace {
-		return vmruntime.MergeEnv(defaults, overrides)
-	}
-	return vmruntime.MergeEnv(vmruntime.MergeEnv(defaults, base), overrides)
-}
-
-func (b *runtimeBackend) startFreeBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if b == nil {
-		return nil, fmt.Errorf("runtime backend is not configured")
-	}
-	if len(req.Shares) != 0 {
-		return nil, fmt.Errorf("FreeBSD runtime does not support filesystem shares yet")
-	}
-	if req.Network != nil && !req.Network.Enabled {
-		return nil, fmt.Errorf("FreeBSD runtime requires virtio-net for the managed control channel")
-	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("FreeBSD runtime currently supports one vCPU")
-	}
-	if req.NestedVirt {
-		return nil, fmt.Errorf("FreeBSD runtime does not support nested virtualization")
-	}
-	network, err := newLinuxPCINetworkRuntime(req.ID, managedBSDNetworkConfig(req.Network))
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil && network != nil {
-			_ = network.Close()
-		}
-	}()
-	rootCfg := freeBSDRuntimeConfig(b.guestInitCache)
-	rootCfg.GuestIPv4 = network.GuestAddress()
-	runtime, err := freebsdrootfs.BuildManagedRuntime(ctx, rootCfg)
-	if err != nil {
-		return nil, err
-	}
-	session, err := kvm.StartFreeBSDManagedSession(ctx, kvm.FreeBSDManagedConfig{
-		Kernel:    runtime.Kernel,
-		Root:      runtime.Root,
-		MemoryMB:  req.MemoryMB,
-		Dmesg:     req.Dmesg,
-		GuestIPv4: network.ip,
-		GuestMAC:  network.mac,
-		NetDevice: network.Device(),
-		NetStack:  network.stack,
-	}, onEvent)
-	if err != nil {
-		_ = runtime.Close()
-		return nil, err
-	}
-	return &freebsdInstance{
-		session: session,
-		runtime: runtime,
-		root:    runtime.RootFS,
-		baseEnv: freeBSDEffectiveExecEnv(nil, nil, false),
-		workDir: "/",
-		dmesg:   req.Dmesg,
-		network: network,
-	}, nil
-}
-
-func freeBSDRuntimeConfig(guestInitCache string) freebsdrootfs.Config {
-	cacheDir := guestInitCache
-	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "cc-freebsd")
-	} else {
-		cacheDir = filepath.Join(filepath.Dir(cacheDir), "freebsd")
-	}
-	return freebsdrootfs.Config{CacheDir: cacheDir}
-}
-
-type freebsdInstance struct {
-	session *kvm.ManagedSession
-	runtime *freebsdrootfs.Runtime
-	root    imagefs.Directory
-	baseEnv []string
-	workDir string
-	dmesg   bool
-	network *linuxNetworkRuntime
-	netOnce sync.Once
-}
-
-func (i *freebsdInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	if i == nil || i.session == nil {
-		return client.ExecResponse{}, fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		return i.session.Exec(ctx, req)
-	}
-	execReq, err := i.freeBSDExecRequest(req)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	return i.session.Exec(ctx, execReq)
-}
-
-func (i *freebsdInstance) AddShare(context.Context, client.ShareMount) error {
-	return fmt.Errorf("FreeBSD runtime does not support filesystem shares yet")
-}
-
-func (i *freebsdInstance) AddPortForward(context.Context, client.PortForward) error {
-	return fmt.Errorf("FreeBSD runtime does not support port forwards yet")
-}
-
-func (i *freebsdInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if i == nil || i.session == nil {
-		return fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = i.workDir
-		}
-		req.WorkDir = workDir
-		return i.session.ExecStream(ctx, req, inputs, onEvent)
-	}
-	execReq, err := i.freeBSDExecRequest(req)
-	if err != nil {
-		return err
-	}
-	return i.session.ExecStream(ctx, execReq, inputs, onEvent)
-}
-
-func (i *freebsdInstance) freeBSDExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
-	env := freeBSDEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.root == nil {
-			return client.ExecRequest{}, fmt.Errorf("running FreeBSD instance does not have a root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.root, req.Command, env)
-		if err != nil {
-			return client.ExecRequest{}, err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return client.ExecRequest{}, fmt.Errorf("workdir must be absolute")
-	}
-	return client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     req.RootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, nil
-}
-
-func (i *freebsdInstance) Flush(ctx context.Context) error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	return i.session.Flush(ctx)
-}
-
-func (i *freebsdInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.session == nil {
-		return "", nil
-	}
-	return i.session.ConsoleHistory(ctx)
-}
-
-func (i *freebsdInstance) Wait() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	defer i.closeNetwork()
-	return i.session.Wait()
-}
-
-func (i *freebsdInstance) Close() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	err := i.session.Close()
-	i.closeNetwork()
-	if closeErr := i.runtime.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func (i *freebsdInstance) closeNetwork() {
-	if i == nil {
-		return
-	}
-	i.netOnce.Do(func() {
-		if i.network != nil {
-			_ = i.network.Close()
-			i.network = nil
-		}
-	})
-}
-
-func (i *freebsdInstance) NetworkIPv4() string {
-	if i == nil {
-		return ""
-	}
-	return networkGuestAddress(i.network)
-}
-
-func freeBSDEffectiveExecEnv(base, overrides []string, replace bool) []string {
-	defaults := []string{
-		"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-		"HOME=/root",
-		"TERM=xterm",
-	}
-	if replace {
-		return vmruntime.MergeEnv(defaults, overrides)
-	}
-	return vmruntime.MergeEnv(vmruntime.MergeEnv(defaults, base), overrides)
 }
 
 func linuxAMD64NotImplemented() error {
@@ -1100,275 +594,80 @@ func ensureLinuxAMD64Image(image *oci.Image) error {
 	return fmt.Errorf("linux/amd64 runtime supports only amd64 images; %s is %s", name, arch)
 }
 
+func linuxManagedMachineSpec(id string, memoryMB uint64, cpus int, dmesg bool, network *linuxNetworkRuntime) machine.Spec {
+	spec := machine.Spec{
+		ID:       id,
+		Guest:    "Linux",
+		Arch:     "amd64",
+		MemoryMB: memoryMB,
+		CPUs:     cpus,
+		Dmesg:    dmesg,
+		Boot:     machine.BootSpec{Kind: "linux"},
+		Control:  machine.ControlSpec{Kind: "vsock", Port: vmruntime.ControlPort},
+	}
+	if network != nil {
+		spec.Network = &machine.NetworkSpec{
+			GuestIPv4: network.GuestAddress(),
+			MAC:       network.mac.String(),
+		}
+		spec.Devices = append(spec.Devices, machine.DeviceSpec{
+			Kind: "virtio-net",
+			Name: "net0",
+			Bus:  "mmio",
+			IRQ:  uint8(network.Device().IRQ),
+		})
+	}
+	return spec
+}
+
 type linuxInstance struct {
-	session        *kvm.ManagedSession
+	*managedInstance
 	image          *oci.Image
-	baseEnv        []string
-	workDir        string
 	defaultRootDir string
 	rootFS         virtio.ShareMounter
 	fsdevs         []*virtio.FS
 	network        *linuxNetworkRuntime
 	dmesg          bool
-	shareMu        sync.Mutex
-	shares         map[string]client.ShareMount
-	imageMounts    map[string]string
+	mounts         managedMountState
 }
 
 func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
-	if i == nil || len(i.fsdevs) == 0 {
+	if i == nil {
 		return nil
 	}
-	out := make([]virtio.FSStats, 0, len(i.fsdevs))
-	for _, fsdev := range i.fsdevs {
-		if fsdev == nil {
-			continue
-		}
-		out = append(out, fsdev.Stats())
-	}
-	return out
-}
-
-func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
-	if i == nil || i.session == nil {
-		return client.ExecResponse{}, fmt.Errorf("instance is not running")
-	}
-	user, err := linuxResolveExecUser(req.User)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.image == nil || i.image.RootFS == nil {
-			return client.ExecResponse{}, fmt.Errorf("running instance does not have a default image root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
-		if err != nil {
-			return client.ExecResponse{}, err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
-	}
-	rootDir := req.RootDir
-	if rootDir == "" {
-		rootDir = i.defaultRootDir
-	}
-	return i.session.Exec(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     rootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        user,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
-}
-
-func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if i == nil || i.session == nil {
-		return fmt.Errorf("instance is not running")
-	}
-	if req.Kind != "" && req.Kind != "exec" {
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = i.workDir
-		}
-		return i.session.ExecStream(ctx, client.ExecRequest{
-			Kind:      req.Kind,
-			RootDir:   req.RootDir,
-			Path:      req.Path,
-			Directory: req.Directory,
-			WorkDir:   workDir,
-			User:      req.User,
-			Stdin:     append([]byte(nil), req.Stdin...),
-		}, inputs, onEvent)
-	}
-	user, err := linuxResolveExecUser(req.User)
-	if err != nil {
-		return err
-	}
-	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
-	command := append([]string(nil), req.Command...)
-	if !req.SkipResolve {
-		if i.image == nil || i.image.RootFS == nil {
-			return fmt.Errorf("running instance does not have a default image root filesystem")
-		}
-		var err error
-		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
-		if err != nil {
-			return err
-		}
-	}
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = i.workDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-	if !strings.HasPrefix(workDir, "/") {
-		return fmt.Errorf("workdir must be absolute")
-	}
-	rootDir := req.RootDir
-	if rootDir == "" {
-		rootDir = i.defaultRootDir
-	}
-	return i.session.ExecStream(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     rootDir,
-		ReplaceEnv:  req.ReplaceEnv,
-		SkipResolve: req.SkipResolve,
-		WorkDir:     workDir,
-		User:        user,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, inputs, onEvent)
-}
-
-func (i *linuxInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	if i == nil || i.session == nil {
-		return "", nil
-	}
-	return i.session.ConsoleHistory(ctx)
+	return virtioFSStats(i.fsdevs)
 }
 
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support shares")
+		return addRuntimeShareMount(nil, nil, nil, share, "shares", nil)
 	}
-	key := strings.TrimSpace(share.Mount)
-	if key == "" {
-		return fmt.Errorf("share mount path is required")
-	}
-	i.shareMu.Lock()
-	if existing, ok := i.shares[key]; ok {
-		i.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
-			return nil
-		}
-		return fmt.Errorf("share mount %q already exists", key)
-	}
-	i.shareMu.Unlock()
-	mount, err := amd64vm.BuildShareMount(0, vmruntime.DirectoryShare{
-		Source:   share.Source,
-		Mount:    share.Mount,
-		Writable: share.Writable,
-		MapOwner: share.MapOwner,
-		OwnerUID: share.OwnerUID,
-		OwnerGID: share.OwnerGID,
-		Cache:    share.Cache,
+	return i.mounts.AddShare(i.rootFS, share, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+		return buildRuntimeDirectoryShare(share, amd64vm.BuildShareMount)
 	})
-	if err != nil {
-		return err
-	}
-	if err := i.rootFS.AddShare(mount); err != nil {
-		return err
-	}
-	i.shareMu.Lock()
-	if i.shares == nil {
-		i.shares = make(map[string]client.ShareMount)
-	}
-	i.shares[key] = share
-	i.shareMu.Unlock()
-	return nil
 }
 
 func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_ = ctx
 	if i == nil || i.network == nil {
-		return fmt.Errorf("instance network is not enabled")
+		return addManagedNetworkPortForward(ctx, nil, forward)
 	}
-	return i.network.AddPortForward(forward)
+	return addManagedNetworkPortForward(ctx, i.network.networkRuntime, forward)
 }
 
 func (i *linuxInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
-	_ = ctx
 	if i == nil || i.network == nil {
-		return fmt.Errorf("instance network is not enabled")
+		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return i.network.AllowServiceProxyPort(port)
-}
-
-func (i *linuxInstance) NetworkIPv4() string {
-	if i == nil || i.network == nil {
-		return ""
-	}
-	return networkGuestAddress(i.network)
+	return allowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
 }
 
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
-	if i == nil || i.rootFS == nil {
-		return fmt.Errorf("instance rootfs does not support image mounts")
+	if i == nil {
+		return addImageMount(nil, nil, nil, mountPath, image, nil)
 	}
-	if strings.TrimSpace(mountPath) == "" || !strings.HasPrefix(mountPath, "/") {
-		return fmt.Errorf("image mount path must be absolute")
-	}
-	if image == nil || image.RootFS == nil {
-		return fmt.Errorf("image root filesystem is not available")
-	}
-	i.shareMu.Lock()
-	if existing, ok := i.imageMounts[mountPath]; ok {
-		i.shareMu.Unlock()
-		if existing == image.Name {
-			return nil
-		}
-		return fmt.Errorf("image mount %q already exists", mountPath)
-	}
-	i.shareMu.Unlock()
-	if err := i.rootFS.AddShare(virtio.ShareMount{
-		GuestPath: mountPath,
-		Backend:   linuxRuntimeImageFS(image),
-		Writable:  true,
-		CacheMode: "aggressive",
-	}); err != nil {
-		return err
-	}
-	i.shareMu.Lock()
-	if i.imageMounts == nil {
-		i.imageMounts = make(map[string]string)
-	}
-	i.imageMounts[mountPath] = image.Name
-	i.shareMu.Unlock()
-	return nil
-}
-
-func (i *linuxInstance) Wait() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	return i.session.Wait()
-}
-
-func (i *linuxInstance) Close() error {
-	if i == nil || i.session == nil {
-		return nil
-	}
-	err := i.session.Close()
-	if netErr := i.network.Close(); err == nil {
-		err = netErr
-	}
-	return err
+	return i.mounts.AddImage(i.rootFS, mountPath, image, linuxRuntimeImageFS(image))
 }
 
 func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig, runtime *linuxNetworkRuntime) vmruntime.GuestInitConfig {
@@ -1543,52 +842,5 @@ func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
 }
 
 func linuxResolveExecUser(user string) (string, error) {
-	user = strings.TrimSpace(user)
-	if user == "" {
-		uid := os.Getuid()
-		gid := os.Getgid()
-		if uid <= 0 {
-			return "0:0", nil
-		}
-		return strconv.Itoa(uid) + ":" + strconv.Itoa(gid), nil
-	}
-	if user == "root" || user == "0" || user == "0:0" {
-		return "0:0", nil
-	}
-	uidPart, gidPart, hasGID := strings.Cut(user, ":")
-	if uidPart == "" {
-		return "", fmt.Errorf("invalid user %q", user)
-	}
-	if _, err := strconv.ParseUint(uidPart, 10, 32); err != nil {
-		return "", fmt.Errorf("linux amd64 runtime supports numeric users only: %q", user)
-	}
-	if hasGID {
-		if gidPart == "" {
-			return "", fmt.Errorf("invalid user %q", user)
-		}
-		if _, err := strconv.ParseUint(gidPart, 10, 32); err != nil {
-			return "", fmt.Errorf("linux amd64 runtime supports numeric users only: %q", user)
-		}
-		return uidPart + ":" + gidPart, nil
-	}
-	return uidPart + ":" + uidPart, nil
-}
-
-func convertLinuxShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
-	if len(shares) == 0 {
-		return nil
-	}
-	out := make([]vmruntime.DirectoryShare, 0, len(shares))
-	for _, share := range shares {
-		out = append(out, vmruntime.DirectoryShare{
-			Source:   share.Source,
-			Mount:    share.Mount,
-			Writable: share.Writable,
-			MapOwner: share.MapOwner,
-			OwnerUID: share.OwnerUID,
-			OwnerGID: share.OwnerGID,
-			Cache:    share.Cache,
-		})
-	}
-	return out
+	return resolveLinuxRuntimeExecUser("linux amd64", user)
 }

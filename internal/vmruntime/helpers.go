@@ -9,18 +9,19 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/protocol"
 )
 
 const (
-	InstanceReadyMarker   = "__CCX3_READY__"
+	InstanceReadyMarker   = protocol.ReadyMarker
 	InitDurationMarker    = "__CCX3_INIT_MS__:"
-	ExecTimingMarker      = "__CCX3_TIMING__:"
-	CommandBeginMarker    = "__CCX3_BEGIN__:"
-	CommandOutputMarker   = "__CCX3_OUT__:"
-	CommandErrorMarker    = "__CCX3_ERR__:"
-	CommandControlMarker  = "__CCX3_CTL__:"
-	CommandUsageMarker    = "__CCX3_USAGE__:"
-	CommandExitMarkerPref = "__CCX3_EXIT__:"
+	ExecTimingMarker      = protocol.TimingMarkerPrefix
+	CommandBeginMarker    = protocol.BeginMarkerPrefix
+	CommandOutputMarker   = protocol.OutputMarkerPrefix
+	CommandErrorMarker    = protocol.ErrorMarkerPrefix
+	CommandControlMarker  = protocol.ControlMarkerPrefix
+	CommandUsageMarker    = protocol.UsageMarkerPrefix
+	CommandExitMarkerPref = protocol.ExitMarkerPrefix
 )
 
 type SerialTranscript struct {

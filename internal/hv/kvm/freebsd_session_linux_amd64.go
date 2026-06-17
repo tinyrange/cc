@@ -5,23 +5,20 @@ package kvm
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"runtime"
-	"strings"
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
 	freebsdamd64 "j5.nz/cc/internal/freebsd/boot/amd64"
+	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/netstack"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
-
-const freeBSDControlPort = 10777
 
 type FreeBSDManagedConfig struct {
 	Kernel      []byte
@@ -42,153 +39,59 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 	}
 
 	netdev, stack, ownStack := freeBSDManagedNet(cfg)
-	ln, err := stack.ListenInternal("tcp", fmt.Sprintf(":%d", freeBSDControlPort))
-	if err != nil {
-		if ownStack {
-			stack.Close()
-		}
-		return nil, fmt.Errorf("listen FreeBSD control tcp: %w", err)
+	devices := []machine.DeviceSpec{{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10}}
+	for idx := range cfg.ExtraBlocks {
+		devices = append(devices, machine.DeviceSpec{
+			Kind:   "virtio-block",
+			Name:   fmt.Sprintf("extra%d", idx),
+			Bus:    "pci",
+			Slot:   uint8(2 + idx),
+			IOBase: uint16(0x1100 + idx*0x100),
+			IRQ:    uint8(11 + idx),
+		})
 	}
-
-	var kvmVM *VM
-	var cancel context.CancelFunc
-	var bootWriter *vmruntime.BootEventWriter
-	cleanupStartup := func() {
-		if cancel != nil {
-			cancel()
-		}
-		_ = ln.Close()
-		if ownStack {
-			stack.Close()
-		}
-		if bootWriter != nil {
-			_ = bootWriter.Close()
-		}
-		if kvmVM != nil {
-			kvmVM.Close()
-		}
-	}
-
-	connCh := make(chan net.Conn, 1)
-	acceptErrCh := make(chan error, 1)
-	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
-
-	kvmVM, err = NewVM()
-	if err != nil {
-		cleanupStartup()
-		return nil, err
-	}
-	mem, err := mapAMD64GuestMemory(kvmVM, cfg.MemoryMB)
-	if err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("map guest memory: %w", err)
-	}
-
-	serialOut := vmruntime.NewSerialTranscript()
-	var serialWriter io.Writer = serialOut
-	if onEvent != nil {
-		bootWriter = vmruntime.NewBootEventWriter(onEvent)
-		serialWriter = io.MultiWriter(serialOut, bootWriter)
-	}
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
-	uart.AttachIRQ(kvmVM, amd64vm.COM1IRQ)
-
-	var pciDevices []*PCIDevice
-	block := virtio.NewBlock(0, 0x1000, 10, cfg.Root)
-	block.Attach(kvmVM, kvmVM)
-	pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
-	for i, backend := range cfg.ExtraBlocks {
-		if backend == nil {
-			continue
-		}
-		dev := uint8(2 + i)
-		ioBase := uint16(0x1100 + i*0x100)
-		irq := uint8(11 + i)
-		extraBlock := virtio.NewBlock(0, 0x1000, uint32(irq), backend)
-		extraBlock.Attach(kvmVM, kvmVM)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(dev, ioBase, irq, extraBlock))
-	}
-	netdev.Attach(kvmVM, kvmVM)
-	netIndex := len(pciDevices) + 1
-	pciDevices = append(pciDevices, NewVirtioNetPCIDevice(uint8(netIndex), uint16(0x1000+netIndex*0x100), uint8(10+netIndex), netdev))
-	pci := NewPCIBus(pciDevices...)
-
-	plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
-		MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
+	netIndex := len(devices) + 1
+	devices = append(devices, machine.DeviceSpec{
+		Kind:   "virtio-net",
+		Name:   "net0",
+		Bus:    "pci",
+		Slot:   uint8(netIndex),
+		IOBase: uint16(0x1000 + netIndex*0x100),
+		IRQ:    uint8(10 + netIndex),
 	})
-	if err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("prepare FreeBSD boot: %w", err)
-	}
-	if err := kvmVM.SetFreeBSDLongMode(plan.EntryGVA, plan.StackGPA, plan.PagingGPA); err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("set FreeBSD long mode: %w", err)
-	}
-
-	runCtx, runCancel := context.WithCancel(context.Background())
-	cancel = runCancel
-	doneCh := make(chan error, 1)
-	vmForRun := kvmVM
-	kvmVM = nil
-	go func() {
-		defer vmForRun.Close()
-		doneCh <- runFreeBSDManagedVM(runCtx, vmForRun, uart, pci, serialOut)
-	}()
-
-	var control net.Conn
-	select {
-	case err := <-acceptErrCh:
-		cleanupStartup()
-		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	case conn := <-connCh:
-		control = conn
-	case err := <-doneCh:
-		cleanupStartup()
-		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	case <-ctx.Done():
-		cleanupStartup()
-		err := fmt.Errorf("FreeBSD guest did not connect to control TCP port %d before startup deadline: %w", freeBSDControlPort, ctx.Err())
-		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	}
-
-	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
-		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
-	}); err != nil {
-		_ = control.Close()
-		cleanupStartup()
-		err = fmt.Errorf("FreeBSD control connection did not report ready marker %q: %w", vmruntime.InstanceReadyMarker, err)
-		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	}
-	if vmruntime.HasFatalBootText(controlTranscript.String()) {
-		_ = control.Close()
-		cleanupStartup()
-		return nil, freeBSDStartupError(fmt.Errorf("FreeBSD guest reported boot failure"), serialOut.String(), controlTranscript.String())
-	}
-
-	return &ManagedSession{
-		cancel:     cancel,
-		doneCh:     doneCh,
-		control:    control,
-		listener:   ln,
-		bootWriter: bootWriter,
-		transcript: controlTranscript,
-		serialOut:  serialOut,
-		cleanup: func() {
-			if ownStack {
-				_ = stack.Close()
-			}
+	return startBSDPCManagedSession(ctx, bsdPCSessionConfig{
+		Spec: machine.Spec{
+			Guest:    "FreeBSD",
+			Arch:     "amd64",
+			MemoryMB: cfg.MemoryMB,
+			Dmesg:    cfg.Dmesg,
+			Control:  machine.ControlSpec{Kind: "tcp", Port: bsdControlPort},
+			Network:  &machine.NetworkSpec{GuestIPv4: cfg.GuestIPv4.String(), MAC: cfg.GuestMAC.String()},
+			Devices:  devices,
 		},
-		dmesg: cfg.Dmesg,
-	}, nil
+		GuestName:   "FreeBSD",
+		Kernel:      cfg.Kernel,
+		Root:        cfg.Root,
+		ExtraBlocks: cfg.ExtraBlocks,
+		MemoryMB:    cfg.MemoryMB,
+		Dmesg:       cfg.Dmesg,
+		NetDevice:   netdev,
+		NetStack:    stack,
+		OwnNetStack: ownStack,
+		Prepare: func(vm *VM, mem []byte) error {
+			plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
+				MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
+			})
+			if err != nil {
+				return fmt.Errorf("prepare FreeBSD boot: %w", err)
+			}
+			if err := vm.SetFreeBSDLongMode(plan.EntryGVA, plan.StackGPA, plan.PagingGPA); err != nil {
+				return fmt.Errorf("set FreeBSD long mode: %w", err)
+			}
+			return nil
+		},
+		Run: runFreeBSDManagedVM,
+	}, onEvent)
 }
 
 func freeBSDManagedNet(cfg FreeBSDManagedConfig) (*virtio.Net, *netstack.NetStack, bool) {
@@ -219,7 +122,7 @@ func normalizeFreeBSDManagedConfig(cfg FreeBSDManagedConfig) (FreeBSDManagedConf
 }
 
 func freeBSDStartupError(err error, serialText, controlText string) error {
-	return transcriptError(err, serialText, controlText)
+	return bsdStartupError(err, serialText, controlText)
 }
 
 func runFreeBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci *PCIBus, serialOut *vmruntime.SerialTranscript) error {

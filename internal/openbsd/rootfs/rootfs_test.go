@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/managed/machine"
 )
 
 func TestIsBuiltInImage(t *testing.T) {
@@ -98,7 +99,11 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"), "10.42.0.7")
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"), machine.NetworkSpec{
+		GuestIPv4: "10.42.0.7",
+		DNSIPv4:   "10.42.0.9",
+		Hostname:  "test-openbsd",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,9 +112,52 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {
 	if !strings.Contains(initScript, "ifconfig vio0 inet 10.42.0.7 ") {
 		t.Fatalf("init script does not configure leased IP: %q", initScript)
 	}
+	if !strings.Contains(initScript, "route add default 10.42.0.1") {
+		t.Fatalf("init script does not configure default gateway: %q", initScript)
+	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.7 cc-openbsd") {
+	if !strings.Contains(hosts, "10.42.0.7 test-openbsd") {
 		t.Fatalf("hosts does not contain leased IP: %q", hosts)
+	}
+	resolv := readRootFile(t, root, "/etc/resolv.conf")
+	if !strings.Contains(resolv, "nameserver 10.42.0.9") {
+		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
+	}
+	myname := readRootFile(t, root, "/etc/myname")
+	if strings.TrimSpace(myname) != "test-openbsd" {
+		t.Fatalf("myname = %q", myname)
+	}
+}
+
+func TestBuildManagedRootFromOpenBSDBaseSetUsesStructuredNetwork(t *testing.T) {
+	baseTGZ := writeTGZFixture(t, []tarFixtureEntry{
+		{name: "sbin", mode: 0o755, dir: true},
+		{name: "sbin/init", mode: 0o555, data: []byte("base init\n")},
+		{name: "usr", mode: 0o755, dir: true},
+		{name: "usr/lib", mode: 0o755, dir: true},
+		{name: "usr/lib/libc.so.99.0", mode: 0o444, data: []byte("libc")},
+		{name: "usr/lib/libpthread.so.99.0", mode: 0o444, data: []byte("libpthread")},
+		{name: "etc", mode: 0o755, dir: true},
+		{name: "dev", mode: 0o755, dir: true},
+	})
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"), machine.NetworkSpec{
+		GuestIPv4:   "10.42.0.11",
+		GatewayIPv4: "10.42.0.12",
+		DNSIPv4:     "10.42.0.13",
+		Hostname:    "structured-openbsd",
+		Interface:   "vio1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRoot()
+	initScript := readRootFile(t, root, "/sbin/init")
+	if !strings.Contains(initScript, "ifconfig vio1 inet 10.42.0.11 ") || !strings.Contains(initScript, "route add default 10.42.0.12") {
+		t.Fatalf("init script does not contain structured network identity: %q", initScript)
+	}
+	resolv := readRootFile(t, root, "/etc/resolv.conf")
+	if !strings.Contains(resolv, "nameserver 10.42.0.13") {
+		t.Fatalf("resolv.conf does not contain structured DNS IP: %q", resolv)
 	}
 }
 
