@@ -133,6 +133,25 @@ func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]strin
 	return configVars, moduleMap
 }
 
+func sameRuntimeImage(targetImage, runningImage string) bool {
+	targetImage = strings.TrimSpace(targetImage)
+	runningImage = strings.TrimSpace(runningImage)
+	if targetImage == "" || targetImage == runningImage {
+		return true
+	}
+	if isBuiltinGuestImage(targetImage) || isBuiltinGuestImage(runningImage) {
+		return canonicalBuiltinRuntimeImage(targetImage) == canonicalBuiltinRuntimeImage(runningImage)
+	}
+	return false
+}
+
+func canonicalBuiltinRuntimeImage(image string) string {
+	if profile, ok := builtinGuestForImage(image); ok {
+		return profile.Canonical
+	}
+	return strings.TrimSpace(image)
+}
+
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
 	return b.StartStream(ctx, req, nil)
 }
@@ -142,6 +161,9 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	start := time.Now()
 	network, err := newDarwinARM64NetworkRuntime(req.Network)
 	if err != nil {
@@ -182,6 +204,9 @@ func (b *runtimeBackend) StartBlankStream(
 	req client.StartInstanceRequest,
 	onEvent func(client.BootEvent) error,
 ) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	start := time.Now()
 	network, err := newDarwinARM64NetworkRuntime(req.Network)
 	if err != nil {
@@ -218,6 +243,9 @@ func (b *runtimeBackend) StartBlankStream(
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
+	}
 	network, err := newDarwinARM64NetworkRuntime(req.Network)
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -267,7 +295,7 @@ func (b *runtimeBackend) RunInInstance(
 	req client.RunRequest,
 ) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
-	if targetImage == "" || targetImage == runningImage {
+	if sameRuntimeImage(targetImage, runningImage) {
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
@@ -276,6 +304,9 @@ func (b *runtimeBackend) RunInInstance(
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecResponse{}, err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return client.ExecResponse{}, fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {
@@ -315,7 +346,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 	onEvent func(client.ExecEvent) error,
 ) error {
 	targetImage := strings.TrimSpace(req.Image)
-	if targetImage == "" || targetImage == runningImage {
+	if sameRuntimeImage(targetImage, runningImage) {
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return err
 		}
@@ -324,6 +355,9 @@ func (b *runtimeBackend) RunInInstanceStream(
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {
@@ -357,12 +391,15 @@ func (b *runtimeBackend) RunInInstanceStream(
 func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	targetImage := strings.TrimSpace(req.Image)
 	req.Image = ""
-	if targetImage == "" || targetImage == runningImage {
+	if sameRuntimeImage(targetImage, runningImage) {
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
+	}
+	if isBuiltinGuestImage(targetImage) {
+		return fmt.Errorf("managed guest image %q cannot be mounted as an alternate Linux root", targetImage)
 	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {

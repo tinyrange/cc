@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"j5.nz/cc/client"
@@ -191,7 +192,7 @@ func (h *placementVMHost) Start(ctx context.Context, req client.CreateInstanceRe
 }
 
 func (h *placementVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
+	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image)})
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +209,7 @@ func (h *placementVMHost) StartBlank(ctx context.Context, req client.StartInstan
 }
 
 func (h *placementVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
+	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image)})
 	if err != nil {
 		return nil, err
 	}
@@ -402,4 +403,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func isBuiltinBSDImageName(image string) bool {
+	switch strings.ToLower(strings.TrimSpace(image)) {
+	case "@openbsd", "openbsd", "@freebsd", "freebsd", "@netbsd", "netbsd":
+		return true
+	default:
+		return false
+	}
 }

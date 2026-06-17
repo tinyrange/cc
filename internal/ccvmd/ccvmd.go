@@ -881,6 +881,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 
 	mux.HandleFunc("GET /image/{image}", func(w http.ResponseWriter, r *http.Request) {
 		imageName := r.PathValue("image")
+		if isBuiltInBSDImage(imageName) {
+			writeJSON(w, http.StatusOK, client.ImageState{
+				Name:       imageName,
+				Source:     "builtin:" + strings.TrimPrefix(imageName, "@"),
+				SourceKind: "builtin",
+				Status:     "downloaded",
+			})
+			return
+		}
 		state, err := srvState.images.Get(imageName)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err)
@@ -891,6 +900,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 
 	mux.HandleFunc("POST /image/{image}/metadata", func(w http.ResponseWriter, r *http.Request) {
 		imageName := r.PathValue("image")
+		if isBuiltInBSDImage(imageName) {
+			writeJSON(w, http.StatusOK, client.ImageMetadataState{
+				Name:       imageName,
+				Status:     "prepared",
+				SourceKind: "builtin",
+				Env:        nil,
+			})
+			return
+		}
 		image, err := srvState.images.Open(imageName)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -907,6 +925,10 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 
 	mux.HandleFunc("POST /image/{image}/qemu/download", func(w http.ResponseWriter, r *http.Request) {
 		imageName := r.PathValue("image")
+		if isBuiltInBSDImage(imageName) {
+			writeJSON(w, http.StatusOK, client.EmulatorState{Status: "skipped", Required: false})
+			return
+		}
 		image, err := srvState.images.Open(imageName)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)

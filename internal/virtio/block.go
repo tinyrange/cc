@@ -42,6 +42,8 @@ type Block struct {
 	Size uint64
 	IRQ  uint32
 
+	DisableSizeMax bool
+
 	mu               sync.Mutex
 	mem              GuestMemory
 	irq              IRQController
@@ -107,7 +109,7 @@ func (b *Block) Read(addr uint64, size int) (uint64, error) {
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
-		features := featureVersion1 | blockFeatureSizeMax | blockFeatureSegMax | blockFeatureFlush
+		features := b.deviceFeaturesLocked()
 		if b.deviceFeatureSel == 0 {
 			return truncateValue(features, size), nil
 		}
@@ -491,7 +493,15 @@ func (b *Block) configBytesLocked() []byte {
 }
 
 func (b *Block) legacyFeaturesLocked() uint64 {
-	return blockFeatureSizeMax | blockFeatureSegMax | blockFeatureFlush
+	return b.deviceFeaturesLocked() &^ featureVersion1
+}
+
+func (b *Block) deviceFeaturesLocked() uint64 {
+	features := featureVersion1 | blockFeatureSegMax | blockFeatureFlush
+	if !b.DisableSizeMax {
+		features |= blockFeatureSizeMax
+	}
+	return features
 }
 
 func (b *Block) updateIRQLocked() error {

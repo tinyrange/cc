@@ -156,6 +156,9 @@ func (i *darwinInstance) Close() error {
 	if i == nil {
 		return nil
 	}
+	if i.network == nil {
+		return hostmanaged.CloseSession(i.session)
+	}
 	return hostmanaged.CloseSessionWithNetwork(i.session, i.network)
 }
 
