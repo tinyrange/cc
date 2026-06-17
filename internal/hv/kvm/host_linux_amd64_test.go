@@ -28,12 +28,22 @@ func TestNormalizeLinuxManagedMachineDefaultsSpec(t *testing.T) {
 	}
 }
 
-func TestKVMHostRejectsUnsupportedManagedGuest(t *testing.T) {
-	_, err := (Host{}).Start(context.Background(), managedhost.StartRequest{
-		Spec: machine.Spec{Guest: "NetBSD", Boot: machine.BootSpec{Kind: "netbsd"}},
-	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "does not support") {
-		t.Fatalf("Start unsupported guest error = %v", err)
+func TestManagedGuestKindRecognizesBSDGuests(t *testing.T) {
+	tests := []struct {
+		name string
+		spec machine.Spec
+		want string
+	}{
+		{name: "openbsd", spec: machine.Spec{Guest: "OpenBSD", Boot: machine.BootSpec{Kind: "openbsd"}}, want: "openbsd"},
+		{name: "freebsd", spec: machine.Spec{Guest: "FreeBSD", Boot: machine.BootSpec{Kind: "freebsd"}}, want: "freebsd"},
+		{name: "netbsd", spec: machine.Spec{Guest: "NetBSD", Boot: machine.BootSpec{Kind: "netbsd"}}, want: "netbsd"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedGuestKind(tc.spec); got != tc.want {
+				t.Fatalf("managedGuestKind = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

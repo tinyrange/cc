@@ -107,7 +107,7 @@ func (b *Block) Read(addr uint64, size int) (uint64, error) {
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
-		features := featureVersion1 | blockFeatureSegMax | blockFeatureFlush
+		features := featureVersion1 | blockFeatureSizeMax | blockFeatureSegMax | blockFeatureFlush
 		if b.deviceFeatureSel == 0 {
 			return truncateValue(features, size), nil
 		}
@@ -491,7 +491,7 @@ func (b *Block) configBytesLocked() []byte {
 }
 
 func (b *Block) legacyFeaturesLocked() uint64 {
-	return blockFeatureSegMax | blockFeatureFlush
+	return blockFeatureSizeMax | blockFeatureSegMax | blockFeatureFlush
 }
 
 func (b *Block) updateIRQLocked() error {

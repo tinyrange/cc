@@ -41,6 +41,25 @@ func TestPCIBusExposesVirtioBlockLegacyIOBAR(t *testing.T) {
 	}
 }
 
+func TestPCIBusExposesType2ConfigSpace(t *testing.T) {
+	block := virtio.NewBlock(0, 0x1000, 10, nil)
+	bus := NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+
+	writePort(t, bus, pciConfigAddressPort, []byte{0xf0})
+	writePort(t, bus, pciConfigAddressPort+2, []byte{0})
+	data := readPort(t, bus, pciConfigType2Port|0x100, 4)
+	if vendor := binary.LittleEndian.Uint16(data[0:2]); vendor != pciVendorQumranet {
+		t.Fatalf("type 2 vendor = %#x", vendor)
+	}
+	if device := binary.LittleEndian.Uint16(data[2:4]); device != pciVirtioBlockDeviceID {
+		t.Fatalf("type 2 device = %#x", device)
+	}
+	data = readPort(t, bus, pciConfigType2Port|0x110, 4)
+	if bar := binary.LittleEndian.Uint32(data); bar != 0x1001 {
+		t.Fatalf("type 2 bar = %#x", bar)
+	}
+}
+
 func writePCIAddress(t *testing.T, bus *PCIBus, busNo, devNo, fnNo uint8, reg uint8) {
 	t.Helper()
 	value := uint32(1<<31) | uint32(busNo)<<16 | uint32(devNo)<<11 | uint32(fnNo)<<8 | uint32(reg&0xfc)

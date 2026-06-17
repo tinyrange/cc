@@ -29,6 +29,8 @@ func (b *runtimeBackend) startBuiltinGuestProfile(ctx context.Context, profile m
 		return b.startOpenBSDStream(ctx, req, onEvent)
 	case managedguest.FreeBSDImageName:
 		return b.startFreeBSDStream(ctx, req, onEvent)
+	case managedguest.NetBSDImageName:
+		return b.startNetBSDStream(ctx, req, onEvent)
 	default:
 		return nil, fmt.Errorf("managed guest profile %q is not supported on linux/amd64", profile.Canonical)
 	}
@@ -109,6 +111,10 @@ func managedBSDNetworkConfig(cfg *client.NetworkConfig) *client.NetworkConfig {
 
 func (b *runtimeBackend) startFreeBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	return b.startBSDManagedStream(ctx, req, onEvent, builtin.FreeBSDDefinition(b.guestInitCache))
+}
+
+func (b *runtimeBackend) startNetBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	return b.startBSDManagedStream(ctx, req, onEvent, builtin.NetBSDDefinition(b.guestInitCache))
 }
 
 func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error, def builtin.BSDDefinition) (inst Instance, err error) {

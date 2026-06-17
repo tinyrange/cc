@@ -191,6 +191,11 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 			if value == 0 {
 				q.lastAvailIdx = 0
 				q.usedIdx = 0
+			} else if n.queueSel == netQueueRX {
+				if err := n.processRXLocked(); err != nil {
+					n.mu.Unlock()
+					return err
+				}
 			}
 		}
 	case regQueueDescLow:
@@ -307,6 +312,12 @@ func (n *Net) WriteLegacy(offset uint16, size int, value uint64) error {
 				return nil
 			}
 			n.configureLegacyQueueLocked(q, uint32(value))
+			if n.queueSel == netQueueRX {
+				if err := n.processRXLocked(); err != nil {
+					n.mu.Unlock()
+					return err
+				}
+			}
 		}
 	case 14:
 		n.queueSel = uint32(value)

@@ -19,6 +19,7 @@ import (
 
 const (
 	hpetBaseAddress          = 0xFED00000
+	hpetNetBSDBaseAddress    = 0xFED40000
 	hpetAlternateBaseAddress = 0xFED80000
 	hpetMMIOWindowSize       = 0x400
 
@@ -309,7 +310,7 @@ func bootHPETOffset(addr uint64, size uint32) (uint64, bool) {
 	if size == 0 {
 		return 0, false
 	}
-	for _, base := range [...]uint64{hpetBaseAddress, hpetAlternateBaseAddress} {
+	for _, base := range [...]uint64{hpetBaseAddress, hpetNetBSDBaseAddress, hpetAlternateBaseAddress} {
 		end := base + hpetMMIOWindowSize
 		if addr >= base && addr+uint64(size) <= end {
 			return addr - base, true

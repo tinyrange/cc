@@ -18,6 +18,8 @@ func TestGuestForImageRecognizesBuiltinBSDProfiles(t *testing.T) {
 		{image: "openbsd", canonical: managedguest.OpenBSDImageName, want: true},
 		{image: "@freebsd", canonical: managedguest.FreeBSDImageName, want: true},
 		{image: "freebsd", canonical: managedguest.FreeBSDImageName, want: true},
+		{image: "@netbsd", canonical: managedguest.NetBSDImageName, want: true},
+		{image: "netbsd", canonical: managedguest.NetBSDImageName, want: true},
 		{image: "alpine", want: false},
 		{image: "", want: false},
 	}
@@ -66,6 +68,16 @@ func TestBSDDefinitionsDescribeManagedGuests(t *testing.T) {
 			iface:      "vtnet0",
 			cacheLeaf:  "freebsd",
 			packageMgr: "pkg",
+		},
+		{
+			name:       "netbsd",
+			def:        NetBSDDefinition(cache),
+			canonical:  managedguest.NetBSDImageName,
+			bootKind:   "netbsd",
+			hostname:   "cc-netbsd",
+			iface:      "vioif0",
+			cacheLeaf:  "netbsd",
+			packageMgr: "pkg_add",
 		},
 	}
 	for _, tc := range tests {

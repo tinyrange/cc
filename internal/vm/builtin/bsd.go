@@ -9,6 +9,7 @@ import (
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/managed/rootartifact"
+	netbsdrootfs "j5.nz/cc/internal/netbsd/rootfs"
 	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -89,6 +90,37 @@ func FreeBSDRuntimeCacheDir(guestInitCache string) string {
 		cacheDir = filepath.Join(os.TempDir(), "cc-freebsd")
 	} else {
 		cacheDir = filepath.Join(filepath.Dir(cacheDir), "freebsd")
+	}
+	return cacheDir
+}
+
+func NetBSDDefinition(guestInitCache string) BSDDefinition {
+	return BSDDefinition{
+		Profile:   managedguest.NetBSDProfile,
+		BootKind:  "netbsd",
+		Hostname:  "cc-netbsd",
+		Interface: "vioif0",
+		CacheDir:  NetBSDRuntimeCacheDir(guestInitCache),
+		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+			runtime, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Network: network})
+			if err != nil {
+				return rootartifact.Artifact{}, err
+			}
+			return runtime.Artifact(), nil
+		},
+	}
+}
+
+func NetBSDRuntimeConfig(guestInitCache string) netbsdrootfs.Config {
+	return netbsdrootfs.Config{CacheDir: NetBSDRuntimeCacheDir(guestInitCache)}
+}
+
+func NetBSDRuntimeCacheDir(guestInitCache string) string {
+	cacheDir := guestInitCache
+	if cacheDir == "" {
+		cacheDir = filepath.Join(os.TempDir(), "cc-netbsd")
+	} else {
+		cacheDir = filepath.Join(filepath.Dir(cacheDir), "netbsd")
 	}
 	return cacheDir
 }

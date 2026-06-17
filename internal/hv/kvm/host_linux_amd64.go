@@ -46,6 +46,8 @@ func (Host) Start(ctx context.Context, req managedhost.StartRequest, onEvent fun
 		return Host{}.startOpenBSD(ctx, req, onEvent)
 	case "freebsd":
 		return Host{}.startFreeBSD(ctx, req, onEvent)
+	case "netbsd":
+		return Host{}.startNetBSD(ctx, req, onEvent)
 	default:
 		return nil, fmt.Errorf("kvm host does not support managed guest %q boot %q", req.Spec.Guest, req.Spec.Boot.Kind)
 	}
@@ -108,6 +110,24 @@ func (Host) startFreeBSD(ctx context.Context, req managedhost.StartRequest, onEv
 	}, onEvent)
 }
 
+func (Host) startNetBSD(ctx context.Context, req managedhost.StartRequest, onEvent func(client.BootEvent) error) (managedsession.Session, error) {
+	attachments, err := bsdManagedAttachments(req.Attachments)
+	if err != nil {
+		return nil, err
+	}
+	return Host{}.StartNetBSDManaged(ctx, NetBSDManagedConfig{
+		Kernel:      req.Artifact.Kernel,
+		Root:        req.Artifact.RootBlock,
+		ExtraBlocks: req.Artifact.ExtraBlocks,
+		MemoryMB:    req.Spec.MemoryMB,
+		Dmesg:       req.Spec.Dmesg,
+		GuestIPv4:   attachments.GuestIPv4,
+		GuestMAC:    attachments.GuestMAC,
+		NetDevice:   attachments.NetDevice,
+		NetStack:    attachments.NetStack,
+	}, onEvent)
+}
+
 func bsdManagedAttachments(value any) (BSDManagedAttachments, error) {
 	switch attachments := value.(type) {
 	case nil:
@@ -147,6 +167,10 @@ func (Host) StartFreeBSDManaged(ctx context.Context, cfg FreeBSDManagedConfig, o
 	return StartFreeBSDManagedSession(ctx, cfg, onEvent)
 }
 
+func (Host) StartNetBSDManaged(ctx context.Context, cfg NetBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartNetBSDManagedSession(ctx, cfg, onEvent)
+}
+
 func normalizeLinuxManagedMachine(machine LinuxManagedMachine) LinuxManagedMachine {
 	if machine.Spec.Guest == "" {
 		machine.Spec.Guest = "Linux"
@@ -183,6 +207,9 @@ func managedGuestKind(spec machine.Spec) string {
 	}
 	if guest == "freebsd" || boot == "freebsd" {
 		return "freebsd"
+	}
+	if guest == "netbsd" || boot == "netbsd" {
+		return "netbsd"
 	}
 	return guest
 }

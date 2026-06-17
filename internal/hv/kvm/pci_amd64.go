@@ -11,6 +11,8 @@ import (
 const (
 	pciConfigAddressPort = 0xcf8
 	pciConfigDataPort    = 0xcfc
+	pciConfigType2Port   = 0xc000
+	pciConfigType2Size   = 0x1000
 
 	pciVendorQumranet = 0x1af4
 
@@ -24,8 +26,10 @@ type pciIOHandler interface {
 }
 
 type PCIBus struct {
-	configAddress uint32
-	devices       []*PCIDevice
+	configAddress      uint32
+	configType2Enable  uint8
+	configType2Forward uint8
+	devices            []*PCIDevice
 }
 
 type PCIDevice struct {
@@ -94,7 +98,23 @@ func (b *PCIBus) HandleIO(ioExit IOExit) (bool, error) {
 	if b == nil {
 		return false, nil
 	}
+	if ioExit.Port == pciConfigAddressPort+2 && len(ioExit.Data) == 1 {
+		if ioExit.Write {
+			b.configType2Forward = ioExit.Data[0]
+		} else {
+			ioExit.Data[0] = b.configType2Forward
+		}
+		return true, nil
+	}
 	if ioExit.Port >= pciConfigAddressPort && ioExit.Port < pciConfigAddressPort+4 {
+		if ioExit.Port == pciConfigAddressPort && len(ioExit.Data) == 1 {
+			if ioExit.Write {
+				b.configType2Enable = ioExit.Data[0]
+			} else {
+				ioExit.Data[0] = b.configType2Enable
+			}
+			return true, nil
+		}
 		var cfgAddr [4]byte
 		binary.LittleEndian.PutUint32(cfgAddr[:], b.configAddress)
 		if ioExit.Write {
@@ -111,6 +131,24 @@ func (b *PCIBus) HandleIO(ioExit IOExit) (bool, error) {
 			b.writeConfig(offset, ioExit.Data)
 		} else {
 			b.readConfig(offset, ioExit.Data)
+		}
+		return true, nil
+	}
+	if ioExit.Port >= pciConfigType2Port && ioExit.Port < pciConfigType2Port+pciConfigType2Size {
+		device := uint8((ioExit.Port >> 8) & 0x0f)
+		offset := uint8(ioExit.Port & 0xff)
+		function := uint8((b.configType2Enable >> 1) & 0x07)
+		bus := b.configType2Forward
+		if b.configType2Enable&0xf0 != 0xf0 {
+			for i := range ioExit.Data {
+				ioExit.Data[i] = 0xff
+			}
+			return true, nil
+		}
+		if ioExit.Write {
+			b.writeConfigAt(bus, device, function, offset, ioExit.Data)
+		} else {
+			b.readConfigAt(bus, device, function, offset, ioExit.Data)
 		}
 		return true, nil
 	}
@@ -143,10 +181,18 @@ func (b *PCIBus) HandleIO(ioExit IOExit) (bool, error) {
 }
 
 func (b *PCIBus) readConfig(offset uint8, dst []byte) {
+	dev := b.selectedDevice()
+	b.readDeviceConfig(dev, offset, dst)
+}
+
+func (b *PCIBus) readConfigAt(bus, device, function, offset uint8, dst []byte) {
+	b.readDeviceConfig(b.deviceAt(bus, device, function), offset, dst)
+}
+
+func (b *PCIBus) readDeviceConfig(dev *PCIDevice, offset uint8, dst []byte) {
 	for i := range dst {
 		dst[i] = 0xff
 	}
-	dev := b.selectedDevice()
 	if dev == nil {
 		return
 	}
@@ -156,7 +202,14 @@ func (b *PCIBus) readConfig(offset uint8, dst []byte) {
 }
 
 func (b *PCIBus) writeConfig(offset uint8, src []byte) {
-	dev := b.selectedDevice()
+	b.writeDeviceConfig(b.selectedDevice(), offset, src)
+}
+
+func (b *PCIBus) writeConfigAt(bus, device, function, offset uint8, src []byte) {
+	b.writeDeviceConfig(b.deviceAt(bus, device, function), offset, src)
+}
+
+func (b *PCIBus) writeDeviceConfig(dev *PCIDevice, offset uint8, src []byte) {
 	if dev == nil {
 		return
 	}
@@ -172,6 +225,10 @@ func (b *PCIBus) selectedDevice() *PCIDevice {
 	bus := uint8((b.configAddress >> 16) & 0xff)
 	device := uint8((b.configAddress >> 11) & 0x1f)
 	function := uint8((b.configAddress >> 8) & 0x07)
+	return b.deviceAt(bus, device, function)
+}
+
+func (b *PCIBus) deviceAt(bus, device, function uint8) *PCIDevice {
 	for _, dev := range b.devices {
 		if dev != nil && dev.Bus == bus && dev.Device == device && dev.Function == function {
 			return dev
