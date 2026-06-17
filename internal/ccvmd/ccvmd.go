@@ -26,17 +26,16 @@ import (
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
-	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
+	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
-	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/vm"
 )
 
 func isBuiltInBSDImage(name string) bool {
-	return openbsdrootfs.IsBuiltInImage(name) || freebsdrootfs.IsBuiltInImage(name)
+	return managedguest.IsBuiltinBSDImage(name)
 }
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""

@@ -3,11 +3,9 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,16 +22,33 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"j5.nz/cc/internal/managed/guestagent"
+	"j5.nz/cc/internal/managed/protocol"
 )
 
 const configPath = "/etc/ccx3-init.json"
 const guestQEMUPath = "/run/ccx3/qemu-x86_64"
 const guestQEMUBinfmtPath = "/run/ccx3-qemu-x86_64"
 const initDurationMarker = "__CCX3_INIT_MS__:"
-const execTimingMarker = "__CCX3_TIMING__:"
 const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
+
+const (
+	managedExecTimingRecv            = "recv"
+	managedExecTimingGuestReadyBegin = "guest_ready_begin"
+	managedExecTimingGuestReadyDone  = "guest_ready_done"
+	managedExecTimingStartBegin      = "start_begin"
+	managedExecTimingFirstStdout     = "first_stdout"
+	managedExecTimingFirstStderr     = "first_stderr"
+	managedExecTimingStartCall       = "start_call"
+	managedExecTimingStarted         = "started"
+	managedExecTimingWaitBegin       = "wait_begin"
+	managedExecTimingWaitDone        = "wait_done"
+	managedExecTimingStreamsDone     = "streams_done"
+	managedExecTimingExitSent        = "exit_sent"
+	managedExecTimingStdinCloseRecv  = "stdin_close_recv"
+)
 const stage2Mode = "--ccx3-stage2"
 const stage2Path = "/etc/ccx3/stage2"
 const stage2ConfigPath = "/etc/ccx3/config.json"
@@ -88,22 +103,32 @@ type share struct {
 	Writable bool   `json:"writable,omitempty"`
 }
 
-type execRequest struct {
-	Kind      string   `json:"kind,omitempty"`
-	ID        string   `json:"id"`
-	Command   []string `json:"command,omitempty"`
-	Env       []string `json:"env,omitempty"`
-	RootDir   string   `json:"root_dir,omitempty"`
-	Path      string   `json:"path,omitempty"`
-	Dir       bool     `json:"directory,omitempty"`
-	WorkDir   string   `json:"workdir,omitempty"`
-	User      string   `json:"user,omitempty"`
-	Stdin     []byte   `json:"stdin,omitempty"`
-	TTY       bool     `json:"tty,omitempty"`
-	ControlFD bool     `json:"control_fd,omitempty"`
-	Signal    string   `json:"signal,omitempty"`
-	Cols      int      `json:"cols,omitempty"`
-	Rows      int      `json:"rows,omitempty"`
+type execRequest = protocol.ManagedExecRequest
+
+type preparedExecRequest struct {
+	ID        string
+	Command   []string
+	Env       []string
+	RootDir   string
+	WorkDir   string
+	User      string
+	Stdin     []byte
+	TTY       bool
+	ControlFD bool
+	Cols      int
+	Rows      int
+}
+
+type execRequestValidation struct {
+	Message  string
+	ExitCode int
+}
+
+type systemdCommandGate struct {
+	enabled bool
+	ready   bool
+	wait    func(time.Duration) error
+	mu      sync.Mutex
 }
 
 type managedExec struct {
@@ -150,7 +175,7 @@ func (m *managedExec) setPTY(pty *os.File) {
 }
 
 func (m *managedExec) signal(name string) error {
-	sig, err := parseSignal(name)
+	sig, err := guestagent.ParseSignal(name)
 	if err != nil {
 		return err
 	}
@@ -184,6 +209,117 @@ func (m *managedExec) resize(cols, rows int) error {
 		Col: uint16(cols),
 		Row: uint16(rows),
 	})
+}
+
+func (m *managedExec) WriteStdin(data []byte) error {
+	return m.writeStdin(data)
+}
+
+func (m *managedExec) CloseStdin() error {
+	return m.closeStdin()
+}
+
+func (m *managedExec) Signal(name string) error {
+	return m.signal(name)
+}
+
+func (m *managedExec) Resize(cols, rows int) error {
+	return m.resize(cols, rows)
+}
+
+func validateExecRequest(req execRequest) execRequestValidation {
+	if len(req.Command) == 0 {
+		return execRequestValidation{Message: "exec request missing command", ExitCode: 125}
+	}
+	if req.ID == "" {
+		return execRequestValidation{Message: "exec request missing id"}
+	}
+	return execRequestValidation{}
+}
+
+func prepareExecRequest(cfg config, req execRequest) preparedExecRequest {
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = cfg.WorkDir
+	}
+	env := req.Env
+	if len(env) == 0 {
+		env = cfg.Env
+	}
+	user := req.User
+	if user == "" {
+		user = cfg.User
+	}
+	return preparedExecRequest{
+		ID:        req.ID,
+		Command:   append([]string(nil), req.Command...),
+		Env:       append([]string(nil), env...),
+		RootDir:   req.RootDir,
+		WorkDir:   workDir,
+		User:      user,
+		Stdin:     append([]byte(nil), req.Stdin...),
+		TTY:       req.TTY,
+		ControlFD: req.ControlFD,
+		Cols:      req.Cols,
+		Rows:      req.Rows,
+	}
+}
+
+func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveExecSet, req preparedExecRequest, waitReady func() error) {
+	stdinR, stdinW := io.Pipe()
+	managed := &managedExec{stdin: stdinW, start: time.Now()}
+	closeStdin := active.Add(req.ID, managed)
+	go runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {
+		_ = managed.closeStdin()
+		active.Delete(req.ID)
+	})
+	if closeStdin {
+		if err := managed.closeStdin(); err != nil {
+			writeKernel("ccx3-init: close pending stdin: " + err.Error())
+		}
+	}
+	if len(req.Stdin) == 0 {
+		return
+	}
+	initialStdin := append([]byte(nil), req.Stdin...)
+	go func(id string, managed *managedExec) {
+		if err := managed.writeStdin(initialStdin); err != nil {
+			writeKernel("ccx3-init: write initial stdin: " + err.Error())
+		}
+		if err := managed.closeStdin(); err != nil {
+			writeKernel("ccx3-init: close initial stdin: " + err.Error())
+		}
+	}(req.ID, managed)
+}
+
+func newSystemdCommandGate(initSystem string) *systemdCommandGate {
+	return &systemdCommandGate{
+		enabled: strings.TrimSpace(initSystem) == initSystemSystemd,
+		ready:   strings.TrimSpace(initSystem) != initSystemSystemd,
+		wait:    waitForSystemdCommandReady,
+	}
+}
+
+func (g *systemdCommandGate) WaitForCommand(argv []string) func() error {
+	if g == nil || !g.enabled || !commandNeedsSystemdReady(argv) {
+		return nil
+	}
+	return func() error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.ready {
+			return nil
+		}
+		wait := g.wait
+		if wait == nil {
+			wait = waitForSystemdCommandReady
+		}
+		if err := wait(systemdReadyTimeout); err != nil {
+			return err
+		}
+		g.ready = true
+		return nil
+	}
 }
 
 func main() {
@@ -574,70 +710,123 @@ func copyCurrentExecutable(dst string) error {
 }
 
 func runExecPivot(args []string) error {
-	if len(args) < 7 {
-		return fmt.Errorf("invalid exec pivot argument count")
-	}
-	rootDir := args[0]
-	workDir := args[1]
-	uid := args[2]
-	gid := args[3]
-	groups := args[4]
-	if args[5] != "--" {
-		return fmt.Errorf("invalid exec pivot separator")
-	}
-	argv := args[6:]
-	if len(argv) == 0 {
-		return fmt.Errorf("missing command")
-	}
-	if rootDir != "" {
-		if err := pivotExecRoot(rootDir); err != nil {
-			return err
-		}
-	}
-	if workDir != "" {
-		if err := os.Chdir(workDir); err != nil {
-			return fmt.Errorf("chdir %s: %w", workDir, err)
-		}
-	}
-	if uid != "" || gid != "" || groups != "" {
-		if err := applyExecCredential(uid, gid, groups); err != nil {
-			return err
-		}
-	}
-	argv0, err := lookPathForExec(argv[0])
+	req, err := parseExecPivotArgs(args)
 	if err != nil {
 		return err
 	}
-	return syscall.Exec(argv0, argv, os.Environ())
+	if req.rootDir != "" {
+		if err := pivotExecRoot(req.rootDir); err != nil {
+			return err
+		}
+	}
+	if req.workDir != "" {
+		if err := os.Chdir(req.workDir); err != nil {
+			return fmt.Errorf("chdir %s: %w", req.workDir, err)
+		}
+	}
+	if req.uid != "" || req.gid != "" || req.groups != "" {
+		if err := applyExecCredential(req.uid, req.gid, req.groups); err != nil {
+			return err
+		}
+	}
+	argv0, err := lookPathForExec(req.argv[0])
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(argv0, req.argv, os.Environ())
+}
+
+type execPivotRequest struct {
+	rootDir string
+	workDir string
+	uid     string
+	gid     string
+	groups  string
+	argv    []string
+}
+
+func parseExecPivotArgs(args []string) (execPivotRequest, error) {
+	if len(args) < 7 {
+		return execPivotRequest{}, fmt.Errorf("invalid exec pivot argument count")
+	}
+	if args[5] != "--" {
+		return execPivotRequest{}, fmt.Errorf("invalid exec pivot separator")
+	}
+	argv := args[6:]
+	if len(argv) == 0 {
+		return execPivotRequest{}, fmt.Errorf("missing command")
+	}
+	return execPivotRequest{
+		rootDir: args[0],
+		workDir: args[1],
+		uid:     args[2],
+		gid:     args[3],
+		groups:  args[4],
+		argv:    append([]string(nil), argv...),
+	}, nil
 }
 
 func pivotExecRoot(rootDir string) error {
+	return pivotExecRootWithOps(rootDir, execPivotRootOps{
+		mount:    syscall.Mount,
+		mkdirAll: os.MkdirAll,
+		pivot:    syscall.PivotRoot,
+		chdir:    os.Chdir,
+		unmount:  syscall.Unmount,
+		remove:   os.Remove,
+	})
+}
+
+type execPivotRootOps struct {
+	mount    func(source, target, fstype string, flags uintptr, data string) error
+	mkdirAll func(path string, perm os.FileMode) error
+	pivot    func(newroot, putold string) error
+	chdir    func(dir string) error
+	unmount  func(target string, flags int) error
+	remove   func(name string) error
+}
+
+func pivotExecRootWithOps(rootDir string, ops execPivotRootOps) error {
 	if rootDir == "" {
 		return fmt.Errorf("missing root_dir")
 	}
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+	if err := ops.mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mount namespace private: %w", err)
 	}
 	putOld := filepath.Join(rootDir, ".ccx3-old-root")
-	if err := os.MkdirAll(putOld, 0o700); err != nil {
+	if err := ops.mkdirAll(putOld, 0o700); err != nil {
 		return fmt.Errorf("mkdir put_old: %w", err)
 	}
-	if err := syscall.PivotRoot(rootDir, putOld); err != nil {
+	if err := ops.pivot(rootDir, putOld); err != nil {
 		return fmt.Errorf("pivot_root %s: %w", rootDir, err)
 	}
-	if err := os.Chdir("/"); err != nil {
+	if err := ops.chdir("/"); err != nil {
 		return fmt.Errorf("chdir / after pivot_root: %w", err)
 	}
-	if err := syscall.Unmount("/.ccx3-old-root", syscall.MNT_DETACH); err != nil {
+	if err := ops.unmount("/.ccx3-old-root", syscall.MNT_DETACH); err != nil {
 		return fmt.Errorf("unmount old root: %w", err)
 	}
-	if err := os.Remove("/.ccx3-old-root"); err != nil && !os.IsNotExist(err) {
+	if err := ops.remove("/.ccx3-old-root"); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove old root: %w", err)
 	}
 	return nil
 }
 
 func applyExecCredential(uidText, gidText, groupsText string) error {
+	return applyExecCredentialWithOps(uidText, gidText, groupsText, execCredentialOps{
+		setgroups: syscall.Setgroups,
+		setgid:    syscall.Setgid,
+		setuid:    syscall.Setuid,
+	})
+}
+
+type execCredentialOps struct {
+	setgroups func([]int) error
+	setgid    func(int) error
+	setuid    func(int) error
+}
+
+func applyExecCredentialWithOps(uidText, gidText, groupsText string, ops execCredentialOps) error {
 	uid, err := parseUint32(uidText)
 	if err != nil {
 		return fmt.Errorf("invalid uid %q: %w", uidText, err)
@@ -656,16 +845,30 @@ func applyExecCredential(uidText, gidText, groupsText string) error {
 			groups = append(groups, int(group))
 		}
 	}
-	if err := syscall.Setgroups(groups); err != nil {
+	if err := ops.setgroups(groups); err != nil {
 		return fmt.Errorf("setgroups: %w", err)
 	}
-	if err := syscall.Setgid(int(gid)); err != nil {
+	if err := ops.setgid(int(gid)); err != nil {
 		return fmt.Errorf("setgid: %w", err)
 	}
-	if err := syscall.Setuid(int(uid)); err != nil {
+	if err := ops.setuid(int(uid)); err != nil {
 		return fmt.Errorf("setuid: %w", err)
 	}
 	return nil
+}
+
+func parseUint32(value string) (uint32, error) {
+	n := uint64(0)
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("not numeric")
+		}
+		n = n*10 + uint64(ch-'0')
+		if n > uint64(^uint32(0)) {
+			return 0, fmt.Errorf("out of range")
+		}
+	}
+	return uint32(n), nil
 }
 
 func lookPathForExec(file string) (string, error) {
@@ -1384,37 +1587,53 @@ func writeProtocolLine(value string) {
 }
 
 func writeProtocolLineTo(w io.Writer, value string) {
-	protocolMu.Lock()
-	defer protocolMu.Unlock()
-	_, _ = io.WriteString(w, strings.TrimRight(value, "\n")+"\n")
+	guestagent.WriteProtocolLine(w, value)
 }
 
 func writeExecStderr(cfg config, control io.Writer, id, value string) {
-	if cfg.ErrorMarkerPref == "" || value == "" {
-		return
-	}
-	writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString([]byte(value)))
+	reporterForConfig(cfg, control, id, time.Time{}).Stderr([]byte(value))
 }
 
 func writeExecStdoutBytes(cfg config, control io.Writer, id string, data []byte) {
-	if cfg.OutputMarkerPref == "" || len(data) == 0 {
-		return
-	}
-	writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(data))
+	reporterForConfig(cfg, control, id, time.Time{}).Stdout(data)
 }
 
 func writeExecControlBytes(cfg config, control io.Writer, id string, data []byte) {
-	if cfg.ControlMarkerPref == "" || len(data) == 0 {
-		return
-	}
-	writeProtocolLineTo(control, cfg.ControlMarkerPref+id+":"+base64.StdEncoding.EncodeToString(data))
+	reporterForConfig(cfg, control, id, time.Time{}).ControlBytes(data)
 }
 
 func writeExecTiming(control io.Writer, id, phase string, start time.Time) {
-	if id == "" || phase == "" {
-		return
+	guestagent.NewExecReporter(guestagent.Protocol{TimingMarkerPrefix: guestagent.TimingMarkerPrefix}, control, id, start).Timing(phase)
+}
+
+func managedExecGuestReadyTimingPhases(waitReady func() error) (begin string, done string, enabled bool) {
+	if waitReady == nil {
+		return "", "", false
 	}
-	writeProtocolLineTo(control, execTimingMarker+id+":"+phase+":"+itoa(int(time.Since(start).Milliseconds())))
+	return managedExecTimingGuestReadyBegin, managedExecTimingGuestReadyDone, true
+}
+
+func managedExecFirstOutputTimingPhase(stderr bool) string {
+	if stderr {
+		return managedExecTimingFirstStderr
+	}
+	return managedExecTimingFirstStdout
+}
+
+func reporterForConfig(cfg config, control io.Writer, id string, start time.Time) guestagent.ExecReporter {
+	return guestagent.NewExecReporter(protocolForConfig(cfg), control, id, start)
+}
+
+func protocolForConfig(cfg config) guestagent.Protocol {
+	return guestagent.Protocol{
+		BeginMarkerPrefix:   cfg.BeginMarker,
+		OutputMarkerPrefix:  cfg.OutputMarkerPref,
+		ErrorMarkerPrefix:   cfg.ErrorMarkerPref,
+		ControlMarkerPrefix: cfg.ControlMarkerPref,
+		UsageMarkerPrefix:   cfg.UsageMarkerPref,
+		ExitMarkerPrefix:    cfg.ExitMarkerPrefix,
+		TimingMarkerPrefix:  guestagent.TimingMarkerPrefix,
+	}
 }
 
 func appendFileContents(buf *strings.Builder, path string) {
@@ -1526,29 +1745,6 @@ func itoa(v int) string {
 	return string(buf[i:])
 }
 
-func parseSignal(name string) (syscall.Signal, error) {
-	switch strings.ToUpper(strings.TrimPrefix(strings.TrimSpace(name), "SIG")) {
-	case "HUP":
-		return syscall.SIGHUP, nil
-	case "INT":
-		return syscall.SIGINT, nil
-	case "QUIT":
-		return syscall.SIGQUIT, nil
-	case "TERM":
-		return syscall.SIGTERM, nil
-	case "KILL":
-		return syscall.SIGKILL, nil
-	case "USR1":
-		return syscall.SIGUSR1, nil
-	case "USR2":
-		return syscall.SIGUSR2, nil
-	case "WINCH":
-		return syscall.SIGWINCH, nil
-	default:
-		return 0, fmt.Errorf("unsupported signal %q", name)
-	}
-}
-
 func openPTY(cols, rows int) (*os.File, *os.File, error) {
 	masterFD, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -1619,7 +1815,7 @@ func execCommand(cfg config) error {
 		return fmt.Errorf("run %s: %w", cfg.Command[0], err)
 	}
 	if cfg.UsageMarkerPref != "" && usage != nil {
-		usageMarker := cfg.UsageMarkerPref + encodeExecUsage(usage)
+		usageMarker := cfg.UsageMarkerPref + guestagent.EncodeExecUsage(usage)
 		writeKernel(usageMarker)
 		writeProtocolLine(usageMarker)
 	}
@@ -1635,7 +1831,7 @@ func execCommand(cfg config) error {
 	}
 }
 
-func execCommandGo(argv []string, env []string, workDir string, user string) (int, *execUsage, error) {
+func execCommandGo(argv []string, env []string, workDir string, user string) (int, *guestagent.ExecUsage, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	start := time.Now()
 	cmd.Env = env
@@ -1646,25 +1842,130 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	cmd.Stdin = console
 	cmd.Stdout = console
 	cmd.Stderr = console
-	if cred, err := credentialForUser(user); err != nil {
+	if cred, err := guestagent.CredentialForUser(user); err != nil {
 		return 0, nil, err
 	} else if cred != nil {
-		if err := ensureCredentialUser("", cred); err != nil {
+		if err := guestagent.EnsureCredentialUser("", cred); err != nil {
 			return 0, nil, err
 		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
 	err := cmd.Run()
-	usage := usageFromProcessState(cmd.ProcessState, time.Since(start))
+	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(start))
 	if err == nil {
 		return 0, usage, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return processExitCode(cmd.ProcessState, exitErr.ExitCode()), usage, nil
+		return guestagent.ProcessExitCode(cmd.ProcessState, exitErr.ExitCode()), usage, nil
 	}
 	return 0, usage, err
+}
+
+func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.ActiveExecSet, req execRequest) bool {
+	switch req.Kind {
+	case "exec":
+		return false
+	case "sync":
+		if req.ID == "" {
+			writeKernel("ccx3-init: sync request missing id")
+			return true
+		}
+		go runSyncRequest(cfg, control, req.ID)
+	case "fs_archive":
+		if req.ID == "" {
+			writeKernel("ccx3-init: fs_archive request missing id")
+			return true
+		}
+		go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path)
+	case "fs_mkdir":
+		if req.ID == "" {
+			writeKernel("ccx3-init: fs_mkdir request missing id")
+			return true
+		}
+		go runFSMkdirRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User))
+	case "fs_write":
+		if req.ID == "" {
+			writeKernel("ccx3-init: fs_write request missing id")
+			return true
+		}
+		go runFSWriteRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User), io.NopCloser(bytes.NewReader(req.Stdin)))
+	case "fs_extract":
+		if req.ID == "" {
+			writeKernel("ccx3-init: fs_extract request missing id")
+			return true
+		}
+		if len(req.Stdin) > 0 {
+			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
+			return true
+		}
+		stdinR, stdinW := io.Pipe()
+		managed := &managedExec{stdin: stdinW, start: time.Now()}
+		active.Add(req.ID, managed)
+		go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, stdinR, func() {
+			_ = managed.closeStdin()
+			active.Delete(req.ID)
+		})
+	case "stdin":
+		result := guestagent.HandleActiveControl(active, guestagent.ActiveControlRequest{
+			Kind:  req.Kind,
+			ID:    req.ID,
+			Stdin: req.Stdin,
+		})
+		if !result.Found {
+			writeKernel("ccx3-init: stdin for unknown exec id " + req.ID)
+			return true
+		}
+		if result.Err != nil {
+			writeKernel("ccx3-init: write stdin: " + result.Err.Error())
+		}
+	case "stdin_close":
+		result := guestagent.HandleActiveControl(active, guestagent.ActiveControlRequest{
+			Kind:                      req.Kind,
+			ID:                        req.ID,
+			RememberPendingStdinClose: true,
+		})
+		if !result.Found {
+			return true
+		}
+		managed, _ := result.Exec.(*managedExec)
+		if managed != nil {
+			writeExecTiming(control, req.ID, managedExecTimingStdinCloseRecv, managed.start)
+		}
+		if result.Err != nil {
+			writeKernel("ccx3-init: close stdin: " + result.Err.Error())
+		}
+	case "signal":
+		result := guestagent.HandleActiveControl(active, guestagent.ActiveControlRequest{
+			Kind:   req.Kind,
+			ID:     req.ID,
+			Signal: req.Signal,
+		})
+		if !result.Found {
+			writeKernel("ccx3-init: signal for unknown exec id " + req.ID)
+			return true
+		}
+		if result.Err != nil {
+			writeKernel("ccx3-init: signal " + req.Signal + ": " + result.Err.Error())
+		}
+	case "resize":
+		result := guestagent.HandleActiveControl(active, guestagent.ActiveControlRequest{
+			Kind: req.Kind,
+			ID:   req.ID,
+			Cols: req.Cols,
+			Rows: req.Rows,
+		})
+		if !result.Found {
+			return true
+		}
+		if result.Err != nil {
+			writeKernel("ccx3-init: resize " + itoa(req.Cols) + "x" + itoa(req.Rows) + ": " + result.Err.Error())
+		}
+	default:
+		writeKernel("ccx3-init: unsupported control kind " + req.Kind)
+	}
+	return true
 }
 
 func commandLoop(cfg config, control io.ReadWriter) error {
@@ -1672,34 +1973,8 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		cfg.ControlMarkerPref = defaultControlMarkerPref
 	}
 	reader := bufio.NewReader(control)
-	active := map[string]*managedExec{}
-	pendingStdinClose := map[string]bool{}
-	var activeMu sync.Mutex
-	var systemdCommandMu sync.Mutex
-	systemdCommandReady := strings.TrimSpace(cfg.InitSystem) != initSystemSystemd
-	waitForCommandReady := func(argv []string) func() error {
-		if strings.TrimSpace(cfg.InitSystem) != initSystemSystemd {
-			return nil
-		}
-		if !commandNeedsSystemdReady(argv) {
-			return nil
-		}
-		return func() error {
-			systemdCommandMu.Lock()
-			if systemdCommandReady {
-				systemdCommandMu.Unlock()
-				return nil
-			}
-			systemdCommandMu.Unlock()
-			if err := waitForSystemdCommandReady(systemdReadyTimeout); err != nil {
-				return err
-			}
-			systemdCommandMu.Lock()
-			systemdCommandReady = true
-			systemdCommandMu.Unlock()
-			return nil
-		}
-	}
+	active := guestagent.NewActiveExecSet()
+	systemdGate := newSystemdCommandGate(cfg.InitSystem)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -1721,165 +1996,19 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		if req.Kind == "" {
 			req.Kind = "exec"
 		}
-		switch req.Kind {
-		case "exec":
-		case "sync":
-			if req.ID == "" {
-				writeKernel("ccx3-init: sync request missing id")
-				continue
-			}
-			go runSyncRequest(cfg, control, req.ID)
-			continue
-		case "fs_archive":
-			if req.ID == "" {
-				writeKernel("ccx3-init: fs_archive request missing id")
-				continue
-			}
-			go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path)
-			continue
-		case "fs_mkdir":
-			if req.ID == "" {
-				writeKernel("ccx3-init: fs_mkdir request missing id")
-				continue
-			}
-			go runFSMkdirRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User))
-			continue
-		case "fs_write":
-			if req.ID == "" {
-				writeKernel("ccx3-init: fs_write request missing id")
-				continue
-			}
-			go runFSWriteRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User), io.NopCloser(bytes.NewReader(req.Stdin)))
-			continue
-		case "fs_extract":
-			if req.ID == "" {
-				writeKernel("ccx3-init: fs_extract request missing id")
-				continue
-			}
-			if len(req.Stdin) > 0 {
-				go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Dir, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
-				continue
-			}
-			stdinR, stdinW := io.Pipe()
-			managed := &managedExec{stdin: stdinW, start: time.Now()}
-			activeMu.Lock()
-			active[req.ID] = managed
-			activeMu.Unlock()
-			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Dir, req.User, stdinR, func() {
-				_ = managed.closeStdin()
-				activeMu.Lock()
-				delete(active, req.ID)
-				activeMu.Unlock()
-			})
-			continue
-		case "stdin":
-			activeMu.Lock()
-			managed := active[req.ID]
-			activeMu.Unlock()
-			if managed == nil {
-				writeKernel("ccx3-init: stdin for unknown exec id " + req.ID)
-				continue
-			}
-			if err := managed.writeStdin(req.Stdin); err != nil {
-				writeKernel("ccx3-init: write stdin: " + err.Error())
-			}
-			continue
-		case "stdin_close":
-			activeMu.Lock()
-			managed := active[req.ID]
-			if managed == nil {
-				pendingStdinClose[req.ID] = true
-			}
-			activeMu.Unlock()
-			if managed == nil {
-				continue
-			}
-			writeExecTiming(control, req.ID, "stdin_close_recv", managed.start)
-			if err := managed.closeStdin(); err != nil {
-				writeKernel("ccx3-init: close stdin: " + err.Error())
-			}
-			continue
-		case "signal":
-			activeMu.Lock()
-			managed := active[req.ID]
-			activeMu.Unlock()
-			if managed == nil {
-				writeKernel("ccx3-init: signal for unknown exec id " + req.ID)
-				continue
-			}
-			if err := managed.signal(req.Signal); err != nil {
-				writeKernel("ccx3-init: signal " + req.Signal + ": " + err.Error())
-			}
-			continue
-		case "resize":
-			activeMu.Lock()
-			managed := active[req.ID]
-			activeMu.Unlock()
-			if managed == nil {
-				continue
-			}
-			if err := managed.resize(req.Cols, req.Rows); err != nil {
-				writeKernel("ccx3-init: resize " + itoa(req.Cols) + "x" + itoa(req.Rows) + ": " + err.Error())
-			}
-			continue
-		default:
-			writeKernel("ccx3-init: unsupported control kind " + req.Kind)
+		if handleInitControlRequest(cfg, control, active, req) {
 			continue
 		}
-		if len(req.Command) == 0 {
-			writeKernel("ccx3-init: exec request missing command")
-			if cfg.ExitMarkerPrefix != "" {
-				writeKernel(cfg.ExitMarkerPrefix + "125")
+		if validation := validateExecRequest(req); validation.Message != "" {
+			writeKernel("ccx3-init: " + validation.Message)
+			if validation.ExitCode != 0 && cfg.ExitMarkerPrefix != "" {
+				writeKernel(cfg.ExitMarkerPrefix + itoa(validation.ExitCode))
 			}
-			continue
-		}
-		if req.ID == "" {
-			writeKernel("ccx3-init: exec request missing id")
 			continue
 		}
 
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = cfg.WorkDir
-		}
-		env := req.Env
-		if len(env) == 0 {
-			env = cfg.Env
-		}
-		user := req.User
-		if user == "" {
-			user = cfg.User
-		}
-
-		stdinR, stdinW := io.Pipe()
-		managed := &managedExec{stdin: stdinW, start: time.Now()}
-		activeMu.Lock()
-		active[req.ID] = managed
-		closeStdin := pendingStdinClose[req.ID]
-		delete(pendingStdinClose, req.ID)
-		activeMu.Unlock()
-		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitForCommandReady(req.Command), func() {
-			_ = managed.closeStdin()
-			activeMu.Lock()
-			delete(active, req.ID)
-			activeMu.Unlock()
-		})
-		if closeStdin {
-			if err := managed.closeStdin(); err != nil {
-				writeKernel("ccx3-init: close pending stdin: " + err.Error())
-			}
-		}
-		if len(req.Stdin) > 0 {
-			initialStdin := append([]byte(nil), req.Stdin...)
-			go func(id string, managed *managedExec) {
-				if err := managed.writeStdin(initialStdin); err != nil {
-					writeKernel("ccx3-init: write initial stdin: " + err.Error())
-				}
-				if err := managed.closeStdin(); err != nil {
-					writeKernel("ccx3-init: close initial stdin: " + err.Error())
-				}
-			}(req.ID, managed)
-		}
+		execReq := prepareExecRequest(cfg, req)
+		startPreparedExec(cfg, control, active, execReq, systemdGate.WaitForCommand(execReq.Command))
 	}
 }
 
@@ -1992,27 +2121,21 @@ func waitForSystemdCommandReady(timeout time.Duration) error {
 }
 
 func runSyncRequest(cfg config, control io.Writer, id string) {
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
-	}
+	proto := protocolForConfig(cfg)
+	proto.WriteBegin(control, id)
 	syscall.Sync()
-	if cfg.ExitMarkerPrefix != "" {
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":0")
-	}
+	proto.WriteExit(control, id, 0)
 }
 
 func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src string) {
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
-	}
+	proto := protocolForConfig(cfg)
+	proto.WriteBegin(control, id)
 	exitCode := 0
 	if err := archivePathToControl(cfg, control, id, rootDir, src); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs archive: "+err.Error()+"\n")
 	}
-	if cfg.ExitMarkerPrefix != "" {
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-	}
+	proto.WriteExit(control, id, exitCode)
 }
 
 func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string) error {
@@ -2026,7 +2149,7 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 	}
 	pr, pw := io.Pipe()
 	go func() {
-		err := writePathTar(pw, src, filepath.Base(src), info)
+		err := guestagent.WritePathTar(pw, src, filepath.Base(src), info)
 		_ = pw.CloseWithError(err)
 	}()
 	var buf [execProtocolChunkSize]byte
@@ -2046,52 +2169,43 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 
 func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
-	}
+	proto := protocolForConfig(cfg)
+	proto.WriteBegin(control, id)
 	exitCode := 0
-	if err := extractTarToPath(stdin, rootDir, dst, dstDir); err != nil {
+	if err := guestagent.ExtractTarToPath(stdin, rootDir, dst, dstDir); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs extract: "+err.Error()+"\n")
 	}
-	if cfg.ExitMarkerPrefix != "" {
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-	}
+	proto.WriteExit(control, id, exitCode)
 }
 
 func runFSMkdirRequest(cfg config, control io.Writer, id, rootDir, dir, user string) {
 	if strings.TrimSpace(dir) == "" {
 		dir = "."
 	}
+	proto := protocolForConfig(cfg)
 	exitCode := 0
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
-	}
+	proto.WriteBegin(control, id)
 	target := rootPath(rootDir, filepath.Clean(dir))
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
-	} else if err := chownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
 	}
-	if cfg.ExitMarkerPrefix != "" {
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-	}
+	proto.WriteExit(control, id, exitCode)
 }
 
 func runFSWriteRequest(cfg config, control io.Writer, id, rootDir, dst, user string, stdin io.ReadCloser) {
 	defer stdin.Close()
+	proto := protocolForConfig(cfg)
 	exitCode := 0
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
-	}
+	proto.WriteBegin(control, id)
 	if strings.TrimSpace(dst) == "" {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: destination path is required\n")
 		exitCode = 1
-		if cfg.ExitMarkerPrefix != "" {
-			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-		}
+		proto.WriteExit(control, id, exitCode)
 		return
 	}
 	target := rootPath(rootDir, filepath.Clean(dst))
@@ -2101,13 +2215,11 @@ func runFSWriteRequest(cfg config, control io.Writer, id, rootDir, dst, user str
 	} else if err := writeStreamToPath(stdin, target, 0o644); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
-	} else if err := chownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
 	}
-	if cfg.ExitMarkerPrefix != "" {
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-	}
+	proto.WriteExit(control, id, exitCode)
 }
 
 func writeStreamToPath(r io.Reader, target string, mode os.FileMode) error {
@@ -2120,258 +2232,33 @@ func writeStreamToPath(r io.Reader, target string, mode os.FileMode) error {
 	return errors.Join(copyErr, closeErr)
 }
 
-func chownPathForUser(target, user string) error {
-	cred, err := credentialForUser(user)
-	if err != nil || cred == nil {
-		return err
-	}
-	return os.Chown(target, int(cred.Uid), int(cred.Gid))
-}
-
-func writePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
-	tw := tar.NewWriter(w)
-	defer tw.Close()
-	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := os.Lstat(filePath)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(filepath.Dir(src), filePath)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			rel = rootName
-			info = rootInfo
-		}
-		link := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err = os.Readlink(filePath)
-			if err != nil {
-				return err
-			}
-		}
-		header, err := tar.FileInfoHeader(info, link)
-		if err != nil {
-			return err
-		}
-		header.Name = filepath.ToSlash(rel)
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		file, err := os.Open(filePath)
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(tw, file)
-		closeErr := file.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
-	})
-}
-
-func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
-	if strings.TrimSpace(dst) == "" {
-		return fmt.Errorf("destination path is required")
-	}
-	dst = rootPath(rootDir, filepath.Clean(dst))
-	if info, err := os.Stat(dst); err == nil && info.IsDir() {
-		dstDir = true
-	}
-	tr := tar.NewReader(r)
-	sawEntry := false
-	var dirs []tarDirMtime
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			if !sawEntry {
-				return fmt.Errorf("archive is empty")
-			}
-			return restoreTarDirMtimes(dirs)
-		}
-		if err != nil {
-			return err
-		}
-		sawEntry = true
-		target, err := guestTarTarget(dst, dstDir, header.Name)
-		if err != nil {
-			return err
-		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
-				return err
-			}
-			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
-			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(file, tr)
-			closeErr := file.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			perm := os.FileMode(header.Mode).Perm()
-			if err := os.Chmod(target, perm); err != nil {
-				return err
-			}
-			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
-				return err
-			}
-		default:
-			continue
-		}
-	}
-}
-
-type tarDirMtime struct {
-	path  string
-	mtime time.Time
-}
-
-func restoreTarDirMtimes(dirs []tarDirMtime) error {
-	for i := len(dirs) - 1; i >= 0; i-- {
-		dir := dirs[i]
-		if dir.mtime.IsZero() {
-			continue
-		}
-		if err := os.Chtimes(dir.path, dir.mtime, dir.mtime); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func guestTarTarget(dst string, dstDir bool, name string) (string, error) {
-	cleanName := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(name, "/")))
-	if cleanName == "." || cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("unsafe tar path %q", name)
-	}
-	if dstDir {
-		return filepath.Join(dst, cleanName), nil
-	}
-	parts := strings.SplitN(cleanName, string(filepath.Separator), 2)
-	if len(parts) == 1 {
-		return dst, nil
-	}
-	return filepath.Join(dst, parts[1]), nil
-}
-
 func execPivotArgs(rootDir, workDir string, cred *syscall.Credential, argv []string) []string {
-	uid := ""
-	gid := ""
-	groups := ""
-	if cred != nil {
-		uid = fmt.Sprint(cred.Uid)
-		gid = fmt.Sprint(cred.Gid)
-		if len(cred.Groups) > 0 {
-			parts := make([]string, 0, len(cred.Groups))
-			for _, group := range cred.Groups {
-				parts = append(parts, fmt.Sprint(group))
-			}
-			groups = strings.Join(parts, ",")
-		}
-	}
+	uid, gid, groups := execPivotCredentialArgs(cred)
 	args := []string{rootDir, workDir, uid, gid, groups, "--"}
 	return append(args, argv...)
 }
 
-func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, waitReady func() error, cleanup func()) {
-	defer cleanup()
-	execStart := time.Now()
-	writeExecTiming(control, id, "recv", execStart)
-	if cfg.BeginMarker != "" {
-		writeProtocolLineTo(control, cfg.BeginMarker+id)
+func execPivotCredentialArgs(cred *syscall.Credential) (uid, gid, groups string) {
+	if cred == nil {
+		return "", "", ""
 	}
-	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
-	if waitReady != nil {
-		writeExecTiming(control, id, "guest_ready_begin", execStart)
-		if err := waitReady(); err != nil {
-			writeKernel("ccx3-init: guest not ready for exec: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: guest not ready for exec: "+err.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
-			return
-		}
-		writeExecTiming(control, id, "guest_ready_done", execStart)
+	uid = fmt.Sprint(cred.Uid)
+	gid = fmt.Sprint(cred.Gid)
+	if len(cred.Groups) == 0 {
+		return uid, gid, ""
 	}
-	writeExecTiming(control, id, "start_begin", execStart)
+	parts := make([]string, 0, len(cred.Groups))
+	for _, group := range cred.Groups {
+		parts = append(parts, fmt.Sprint(group))
+	}
+	return uid, gid, strings.Join(parts, ",")
+}
 
-	signalGroup := true
-	var rootMounts []string
-	if rootDir != "" {
-		preparedRoot, mounts, err := prepareExecRoot(rootDir)
-		if err != nil {
-			writeKernel("ccx3-init: prepare exec root: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: prepare exec root: "+err.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
-			return
-		}
-		rootDir = preparedRoot
-		rootMounts = mounts
-		defer teardownExecRoot(rootMounts)
-	}
-	execCred, err := credentialForUser(user)
-	if err != nil {
-		writeKernel("ccx3-init: resolve user: " + err.Error())
-		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
-		if cfg.ExitMarkerPrefix != "" {
-			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-		}
-		return
-	}
-	if execCred != nil {
-		if err := ensureCredentialUser(rootDir, execCred); err != nil {
-			writeKernel("ccx3-init: ensure user: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
-			return
-		}
-		if err := ensureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
-			writeKernel("ccx3-init: ensure workdir: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
-			return
-		}
-	}
+func managedExecCommand(argv []string, env []string, rootDir string, workDir string, cred *syscall.Credential, tty bool) (*exec.Cmd, bool) {
+	useExecPivot := rootDir != "" || (tty && cred != nil)
 	var cmd *exec.Cmd
-	useExecPivot := rootDir != "" || (tty && execCred != nil)
 	if useExecPivot {
-		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, execCred, argv)...)...)
+		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, cred, argv)...)...)
 	} else {
 		cmd = exec.Command(argv[0], argv[1:]...)
 		if workDir != "" {
@@ -2380,6 +2267,201 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	}
 	cmd.Env = env
 	cmd.WaitDelay = 2 * time.Second
+	return cmd, useExecPivot
+}
+
+func configureManagedExecProcessAttrs(cmd *exec.Cmd, rootDir string, cred *syscall.Credential, useExecPivot bool) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+	if rootDir != "" {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS
+		return
+	}
+	if cred != nil && !useExecPivot {
+		cmd.SysProcAttr.Credential = cred
+	}
+}
+
+func managedExecExitCode(waitErr error, state *os.ProcessState) (int, error) {
+	if waitErr != nil && errors.Is(waitErr, exec.ErrWaitDelay) {
+		waitErr = nil
+	}
+	if waitErr == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		return guestagent.ProcessExitCode(state, exitErr.ExitCode()), nil
+	}
+	return 126, waitErr
+}
+
+func startManagedExecProcess(cmd *exec.Cmd, controlW **os.File) error {
+	err := cmd.Start()
+	if controlW != nil && *controlW != nil {
+		_ = (*controlW).Close()
+		*controlW = nil
+	}
+	return err
+}
+
+type managedExecWaitResult struct {
+	WaitErr      error
+	ProcessState *os.ProcessState
+	Usage        string
+	ExitCode     int
+	ExitErr      error
+}
+
+func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitResult {
+	waitErr := cmd.Wait()
+	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(execStart))
+	exitCode, exitErr := managedExecExitCode(waitErr, cmd.ProcessState)
+	var usagePayload string
+	if usage != nil {
+		usagePayload = guestagent.EncodeExecUsage(usage)
+	}
+	return managedExecWaitResult{
+		WaitErr:      waitErr,
+		ProcessState: cmd.ProcessState,
+		Usage:        usagePayload,
+		ExitCode:     exitCode,
+		ExitErr:      exitErr,
+	}
+}
+
+func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
+	streams := 2
+	if tty {
+		streams = 1
+		if hasStdin {
+			streams++
+		}
+	}
+	if hasControl {
+		streams++
+	}
+	return streams
+}
+
+func waitManagedExecStreams(done <-chan struct{}, count int) {
+	for i := 0; i < count; i++ {
+		<-done
+	}
+}
+
+func attachManagedExecControlPipe(cmd *exec.Cmd, enabled bool) (*os.File, *os.File, error) {
+	if !enabled {
+		return nil, nil, nil
+	}
+	controlR, controlW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
+	return controlR, controlW, nil
+}
+
+func copyManagedExecReader(done chan<- struct{}, r io.Reader, closeReader func() error, onFirst func(), emit func([]byte)) {
+	defer func() { done <- struct{}{} }()
+	if closeReader != nil {
+		defer closeReader()
+	}
+	var buf [execProtocolChunkSize]byte
+	first := true
+	for {
+		n, err := r.Read(buf[:])
+		if n > 0 && emit != nil {
+			if first {
+				if onFirst != nil {
+					onFirst()
+				}
+				first = false
+			}
+			emit(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func copyManagedExecStdinToPTY(done chan<- struct{}, stdin io.ReadCloser, pty io.Writer) {
+	defer func() { done <- struct{}{} }()
+	defer stdin.Close()
+	var buf [execProtocolChunkSize]byte
+	for {
+		n, err := stdin.Read(buf[:])
+		if n > 0 {
+			if _, writeErr := pty.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				_, _ = pty.Write([]byte{4})
+			}
+			return
+		}
+	}
+}
+
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, waitReady func() error, cleanup func()) {
+	defer cleanup()
+	execStart := time.Now()
+	reporter := reporterForConfig(cfg, control, id, execStart)
+	reporter.Timing(managedExecTimingRecv)
+	reporter.Begin()
+	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
+	if readyBegin, readyDone, ok := managedExecGuestReadyTimingPhases(waitReady); ok {
+		reporter.Timing(readyBegin)
+		if err := waitReady(); err != nil {
+			writeKernel("ccx3-init: guest not ready for exec: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: guest not ready for exec: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+		reporter.Timing(readyDone)
+	}
+	reporter.Timing(managedExecTimingStartBegin)
+
+	signalGroup := true
+	var rootMounts []string
+	if rootDir != "" {
+		preparedRoot, mounts, err := prepareExecRoot(rootDir)
+		if err != nil {
+			writeKernel("ccx3-init: prepare exec root: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: prepare exec root: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+		rootDir = preparedRoot
+		rootMounts = mounts
+		defer teardownExecRoot(rootMounts)
+	}
+	execCred, err := guestagent.CredentialForUser(user)
+	if err != nil {
+		writeKernel("ccx3-init: resolve user: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
+		reporter.Exit(126)
+		return
+	}
+	if execCred != nil {
+		if err := guestagent.EnsureCredentialUser(rootDir, execCred); err != nil {
+			writeKernel("ccx3-init: ensure user: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+		if err := guestagent.EnsureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
+			writeKernel("ccx3-init: ensure workdir: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+	}
+	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
 		stdoutW    *io.PipeWriter
@@ -2391,13 +2473,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		startError error
 	)
 	if controlFD {
-		controlR, controlW, startError = os.Pipe()
+		controlR, controlW, startError = attachManagedExecControlPipe(cmd, true)
 		if startError != nil {
 			writeKernel("ccx3-init: open control fd: " + startError.Error())
 			writeExecStderr(cfg, control, id, "ccx3-init: open control fd: "+startError.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
+			reporter.Exit(126)
 			return
 		}
 		defer func() {
@@ -2410,16 +2490,13 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 				_ = controlW.Close()
 			}
 		}()
-		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
 	}
 
 	if tty {
 		ptyMaster, ptySlave, startError = openPTY(cols, rows)
 		if startError != nil {
 			writeKernel("ccx3-init: open pty: " + startError.Error())
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
+			reporter.Exit(126)
 			return
 		}
 		defer func() {
@@ -2441,52 +2518,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		streams := 1
-		if stdin != nil {
-			streams++
+		done = make(chan struct{}, managedExecStreamCount(true, stdin != nil, controlR != nil))
+		var ptyEmit func([]byte)
+		if cfg.OutputMarkerPref != "" {
+			ptyEmit = reporter.Stdout
 		}
-		if controlR != nil {
-			streams++
-		}
-		done = make(chan struct{}, streams)
-		go func() {
-			defer func() { done <- struct{}{} }()
-			var buf [execProtocolChunkSize]byte
-			first := true
-			for {
-				n, err := ptyMaster.Read(buf[:])
-				if n > 0 && cfg.OutputMarkerPref != "" {
-					if first {
-						writeExecTiming(control, id, "first_stdout", execStart)
-						first = false
-					}
-					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
+		go copyManagedExecReader(done, ptyMaster, nil, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, ptyEmit)
 		if stdin != nil {
-			go func() {
-				defer func() { done <- struct{}{} }()
-				defer stdin.Close()
-				var buf [execProtocolChunkSize]byte
-				for {
-					n, err := stdin.Read(buf[:])
-					if n > 0 {
-						if _, writeErr := ptyMaster.Write(buf[:n]); writeErr != nil {
-							return
-						}
-					}
-					if err != nil {
-						if err == io.EOF {
-							_, _ = ptyMaster.Write([]byte{4})
-						}
-						return
-					}
-				}
-			}()
+			go copyManagedExecStdinToPTY(done, stdin, ptyMaster)
 		}
 	} else {
 		if stdin != nil {
@@ -2507,80 +2546,25 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 
-		streams := 2
-		if controlR != nil {
-			streams++
+		done = make(chan struct{}, managedExecStreamCount(false, stdin != nil, controlR != nil))
+		var stdoutEmit func([]byte)
+		if cfg.OutputMarkerPref != "" {
+			stdoutEmit = reporter.Stdout
 		}
-		done = make(chan struct{}, streams)
-		go func() {
-			defer func() { done <- struct{}{} }()
-			defer stdoutR.Close()
-			var buf [execProtocolChunkSize]byte
-			first := true
-			for {
-				n, err := stdoutR.Read(buf[:])
-				if n > 0 && cfg.OutputMarkerPref != "" {
-					if first {
-						writeExecTiming(control, id, "first_stdout", execStart)
-						first = false
-					}
-					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
-		go func() {
-			defer func() { done <- struct{}{} }()
-			defer stderrR.Close()
-			var buf [execProtocolChunkSize]byte
-			first := true
-			for {
-				n, err := stderrR.Read(buf[:])
-				if n > 0 && cfg.ErrorMarkerPref != "" {
-					if first {
-						writeExecTiming(control, id, "first_stderr", execStart)
-						first = false
-					}
-					writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
+		go copyManagedExecReader(done, stdoutR, stdoutR.Close, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, stdoutEmit)
+		var stderrEmit func([]byte)
+		if cfg.ErrorMarkerPref != "" {
+			stderrEmit = func(data []byte) { writeExecStderr(cfg, control, id, string(data)) }
+		}
+		go copyManagedExecReader(done, stderrR, stderrR.Close, func() { reporter.Timing(managedExecFirstOutputTimingPhase(true)) }, stderrEmit)
 	}
 	if controlR != nil {
-		go func() {
-			defer func() { done <- struct{}{} }()
-			var buf [execProtocolChunkSize]byte
-			for {
-				n, err := controlR.Read(buf[:])
-				if n > 0 {
-					writeExecControlBytes(cfg, control, id, buf[:n])
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
+		go copyManagedExecReader(done, controlR, nil, nil, reporter.ControlBytes)
 	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
-	if rootDir != "" {
-		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS
-	} else if execCred != nil && !useExecPivot {
-		cmd.SysProcAttr.Credential = execCred
-	}
+	configureManagedExecProcessAttrs(cmd, rootDir, execCred, useExecPivot)
 
-	writeExecTiming(control, id, "start_call", execStart)
-	startErr := cmd.Start()
-	if controlW != nil {
-		_ = controlW.Close()
-		controlW = nil
-	}
+	reporter.Timing(managedExecTimingStartCall)
+	startErr := startManagedExecProcess(cmd, &controlW)
 	if startErr != nil {
 		_ = managed.closeStdin()
 		if ptySlave != nil {
@@ -2597,27 +2581,22 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		if stderrW != nil {
 			_ = stderrW.Close()
 		}
-		for i := 0; i < cap(done); i++ {
-			<-done
-		}
+		waitManagedExecStreams(done, cap(done))
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
 		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics(rootDir, argv, workDir))
-		if cfg.ExitMarkerPrefix != "" {
-			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-		}
+		reporter.Exit(126)
 		return
 	}
-	writeExecTiming(control, id, "started", execStart)
+	reporter.Timing(managedExecTimingStarted)
 	managed.setProcess(cmd.Process, signalGroup)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil
 	}
 
-	writeExecTiming(control, id, "wait_begin", execStart)
-	waitErr := cmd.Wait()
-	usage := usageFromProcessState(cmd.ProcessState, time.Since(execStart))
-	writeExecTiming(control, id, "wait_done", execStart)
+	reporter.Timing(managedExecTimingWaitBegin)
+	waitResult := waitManagedExecProcess(cmd, execStart)
+	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()
 	}
@@ -2627,79 +2606,20 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if stderrW != nil {
 		_ = stderrW.Close()
 	}
-	for i := 0; i < cap(done); i++ {
-		<-done
-	}
-	writeExecTiming(control, id, "streams_done", execStart)
+	waitManagedExecStreams(done, cap(done))
+	reporter.Timing(managedExecTimingStreamsDone)
 
-	exitCode := 0
-	if waitErr != nil {
-		if errors.Is(waitErr, exec.ErrWaitDelay) {
-			waitErr = nil
-		}
+	if waitResult.ExitErr != nil {
+		writeKernel("ccx3-init: exec error: " + waitResult.ExitErr.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+waitResult.ExitErr.Error()+"\n")
 	}
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = processExitCode(cmd.ProcessState, exitErr.ExitCode())
-		} else {
-			writeKernel("ccx3-init: exec error: " + waitErr.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+waitErr.Error()+"\n")
-			exitCode = 126
-		}
+	if waitResult.Usage != "" {
+		reporter.Usage(waitResult.Usage)
 	}
-	if cfg.UsageMarkerPref != "" && usage != nil {
-		writeProtocolLineTo(control, cfg.UsageMarkerPref+id+":"+encodeExecUsage(usage))
+	if reporter.HasExitMarker() {
+		reporter.Timing(managedExecTimingExitSent)
+		reporter.Exit(waitResult.ExitCode)
 	}
-	if cfg.ExitMarkerPrefix != "" {
-		writeExecTiming(control, id, "exit_sent", execStart)
-		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
-	}
-}
-
-func processExitCode(state *os.ProcessState, fallback int) int {
-	if state == nil {
-		return fallback
-	}
-	status, ok := state.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() {
-		return fallback
-	}
-	return 128 + int(status.Signal())
-}
-
-type execUsage struct {
-	WallSeconds   float64 `json:"wall_seconds,omitempty"`
-	UserSeconds   float64 `json:"user_seconds,omitempty"`
-	SystemSeconds float64 `json:"system_seconds,omitempty"`
-	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
-	MaxRSSBytes   uint64  `json:"max_rss_bytes,omitempty"`
-}
-
-func usageFromProcessState(state *os.ProcessState, wall time.Duration) *execUsage {
-	usage := &execUsage{WallSeconds: wall.Seconds()}
-	if state == nil {
-		return usage
-	}
-	if state.UserTime() > 0 {
-		usage.UserSeconds = state.UserTime().Seconds()
-	}
-	if state.SystemTime() > 0 {
-		usage.SystemSeconds = state.SystemTime().Seconds()
-	}
-	usage.CPUSeconds = usage.UserSeconds + usage.SystemSeconds
-	if raw, ok := state.SysUsage().(*syscall.Rusage); ok && raw != nil && raw.Maxrss > 0 {
-		usage.MaxRSSBytes = uint64(raw.Maxrss) * 1024
-	}
-	return usage
-}
-
-func encodeExecUsage(usage *execUsage) string {
-	buf, err := json.Marshal(usage)
-	if err != nil {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(buf)
 }
 
 func configureHostname(hostname string) error {
@@ -2744,69 +2664,6 @@ func pathExists(name string) bool {
 	return err == nil
 }
 
-func ensureCredentialUser(rootDir string, cred *syscall.Credential) error {
-	if cred == nil || cred.Uid == 0 {
-		return nil
-	}
-	rootDir = strings.TrimRight(rootDir, "/")
-	uid := fmt.Sprintf("%d", cred.Uid)
-	gid := fmt.Sprintf("%d", cred.Gid)
-	name := usernameForUID(rootDir, uid)
-	if name == "" {
-		name = availableUserName(rootDir, "cc")
-	}
-	homeDir := homeDirForUID(rootDir, uid)
-	if homeDir == "" {
-		homeDir = "/home/" + name
-	}
-	group := groupNameForGID(rootDir, gid)
-	if group == "" {
-		group = availableGroupName(rootDir, name)
-		if err := appendGroupEntry(rootDir, group, gid); err != nil {
-			return err
-		}
-	}
-	if name != "" && passwdHasUID(rootDir, uid) {
-		return ensureCredentialHome(rootDir, homeDir, cred)
-	}
-	if err := appendPasswdEntry(rootDir, name, uid, gid, homeDir, "/bin/sh"); err != nil {
-		return err
-	}
-	return ensureCredentialHome(rootDir, homeDir, cred)
-}
-
-func ensureCredentialHome(rootDir, homeDir string, cred *syscall.Credential) error {
-	if strings.TrimSpace(homeDir) == "" || homeDir == "/" {
-		return nil
-	}
-	return ensureCredentialDirectory(rootDir, homeDir, cred)
-}
-
-func ensureCredentialWorkDir(rootDir, workDir string, cred *syscall.Credential) error {
-	workDir = filepath.Clean(strings.TrimSpace(workDir))
-	if workDir == "" || workDir == "." || workDir == "/" {
-		return nil
-	}
-	if !strings.HasPrefix(workDir, "/home/") {
-		return nil
-	}
-	return ensureCredentialDirectory(rootDir, workDir, cred)
-}
-
-func ensureCredentialDirectory(rootDir, dir string, cred *syscall.Credential) error {
-	if strings.TrimSpace(dir) == "" || dir == "/" {
-		return nil
-	}
-	path := rootPath(rootDir, dir)
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", path, err)
-	}
-	if err := os.Chown(path, int(cred.Uid), int(cred.Gid)); err != nil {
-		return fmt.Errorf("chown %s: %w", path, err)
-	}
-	return nil
-}
-
 func rootPath(rootDir, name string) string {
 	if rootDir == "" {
 		return name
@@ -2821,167 +2678,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func usernameForUID(rootDir, uid string) string {
-	for _, line := range colonFileLines(rootPath(rootDir, "/etc/passwd")) {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 3 && fields[2] == uid {
-			return fields[0]
-		}
-	}
-	return ""
-}
-
-func homeDirForUID(rootDir, uid string) string {
-	for _, line := range colonFileLines(rootPath(rootDir, "/etc/passwd")) {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 6 && fields[2] == uid {
-			return fields[5]
-		}
-	}
-	return ""
-}
-
-func groupNameForGID(rootDir, gid string) string {
-	for _, line := range colonFileLines(rootPath(rootDir, "/etc/group")) {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 3 && fields[2] == gid {
-			return fields[0]
-		}
-	}
-	return ""
-}
-
-func passwdHasUID(rootDir, uid string) bool {
-	return usernameForUID(rootDir, uid) != ""
-}
-
-func colonFileLines(path string) []string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	lines := strings.Split(string(data), "\n")
-	out := lines[:0]
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		out = append(out, line)
-	}
-	return out
-}
-
-func availableUserName(rootDir, base string) string {
-	if !nameExists(rootPath(rootDir, "/etc/passwd"), base) {
-		return base
-	}
-	for i := 1000; ; i++ {
-		name := base + itoa(i)
-		if !nameExists(rootPath(rootDir, "/etc/passwd"), name) {
-			return name
-		}
-	}
-}
-
-func availableGroupName(rootDir, base string) string {
-	if !nameExists(rootPath(rootDir, "/etc/group"), base) {
-		return base
-	}
-	for i := 1000; ; i++ {
-		name := base + itoa(i)
-		if !nameExists(rootPath(rootDir, "/etc/group"), name) {
-			return name
-		}
-	}
-}
-
-func nameExists(path, name string) bool {
-	for _, line := range colonFileLines(path) {
-		fields := strings.Split(line, ":")
-		if len(fields) > 0 && fields[0] == name {
-			return true
-		}
-	}
-	return false
-}
-
-func appendGroupEntry(rootDir, name, gid string) error {
-	path := rootPath(rootDir, "/etc/group")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
-	}
-	return appendLine(path, name+":x:"+gid+":")
-}
-
-func appendPasswdEntry(rootDir, name, uid, gid, home, shell string) error {
-	path := rootPath(rootDir, "/etc/passwd")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
-	}
-	return appendLine(path, strings.Join([]string{name, "x", uid, gid, "ccvm user", home, shell}, ":"))
-}
-
-func appendLine(path, line string) error {
-	existing, _ := os.ReadFile(path)
-	prefix := ""
-	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
-		prefix = "\n"
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	if _, err := io.WriteString(f, prefix+line+"\n"); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	return nil
-}
-
-func credentialForUser(user string) (*syscall.Credential, error) {
-	user = strings.TrimSpace(user)
-	if user == "" {
-		return nil, nil
-	}
-	if user == "root" || user == "0" || user == "0:0" {
-		return nil, nil
-	}
-	uidPart, gidPart, hasGID := strings.Cut(user, ":")
-	if uidPart == "" {
-		return nil, fmt.Errorf("invalid user %q", user)
-	}
-	uid, err := parseUint32(uidPart)
-	if err != nil {
-		return nil, fmt.Errorf("invalid uid %q", uidPart)
-	}
-	gid := uid
-	if hasGID {
-		if gidPart == "" {
-			return nil, fmt.Errorf("invalid gid in user %q", user)
-		}
-		gid, err = parseUint32(gidPart)
-		if err != nil {
-			return nil, fmt.Errorf("invalid gid %q", gidPart)
-		}
-	}
-	return &syscall.Credential{Uid: uid, Gid: gid}, nil
-}
-
-func parseUint32(value string) (uint32, error) {
-	n := uint64(0)
-	for _, ch := range value {
-		if ch < '0' || ch > '9' {
-			return 0, fmt.Errorf("not numeric")
-		}
-		n = n*10 + uint64(ch-'0')
-		if n > uint64(^uint32(0)) {
-			return 0, fmt.Errorf("out of range")
-		}
-	}
-	return uint32(n), nil
 }
 
 func prepareExecRoot(rootDir string) (string, []string, error) {

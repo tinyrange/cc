@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,11 +13,16 @@ import (
 
 	"j5.nz/cc/internal/fsimage"
 	"j5.nz/cc/internal/imagefs"
+	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/machine"
+	"j5.nz/cc/internal/managed/release"
+	"j5.nz/cc/internal/managed/rootartifact"
+	"j5.nz/cc/internal/managed/rootplan"
 	openbsdguestinit "j5.nz/cc/internal/openbsd/guestinit"
 )
 
 const (
-	BuiltInImageName = "@openbsd"
+	BuiltInImageName = managedguest.OpenBSDImageName
 	defaultVersion   = "7.9"
 	defaultArch      = "amd64"
 	defaultMirror    = "https://mirror.aarnet.edu.au/pub/OpenBSD"
@@ -30,6 +34,7 @@ type Config struct {
 	Arch      string
 	Mirror    string
 	GuestIPv4 string
+	Network   machine.NetworkSpec
 }
 
 type Runtime struct {
@@ -46,13 +51,23 @@ func (r *Runtime) Close() error {
 	return r.close()
 }
 
-func IsBuiltInImage(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case BuiltInImageName, "openbsd":
-		return true
-	default:
-		return false
+func (r *Runtime) Artifact() rootartifact.Artifact {
+	if r == nil {
+		return rootartifact.Artifact{}
 	}
+	return rootartifact.Artifact{
+		Kernel:    append([]byte(nil), r.Kernel...),
+		RootBlock: r.Root,
+		RootFS:    r.RootFS,
+		Cleanup:   r.Close,
+		Metadata: map[string]string{
+			"guest": "openbsd",
+		},
+	}
+}
+
+func IsBuiltInImage(name string) bool {
+	return managedguest.OpenBSDProfile.Match(name)
 }
 
 func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
@@ -73,7 +88,7 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRoot(ctx, basePath, initBin, cfg.GuestIPv4)
+	root, closeRoot, err := buildManagedRoot(ctx, basePath, initBin, openBSDNetworkSpec(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -89,42 +104,55 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 }
 
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
-	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, "")
+	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, machine.NetworkSpec{})
 	return root, err
 }
 
-func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, guestIPv4 string) (imagefs.Directory, func() error, error) {
-	guestIPv4 = normalizeGuestIPv4(guestIPv4)
-	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, guestIPv4)))
+func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
+	network = normalizeOpenBSDNetwork(network)
+	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4)))
 	if err != nil {
 		return nil, nil, err
 	}
 	overlay := imagefs.NewOverlay(root)
-	for _, file := range []struct {
-		path string
-		mode fs.FileMode
-		data []byte
-	}{
+	if err := rootplan.AddFiles(overlay, []rootplan.File{
 		{"/sbin/cc-openbsd-init", 0o755, initBin},
 		{"/etc/fstab", 0o644, []byte("/dev/sd0a / ffs rw 1 1\n")},
-		{"/etc/myname", 0o644, []byte("cc-openbsd\n")},
-		{"/etc/resolv.conf", 0o644, []byte("nameserver 10.42.0.1\n")},
-		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s cc-openbsd\n", guestIPv4))},
-	} {
-		if err := overlay.AddFile(file.path, file.mode, file.data); err != nil {
-			_ = closeRoot()
-			return nil, nil, fmt.Errorf("overlay %s: %w", file.path, err)
-		}
+		{"/etc/myname", 0o644, []byte(network.Hostname + "\n")},
+		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
+		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+	}); err != nil {
+		_ = closeRoot()
+		return nil, nil, err
 	}
 	return overlay.Root(), closeRoot, nil
 }
 
-func normalizeGuestIPv4(ip string) string {
-	ip = strings.TrimSpace(ip)
-	if ip == "" {
-		return "10.42.0.2"
+func openBSDNetworkSpec(cfg Config) machine.NetworkSpec {
+	network := cfg.Network
+	if strings.TrimSpace(network.GuestIPv4) == "" {
+		network.GuestIPv4 = cfg.GuestIPv4
 	}
-	return ip
+	return normalizeOpenBSDNetwork(network)
+}
+
+func normalizeOpenBSDNetwork(network machine.NetworkSpec) machine.NetworkSpec {
+	if strings.TrimSpace(network.GuestIPv4) == "" {
+		network.GuestIPv4 = "10.42.0.2"
+	}
+	if strings.TrimSpace(network.GatewayIPv4) == "" {
+		network.GatewayIPv4 = "10.42.0.1"
+	}
+	if strings.TrimSpace(network.DNSIPv4) == "" {
+		network.DNSIPv4 = network.GatewayIPv4
+	}
+	if strings.TrimSpace(network.Hostname) == "" {
+		network.Hostname = "cc-openbsd"
+	}
+	if strings.TrimSpace(network.Interface) == "" {
+		network.Interface = "vio0"
+	}
+	return network
 }
 
 func BuildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagefs.Directory, error) {
@@ -146,11 +174,7 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		_ = tfs.Close()
 		return nil, nil, err
 	}
-	for _, dev := range []struct {
-		path string
-		mode fs.FileMode
-		rdev uint32
-	}{
+	if err := rootplan.AddDevices(overlay, []rootplan.Device{
 		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
 		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 514},
 		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 515},
@@ -158,11 +182,9 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, 566},
 		{"/dev/sd0a", fs.ModeDevice | 0o640, 1024},
 		{"/dev/sd0b", fs.ModeDevice | 0o640, 1025},
-	} {
-		if err := overlay.AddDevice(dev.path, dev.mode, dev.rdev); err != nil {
-			_ = tfs.Close()
-			return nil, nil, fmt.Errorf("add %s: %w", dev.path, err)
-		}
+	}); err != nil {
+		_ = tfs.Close()
+		return nil, nil, err
 	}
 	if err := overlay.AddFile("/sbin/init", 0o755, init); err != nil {
 		_ = tfs.Close()
@@ -172,54 +194,17 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 }
 
 func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
-	target := strings.TrimSuffix(source, filepath.Ext(source)) + ".tar"
-	if st, err := os.Stat(target); err == nil && st.Size() > 0 {
-		if src, srcErr := os.Stat(source); srcErr == nil && !st.ModTime().Before(src.ModTime()) {
-			return target, nil
+	target, err := release.EnsureDecompressed(ctx, source, "", func(r io.Reader) (io.ReadCloser, error) {
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("read OpenBSD base gzip %s: %w", source, err)
 		}
-	}
-	f, err := os.Open(source)
+		return gz, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("open OpenBSD base set %s: %w", source, err)
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("read OpenBSD base gzip %s: %w", source, err)
-	}
-	defer gz.Close()
-	tmp := target + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return "", fmt.Errorf("create decompressed OpenBSD base set %s: %w", tmp, err)
-	}
-	_, copyErr := io.Copy(out, contextReader{ctx: ctx, r: gz})
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return "", fmt.Errorf("decompress OpenBSD base set %s: %w", source, copyErr)
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return "", fmt.Errorf("close decompressed OpenBSD base set %s: %w", tmp, closeErr)
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return "", fmt.Errorf("install decompressed OpenBSD base set %s: %w", target, err)
+		return "", fmt.Errorf("decompress OpenBSD base set %s: %w", source, err)
 	}
 	return target, nil
-}
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.r.Read(p)
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -240,69 +225,27 @@ func normalizeConfig(cfg Config) Config {
 }
 
 func ensureArtifact(ctx context.Context, cfg Config, name string) (string, error) {
-	if local := localFixturePath(cfg, name); local != "" {
-		return local, nil
+	path, err := release.EnsureArtifact(ctx, release.Artifact{
+		CacheDir:        cfg.CacheDir,
+		Family:          "openbsd",
+		Version:         cfg.Version,
+		Arch:            cfg.Arch,
+		Mirror:          cfg.Mirror,
+		Name:            name,
+		URLPath:         cfg.Version + "/" + cfg.Arch + "/" + name,
+		LocalCandidates: localFixturePaths(cfg, name),
+	})
+	if err != nil {
+		return "", fmt.Errorf("ensure OpenBSD artifact %s: %w", name, err)
 	}
-	dir := filepath.Join(cfg.CacheDir, "openbsd", cfg.Version, cfg.Arch)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create OpenBSD cache dir: %w", err)
-	}
-	target := filepath.Join(dir, name)
-	if st, err := os.Stat(target); err == nil && st.Size() > 0 {
-		return target, nil
-	}
-	url := cfg.Mirror + "/" + cfg.Version + "/" + cfg.Arch + "/" + name
-	if err := downloadFile(ctx, url, target); err != nil {
-		return "", err
-	}
-	return target, nil
+	return path, nil
 }
 
-func localFixturePath(cfg Config, name string) string {
-	for _, candidate := range []string{
+func localFixturePaths(cfg Config, name string) []string {
+	return []string{
 		filepath.Join("local", "openbsd"+versionNoDot(cfg.Version)+"-"+cfg.Arch, name),
 		filepath.Join(".cache", "openbsd"+versionNoDot(cfg.Version), name),
-	} {
-		if st, err := os.Stat(candidate); err == nil && st.Size() > 0 {
-			return candidate
-		}
 	}
-	return ""
-}
-
-func downloadFile(ctx context.Context, url, target string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("create OpenBSD download request: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("download %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download %s: unexpected HTTP status %s", url, resp.Status)
-	}
-	tmp := target + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", tmp, err)
-	}
-	_, copyErr := io.Copy(out, resp.Body)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("write %s: %w", tmp, copyErr)
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("close %s: %w", tmp, closeErr)
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("install %s: %w", target, err)
-	}
-	return nil
 }
 
 func addRuntimeLibraryLinks(overlay *imagefs.Overlay, root imagefs.Directory) error {
@@ -329,13 +272,10 @@ func addRuntimeLibraryLinks(overlay *imagefs.Overlay, root imagefs.Directory) er
 	if libcName == "" || libpthreadName == "" {
 		return fmt.Errorf("OpenBSD runtime libraries missing: libc=%q libpthread=%q", libcName, libpthreadName)
 	}
-	if err := overlay.AddSymlink("/usr/lib/libc.so", libcName); err != nil {
-		return fmt.Errorf("add libc.so symlink: %w", err)
-	}
-	if err := overlay.AddSymlink("/usr/lib/libpthread.so", libpthreadName); err != nil {
-		return fmt.Errorf("add libpthread.so symlink: %w", err)
-	}
-	return nil
+	return rootplan.AddSymlinks(overlay, []rootplan.Symlink{
+		{Path: "/usr/lib/libc.so", Target: libcName},
+		{Path: "/usr/lib/libpthread.so", Target: libpthreadName},
+	})
 }
 
 func versionNoDot(version string) string {
@@ -348,10 +288,10 @@ exec >/dev/console 2>&1
 	echo OPENBSD_MANAGED_REMOUNT_FAILED
 	while :; do /bin/sleep 3600; done
 }
-/sbin/ifconfig vio0 inet %s netmask 255.255.255.0 up || {
+/sbin/ifconfig %s inet %s netmask 255.255.255.0 up || {
 	echo OPENBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }
-/sbin/route add default 10.42.0.1 || true
+/sbin/route add default %s || true
 exec /sbin/cc-openbsd-init
 `

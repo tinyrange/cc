@@ -8,25 +8,10 @@ import (
 	"strings"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/protocol"
 )
 
-type ManagedExecRequest struct {
-	ID        string   `json:"id"`
-	Command   []string `json:"command"`
-	Env       []string `json:"env,omitempty"`
-	RootDir   string   `json:"root_dir,omitempty"`
-	Path      string   `json:"path,omitempty"`
-	Directory bool     `json:"directory,omitempty"`
-	WorkDir   string   `json:"workdir,omitempty"`
-	User      string   `json:"user,omitempty"`
-	Stdin     []byte   `json:"stdin,omitempty"`
-	TTY       bool     `json:"tty,omitempty"`
-	ControlFD bool     `json:"control_fd,omitempty"`
-	Kind      string   `json:"kind,omitempty"`
-	Signal    string   `json:"signal,omitempty"`
-	Cols      int      `json:"cols,omitempty"`
-	Rows      int      `json:"rows,omitempty"`
-}
+type ManagedExecRequest = protocol.ManagedExecRequest
 
 func HasManagedExecBegin(text, id string) bool {
 	return strings.Contains(text, CommandBeginMarker+id)

@@ -4,14 +4,13 @@ package kvm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"strconv"
-	"strings"
 	"time"
 
 	"j5.nz/cc/client"
+	managedagent "j5.nz/cc/internal/managed/agent"
+	managedsession "j5.nz/cc/internal/managed/session"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -31,7 +30,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
-	} else if len(req.Stdin) == 0 {
+	} else if len(req.Stdin) == 0 && !req.TTY {
 		if err := s.sendStdinClose(id); err != nil {
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
@@ -44,157 +43,57 @@ func (s *ManagedSession) nextExecID() string {
 }
 
 func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error {
-	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
-		Kind:      execRequestKind(req.Kind),
-		ID:        id,
-		Command:   append([]string(nil), req.Command...),
-		Env:       append([]string(nil), req.Env...),
-		RootDir:   req.RootDir,
-		Path:      req.Path,
-		Directory: req.Directory,
-		WorkDir:   req.WorkDir,
-		User:      req.User,
-		Stdin:     append([]byte(nil), req.Stdin...),
-		TTY:       req.TTY,
-		ControlFD: req.ControlFD,
-		Cols:      req.Cols,
-		Rows:      req.Rows,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal exec request: %w", err)
-	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	if _, err := s.control.Write(append(payload, '\n')); err != nil {
-		return fmt.Errorf("write exec request: %w", err)
-	}
-	return nil
+	return managedagent.Send(s.control, managedagent.ExecRequest(id, req))
 }
 
 func (s *ManagedSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
-	stdinClosed := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case input, ok := <-inputs:
-			if !ok {
-				if !stdinClosed {
-					_ = s.sendStdinClose(id)
-				}
-				return
-			}
-			if input.Kind == "stdin_close" {
-				if stdinClosed {
-					continue
-				}
-				stdinClosed = true
-			} else if input.Kind == "stdin" && stdinClosed {
-				continue
-			}
-			_ = s.sendExecInput(id, input)
-		}
-	}
+	managedagent.ForwardInputs(ctx, id, inputs, s.sendExecMessage)
 }
 
 func (s *ManagedSession) sendExecInput(id string, input client.ExecInput) error {
-	msg := vmruntime.ManagedExecRequest{ID: id, Kind: input.Kind}
-	switch input.Kind {
-	case "stdin":
-		if len(input.Data) > 0 {
-			msg.Stdin = append([]byte(nil), input.Data...)
-		} else if input.Input != "" {
-			msg.Stdin = []byte(input.Input)
-		}
-	case "stdin_close":
-	case "signal":
-		msg.Signal = input.Signal
-	case "resize":
-		msg.Cols = input.Cols
-		msg.Rows = input.Rows
-	default:
+	msg, ok := managedagent.InputRequest(id, input)
+	if !ok {
 		return nil
 	}
 	return s.sendExecMessage(msg)
 }
 
 func (s *ManagedSession) sendStdinClose(id string) error {
-	return s.sendExecMessage(vmruntime.ManagedExecRequest{ID: id, Kind: "stdin_close"})
+	return s.sendExecMessage(managedagent.StdinCloseRequest(id))
 }
 
 func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	return sendManagedExecMessage(s.control, msg)
-}
-
-func sendManagedExecMessage(control io.Writer, msg vmruntime.ManagedExecRequest) error {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal exec request: %w", err)
-	}
-	if err := writeFull(control, append(payload, '\n')); err != nil {
-		return fmt.Errorf("write exec request: %w", err)
-	}
-	return nil
-}
-
-func writeFull(w io.Writer, payload []byte) error {
-	for len(payload) > 0 {
-		n, err := w.Write(payload)
-		if n > 0 {
-			payload = payload[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
+	return managedagent.Send(s.control, msg)
 }
 
 func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
-	offset := start
-	var pending string
-	for {
-		text := s.transcript.String()
-		if offset < len(text) {
-			pending += text[offset:]
-			offset = len(text)
-			for {
-				lineEnd := strings.IndexByte(pending, '\n')
-				if lineEnd < 0 {
-					break
-				}
-				line := strings.TrimSpace(pending[:lineEnd])
-				pending = pending[lineEnd+1:]
-				event, done, ok, err := vmruntime.ParseManagedExecEventLine(line, id)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					continue
-				}
-				if onEvent != nil {
-					if err := onEvent(event); err != nil {
-						s.terminateExecAndWait(id, start)
-						return err
-					}
-				}
-				if done {
-					return nil
-				}
-			}
-			continue
-		}
-		if ctx.Err() != nil {
+	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
+		Transcript: s.transcript,
+		Start:      start,
+		ID:         id,
+		OnEvent:    onEvent,
+		OnCallbackFail: func() {
 			s.terminateExecAndWait(id, start)
-			return ctx.Err()
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		},
+		OnContextDone: func() {
+			s.terminateExecAndWait(id, start)
+		},
+		Wait: func(context.Context) error {
+			select {
+			case <-s.done.done():
+				return sessionExitError(s.done.result())
+			case <-ctx.Done():
+				s.terminateExecAndWait(id, start)
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+				return nil
+			}
+		},
+	})
 }
 
 func (s *ManagedSession) terminateExecAndWait(id string, start int) {
@@ -209,7 +108,7 @@ func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	_, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})

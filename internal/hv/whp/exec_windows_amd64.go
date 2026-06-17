@@ -4,7 +4,6 @@ package whp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	managedagent "j5.nz/cc/internal/managed/agent"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -124,7 +124,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(fmt.Errorf("guest reported boot failure"))
 	}
-	if err := sendManagedExec(control, execID, req); err != nil {
+	if err := managedagent.SendExec(control, execID, req); err != nil {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
 	segment, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
@@ -262,40 +262,4 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 			return fmt.Errorf("guest halted with pending irq blocked\nserial:\n%s\n%s", serialOut.String(), platform.Summary())
 		}
 	}
-}
-
-func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest) error {
-	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
-		Kind:      execRequestKind(req.Kind),
-		ID:        id,
-		Command:   append([]string(nil), req.Command...),
-		Env:       append([]string(nil), req.Env...),
-		RootDir:   req.RootDir,
-		Path:      req.Path,
-		Directory: req.Directory,
-		WorkDir:   req.WorkDir,
-		User:      req.User,
-		Stdin:     append([]byte(nil), req.Stdin...),
-		TTY:       req.TTY,
-		ControlFD: req.ControlFD,
-		Cols:      req.Cols,
-		Rows:      req.Rows,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal exec request: %w", err)
-	}
-	if _, err := control.Write(append(payload, '\n')); err != nil {
-		return fmt.Errorf("write exec request: %w", err)
-	}
-	if len(req.Stdin) != 0 {
-		return nil
-	}
-	closePayload, err := json.Marshal(vmruntime.ManagedExecRequest{Kind: "stdin_close", ID: id})
-	if err != nil {
-		return fmt.Errorf("marshal stdin close request: %w", err)
-	}
-	if _, err := control.Write(append(closePayload, '\n')); err != nil {
-		return fmt.Errorf("write stdin close request: %w", err)
-	}
-	return nil
 }

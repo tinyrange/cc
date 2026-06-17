@@ -14,48 +14,20 @@ import (
 	"j5.nz/cc/internal/hv"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/virtio"
+	vmhost "j5.nz/cc/internal/vm/host"
 )
 
 const DefaultInstanceID = "default"
 
-type Backend interface {
-	Start(context.Context, client.CreateInstanceRequest) (Instance, error)
-	StartStream(context.Context, client.CreateInstanceRequest, func(client.BootEvent) error) (Instance, error)
-	StartBlank(context.Context, client.StartInstanceRequest) (Instance, error)
-	StartBlankStream(context.Context, client.StartInstanceRequest, func(client.BootEvent) error) (Instance, error)
-	Run(context.Context, client.RunRequest) (client.ExecResponse, error)
-	RunStream(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
-	RunInInstance(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
-	RunInInstanceStream(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
-	ExecInInstanceStream(context.Context, Instance, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
-}
+type Backend = vmhost.Backend
 
-type VMHost interface {
-	Backend
-	HostCapabilities(context.Context) VMHostCapabilities
-	Close() error
-}
-
-type VMHostCapabilities struct {
-	Backend       string
-	MaxVMs        int
-	Locality      string
-	SupportsFSRPC bool
-	SupportsL2    bool
-}
+type VMHost = vmhost.VMHost
 
 type VMHandle interface {
 	Instance
 }
 
-type Instance interface {
-	AddShare(context.Context, client.ShareMount) error
-	AddPortForward(context.Context, client.PortForward) error
-	Exec(context.Context, client.ExecRequest) (client.ExecResponse, error)
-	ExecStream(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
-	Wait() error
-	Close() error
-}
+type Instance = vmhost.Instance
 
 type virtioFSStatsProvider interface {
 	VirtioFSStats() []virtio.FSStats
@@ -112,12 +84,12 @@ type Machine struct {
 }
 
 func NewManager() *Manager {
-	return NewManagerWithBackend(unsupportedBackend{})
+	return NewManagerWithBackend(vmhost.UnsupportedBackend{})
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
 	m := &Manager{supports: Supports, capabilities: HostCapabilities}
-	m.host = newInProcessVMHost(backend, func() client.CapabilitiesResponse {
+	m.host = vmhost.NewInProcess(backend, func() client.CapabilitiesResponse {
 		return m.Capabilities()
 	})
 	return m
@@ -125,13 +97,13 @@ func NewManagerWithBackend(backend Backend) *Manager {
 
 func NewManagerWithHost(host VMHost) *Manager {
 	if host == nil {
-		host = newInProcessVMHost(unsupportedBackend{}, HostCapabilities)
+		host = vmhost.NewInProcess(vmhost.UnsupportedBackend{}, HostCapabilities)
 	}
 	return &Manager{host: host, supports: Supports, capabilities: HostCapabilities}
 }
 
 func NewManagerWithHosts(hosts ...VMHost) *Manager {
-	return NewManagerWithHost(newPlacementVMHost(hosts...))
+	return NewManagerWithHost(vmhost.NewPlacement(hosts...))
 }
 
 func Supports() error {
@@ -206,327 +178,6 @@ func backendName() string {
 	default:
 		return "unsupported"
 	}
-}
-
-type inProcessVMHost struct {
-	backend      Backend
-	capabilities func() client.CapabilitiesResponse
-}
-
-func newInProcessVMHost(backend Backend, capabilities func() client.CapabilitiesResponse) VMHost {
-	if backend == nil {
-		backend = unsupportedBackend{}
-	}
-	return &inProcessVMHost{backend: backend, capabilities: capabilities}
-}
-
-func (h *inProcessVMHost) HostCapabilities(context.Context) VMHostCapabilities {
-	caps := client.CapabilitiesResponse{}
-	if h.capabilities != nil {
-		caps = h.capabilities()
-	}
-	return VMHostCapabilities{
-		Backend:       caps.Backend,
-		MaxVMs:        caps.MaxInstances,
-		Locality:      "in-process",
-		SupportsFSRPC: false,
-		SupportsL2:    len(caps.NetworkModes) > 0,
-	}
-}
-
-func (h *inProcessVMHost) Close() error {
-	return nil
-}
-
-func (h *inProcessVMHost) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
-	return h.backend.Start(ctx, req)
-}
-
-func (h *inProcessVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	return h.backend.StartStream(ctx, req, onEvent)
-}
-
-func (h *inProcessVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
-	return h.backend.StartBlank(ctx, req)
-}
-
-func (h *inProcessVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	return h.backend.StartBlankStream(ctx, req, onEvent)
-}
-
-func (h *inProcessVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	return h.backend.Run(ctx, req)
-}
-
-func (h *inProcessVMHost) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	return h.backend.RunStream(ctx, req, inputs, onEvent)
-}
-
-func (h *inProcessVMHost) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
-	return h.backend.RunInInstance(ctx, inst, runningImage, req)
-}
-
-func (h *inProcessVMHost) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	return h.backend.RunInInstanceStream(ctx, inst, runningImage, req, inputs, onEvent)
-}
-
-func (h *inProcessVMHost) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	return h.backend.ExecInInstanceStream(ctx, inst, runningImage, req, inputs, onEvent)
-}
-
-type placementVMHost struct {
-	mu      sync.Mutex
-	hosts   []VMHost
-	running map[VMHost]int
-}
-
-func newPlacementVMHost(hosts ...VMHost) VMHost {
-	filtered := make([]VMHost, 0, len(hosts))
-	for _, host := range hosts {
-		if host != nil {
-			filtered = append(filtered, host)
-		}
-	}
-	if len(filtered) == 0 {
-		filtered = append(filtered, newInProcessVMHost(unsupportedBackend{}, HostCapabilities))
-	}
-	return &placementVMHost{hosts: filtered, running: map[VMHost]int{}}
-}
-
-func (h *placementVMHost) HostCapabilities(ctx context.Context) VMHostCapabilities {
-	caps := VMHostCapabilities{
-		Backend:  "placement",
-		Locality: "mixed",
-	}
-	allLimited := true
-	for _, host := range h.hosts {
-		hostCaps := host.HostCapabilities(ctx)
-		if hostCaps.MaxVMs <= 0 {
-			allLimited = false
-		} else if allLimited {
-			caps.MaxVMs += hostCaps.MaxVMs
-		}
-		caps.SupportsFSRPC = caps.SupportsFSRPC || hostCaps.SupportsFSRPC
-		caps.SupportsL2 = caps.SupportsL2 || hostCaps.SupportsL2
-	}
-	if !allLimited {
-		caps.MaxVMs = 0
-	}
-	return caps
-}
-
-func (h *placementVMHost) Close() error {
-	var errs []error
-	for _, host := range h.hosts {
-		if err := host.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (h *placementVMHost) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
-	return h.StartStream(ctx, req, nil)
-}
-
-func (h *placementVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
-	if err != nil {
-		return nil, err
-	}
-	inst, err := host.StartStream(ctx, req, onEvent)
-	if err != nil {
-		h.releaseHost(host)
-		return nil, err
-	}
-	return &hostedInstance{Instance: inst, host: host, release: func() { h.releaseHost(host) }}, nil
-}
-
-func (h *placementVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
-	return h.StartBlankStream(ctx, req, nil)
-}
-
-func (h *placementVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
-	if err != nil {
-		return nil, err
-	}
-	inst, err := host.StartBlankStream(ctx, req, onEvent)
-	if err != nil {
-		h.releaseHost(host)
-		return nil, err
-	}
-	return &hostedInstance{Instance: inst, host: host, release: func() { h.releaseHost(host) }}, nil
-}
-
-func (h *placementVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	host, err := h.firstHost(ctx)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	return host.Run(ctx, req)
-}
-
-func (h *placementVMHost) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	host, err := h.firstHost(ctx)
-	if err != nil {
-		return err
-	}
-	return host.RunStream(ctx, req, inputs, onEvent)
-}
-
-func (h *placementVMHost) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
-	host, inner, err := h.instanceHost(ctx, inst)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	return host.RunInInstance(ctx, inner, runningImage, req)
-}
-
-func (h *placementVMHost) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	host, inner, err := h.instanceHost(ctx, inst)
-	if err != nil {
-		return err
-	}
-	return host.RunInInstanceStream(ctx, inner, runningImage, req, inputs, onEvent)
-}
-
-func (h *placementVMHost) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	host, inner, err := h.instanceHost(ctx, inst)
-	if err != nil {
-		return err
-	}
-	return host.ExecInInstanceStream(ctx, inner, runningImage, req, inputs, onEvent)
-}
-
-type placementRequirements struct {
-	requiresL2 bool
-}
-
-func (h *placementVMHost) reserveHost(ctx context.Context, req placementRequirements) (VMHost, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	var skipped []string
-	for _, host := range h.hosts {
-		caps := host.HostCapabilities(ctx)
-		if req.requiresL2 && !caps.SupportsL2 {
-			skipped = append(skipped, firstNonEmpty(caps.Locality, caps.Backend, "unknown"))
-			continue
-		}
-		if caps.MaxVMs <= 0 || h.running[host] < caps.MaxVMs {
-			h.running[host]++
-			return host, nil
-		}
-	}
-	if req.requiresL2 && len(skipped) != 0 {
-		return nil, fmt.Errorf("no VM host with coordinator L2 capacity available")
-	}
-	return nil, fmt.Errorf("no VM host capacity available")
-}
-
-func networkEnabled(cfg *client.NetworkConfig) bool {
-	return cfg != nil && cfg.Enabled
-}
-
-func (h *placementVMHost) releaseHost(host VMHost) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.running[host] > 0 {
-		h.running[host]--
-	}
-}
-
-func (h *placementVMHost) firstHost(context.Context) (VMHost, error) {
-	if len(h.hosts) == 0 {
-		return nil, fmt.Errorf("no VM hosts configured")
-	}
-	return h.hosts[0], nil
-}
-
-type hostedInstance struct {
-	Instance
-	host    VMHost
-	release func()
-	once    sync.Once
-}
-
-func (i *hostedInstance) Wait() error {
-	err := i.Instance.Wait()
-	i.once.Do(i.release)
-	return err
-}
-
-func (i *hostedInstance) Close() error {
-	err := i.Instance.Close()
-	i.once.Do(i.release)
-	return err
-}
-
-func (i *hostedInstance) Flush(ctx context.Context) error {
-	flusher, ok := i.Instance.(instanceFlushProvider)
-	if !ok {
-		return fmt.Errorf("root filesystem cannot be flushed")
-	}
-	return flusher.Flush(ctx)
-}
-
-func (i *hostedInstance) ConsoleHistory(ctx context.Context) (string, error) {
-	provider, ok := i.Instance.(consoleHistoryProvider)
-	if !ok {
-		return "", fmt.Errorf("console history is not available")
-	}
-	return provider.ConsoleHistory(ctx)
-}
-
-func (i *hostedInstance) RootSnapshot() (imagefs.Directory, error) {
-	snapshotter, ok := i.Instance.(rootSnapshotProvider)
-	if !ok {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-	}
-	return snapshotter.RootSnapshot()
-}
-
-func (i *hostedInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
-	snapshotter, ok := i.Instance.(imageSnapshotProvider)
-	if !ok {
-		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
-	}
-	return snapshotter.SnapshotImage(imageName)
-}
-
-func (i *hostedInstance) NetworkIPv4() string {
-	provider, ok := i.Instance.(networkIPv4Provider)
-	if !ok {
-		return ""
-	}
-	return provider.NetworkIPv4()
-}
-
-func (i *hostedInstance) VirtioFSStats() []virtio.FSStats {
-	provider, ok := i.Instance.(virtioFSStatsProvider)
-	if !ok {
-		return nil
-	}
-	return provider.VirtioFSStats()
-}
-
-func (i *hostedInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
-	allower, ok := i.Instance.(serviceProxyPortAllower)
-	if !ok {
-		return fmt.Errorf("network does not support service proxy port updates")
-	}
-	return allower.AllowServiceProxyPort(ctx, port)
-}
-
-func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
-	if hosted, ok := inst.(*hostedInstance); ok {
-		return hosted.host, hosted.Instance, nil
-	}
-	host, err := h.firstHost(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	return host, inst, nil
 }
 
 func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
@@ -788,7 +439,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		return m.host.RunStream(ctx, req, inputs, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
-	if _, hosted := machine.instance.(*hostedInstance); hosted || len(req.Shares) != 0 || (targetImage != "" && targetImage != machine.image) {
+	if vmhost.IsHostedInstance(machine.instance) || len(req.Shares) != 0 || (targetImage != "" && targetImage != machine.image) {
 		return m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	for _, share := range req.Shares {
@@ -808,7 +459,7 @@ func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecReques
 		return fmt.Errorf("no VM %q is running", id)
 	}
 	targetImage := strings.TrimSpace(req.Image)
-	if _, hosted := machine.instance.(*hostedInstance); hosted || targetImage != "" {
+	if vmhost.IsHostedInstance(machine.instance) || targetImage != "" {
 		return m.host.ExecInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	return machine.instance.ExecStream(ctx, req, inputs, onEvent)
@@ -1018,75 +669,4 @@ func instanceID(id string) string {
 		return DefaultInstanceID
 	}
 	return id
-}
-
-type unsupportedBackend struct{}
-
-func (unsupportedBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
-	return unsupportedBackend{}.StartStream(ctx, req, nil)
-}
-
-func (unsupportedBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	_ = ctx
-	_ = req
-	_ = onEvent
-	return nil, fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
-	return unsupportedBackend{}.StartBlankStream(ctx, req, nil)
-}
-
-func (unsupportedBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	_ = ctx
-	_ = req
-	_ = onEvent
-	return nil, fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	_ = ctx
-	_ = req
-	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	_ = ctx
-	_ = req
-	_ = inputs
-	_ = onEvent
-	return fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
-	_ = ctx
-	_ = inst
-	_ = runningImage
-	_ = req
-	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	_ = ctx
-	_ = inst
-	_ = runningImage
-	_ = req
-	_ = inputs
-	_ = onEvent
-	return fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	_ = ctx
-	_ = inst
-	_ = runningImage
-	_ = req
-	_ = inputs
-	_ = onEvent
-	return fmt.Errorf("VM backend is not configured")
-}
-
-func (unsupportedBackend) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_, _ = ctx, forward
-	return fmt.Errorf("VM backend is not configured")
 }

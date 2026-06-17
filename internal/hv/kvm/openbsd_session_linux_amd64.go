@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"runtime"
@@ -17,14 +16,13 @@ import (
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/netstack"
 	openbsdamd64 "j5.nz/cc/internal/openbsd/boot/amd64"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
-
-const openBSDControlPort = 10777
 
 type OpenBSDManagedConfig struct {
 	Kernel    []byte
@@ -44,141 +42,41 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 	}
 
 	netdev, stack, ownStack := openBSDManagedNet(cfg)
-	ln, err := stack.ListenInternal("tcp", fmt.Sprintf(":%d", openBSDControlPort))
-	if err != nil {
-		if ownStack {
-			stack.Close()
-		}
-		return nil, fmt.Errorf("listen OpenBSD control tcp: %w", err)
-	}
-
-	var kvmVM *VM
-	var cancel context.CancelFunc
-	var bootWriter *vmruntime.BootEventWriter
-	cleanupStartup := func() {
-		if cancel != nil {
-			cancel()
-		}
-		_ = ln.Close()
-		if ownStack {
-			stack.Close()
-		}
-		if bootWriter != nil {
-			_ = bootWriter.Close()
-		}
-		if kvmVM != nil {
-			kvmVM.Close()
-		}
-	}
-
-	connCh := make(chan net.Conn, 1)
-	acceptErrCh := make(chan error, 1)
-	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
-
-	kvmVM, err = NewVM()
-	if err != nil {
-		cleanupStartup()
-		return nil, err
-	}
-	mem, err := mapAMD64GuestMemory(kvmVM, cfg.MemoryMB)
-	if err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("map guest memory: %w", err)
-	}
-
-	serialOut := vmruntime.NewSerialTranscript()
-	var serialWriter io.Writer = serialOut
-	if onEvent != nil {
-		bootWriter = vmruntime.NewBootEventWriter(onEvent)
-		serialWriter = io.MultiWriter(serialOut, bootWriter)
-	}
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
-	uart.AttachIRQ(kvmVM, amd64vm.COM1IRQ)
-
-	block := virtio.NewBlock(0, 0x1000, 10, cfg.Root)
-	block.Attach(kvmVM, kvmVM)
-	netdev.Attach(kvmVM, kvmVM)
-	pci := NewPCIBus(
-		NewVirtioBlockPCIDevice(1, 0x1000, 10, block),
-		NewVirtioNetPCIDevice(2, 0x1100, 11, netdev),
-	)
-
-	plan, err := openbsdamd64.PrepareBoot(mem, cfg.Kernel, openbsdamd64.BootOptions{
-		MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
-	})
-	if err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("prepare OpenBSD boot: %w", err)
-	}
-	if err := kvmVM.SetProtectedMode32(plan.EntryGPA, plan.StackGPA); err != nil {
-		cleanupStartup()
-		return nil, fmt.Errorf("set protected mode: %w", err)
-	}
-
-	runCtx, runCancel := context.WithCancel(context.Background())
-	cancel = runCancel
-	doneCh := make(chan error, 1)
-	vmForRun := kvmVM
-	kvmVM = nil
-	go func() {
-		defer vmForRun.Close()
-		doneCh <- runOpenBSDManagedVM(runCtx, vmForRun, uart, pci, serialOut)
-	}()
-
-	var control net.Conn
-	select {
-	case err := <-acceptErrCh:
-		cleanupStartup()
-		return nil, openBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	case conn := <-connCh:
-		control = conn
-	case err := <-doneCh:
-		cleanupStartup()
-		return nil, openBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	case <-ctx.Done():
-		cleanupStartup()
-		err := fmt.Errorf("OpenBSD guest did not connect to control TCP port %d before startup deadline: %w", openBSDControlPort, ctx.Err())
-		return nil, openBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	}
-
-	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
-		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
-	}); err != nil {
-		_ = control.Close()
-		cleanupStartup()
-		err = fmt.Errorf("OpenBSD control connection did not report ready marker %q: %w", vmruntime.InstanceReadyMarker, err)
-		return nil, openBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	}
-	if vmruntime.HasFatalBootText(controlTranscript.String()) {
-		_ = control.Close()
-		cleanupStartup()
-		return nil, openBSDStartupError(fmt.Errorf("OpenBSD guest reported boot failure"), serialOut.String(), controlTranscript.String())
-	}
-
-	return &ManagedSession{
-		cancel:     cancel,
-		doneCh:     doneCh,
-		control:    control,
-		listener:   ln,
-		bootWriter: bootWriter,
-		transcript: controlTranscript,
-		serialOut:  serialOut,
-		cleanup: func() {
-			if ownStack {
-				_ = stack.Close()
-			}
+	return startBSDPCManagedSession(ctx, bsdPCSessionConfig{
+		Spec: machine.Spec{
+			Guest:    "OpenBSD",
+			Arch:     "amd64",
+			MemoryMB: cfg.MemoryMB,
+			Dmesg:    cfg.Dmesg,
+			Control:  machine.ControlSpec{Kind: "tcp", Port: bsdControlPort},
+			Network:  &machine.NetworkSpec{GuestIPv4: cfg.GuestIPv4.String(), MAC: cfg.GuestMAC.String()},
+			Devices: []machine.DeviceSpec{
+				{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10},
+				{Kind: "virtio-net", Name: "net0", Bus: "pci", Slot: 2, IOBase: 0x1100, IRQ: 11},
+			},
 		},
-		dmesg: cfg.Dmesg,
-	}, nil
+		GuestName:   "OpenBSD",
+		Kernel:      cfg.Kernel,
+		Root:        cfg.Root,
+		MemoryMB:    cfg.MemoryMB,
+		Dmesg:       cfg.Dmesg,
+		NetDevice:   netdev,
+		NetStack:    stack,
+		OwnNetStack: ownStack,
+		Prepare: func(vm *VM, mem []byte) error {
+			plan, err := openbsdamd64.PrepareBoot(mem, cfg.Kernel, openbsdamd64.BootOptions{
+				MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
+			})
+			if err != nil {
+				return fmt.Errorf("prepare OpenBSD boot: %w", err)
+			}
+			if err := vm.SetProtectedMode32(plan.EntryGPA, plan.StackGPA); err != nil {
+				return fmt.Errorf("set protected mode: %w", err)
+			}
+			return nil
+		},
+		Run: runOpenBSDManagedVM,
+	}, onEvent)
 }
 
 func openBSDManagedNet(cfg OpenBSDManagedConfig) (*virtio.Net, *netstack.NetStack, bool) {
@@ -209,7 +107,7 @@ func normalizeOpenBSDManagedConfig(cfg OpenBSDManagedConfig) (OpenBSDManagedConf
 }
 
 func openBSDStartupError(err error, serialText, controlText string) error {
-	return transcriptError(err, serialText, controlText)
+	return bsdStartupError(err, serialText, controlText)
 }
 
 func runOpenBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci *PCIBus, serialOut *vmruntime.SerialTranscript) error {

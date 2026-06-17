@@ -1846,7 +1846,14 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 	}
 	ns.tcpMu.Unlock()
 
-	return conn.handleSegment(h, hdr)
+	if err := conn.handleSegment(h, hdr); err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			tracef("netstack.handleTCP drop closed connection segment", "src=%s:%d dst=%s:%d", h.src.String(), hdr.srcPort, h.dst.String(), hdr.dstPort)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {

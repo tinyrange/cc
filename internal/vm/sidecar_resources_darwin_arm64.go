@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/guestinit"
@@ -21,6 +20,7 @@ import (
 	"j5.nz/cc/internal/kernel/ubuntu"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/mounts"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -201,33 +201,11 @@ func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *o
 }
 
 func serveSidecarBootBundle(cacheDir string, bundle sidecarBootBundle) (sidecarStartResources, error) {
-	socketDir := filepath.Join(cacheDir, "_worker-sockets")
-	if err := os.MkdirAll(socketDir, 0o700); err != nil {
-		return sidecarStartResources{}, err
-	}
-	socketPath := filepath.Join(socketDir, fmt.Sprintf("boot-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
-	_ = os.Remove(socketPath)
-	ln, err := net.Listen("unix", socketPath)
+	socketPath, closeFn, err := serveSidecarUnixOnce(cacheDir, "boot", func(conn net.Conn) error {
+		return writeSidecarBootBundle(conn, bundle)
+	})
 	if err != nil {
 		return sidecarStartResources{}, err
-	}
-	done := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			done <- err
-			return
-		}
-		defer conn.Close()
-		done <- writeSidecarBootBundle(conn, bundle)
-	}()
-	closeFn := func() {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
-		select {
-		case <-done:
-		default:
-		}
 	}
 	return sidecarStartResources{
 		env:    []string{sidecarBootSocketEnv + "=" + socketPath},
@@ -283,69 +261,12 @@ func writeSidecarBootTLV(w io.Writer, typ uint16, data []byte) error {
 	return err
 }
 
-func combineSidecarResources(resources ...sidecarStartResources) sidecarStartResources {
-	var combined sidecarStartResources
-	for _, resource := range resources {
-		combined.env = append(combined.env, resource.env...)
-		if resource.remote {
-			combined.remote = true
-		}
-		if combined.rootFS == nil && resource.rootFS != nil {
-			combined.rootFS = resource.rootFS
-		}
-		if combined.resolver == nil && resource.resolver != nil {
-			combined.resolver = resource.resolver
-		}
-		if combined.networkIPv4 == "" && resource.networkIPv4 != "" {
-			combined.networkIPv4 = resource.networkIPv4
-		}
-		if combined.network == nil && resource.network != nil {
-			combined.network = resource.network
-		}
-		if resource.close != nil {
-			combined.close = appendSidecarClose(combined.close, resource.close)
-		}
-	}
-	return combined
-}
-
-func appendSidecarClose(existing, next func()) func() {
-	if existing == nil {
-		return next
-	}
-	return func() {
-		existing()
-		next()
-	}
-}
-
 func serveSidecarFS(cacheDir string, backend sidecarRootFS) (sidecarStartResources, error) {
-	socketDir := filepath.Join(cacheDir, "_worker-sockets")
-	if err := os.MkdirAll(socketDir, 0o700); err != nil {
-		return sidecarStartResources{}, err
-	}
-	socketPath := filepath.Join(socketDir, fmt.Sprintf("fs-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
-	_ = os.Remove(socketPath)
-	ln, err := net.Listen("unix", socketPath)
+	socketPath, closeFn, err := serveSidecarUnixOnce(cacheDir, "fs", func(conn net.Conn) error {
+		return virtio.ServeFSBackend(conn, backend)
+	})
 	if err != nil {
 		return sidecarStartResources{}, err
-	}
-	done := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			done <- err
-			return
-		}
-		done <- virtio.ServeFSBackend(conn, backend)
-	}()
-	closeFn := func() {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
-		select {
-		case <-done:
-		default:
-		}
 	}
 	return sidecarStartResources{
 		env:    []string{sidecarFSSocketEnv + "=" + socketPath},
@@ -391,25 +312,7 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 		defaultDarwinSidecarSwitch.Unregister(lease.id)
 		return sidecarStartResources{}, err
 	}
-	socketDir := filepath.Join(cacheDir, "_worker-sockets")
-	if err := os.MkdirAll(socketDir, 0o700); err != nil {
-		_ = runtime.Close()
-		return sidecarStartResources{}, err
-	}
-	socketPath := filepath.Join(socketDir, fmt.Sprintf("net-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
-	_ = os.Remove(socketPath)
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		_ = runtime.Close()
-		return sidecarStartResources{}, err
-	}
-	done := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			done <- err
-			return
-		}
+	socketPath, cleanupListener, err := serveSidecarUnixOnceConn(cacheDir, "net", false, func(conn net.Conn) error {
 		netCodec := virtio.NewNetPacketCodec(conn)
 		codecMu.Lock()
 		codec = netCodec
@@ -427,7 +330,7 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 				})
 			},
 		})
-		done <- virtio.ReceiveNetPackets(context.Background(), netCodec, func(packet virtio.NetPacket) error {
+		return virtio.ReceiveNetPackets(context.Background(), netCodec, func(packet virtio.NetPacket) error {
 			if packet.Kind != virtio.NetPacketTX {
 				return nil
 			}
@@ -437,9 +340,13 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 			}
 			return runtime.ifaceDeliver(packet.Frame)
 		})
-	}()
+	})
+	if err != nil {
+		_ = runtime.Close()
+		return sidecarStartResources{}, err
+	}
 	closeFn := func() {
-		_ = ln.Close()
+		cleanupListener()
 		codecMu.Lock()
 		if codec != nil {
 			_ = codec.Close()
@@ -449,11 +356,6 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 		defaultDarwinSidecarSwitch.Unregister(lease.id)
 		if runtime != nil {
 			_ = runtime.Close()
-		}
-		_ = os.Remove(socketPath)
-		select {
-		case <-done:
-		default:
 		}
 	}
 	return sidecarStartResources{
@@ -644,7 +546,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 		return nil, nil
 	}
 	out := make([]virtio.ShareMount, 0, len(shares))
-	for i, share := range convertShareMounts(shares) {
+	for i, share := range mounts.ConvertShareMounts(shares) {
 		mount, err := arm64ShareMount(share)
 		if err != nil {
 			return nil, fmt.Errorf("share %d: %w", i, err)
@@ -655,7 +557,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 }
 
 func sidecarRuntimeShareMount(share client.ShareMount) (virtio.ShareMount, error) {
-	shares := convertShareMounts([]client.ShareMount{share})
+	shares := mounts.ConvertShareMounts([]client.ShareMount{share})
 	if len(shares) != 1 {
 		return virtio.ShareMount{}, fmt.Errorf("runtime share is required")
 	}

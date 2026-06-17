@@ -2,6 +2,8 @@
 
 package vm
 
+import whphost "j5.nz/cc/internal/vm/host/whp"
+
 func sidecarImageMountPath(image string) string {
-	return windowsImageMountPath(image)
+	return whphost.ImageMountPath(image)
 }

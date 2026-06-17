@@ -21,9 +21,15 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/kernel/ubuntu"
+	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/machine"
+	managedruntime "j5.nz/cc/internal/managed/runtime"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/execplan"
+	hvfhost "j5.nz/cc/internal/vm/host/hvf"
+	"j5.nz/cc/internal/vm/mounts"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -153,12 +159,22 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	timingLog("runtime.Start buildStartRequest took=%s image=%q", time.Since(start), req.Image)
-	session, err := hvf.StartContainerStream(ctx, runReq, onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile:     managedguest.LinuxProfile,
+		Host:        hvf.Host{},
+		Spec:        darwinLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+		Attachments: hvf.LinuxManagedAttachments{RunRequest: runReq},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
+	containerSession, ok := started.Session.(*hvf.ContainerSession)
+	if !ok {
+		_ = started.Session.Close()
+		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
+	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
-	return &darwinInstance{session: session, network: network, imageName: strings.TrimSpace(req.Image)}, nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
 }
 
 func (b *runtimeBackend) StartBlankStream(
@@ -183,12 +199,22 @@ func (b *runtimeBackend) StartBlankStream(
 		return nil, err
 	}
 	timingLog("runtime.StartBlank buildBlankStartRequest took=%s", time.Since(start))
-	session, err := hvf.StartContainerStream(ctx, runReq, onEvent)
+	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+		Profile:     managedguest.LinuxProfile,
+		Host:        hvf.Host{},
+		Spec:        darwinLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+		Attachments: hvf.LinuxManagedAttachments{RunRequest: runReq},
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}
+	containerSession, ok := started.Session.(*hvf.ContainerSession)
+	if !ok {
+		_ = started.Session.Close()
+		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
+	}
 	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
-	return &darwinInstance{session: session, network: network, imageName: strings.TrimSpace(req.Image)}, nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -242,24 +268,15 @@ func (b *runtimeBackend) RunInInstance(
 ) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, client.ExecRequest{
-			Command:    append([]string(nil), req.Command...),
-			Env:        append([]string(nil), req.Env...),
-			RootDir:    req.RootDir,
-			ReplaceEnv: req.ReplaceEnv,
-			WorkDir:    req.WorkDir,
-			User:       req.User,
-			Stdin:      append([]byte(nil), req.Stdin...),
-			TTY:        req.TTY,
-			ControlFD:  req.ControlFD,
-			Cols:       req.Cols,
-			Rows:       req.Rows,
-		})
+		return inst.Exec(ctx, runExecRequest(req))
 	}
 
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
+		return client.ExecResponse{}, err
+	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {
 		return client.ExecResponse{}, fmt.Errorf("running instance does not support image mounts")
@@ -270,43 +287,23 @@ func (b *runtimeBackend) RunInInstance(
 		return client.ExecResponse{}, err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return client.ExecResponse{}, err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return client.ExecResponse{}, err
 	}
 
-	env := append([]string(nil), image.Config.Env...)
-	env = mergeRuntimeEnv(env, req.Env)
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env: func(base, overrides []string, _ bool) []string {
+			return mergeRuntimeEnv(append([]string(nil), base...), overrides)
+		},
+	})
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
-
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.Exec(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	})
+	return inst.Exec(ctx, execReq)
 }
 
 func (b *runtimeBackend) RunInInstanceStream(
@@ -319,12 +316,15 @@ func (b *runtimeBackend) RunInInstanceStream(
 ) error {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return err
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
 
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
+		return err
+	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
@@ -335,43 +335,23 @@ func (b *runtimeBackend) RunInInstanceStream(
 		return err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
-		return err
-	}
-	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return err
 	}
 
-	env := append([]string(nil), image.Config.Env...)
-	env = mergeRuntimeEnv(env, req.Env)
-	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env: func(base, overrides []string, _ bool) []string {
+			return mergeRuntimeEnv(append([]string(nil), base...), overrides)
+		},
+	})
 	if err != nil {
 		return err
 	}
-
-	workDir := req.WorkDir
-	if workDir == "" {
-		workDir = image.Config.WorkingDir
-	}
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	return inst.ExecStream(ctx, client.ExecRequest{
-		Command:     command,
-		Env:         env,
-		RootDir:     mountPath,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     workDir,
-		User:        req.User,
-		Stdin:       append([]byte(nil), req.Stdin...),
-		TTY:         req.TTY,
-		ControlFD:   req.ControlFD,
-		Cols:        req.Cols,
-		Rows:        req.Rows,
-	}, inputs, onEvent)
+	return inst.ExecStream(ctx, execReq, inputs, onEvent)
 }
 
 func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -381,6 +361,9 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
 
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
+		return err
+	}
 	session, ok := darwinContainerSession(inst)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
@@ -393,8 +376,8 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 		return err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := session.AddImage(ctx, mountPath, image); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
 		return err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
@@ -495,6 +478,18 @@ func blankRuntimeRootFS() imagefs.Directory {
 	return overlay.Root()
 }
 
+func darwinLinuxMachineSpec(memoryMB uint64, cpus int, dmesg bool) machine.Spec {
+	return machine.Spec{
+		Guest:    "Linux",
+		Arch:     "arm64",
+		MemoryMB: memoryMB,
+		CPUs:     cpus,
+		Dmesg:    dmesg,
+		Boot:     machine.BootSpec{Kind: "linux"},
+		Control:  machine.ControlSpec{Kind: "vsock", Port: vmruntime.ControlPort},
+	}
+}
+
 func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 	if image == nil || image.RootFS == nil {
 		return image
@@ -527,7 +522,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	}
 	shareStart := time.Now()
 	if runReq.RootFS == nil {
-		runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+		runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	}
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
@@ -738,36 +733,12 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequ
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	runReq.Command = append([]string(nil), req.Command...)
 	runReq.Env = append([]string(nil), req.Env...)
 	runReq.WorkDir = req.WorkDir
 	runReq.User = req.User
 	return runReq, nil
-}
-
-func convertShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
-	if len(shares) == 0 {
-		return nil
-	}
-	out := make([]vmruntime.DirectoryShare, 0, len(shares))
-	for _, share := range shares {
-		out = append(out, vmruntime.DirectoryShare{
-			Source:   share.Source,
-			Mount:    share.Mount,
-			Writable: share.Writable,
-			MapOwner: share.MapOwner,
-			OwnerUID: share.OwnerUID,
-			OwnerGID: share.OwnerGID,
-			Cache:    share.Cache,
-		})
-	}
-	return out
-}
-
-func imageMountPath(image string) string {
-	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
-	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
 }
 
 func mergeRuntimeEnv(base []string, extra []string) []string {

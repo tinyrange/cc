@@ -1,6 +1,9 @@
 package vm
 
-import "j5.nz/cc/client"
+import (
+	"j5.nz/cc/client"
+	"j5.nz/cc/internal/vmruntime"
+)
 
 func runExecRequest(req client.RunRequest) client.ExecRequest {
 	return client.ExecRequest{
@@ -16,4 +19,8 @@ func runExecRequest(req client.RunRequest) client.ExecRequest {
 		Cols:       req.Cols,
 		Rows:       req.Rows,
 	}
+}
+
+func mergeImageRunEnv(base, overrides []string, _ bool) []string {
+	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
