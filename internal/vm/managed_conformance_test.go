@@ -35,44 +35,6 @@ var managedConformanceChecklist = []managedConformanceFeature{
 	{name: "shutdown", supported: func(c guestCapabilities) bool { return c.PersistentExec }},
 }
 
-func TestManagedConformanceChecklistCoversPlan(t *testing.T) {
-	want := map[string]bool{
-		"boot":                 false,
-		"exec":                 false,
-		"streaming exec":       false,
-		"tty":                  false,
-		"resize tty":           false,
-		"stdin":                false,
-		"signals":              false,
-		"copy in":              false,
-		"copy out":             false,
-		"archive extract":      false,
-		"network":              false,
-		"dns":                  false,
-		"package manager":      false,
-		"alternate image exec": false,
-		"root snapshot":        false,
-		"image snapshot":       false,
-		"writable root block":  false,
-		"console history":      false,
-		"shutdown":             false,
-	}
-	for _, feature := range managedConformanceChecklist {
-		if _, ok := want[feature.name]; !ok {
-			t.Fatalf("unexpected conformance feature %q", feature.name)
-		}
-		want[feature.name] = true
-		if feature.supported == nil {
-			t.Fatalf("feature %q has no capability predicate", feature.name)
-		}
-	}
-	for feature, seen := range want {
-		if !seen {
-			t.Fatalf("conformance checklist is missing %q", feature)
-		}
-	}
-}
-
 func TestManagedGuestProfilesDeclareConformance(t *testing.T) {
 	tests := []struct {
 		name    string

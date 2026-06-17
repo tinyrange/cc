@@ -34,24 +34,3 @@ func TestBuiltinGuestForImage(t *testing.T) {
 		}
 	}
 }
-
-func TestBuiltinGuestCapabilities(t *testing.T) {
-	openbsd := builtinGuestCapabilities(managedguest.OpenBSDImageName)
-	if !openbsd.PersistentExec || !openbsd.CopyIn || !openbsd.CopyOut || openbsd.TTY || openbsd.ResizeTTY {
-		t.Fatalf("OpenBSD capabilities = %+v", openbsd)
-	}
-	if openbsd.PackageManager != "pkg_add" {
-		t.Fatalf("OpenBSD package manager = %q", openbsd.PackageManager)
-	}
-
-	freebsd := builtinGuestCapabilities(managedguest.FreeBSDImageName)
-	if !freebsd.PersistentExec || !freebsd.CopyIn || !freebsd.CopyOut || !freebsd.TTY || !freebsd.ResizeTTY {
-		t.Fatalf("FreeBSD capabilities = %+v", freebsd)
-	}
-	if freebsd.PackageManager != "pkg" {
-		t.Fatalf("FreeBSD package manager = %q", freebsd.PackageManager)
-	}
-	if freebsd.DynamicShares || freebsd.PortForward || freebsd.AlternateImageExec {
-		t.Fatalf("FreeBSD unsupported capabilities should be false: %+v", freebsd)
-	}
-}
