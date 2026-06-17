@@ -15,6 +15,7 @@ import (
 	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/fdt"
 	freebsdarm64 "j5.nz/cc/internal/freebsd/boot/arm64"
+	netbsdarm64 "j5.nz/cc/internal/netbsd/boot/arm64"
 	"j5.nz/cc/internal/netstack"
 	openbsdarm64 "j5.nz/cc/internal/openbsd/boot/arm64"
 	"j5.nz/cc/internal/serial"
@@ -46,6 +47,17 @@ type FreeBSDManagedConfig struct {
 	NetStack  *netstack.NetStack
 }
 
+type NetBSDManagedConfig struct {
+	Kernel    []byte
+	Root      virtio.BlockBackend
+	MemoryMB  uint64
+	Dmesg     bool
+	GuestIPv4 net.IP
+	GuestMAC  net.HardwareAddr
+	NetDevice *virtio.Net
+	NetStack  *netstack.NetStack
+}
+
 type bsdManagedConfig struct {
 	GuestName           string
 	Kernel              []byte
@@ -54,8 +66,11 @@ type bsdManagedConfig struct {
 	Dmesg               bool
 	NetDevice           *virtio.Net
 	NetStack            *netstack.NetStack
-	PrepareOpenBSD      bool
+	BootKind            string
+	MemoryBase          uint64
+	BootArgs            string
 	FreeBSDVirtioQuirks bool
+	NetBSDVirtioQuirks  bool
 }
 
 func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -72,14 +87,15 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 		return nil, fmt.Errorf("OpenBSD network device and stack are required")
 	}
 	return startBSDManagedSession(ctx, bsdManagedConfig{
-		GuestName:      "OpenBSD",
-		Kernel:         cfg.Kernel,
-		Root:           cfg.Root,
-		MemoryMB:       cfg.MemoryMB,
-		Dmesg:          cfg.Dmesg,
-		NetDevice:      cfg.NetDevice,
-		NetStack:       cfg.NetStack,
-		PrepareOpenBSD: true,
+		GuestName:  "OpenBSD",
+		Kernel:     cfg.Kernel,
+		Root:       cfg.Root,
+		MemoryMB:   cfg.MemoryMB,
+		Dmesg:      cfg.Dmesg,
+		NetDevice:  cfg.NetDevice,
+		NetStack:   cfg.NetStack,
+		BootKind:   "openbsd",
+		MemoryBase: arm64vm.MemoryBase,
 	}, onEvent)
 }
 
@@ -104,9 +120,41 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		Dmesg:               cfg.Dmesg,
 		NetDevice:           cfg.NetDevice,
 		NetStack:            cfg.NetStack,
+		BootKind:            "freebsd",
+		MemoryBase:          arm64vm.MemoryBase,
 		FreeBSDVirtioQuirks: true,
 	}, onEvent)
 }
+
+func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if len(cfg.Kernel) == 0 {
+		return nil, fmt.Errorf("NetBSD kernel is required")
+	}
+	if cfg.Root == nil {
+		return nil, fmt.Errorf("NetBSD root filesystem is required")
+	}
+	if cfg.MemoryMB == 0 {
+		cfg.MemoryMB = 1024
+	}
+	if cfg.NetDevice == nil || cfg.NetStack == nil {
+		return nil, fmt.Errorf("NetBSD network device and stack are required")
+	}
+	return startBSDManagedSession(ctx, bsdManagedConfig{
+		GuestName:          "NetBSD",
+		Kernel:             cfg.Kernel,
+		Root:               cfg.Root,
+		MemoryMB:           cfg.MemoryMB,
+		Dmesg:              cfg.Dmesg,
+		NetDevice:          cfg.NetDevice,
+		NetStack:           cfg.NetStack,
+		BootKind:           "netbsd",
+		MemoryBase:         netBSDArm64MemoryBase,
+		BootArgs:           "root=ld4a",
+		NetBSDVirtioQuirks: true,
+	}, onEvent)
+}
+
+const netBSDArm64MemoryBase = 0x40000000
 
 func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
@@ -152,7 +200,11 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 		return nil, err
 	}
 	memorySize := arm64vm.MemorySizeBytes(cfg.MemoryMB)
-	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
+	memoryBase := cfg.MemoryBase
+	if memoryBase == 0 {
+		memoryBase = arm64vm.MemoryBase
+	}
+	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(memoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
 	if err != nil {
 		cleanupStartup()
 		return nil, fmt.Errorf("map guest memory: %w", err)
@@ -168,18 +220,25 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, cfg.Root)
 	block.DisableSizeMax = cfg.FreeBSDVirtioQuirks
+	block.LegacyMMIO = cfg.NetBSDVirtioQuirks
 	block.Attach(vm, vm)
 	if cfg.FreeBSDVirtioQuirks {
 		cfg.NetDevice.DisableMergeRX = true
 		cfg.NetDevice.HeaderLength = 12
 	}
+	if cfg.NetBSDVirtioQuirks {
+		cfg.NetDevice.DisableMergeRX = true
+		cfg.NetDevice.LegacyMMIO = true
+	}
 	cfg.NetDevice.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.LegacyMMIO = cfg.NetBSDVirtioQuirks
 	rng.Attach(vm, vm)
 
-	if cfg.PrepareOpenBSD {
+	switch cfg.BootKind {
+	case "openbsd":
 		plan, err := openbsdarm64.PrepareBoot(mem, cfg.Kernel, openbsdarm64.BootOptions{
-			MemoryBase: arm64vm.MemoryBase,
+			MemoryBase: memoryBase,
 			MemorySize: memorySize,
 			NumCPUs:    1,
 			GICVersion: openbsdarm64.GICVersionV3,
@@ -194,9 +253,9 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			cleanupStartup()
 			return nil, err
 		}
-	} else {
+	case "freebsd":
 		plan, err := freebsdarm64.PrepareBoot(mem, cfg.Kernel, freebsdarm64.BootOptions{
-			MemoryBase: arm64vm.MemoryBase,
+			MemoryBase: memoryBase,
 			MemorySize: memorySize,
 			NumCPUs:    1,
 			GICVersion: freebsdarm64.GICVersionV3,
@@ -211,6 +270,31 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			cleanupStartup()
 			return nil, err
 		}
+	case "netbsd":
+		bootArgs := cfg.BootArgs
+		if bootArgs == "" {
+			bootArgs = "root=ld0a"
+		}
+		plan, err := netbsdarm64.PrepareBoot(mem, cfg.Kernel, netbsdarm64.BootOptions{
+			MemoryBase: memoryBase,
+			MemorySize: memorySize,
+			NumCPUs:    1,
+			GICVersion: netbsdarm64.GICVersionV3,
+			Console:    true,
+			BootArgs:   bootArgs,
+			ExtraNodes: []fdt.Node{block.DeviceTreeNode(), cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()},
+		})
+		if err != nil {
+			cleanupStartup()
+			return nil, fmt.Errorf("prepare NetBSD boot: %w", err)
+		}
+		if err := setupNetBSDBootState(vm, plan); err != nil {
+			cleanupStartup()
+			return nil, err
+		}
+	default:
+		cleanupStartup()
+		return nil, fmt.Errorf("unsupported BSD boot kind %q", cfg.BootKind)
 	}
 
 	runCtx, runCancel := context.WithCancel(context.Background())
@@ -303,6 +387,24 @@ func setupFreeBSDBootState(vm *VM, plan *freebsdarm64.BootPlan) error {
 		return fmt.Errorf("set PC: %w", err)
 	}
 	if err := vm.SetReg(hvRegCPSR, arm64vm.DefaultPStateBits); err != nil {
+		return fmt.Errorf("set CPSR: %w", err)
+	}
+	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {
+		return fmt.Errorf("set X0: %w", err)
+	}
+	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
+		if err := vm.SetReg(reg, 0); err != nil {
+			return fmt.Errorf("clear reg %d: %w", reg, err)
+		}
+	}
+	return nil
+}
+
+func setupNetBSDBootState(vm *VM, plan *netbsdarm64.BootPlan) error {
+	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
+		return fmt.Errorf("set PC: %w", err)
+	}
+	if err := vm.SetReg(hvRegCPSR, 0x40000000|arm64vm.DefaultPStateBits); err != nil {
 		return fmt.Errorf("set CPSR: %w", err)
 	}
 	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {

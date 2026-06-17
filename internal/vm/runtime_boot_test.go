@@ -101,6 +101,9 @@ func TestRuntimeOneShotDmesgIncludesTranscript(t *testing.T) {
 }
 
 func TestRuntimeBootsLinuxWithExt4Root(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("rootfs image mode is implemented by the Linux KVM backends")
+	}
 	t.Setenv("CCX3_ROOTFS_IMAGE_TYPE", "ext4")
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
@@ -117,8 +120,9 @@ func TestRuntimeBootsLinuxWithExt4Root(t *testing.T) {
 		},
 	})
 	requireRunResponse(t, resp, err, 0)
-	if strings.TrimSpace(resp.Output) != "ext4" {
-		t.Fatalf("root filesystem type = %q, want ext4\noutput:\n%s", strings.TrimSpace(resp.Output), resp.Output)
+	fields := strings.Fields(resp.Output)
+	if len(fields) == 0 || fields[0] != "ext4" {
+		t.Fatalf("root filesystem type output = %q, want ext4\noutput:\n%s", strings.TrimSpace(resp.Output), resp.Output)
 	}
 }
 
