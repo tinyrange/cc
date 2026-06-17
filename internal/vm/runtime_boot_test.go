@@ -816,6 +816,9 @@ func TestRuntimeBootsLinuxWithNestedVirtualizationWhenSupported(t *testing.T) {
 
 func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping VM runtime boot test in short mode")
+	}
 	if err := Supports(); err != nil {
 		t.Skipf("VM runtime unsupported on this host: %v", err)
 	}

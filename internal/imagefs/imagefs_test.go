@@ -45,13 +45,21 @@ func TestOverlayMergesBaseAndOverrides(t *testing.T) {
 }
 
 func TestResolveCommandUsesPathAndExecutableBits(t *testing.T) {
-	rootDir := t.TempDir()
-	mustMkdir(t, filepath.Join(rootDir, "bin"))
-	mustWriteExecutable(t, filepath.Join(rootDir, "bin", "run"), "run")
-	mustWriteFile(t, filepath.Join(rootDir, "bin", "not-exec"), "nope")
-	mustMkdir(t, filepath.Join(rootDir, "sbin"))
+	overlay := NewOverlay(nil)
+	if err := overlay.AddDir("/bin", fs.ModeDir|0o755); err != nil {
+		t.Fatalf("add bin: %v", err)
+	}
+	if err := overlay.AddFile("/bin/run", 0o755, []byte("run")); err != nil {
+		t.Fatalf("add executable: %v", err)
+	}
+	if err := overlay.AddFile("/bin/not-exec", 0o644, []byte("nope")); err != nil {
+		t.Fatalf("add non-executable: %v", err)
+	}
+	if err := overlay.AddDir("/sbin", fs.ModeDir|0o755); err != nil {
+		t.Fatalf("add sbin: %v", err)
+	}
 
-	root := NewHostFS(rootDir, nil)
+	root := overlay.Root()
 	cmd, err := ResolveCommand(root, []string{"run", "--flag"}, []string{"PATH=/missing:/bin"})
 	if err != nil {
 		t.Fatalf("resolve command: %v", err)
@@ -68,14 +76,18 @@ func TestResolveCommandUsesPathAndExecutableBits(t *testing.T) {
 }
 
 func TestResolvePathFollowsSymlinks(t *testing.T) {
-	rootDir := t.TempDir()
-	mustMkdir(t, filepath.Join(rootDir, "bin"))
-	mustWriteExecutable(t, filepath.Join(rootDir, "bin", "target"), "target")
-	if err := os.Symlink("../bin/target", filepath.Join(rootDir, "bin", "link")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+	overlay := NewOverlay(nil)
+	if err := overlay.AddDir("/bin", fs.ModeDir|0o755); err != nil {
+		t.Fatalf("add bin: %v", err)
+	}
+	if err := overlay.AddFile("/bin/target", 0o755, []byte("target")); err != nil {
+		t.Fatalf("add target: %v", err)
+	}
+	if err := overlay.AddSymlink("/bin/link", "../bin/target"); err != nil {
+		t.Fatalf("add symlink: %v", err)
 	}
 
-	resolved, entry, err := ResolvePath(NewHostFS(rootDir, nil), "/bin/link")
+	resolved, entry, err := ResolvePath(overlay.Root(), "/bin/link")
 	if err != nil {
 		t.Fatalf("resolve symlink: %v", err)
 	}

@@ -1,8 +1,7 @@
 package execplan
 
 import (
-	"os"
-	"path/filepath"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -13,19 +12,12 @@ import (
 )
 
 func TestResolveExecRequest(t *testing.T) {
-	rootDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootDir, "bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rootDir, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	got, err := ResolveExecRequest(client.ExecRequest{
 		Command: []string{"tool", "arg"},
 		Env:     []string{"EXTRA=1"},
 		Stdin:   []byte("input"),
 	}, Resolver{
-		Root:           imagefs.NewHostFS(rootDir, nil),
+		Root:           testResolverRoot(t),
 		BaseEnv:        []string{"PATH=/bin"},
 		DefaultWorkDir: "/work",
 		DefaultRootDir: "/rootfs",
@@ -77,17 +69,10 @@ func TestResolveExecRequestValidation(t *testing.T) {
 }
 
 func TestResolveExecRequestCanMarkHostResolved(t *testing.T) {
-	rootDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootDir, "bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rootDir, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	got, err := ResolveExecRequest(client.ExecRequest{
 		Command: []string{"tool"},
 	}, Resolver{
-		Root:           imagefs.NewHostFS(rootDir, nil),
+		Root:           testResolverRoot(t),
 		BaseEnv:        []string{"PATH=/bin"},
 		DefaultWorkDir: "/",
 		MarkResolved:   true,
@@ -104,19 +89,12 @@ func TestResolveExecRequestCanMarkHostResolved(t *testing.T) {
 }
 
 func TestResolveRunRequestMarksResolvedAlternateRoot(t *testing.T) {
-	rootDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootDir, "bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rootDir, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	got, err := ResolveRunRequest(client.RunRequest{
 		Command: []string{"tool"},
 		Env:     []string{"EXTRA=1"},
 		Stdin:   []byte("input"),
 	}, "/run/image", Resolver{
-		Root:           imagefs.NewHostFS(rootDir, nil),
+		Root:           testResolverRoot(t),
 		BaseEnv:        []string{"PATH=/bin", "BASE=1"},
 		DefaultWorkDir: "/workspace",
 		Env: func(base, overrides []string, _ bool) []string {
@@ -141,6 +119,18 @@ func TestResolveRunRequestMarksResolvedAlternateRoot(t *testing.T) {
 	if string(got.Stdin) != "input" {
 		t.Fatalf("stdin = %q", got.Stdin)
 	}
+}
+
+func testResolverRoot(t *testing.T) imagefs.Directory {
+	t.Helper()
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddDir("/bin", fs.ModeDir|0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := overlay.AddFile("/bin/tool", 0o755, []byte("#!/bin/sh\n")); err != nil {
+		t.Fatal(err)
+	}
+	return overlay.Root()
 }
 
 func TestControlRequest(t *testing.T) {

@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,9 +19,8 @@ import (
 )
 
 func TestSidecarCommandResolverUsesManagedResolver(t *testing.T) {
-	root := sidecarResolverRoot(t)
 	resolver := &sidecarCommandResolver{
-		root:    imagefs.NewHostFS(root, nil),
+		root:    sidecarResolverRoot(t),
 		baseEnv: []string{"PATH=/bin", "BASE=1"},
 		workDir: "/workspace",
 	}
@@ -51,7 +51,7 @@ func TestSidecarCommandResolverUsesManagedResolver(t *testing.T) {
 
 func TestSidecarCommandResolverSkipsResolvedRequests(t *testing.T) {
 	resolver := &sidecarCommandResolver{
-		root:    imagefs.NewHostFS(sidecarResolverRoot(t), nil),
+		root:    sidecarResolverRoot(t),
 		baseEnv: []string{"PATH=/bin"},
 		workDir: "/workspace",
 	}
@@ -83,7 +83,7 @@ func TestSidecarBlankRootPassthroughDecision(t *testing.T) {
 		t.Fatalf("already-resolved request should use managed core")
 	}
 	imageCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), &sidecarCommandResolver{
-		root:    imagefs.NewHostFS(sidecarResolverRoot(t), nil),
+		root:    sidecarResolverRoot(t),
 		baseEnv: []string{"PATH=/bin"},
 	})
 	if sidecarShouldPassthroughToWorker(true, imageCore, client.ExecRequest{Command: []string{"tool"}}) {
@@ -95,7 +95,7 @@ func TestPrepareRunInInstanceExecAlternateImageUsesManagedResolver(t *testing.T)
 	baseImage := "@base"
 	altImage := "alt"
 	store := oci.NewStore(filepath.Join(t.TempDir(), "images"))
-	root := imagefs.NewHostFS(sidecarResolverRoot(t), nil)
+	root := sidecarResolverRoot(t)
 	_, err := store.SaveRootFS(context.Background(), altImage, root, oci.SaveOptions{
 		Config: oci.RuntimeConfig{
 			Env:        []string{"PATH=/bin", "BASE=1"},
@@ -186,7 +186,7 @@ func TestPrepareSidecarUnixListener(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix sockets are not available on windows")
 	}
-	socketPath, ln, cleanup, err := prepareSidecarUnixListener(t.TempDir(), "test")
+	socketPath, ln, cleanup, err := prepareSidecarUnixListener(shortSocketTempDir(t), "test")
 	if err != nil {
 		t.Fatalf("prepareSidecarUnixListener: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestServeSidecarUnixOnce(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix sockets are not available on windows")
 	}
-	socketPath, cleanup, err := serveSidecarUnixOnce(t.TempDir(), "test", func(conn net.Conn) error {
+	socketPath, cleanup, err := serveSidecarUnixOnce(shortSocketTempDir(t), "test", func(conn net.Conn) error {
 		_, err := conn.Write([]byte("hello"))
 		return err
 	})
@@ -245,7 +245,7 @@ func TestServeSidecarUnixOnceConnCanLeaveConnectionOpen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix sockets are not available on windows")
 	}
-	dir, err := os.MkdirTemp("", "ccsc-")
+	dir, err := os.MkdirTemp(socketTempRoot(), "ccsc-")
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
 	}
@@ -278,16 +278,33 @@ func TestServeSidecarUnixOnceConnCanLeaveConnectionOpen(t *testing.T) {
 	cleanup()
 }
 
-func sidecarResolverRoot(t *testing.T) string {
+func sidecarResolverRoot(t *testing.T) imagefs.Directory {
 	t.Helper()
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddDir("/bin", fs.ModeDir|0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := overlay.AddFile("/bin/tool", 0o755, []byte("#!/bin/sh\n")); err != nil {
 		t.Fatal(err)
 	}
-	return root
+	return overlay.Root()
+}
+
+func shortSocketTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(socketTempRoot(), "ccsc-")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func socketTempRoot() string {
+	if runtime.GOOS == "darwin" {
+		return "/tmp"
+	}
+	return ""
 }
 
 func envHas(env []string, want string) bool {
