@@ -78,6 +78,9 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		NetDevice:   netdev,
 		NetStack:    stack,
 		OwnNetStack: ownStack,
+		BlockQuirks: bsdPCBlockQuirks{
+			DisableSizeMax: true,
+		},
 		Prepare: func(vm *VM, mem []byte) error {
 			plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
 				MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),

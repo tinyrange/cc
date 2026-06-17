@@ -64,6 +64,27 @@ func TestBlockAdvertisesSizeMaxWhenConfigProvidesIt(t *testing.T) {
 	}
 }
 
+func TestBlockCanDisableSizeMax(t *testing.T) {
+	dev := NewBlock(0, 0x1000, 10, make(testBlockBackend, 4096))
+	dev.DisableSizeMax = true
+
+	legacy, err := dev.ReadLegacy(0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy&blockFeatureSizeMax != 0 {
+		t.Fatalf("legacy features include SIZE_MAX: %#x", legacy)
+	}
+
+	modern, err := dev.Read(regDeviceFeatures, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modern&blockFeatureSizeMax != 0 {
+		t.Fatalf("modern features include SIZE_MAX: %#x", modern)
+	}
+}
+
 func TestBlockLegacyReadRequest(t *testing.T) {
 	mem := make(testGuestMemory, 0x20000)
 	backend := make(testBlockBackend, 4096)

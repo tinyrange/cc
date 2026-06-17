@@ -53,13 +53,17 @@ func TestBootFreeBSDFullBaseRootFromReleaseSets(t *testing.T) {
 	}
 	defer rt.Close()
 	block := virtio.NewBlock(0, 0x1000, 10, rt.Root)
-	serial, err := BootFreeBSDKernelToMarkerWithPCIBlockNetConsole(ctx, rt.Kernel, 1024, "random: unblocking device.", block, nil, nil)
+	block.DisableSizeMax = true
+	serial, err := BootFreeBSDKernelToMarkerWithPCIBlockNetConsole(ctx, rt.Kernel, 1024, "Dual Console: Serial Primary", block, nil, nil)
 	t.Logf("serial tail:\n%s", tailString(serial, 8192))
 	if err != nil {
 		t.Fatalf("boot FreeBSD full base root: %v\nserial:\n%s", err, serial)
 	}
-	if !strings.Contains(serial, "start_init: trying /sbin/init") {
-		t.Fatalf("FreeBSD did not start /sbin/init:\n%s", serial)
+	if !strings.Contains(serial, "vtblk0: <VirtIO Block Adapter>") || !strings.Contains(serial, "Trying to mount root from ufs:/dev/vtbd0") {
+		t.Fatalf("FreeBSD did not attach and mount root block device:\n%s", serial)
+	}
+	if strings.Contains(serial, "mountroot>") || strings.Contains(serial, "failed with error") {
+		t.Fatalf("FreeBSD failed to mount root block device:\n%s", serial)
 	}
 	if strings.Contains(serial, "init died") {
 		t.Fatalf("FreeBSD init died:\n%s", serial)

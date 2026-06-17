@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dosfstools
+          sudo apt-get install -y --no-install-recommends dosfstools musl-tools
 
       - name: Enable KVM for the runner user
         run: |
