@@ -104,6 +104,36 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	return &Runtime{Kernel: kernel, Root: region, RootFS: root, close: closeRoot}, nil
 }
 
+func BuildManagedRuntimeFromOCI(ctx context.Context, cfg Config, kernel []byte, rootLayerPath string) (*Runtime, error) {
+	cfg = normalizeConfig(cfg)
+	baseTar, err := ensureDecompressedTar(ctx, rootLayerPath)
+	if err != nil {
+		return nil, err
+	}
+	tfs, err := imagefs.NewSeekableTarFS(ctx, baseTar)
+	if err != nil {
+		return nil, fmt.Errorf("read OpenBSD OCI root layer %s: %w", baseTar, err)
+	}
+	initBin, err := openbsdguestinit.BuildForArch(ctx, filepath.Join(cfg.CacheDir, "guestinit"), cfg.Arch)
+	if err != nil {
+		_ = tfs.Close()
+		return nil, err
+	}
+	root, closeRoot, err := buildManagedRootFromBase(tfs.Root(), tfs.Close, initBin, openBSDNetworkSpec(cfg))
+	if err != nil {
+		return nil, err
+	}
+	region, err := fsimage.Build(ctx, root, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		_ = closeRoot()
+		return nil, fmt.Errorf("build OpenBSD FFS root: %w", err)
+	}
+	return &Runtime{Kernel: append([]byte(nil), kernel...), Root: region, RootFS: root, close: closeRoot}, nil
+}
+
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
 	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, machine.NetworkSpec{})
 	return root, err
@@ -115,6 +145,36 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, n
 	if err != nil {
 		return nil, nil, err
 	}
+	return buildManagedRootFromPreparedBase(root, closeRoot, initBin, network)
+}
+
+func buildManagedRootFromBase(base imagefs.Directory, closeBase func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
+	network = normalizeOpenBSDNetwork(network)
+	overlay := imagefs.NewOverlay(base)
+	if err := addRuntimeLibraryLinks(overlay, base); err != nil {
+		_ = closeBase()
+		return nil, nil, err
+	}
+	if err := rootplan.AddDevices(overlay, []rootplan.Device{
+		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
+		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 514},
+		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 515},
+		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o644, 565},
+		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, 566},
+		{"/dev/sd0a", fs.ModeDevice | 0o640, 1024},
+		{"/dev/sd0b", fs.ModeDevice | 0o640, 1025},
+	}); err != nil {
+		_ = closeBase()
+		return nil, nil, err
+	}
+	if err := overlay.AddFile("/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))); err != nil {
+		_ = closeBase()
+		return nil, nil, fmt.Errorf("overlay /sbin/init: %w", err)
+	}
+	return buildManagedRootFromPreparedBase(overlay.Root(), closeBase, initBin, network)
+}
+
+func buildManagedRootFromPreparedBase(root imagefs.Directory, closeRoot func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
 		{"/sbin/cc-openbsd-init", 0o755, initBin},

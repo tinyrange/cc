@@ -44,11 +44,7 @@ func OpenBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Interface: "vio0",
 		CacheDir:  OpenBSDRuntimeCacheDir(guestInitCache),
 		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
-			if err != nil {
-				return rootartifact.Artifact{}, err
-			}
-			return runtime.Artifact(), nil
+			return buildOpenBSDArtifact(ctx, cacheDir, arch, network)
 		},
 	}
 }
@@ -79,11 +75,7 @@ func FreeBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Interface: "vtnet0",
 		CacheDir:  FreeBSDRuntimeCacheDir(guestInitCache),
 		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
-			if err != nil {
-				return rootartifact.Artifact{}, err
-			}
-			return runtime.Artifact(), nil
+			return buildFreeBSDArtifact(ctx, cacheDir, arch, network)
 		},
 	}
 }
@@ -114,11 +106,7 @@ func NetBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Interface: "vioif0",
 		CacheDir:  NetBSDRuntimeCacheDir(guestInitCache),
 		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
-			if err != nil {
-				return rootartifact.Artifact{}, err
-			}
-			return runtime.Artifact(), nil
+			return buildNetBSDArtifact(ctx, cacheDir, arch, network)
 		},
 	}
 }

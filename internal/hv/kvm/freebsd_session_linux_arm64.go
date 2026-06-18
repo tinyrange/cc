@@ -141,7 +141,7 @@ func startFreeBSDArm64ManagedSession(ctx context.Context, cfg freeBSDArm64Sessio
 	}
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(kvmVM, arm64vm.UARTSPI)
-	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, cfg.Root)
+	block := newFreeBSDArm64Block(cfg.Root)
 	block.Attach(kvmVM, kvmVM)
 	cfg.NetDevice.DisableMergeRX = true
 	cfg.NetDevice.HeaderLength = 12
@@ -240,6 +240,12 @@ func startFreeBSDArm64ManagedSession(ctx context.Context, cfg freeBSDArm64Sessio
 		},
 		dmesg: cfg.Dmesg,
 	}, nil
+}
+
+func newFreeBSDArm64Block(root virtio.BlockBackend) *virtio.Block {
+	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, root)
+	block.DisableSizeMax = true
+	return block
 }
 
 func normalizeFreeBSDArm64SessionConfig(cfg freeBSDArm64SessionConfig) freeBSDArm64SessionConfig {

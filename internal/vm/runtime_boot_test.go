@@ -171,6 +171,12 @@ func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
 	if got := interactiveControl.String(); !strings.Contains(got, "ready:/tmp") || !strings.Contains(got, "done:/tmp") {
 		t.Fatalf("OpenBSD interactive control fd output = %q, want ready and done", got)
 	}
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "set -eu; pkg_info -q >/tmp/pkg-list; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
+		WorkDir: "/tmp",
+	})
+	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
@@ -186,7 +192,7 @@ func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
 }
 
 func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {
-	_, _ = bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
+	ctx, inst := bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
 		name:     "NetBSD",
 		envVar:   "CC_TEST_NETBSD_KVM",
 		image:    "@netbsd",
@@ -195,6 +201,12 @@ func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {
 		guestOS:  "NetBSD",
 		label:    "netbsd",
 	})
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "set -eu; pkg_info -V >/tmp/pkg-version; test -s /tmp/pkg-version; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
+		WorkDir: "/tmp",
+	})
+	requireRunResponse(t, resp, err, 0)
 }
 
 type managedBSDRuntimeBootCase struct {

@@ -2,6 +2,7 @@ package rootfs
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -108,6 +109,38 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	return &Runtime{Kernel: kernel, Root: region, RootFS: root, close: closeRoot}, nil
 }
 
+func BuildManagedRuntimeFromOCI(ctx context.Context, cfg Config, kernel []byte, rootLayerPath string) (*Runtime, error) {
+	cfg = normalizeConfig(cfg)
+	baseTar, err := ensureGzipDecompressedTar(ctx, rootLayerPath)
+	if err != nil {
+		return nil, err
+	}
+	tfs, err := imagefs.NewSeekableTarFS(ctx, baseTar)
+	if err != nil {
+		return nil, fmt.Errorf("read FreeBSD OCI root layer %s: %w", baseTar, err)
+	}
+	initBin, err := freebsdguestinit.BuildForArch(ctx, filepath.Join(cfg.CacheDir, "guestinit"), cfg.Arch)
+	if err != nil {
+		_ = tfs.Close()
+		return nil, err
+	}
+	root, closeRoot, err := buildManagedRootFromBase(tfs.Root(), tfs.Close, initBin, freeBSDNetworkSpec(cfg))
+	if err != nil {
+		return nil, err
+	}
+	region, err := fsimage.Build(ctx, root, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		FFSLayout:         ffsimage.LayoutRaw,
+		DeterministicTime: time.Unix(1700000000, 0),
+		ExtraBytes:        128 << 20,
+	})
+	if err != nil {
+		_ = closeRoot()
+		return nil, fmt.Errorf("build FreeBSD FFS root: %w", err)
+	}
+	return &Runtime{Kernel: append([]byte(nil), kernel...), Root: region, RootFS: root, close: closeRoot}, nil
+}
+
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
 	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, machine.NetworkSpec{})
 	return root, err
@@ -119,6 +152,11 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, n
 	if err != nil {
 		return nil, nil, err
 	}
+	return buildManagedRootFromBase(root, closeRoot, initBin, network)
+}
+
+func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
+	network = normalizeFreeBSDNetwork(network)
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
 		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
@@ -207,6 +245,20 @@ func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
 	})
 	if err != nil {
 		return "", fmt.Errorf("decompress FreeBSD release set %s: %w", source, err)
+	}
+	return target, nil
+}
+
+func ensureGzipDecompressedTar(ctx context.Context, source string) (string, error) {
+	target, err := release.EnsureDecompressed(ctx, source, "", func(r io.Reader) (io.ReadCloser, error) {
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("read FreeBSD OCI root gzip %s: %w", source, err)
+		}
+		return gz, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("decompress FreeBSD OCI root layer %s: %w", source, err)
 	}
 	return target, nil
 }
