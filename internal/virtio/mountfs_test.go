@@ -3,6 +3,7 @@ package virtio
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +229,64 @@ func TestImageFSAllowsOwnerAfterRootChown(t *testing.T) {
 
 	if _, errno := fsys.(fsSetAttrCallerBackend).SetAttrForCaller(fileID, fattrUID, 0, 0, 0, 1001, 1000, zeroTime(), zeroTime(), 1000, 1000); errno != -linuxEPERM {
 		t.Fatalf("non-root chown errno = %d, want %d", errno, -linuxEPERM)
+	}
+}
+
+func BenchmarkImageFSGentooLikeTinyFiles(b *testing.B) {
+	const (
+		fileCount = 1024
+		fileSize  = 128
+	)
+	payload := make([]byte, fileSize)
+	names := make([]string, fileCount)
+	for i := range names {
+		names[i] = "repo-file-" + strconv.Itoa(i)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(fileCount * fileSize)
+	b.ReportMetric(fileCount, "files/op")
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		fsys := NewImageFS(imagefs.NewOverlay(nil).Root(), "")
+		create := fsys.(fsCreateCallerBackend)
+		write := fsys.(fsWriteCallerBackend)
+
+		for _, name := range names {
+			nodeID, fh, _, errno := create.CreateForCaller(1, name, linuxOWRONLY|linuxOCREAT|linuxOEXCL, 0o644, 0, 0)
+			if errno != 0 {
+				b.Fatalf("create %s errno = %d", name, errno)
+			}
+			if _, errno := write.WriteForCaller(nodeID, fh, 0, payload, 0, 0, 0); errno != 0 {
+				b.Fatalf("write %s errno = %d", name, errno)
+			}
+			fsys.Release(nodeID, fh)
+		}
+	}
+}
+
+func BenchmarkImageFSSameBytesSingleFile(b *testing.B) {
+	const (
+		fileCount = 1024
+		fileSize  = 128
+	)
+	payload := make([]byte, fileCount*fileSize)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ReportMetric(1, "files/op")
+
+	for n := 0; n < b.N; n++ {
+		fsys := NewImageFS(imagefs.NewOverlay(nil).Root(), "")
+		nodeID, fh, _, errno := fsys.(fsCreateCallerBackend).CreateForCaller(1, "repo-pack", linuxOWRONLY|linuxOCREAT|linuxOEXCL, 0o644, 0, 0)
+		if errno != 0 {
+			b.Fatalf("create repo-pack errno = %d", errno)
+		}
+		if _, errno := fsys.(fsWriteCallerBackend).WriteForCaller(nodeID, fh, 0, payload, 0, 0, 0); errno != 0 {
+			b.Fatalf("write repo-pack errno = %d", errno)
+		}
+		fsys.Release(nodeID, fh)
 	}
 }
 

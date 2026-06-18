@@ -99,6 +99,41 @@ func TestResolvePathFollowsSymlinks(t *testing.T) {
 	}
 }
 
+func TestResolvePathFollowsIntermediateSymlinkDirectories(t *testing.T) {
+	overlay := NewOverlay(nil)
+	if err := overlay.AddDir("/usr/bin", fs.ModeDir|0o755); err != nil {
+		t.Fatalf("add usr bin: %v", err)
+	}
+	if err := overlay.AddSymlink("/bin", "usr/bin"); err != nil {
+		t.Fatalf("add bin symlink: %v", err)
+	}
+	if err := overlay.AddFile("/usr/bin/bash", 0o755, []byte("bash")); err != nil {
+		t.Fatalf("add bash: %v", err)
+	}
+	if err := overlay.AddSymlink("/usr/bin/sh", "bash"); err != nil {
+		t.Fatalf("add sh symlink: %v", err)
+	}
+
+	resolved, entry, err := ResolvePath(overlay.Root(), "/bin/sh")
+	if err != nil {
+		t.Fatalf("resolve intermediate symlink: %v", err)
+	}
+	if resolved != "/usr/bin/bash" {
+		t.Fatalf("resolved path = %q, want /usr/bin/bash", resolved)
+	}
+	if entry.File == nil {
+		t.Fatalf("resolved intermediate symlink did not yield a file")
+	}
+
+	cmd, err := ResolveCommand(overlay.Root(), []string{"sh", "-c", "true"}, []string{"PATH=/bin"})
+	if err != nil {
+		t.Fatalf("resolve command through intermediate symlink: %v", err)
+	}
+	if strings.Join(cmd, " ") != "/bin/sh -c true" {
+		t.Fatalf("resolved command = %#v", cmd)
+	}
+}
+
 func TestLookupPathCleansInputAndReportsNonDirectory(t *testing.T) {
 	rootDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(rootDir, "file"), "contents")

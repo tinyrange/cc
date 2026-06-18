@@ -109,6 +109,41 @@ func TestMuxBadRequests(t *testing.T) {
 	}
 }
 
+func TestSanitizeExecEventForJSONUsesTextOrBinary(t *testing.T) {
+	text := sanitizeExecEventForJSON(client.ExecEvent{
+		Kind:   "stdout",
+		Output: "hello\n",
+		Data:   []byte("hello\n"),
+	})
+	if text.Output != "hello\n" {
+		t.Fatalf("text output = %q", text.Output)
+	}
+	if len(text.Data) != 0 {
+		t.Fatalf("text data was not cleared: %q", string(text.Data))
+	}
+
+	binary := sanitizeExecEventForJSON(client.ExecEvent{
+		Kind:   "stdout",
+		Output: "\xff\x00",
+		Data:   []byte{0xff, 0x00},
+	})
+	if binary.Output != "" {
+		t.Fatalf("binary output = %q", binary.Output)
+	}
+	if !bytes.Equal(binary.Data, []byte{0xff, 0x00}) {
+		t.Fatalf("binary data = %v", binary.Data)
+	}
+
+	encoded := mustJSON(t, binary)
+	var decoded client.ExecEvent
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decode sanitized binary event: %v json=%s", err, string(encoded))
+	}
+	if !bytes.Equal(decoded.Data, []byte{0xff, 0x00}) {
+		t.Fatalf("decoded data = %v", decoded.Data)
+	}
+}
+
 func jsonBody(t *testing.T, value any) *bytes.Reader {
 	t.Helper()
 	return bytes.NewReader(mustJSON(t, value))

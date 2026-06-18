@@ -172,6 +172,32 @@ func TestResolvedOCISourceUsesImmutableDigest(t *testing.T) {
 	}
 }
 
+func TestRegistryAuthorizeEncodesChallengeParams(t *testing.T) {
+	var gotService, gotScope string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotService = r.URL.Query().Get("service")
+		gotScope = r.URL.Query().Get("scope")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token":"ok"}`))
+	}))
+	defer server.Close()
+
+	reg := &registryContext{client: server.Client()}
+	header := `Bearer realm="` + server.URL + `/token",service="SUSE Linux Docker Registry",scope="repository:bci/bci-base:pull"`
+	if err := reg.authorize(context.Background(), header); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if gotService != "SUSE Linux Docker Registry" {
+		t.Fatalf("service query = %q", gotService)
+	}
+	if gotScope != "repository:bci/bci-base:pull" {
+		t.Fatalf("scope query = %q", gotScope)
+	}
+	if reg.token != "ok" {
+		t.Fatalf("token = %q", reg.token)
+	}
+}
+
 func alpineFixture(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
