@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -98,6 +99,9 @@ func (h *sidecarVMHost) Start(ctx context.Context, req client.CreateInstanceRequ
 }
 
 func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := h.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	resources, err := h.prepareCreateResources(ctx, req)
 	if err != nil {
 		return nil, err
@@ -121,6 +125,9 @@ func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstance
 }
 
 func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := h.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	resources, err := h.prepareBlankResources(ctx, req)
 	if err != nil {
 		return nil, err
@@ -202,6 +209,9 @@ func (h *sidecarVMHost) prepareExecInInstance(ctx context.Context, inst *sidecar
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err
 	}
+	if err := h.rejectBuiltinGuestAlternateImage(targetImage); err != nil {
+		return client.ExecRequest{}, err
+	}
 	if h.images == nil {
 		return client.ExecRequest{}, fmt.Errorf("sidecar image store is not configured")
 	}
@@ -237,6 +247,9 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err
 	}
+	if err := h.rejectBuiltinGuestAlternateImage(targetImage); err != nil {
+		return client.ExecRequest{}, err
+	}
 	if h.images == nil {
 		return client.ExecRequest{}, fmt.Errorf("sidecar image store is not configured")
 	}
@@ -258,13 +271,16 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 }
 
 type sidecarStartResources struct {
-	env         []string
-	close       func()
-	remote      bool
-	rootFS      sidecarRootFS
-	resolver    *sidecarCommandResolver
-	networkIPv4 string
-	network     *networkRuntime
+	env          []string
+	close        func()
+	remote       bool
+	rootFS       sidecarRootFS
+	resolver     *sidecarCommandResolver
+	networkIPv4  string
+	network      *networkRuntime
+	osName       string
+	capabilities guestCapabilities
+	execEnv      func(base, overrides []string, replace bool) []string
 }
 
 type sidecarBootBundle struct {
@@ -303,11 +319,24 @@ func combineSidecarResources(resources ...sidecarStartResources) sidecarStartRes
 		if combined.network == nil && resource.network != nil {
 			combined.network = resource.network
 		}
+		if combined.osName == "" && resource.osName != "" {
+			combined.osName = resource.osName
+		}
+		if isZeroGuestCapabilities(combined.capabilities) && !isZeroGuestCapabilities(resource.capabilities) {
+			combined.capabilities = resource.capabilities
+		}
+		if combined.execEnv == nil && resource.execEnv != nil {
+			combined.execEnv = resource.execEnv
+		}
 		if resource.close != nil {
 			combined.close = appendSidecarClose(combined.close, resource.close)
 		}
 	}
 	return combined
+}
+
+func isZeroGuestCapabilities(caps guestCapabilities) bool {
+	return reflect.DeepEqual(caps, guestCapabilities{})
 }
 
 func appendSidecarClose(existing, next func()) func() {
@@ -469,22 +498,34 @@ func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string,
 		network:      resources.network,
 		hasImageRoot: resources.resolver != nil,
 	}
-	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources.resolver)
+	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources)
 	return inst
 }
 
-func newSidecarManagedCore(session *sidecarpkg.ManagedSession, resolver *sidecarCommandResolver) *managedInstanceCore {
+func newSidecarManagedCore(session *sidecarpkg.ManagedSession, resources sidecarStartResources) *managedInstanceCore {
+	osName := resources.osName
+	if osName == "" {
+		osName = "sidecar"
+	}
+	caps := resources.capabilities
+	if isZeroGuestCapabilities(caps) {
+		caps = managedguest.LinuxProfile.Caps
+	}
+	env := resources.execEnv
+	if env == nil {
+		env = sidecarEffectiveExecEnv
+	}
 	cfg := hostmanaged.Config{
-		OSName:       "sidecar",
+		OSName:       osName,
 		Session:      session,
-		Capabilities: managedguest.LinuxProfile.Caps,
-		Env:          sidecarEffectiveExecEnv,
+		Capabilities: caps,
+		Env:          env,
 		MarkResolved: true,
 	}
-	if resolver != nil {
-		cfg.Root = resolver.root
-		cfg.BaseEnv = resolver.baseEnv
-		cfg.WorkDir = resolver.workDir
+	if resources.resolver != nil {
+		cfg.Root = resources.resolver.root
+		cfg.BaseEnv = resources.resolver.baseEnv
+		cfg.WorkDir = resources.resolver.workDir
 	}
 	return hostmanaged.NewCore(cfg)
 }
@@ -611,7 +652,7 @@ func (i *sidecarInstance) managedCore() *managedInstanceCore {
 	if i.managedInstanceCore != nil {
 		return i.managedInstanceCore
 	}
-	return newSidecarManagedCore(i.managedSession(), i.resolver)
+	return newSidecarManagedCore(i.managedSession(), sidecarStartResources{resolver: i.resolver})
 }
 
 func sidecarShouldPassthroughToWorker(hasImageRoot bool, core *managedInstanceCore, req client.ExecRequest) bool {

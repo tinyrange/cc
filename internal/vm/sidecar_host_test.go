@@ -72,7 +72,7 @@ func TestSidecarCommandResolverSkipsResolvedRequests(t *testing.T) {
 }
 
 func TestSidecarBlankRootPassthroughDecision(t *testing.T) {
-	blankCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), nil)
+	blankCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), sidecarStartResources{})
 	if !sidecarShouldPassthroughToWorker(false, blankCore, client.ExecRequest{Command: []string{"echo"}}) {
 		t.Fatalf("blank unresolved exec should pass through to worker")
 	}
@@ -82,9 +82,11 @@ func TestSidecarBlankRootPassthroughDecision(t *testing.T) {
 	if sidecarShouldPassthroughToWorker(false, blankCore, client.ExecRequest{Command: []string{"/bin/echo"}, SkipResolve: true}) {
 		t.Fatalf("already-resolved request should use managed core")
 	}
-	imageCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), &sidecarCommandResolver{
-		root:    sidecarResolverRoot(t),
-		baseEnv: []string{"PATH=/bin"},
+	imageCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), sidecarStartResources{
+		resolver: &sidecarCommandResolver{
+			root:    sidecarResolverRoot(t),
+			baseEnv: []string{"PATH=/bin"},
+		},
 	})
 	if sidecarShouldPassthroughToWorker(true, imageCore, client.ExecRequest{Command: []string{"tool"}}) {
 		t.Fatalf("image-backed exec should use managed core")
