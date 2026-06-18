@@ -18,6 +18,7 @@ var LinuxProfile = Profile{
 		Network:            true,
 		DNS:                true,
 		DynamicShares:      true,
+		ShareTransports:    []string{"virtio-fs"},
 		PortForward:        true,
 		AlternateImageExec: true,
 		RootSnapshot:       true,

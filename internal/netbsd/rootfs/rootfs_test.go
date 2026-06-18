@@ -132,6 +132,18 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	if !strings.Contains(resolv, "nameserver 10.42.0.10") {
 		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
+	services := readRootFile(t, root, "/etc/services")
+	if !strings.Contains(services, "nfs") || !strings.Contains(services, "2049/tcp") || !strings.Contains(services, "sunrpc") {
+		t.Fatalf("services does not contain NFS RPC entries: %q", services)
+	}
+	protocols := readRootFile(t, root, "/etc/protocols")
+	if !strings.Contains(protocols, "tcp") || !strings.Contains(protocols, "udp") {
+		t.Fatalf("protocols does not contain TCP/UDP entries: %q", protocols)
+	}
+	netconfig := readRootFile(t, root, "/etc/netconfig")
+	if !strings.Contains(netconfig, "tcp") || !strings.Contains(netconfig, "tpi_cots_ord") {
+		t.Fatalf("netconfig does not contain TCP RPC transport: %q", netconfig)
+	}
 }
 
 func TestBuildManagedRuntimeFromNetBSDReleaseSets(t *testing.T) {

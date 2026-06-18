@@ -15,6 +15,7 @@ type Capabilities struct {
 	DNS                bool
 	PackageManager     string
 	DynamicShares      bool
+	ShareTransports    []string
 	PortForward        bool
 	AlternateImageExec bool
 	RootSnapshot       bool

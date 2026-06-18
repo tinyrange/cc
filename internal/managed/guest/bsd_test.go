@@ -45,7 +45,10 @@ func TestBSDProfileCapabilities(t *testing.T) {
 	if freebsd.PackageManager != "pkg" {
 		t.Fatalf("FreeBSD package manager = %q", freebsd.PackageManager)
 	}
-	if freebsd.DynamicShares || freebsd.PortForward || freebsd.AlternateImageExec {
+	if !freebsd.DynamicShares || len(freebsd.ShareTransports) != 1 || freebsd.ShareTransports[0] != "nfs" {
+		t.Fatalf("FreeBSD share capabilities = %+v", freebsd)
+	}
+	if freebsd.PortForward || freebsd.AlternateImageExec {
 		t.Fatalf("FreeBSD unsupported capabilities should be false: %+v", freebsd)
 	}
 	if !openbsd.RootSnapshot || openbsd.ImageSnapshot {

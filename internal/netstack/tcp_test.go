@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -50,4 +51,43 @@ func TestBuildSynAckOptions(t *testing.T) {
 	if len(got) != 4 || got[0] != tcpOptMSS || binary.BigEndian.Uint16(got[2:4]) != 1200 {
 		t.Fatalf("SYN-ACK options without scale = %#v", got)
 	}
+}
+
+func TestHostAccessDisabledAllowsInternalTCPListeners(t *testing.T) {
+	ns := New(nil)
+	ns.SetHostAccessEnabled(false)
+	ln, err := ns.ListenInternal("tcp", ":10777")
+	if err != nil {
+		t.Fatalf("ListenInternal: %v", err)
+	}
+	defer ln.Close()
+
+	guestIP := net.IPv4(10, 42, 0, 2)
+	hostIP := net.IP(ns.hostIPv4[:])
+	syn := buildTestTCPSegment(40000, 10777, 1000, 0, tcpFlagSYN, guestIP, hostIP)
+	if err := ns.handleTCP(ipv4Header{
+		src: guestIP,
+		dst: hostIP,
+	}, syn); err != nil {
+		t.Fatalf("handleTCP SYN to internal listener: %v", err)
+	}
+
+	ns.tcpMu.Lock()
+	defer ns.tcpMu.Unlock()
+	if len(ns.tcpConns) != 1 {
+		t.Fatalf("tcp connections = %d, want internal listener connection", len(ns.tcpConns))
+	}
+}
+
+func buildTestTCPSegment(srcPort, dstPort uint16, seq, ack uint32, flags uint8, srcIP, dstIP net.IP) []byte {
+	seg := make([]byte, tcpHeaderLen)
+	binary.BigEndian.PutUint16(seg[0:2], srcPort)
+	binary.BigEndian.PutUint16(seg[2:4], dstPort)
+	binary.BigEndian.PutUint32(seg[4:8], seq)
+	binary.BigEndian.PutUint32(seg[8:12], ack)
+	seg[12] = byte(tcpHeaderLen/4) << 4
+	seg[13] = flags
+	binary.BigEndian.PutUint16(seg[14:16], 65535)
+	binary.BigEndian.PutUint16(seg[16:18], tcpChecksum(srcIP, dstIP, seg))
+	return seg
 }

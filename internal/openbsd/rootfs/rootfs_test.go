@@ -129,6 +129,10 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {
 	if !strings.Contains(resolv, "nameserver 10.42.0.9") {
 		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
+	services := readRootFile(t, root, "/etc/services")
+	if !strings.Contains(services, "nfs") || !strings.Contains(services, "2049/tcp") || !strings.Contains(services, "sunrpc") {
+		t.Fatalf("services does not contain NFS RPC entries: %q", services)
+	}
 	myname := readRootFile(t, root, "/etc/myname")
 	if strings.TrimSpace(myname) != "test-openbsd" {
 		t.Fatalf("myname = %q", myname)

@@ -11,8 +11,8 @@ import (
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/managed/machine"
 	managedruntime "j5.nz/cc/internal/managed/runtime"
+	"j5.nz/cc/internal/nfs"
 	"j5.nz/cc/internal/vm/builtin"
-	"j5.nz/cc/internal/vm/execplan"
 )
 
 func builtinGuestForImage(image string) (managedguest.Profile, bool) {
@@ -125,9 +125,6 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 	if displayName == "" {
 		displayName = def.BootKind
 	}
-	if len(req.Shares) != 0 {
-		return nil, execplan.UnsupportedFeature(displayName, def.Profile.Caps, "filesystem shares")
-	}
 	if req.Network != nil && !req.Network.Enabled {
 		return nil, fmt.Errorf("%s runtime requires virtio-net for the managed control channel", displayName)
 	}
@@ -184,17 +181,40 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 	if err != nil {
 		return nil, err
 	}
-	return &managedInstance{
-		osName:       displayName,
-		session:      started.Session,
-		closeRuntime: started.Artifact.Close,
-		root:         started.Artifact.RootFS,
-		baseEnv:      builtin.EffectiveExecEnv(nil, nil, false),
-		workDir:      "/",
-		network:      network,
-		caps:         def.Profile.Caps,
-		env:          builtin.EffectiveExecEnv,
-	}, nil
+	nfsServer := nfs.New(network.stack)
+	if err := nfsServer.Start(); err != nil {
+		_ = started.Session.Close()
+		return nil, err
+	}
+	base := &managedInstance{
+		osName:  displayName,
+		session: started.Session,
+		closeRuntime: func() error {
+			nfsErr := nfsServer.Close()
+			artifactErr := started.Artifact.Close()
+			if nfsErr != nil {
+				return nfsErr
+			}
+			return artifactErr
+		},
+		root:    started.Artifact.RootFS,
+		baseEnv: builtin.EffectiveExecEnv(nil, nil, false),
+		workDir: "/",
+		network: network,
+		caps:    def.Profile.Caps,
+		env:     builtin.EffectiveExecEnv,
+	}
+	bsdInst := &bsdNFSInstance{
+		managedInstance: base,
+		nfs:             nfsServer,
+	}
+	for _, share := range req.Shares {
+		if err := bsdInst.AddShare(ctx, share); err != nil {
+			_ = bsdInst.Close()
+			return nil, err
+		}
+	}
+	return bsdInst, nil
 }
 
 func builtinGuestCapabilities(image string) guestCapabilities {
@@ -203,4 +223,20 @@ func builtinGuestCapabilities(image string) guestCapabilities {
 		return guestCapabilities{}
 	}
 	return profile.Caps
+}
+
+type bsdNFSInstance struct {
+	*managedInstance
+	nfs *nfs.Server
+}
+
+func (i *bsdNFSInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	if i == nil || i.nfs == nil {
+		return (&managedInstance{}).AddShare(ctx, share)
+	}
+	exp, err := i.nfs.AddShare(share)
+	if err != nil {
+		return err
+	}
+	return nfs.MountShare(ctx, i.osName, i.Exec, exp)
 }

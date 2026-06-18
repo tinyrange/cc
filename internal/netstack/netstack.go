@@ -1797,10 +1797,6 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		opts := parseTCPOptions(hdr.options)
 		dstIP := h.dst.To4()
 		allowServiceProxy := ns.serviceProxyAllowed(dstIP, hdr.dstPort)
-		if !ns.hostAccessEnabled && isHostLocalIPv4(dstIP) && !allowServiceProxy {
-			ns.tcpMu.Unlock()
-			return ns.sendRST(h, hdr)
-		}
 
 		// Local listener present? Create a conn and complete handshake.
 		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
@@ -1811,6 +1807,11 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
 			return nil
+		}
+
+		if !ns.hostAccessEnabled && isHostLocalIPv4(dstIP) && !allowServiceProxy {
+			ns.tcpMu.Unlock()
+			return ns.sendRST(h, hdr)
 		}
 
 		if netstackTraceEnabled {

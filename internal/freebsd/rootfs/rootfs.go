@@ -127,6 +127,7 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, n
 		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("hostname=\"%s\"\nifconfig_%s=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"%s\"\n", network.Hostname, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
 		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{"/etc/services", 0o644, []byte(bsdNetworkServices)},
 	}); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
@@ -141,6 +142,16 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, n
 	}
 	return overlay.Root(), closeRoot, nil
 }
+
+const bsdNetworkServices = `sunrpc		111/tcp
+sunrpc		111/udp
+portmap		111/tcp
+portmap		111/udp
+nfs		2049/tcp
+nfs		2049/udp
+mountd		20048/tcp
+mountd		20048/udp
+`
 
 func freeBSDNetworkSpec(cfg Config) machine.NetworkSpec {
 	network := cfg.Network

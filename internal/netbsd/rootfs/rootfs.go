@@ -135,6 +135,9 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, a
 		{"/etc/ifconfig." + network.Interface, 0o644, []byte(fmt.Sprintf("inet %s netmask 255.255.255.0\n", network.GuestIPv4))},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
 		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{"/etc/services", 0o644, []byte(bsdNetworkServices)},
+		{"/etc/protocols", 0o644, []byte(bsdNetworkProtocols)},
+		{"/etc/netconfig", 0o644, []byte(netBSDNetconfig)},
 		{"/root/.profile", 0o644, []byte(`export PKG_PATH=${PKG_PATH:-https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/x86_64/10.1/All}
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/pkg/bin:/usr/pkg/sbin
 `)},
@@ -203,6 +206,28 @@ func netBSDManagedDevices(arch string) []rootplan.Device {
 		{"/dev/rld4d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 35)},
 	}
 }
+
+const bsdNetworkServices = `sunrpc		111/tcp
+sunrpc		111/udp
+portmap		111/tcp
+portmap		111/udp
+nfs		2049/tcp
+nfs		2049/udp
+mountd		20048/tcp
+mountd		20048/udp
+`
+
+const bsdNetworkProtocols = `ip	0	IP
+icmp	1	ICMP
+tcp	6	TCP
+udp	17	UDP
+`
+
+const netBSDNetconfig = `udp	tpi_clts	v	inet	udp	-	-
+tcp	tpi_cots_ord	v	inet	tcp	-	-
+udp6	tpi_clts	v	inet6	udp	-	-
+tcp6	tpi_cots_ord	v	inet6	tcp	-	-
+`
 
 func rdev(major, minor uint32) uint32 {
 	return major<<8 | minor
