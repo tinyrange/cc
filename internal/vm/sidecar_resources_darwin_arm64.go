@@ -52,6 +52,9 @@ type sidecarBootBundleMetadata struct {
 
 func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req client.CreateInstanceRequest) (sidecarStartResources, error) {
 	_ = ctx
+	if isBuiltinGuestImage(req.Image) {
+		return sidecarStartResources{}, fmt.Errorf("built-in guest image %q must be started by the managed guest runtime, not sidecar OCI resources", req.Image)
+	}
 	if h.images == nil {
 		return sidecarStartResources{}, fmt.Errorf("sidecar image store is not configured")
 	}
@@ -93,6 +96,9 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	var resolver *sidecarCommandResolver
 	var image *oci.Image
 	if imageName := strings.TrimSpace(req.Image); imageName != "" {
+		if isBuiltinGuestImage(imageName) {
+			return sidecarStartResources{}, fmt.Errorf("built-in guest image %q must be started by the managed guest runtime, not sidecar OCI resources", imageName)
+		}
 		if h.images == nil {
 			return sidecarStartResources{}, fmt.Errorf("sidecar image store is not configured")
 		}
