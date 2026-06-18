@@ -727,12 +727,18 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
+			if err := ensureTarTargetCompatible(target, true); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
+			if err := ensureTarTargetCompatible(target, false); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
@@ -743,6 +749,9 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
+			if err := ensureTarTargetCompatible(target, false); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
@@ -766,6 +775,25 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 				return err
 			}
 		}
+	}
+}
+
+func ensureTarTargetCompatible(target string, incomingDir bool) error {
+	info, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existingDir := info.IsDir()
+	switch {
+	case incomingDir && !existingDir:
+		return fmt.Errorf("copy conflict at %s: cannot overwrite non-directory with directory", target)
+	case !incomingDir && existingDir:
+		return fmt.Errorf("copy conflict at %s: cannot overwrite directory with non-directory", target)
+	default:
+		return nil
 	}
 }
 

@@ -84,6 +84,99 @@ func TestWriteAndExtractTarPreservesSymlink(t *testing.T) {
 	}
 }
 
+func TestExtractTarToPathConflictSemantics(t *testing.T) {
+	t.Run("file over file overwrites", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeSingleFileTar(&archive, "src.txt", "new"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst.txt")
+		if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+			t.Fatalf("write dst: %v", err)
+		}
+
+		if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "/", dst, false); err != nil {
+			t.Fatalf("extract file over file: %v", err)
+		}
+		if got := readTestFile(t, dst); got != "new" {
+			t.Fatalf("dst content = %q, want new", got)
+		}
+	})
+
+	t.Run("file into directory copies under source name", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeSingleFileTar(&archive, "src.txt", "payload"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := t.TempDir()
+
+		if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "/", dst, false); err != nil {
+			t.Fatalf("extract file into directory: %v", err)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "src.txt")); got != "payload" {
+			t.Fatalf("copied file content = %q, want payload", got)
+		}
+	})
+
+	t.Run("directory over file fails", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeTestPathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.WriteFile(dst, []byte("keep"), 0o644); err != nil {
+			t.Fatalf("write dst: %v", err)
+		}
+
+		err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "/", dst, false)
+		if err == nil || !strings.Contains(err.Error(), "cannot overwrite non-directory with directory") {
+			t.Fatalf("extract directory over file error = %v", err)
+		}
+		if got := readTestFile(t, dst); got != "keep" {
+			t.Fatalf("dst content = %q, want keep", got)
+		}
+	})
+
+	t.Run("directory into directory merges under source name", func(t *testing.T) {
+		var archive bytes.Buffer
+		if err := writeTestPathTar(&archive, makeTestCopyTree(t), "tree"); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.MkdirAll(filepath.Join(dst, "tree", "nested"), 0o755); err != nil {
+			t.Fatalf("make dst nested: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, "tree", "nested", "old.txt"), []byte("old"), 0o644); err != nil {
+			t.Fatalf("write old file: %v", err)
+		}
+
+		if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "/", dst, false); err != nil {
+			t.Fatalf("extract directory into directory: %v", err)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "tree", "nested", "file.txt")); got != "payload" {
+			t.Fatalf("new nested file = %q, want payload", got)
+		}
+		if got := readTestFile(t, filepath.Join(dst, "tree", "nested", "old.txt")); got != "old" {
+			t.Fatalf("old nested file = %q, want old", got)
+		}
+	})
+
+	t.Run("non-directory over directory fails when forced exact", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "dst")
+		if err := os.Mkdir(dst, 0o755); err != nil {
+			t.Fatalf("make dst dir: %v", err)
+		}
+
+		err := ensureTarTargetCompatible(dst, false)
+		if err == nil || !strings.Contains(err.Error(), "cannot overwrite directory with non-directory") {
+			t.Fatalf("exact file over directory error = %v", err)
+		}
+		if info, err := os.Stat(dst); err != nil || !info.IsDir() {
+			t.Fatalf("dst dir stat = %v info=%v", err, info)
+		}
+	})
+}
+
 func TestParseSignal(t *testing.T) {
 	tests := map[string]syscall.Signal{
 		"SIGHUP":  syscall.SIGHUP,
@@ -108,6 +201,49 @@ func TestParseSignal(t *testing.T) {
 	if _, err := ParseSignal("SIGBOGUS"); err == nil {
 		t.Fatalf("ParseSignal accepted unsupported signal")
 	}
+}
+
+func makeTestCopyTree(t *testing.T) string {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("make empty dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatalf("make nested dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "file.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+	return src
+}
+
+func writeTestPathTar(w io.Writer, src, rootName string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	return WritePathTar(w, src, rootName, info)
+}
+
+func writeSingleFileTar(w io.Writer, name, content string) error {
+	tw := tar.NewWriter(w)
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
+		return err
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		return err
+	}
+	return tw.Close()
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
 }
 
 func TestProtocolFraming(t *testing.T) {
