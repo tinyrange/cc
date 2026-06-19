@@ -358,6 +358,7 @@ type StartInstanceRequest struct {
 	Image          string         `json:"image,omitempty"`
 	InitSystem     string         `json:"init,omitempty"`
 	Kernel         string         `json:"kernel,omitempty"`
+	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`

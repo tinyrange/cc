@@ -11,7 +11,6 @@ import (
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/vm/builtin"
-	"j5.nz/cc/internal/vm/execplan"
 )
 
 func builtinGuestForImage(image string) (managedguest.Profile, bool) {
@@ -55,6 +54,7 @@ func (b *runtimeBackend) startBuiltinGuestBlankStream(ctx context.Context, req c
 		Image:          profile.Canonical,
 		InitSystem:     req.InitSystem,
 		Kernel:         req.Kernel,
+		Shares:         append([]client.ShareMount(nil), req.Shares...),
 		Network:        req.Network,
 		KernelModules:  append([]string(nil), req.KernelModules...),
 		MemoryMB:       req.MemoryMB,
@@ -160,9 +160,6 @@ func (b *runtimeBackend) startBSDArm64ManagedStream(ctx context.Context, req cli
 	if displayName == "" {
 		displayName = def.BootKind
 	}
-	if len(req.Shares) != 0 {
-		return nil, execplan.UnsupportedFeature(displayName, def.Profile.Caps, "filesystem shares")
-	}
 	if req.Network != nil && !req.Network.Enabled {
 		return nil, fmt.Errorf("%s runtime requires virtio-net for the managed control channel", displayName)
 	}
@@ -213,17 +210,24 @@ func (b *runtimeBackend) startBSDArm64ManagedStream(ctx context.Context, req cli
 		_ = artifact.Close()
 		return nil, err
 	}
-	return newDarwinBSDInstance(darwinBSDInstanceConfig{
+	nfsServer, err := startBSDNFSServer(network.stack)
+	if err != nil {
+		_ = session.Close()
+		_ = artifact.Close()
+		return nil, err
+	}
+	base := newDarwinBSDInstance(darwinBSDInstanceConfig{
 		OSName:       displayName,
 		Session:      session,
-		CloseRuntime: artifact.Close,
+		CloseRuntime: closeBSDNFSRuntime(nfsServer, artifact.Close),
 		Root:         artifact.RootFS,
 		BaseEnv:      builtin.EffectiveExecEnv(nil, nil, false),
 		WorkDir:      "/",
 		Network:      network,
 		Capabilities: def.Profile.Caps,
 		Env:          builtin.EffectiveExecEnv,
-	}), nil
+	})
+	return wrapBSDNFSInstance(ctx, displayName, base, nfsServer, req.Shares)
 }
 
 func builtinGuestCapabilities(image string) guestCapabilities {
