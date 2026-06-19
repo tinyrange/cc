@@ -559,11 +559,7 @@ func (a *bootIOAPIC) assert(line uint8, high bool) (bootIOAPICRoute, bool) {
 	if int(line) >= len(a.redir) {
 		return bootIOAPICRoute{}, false
 	}
-	asserted := high
-	if a.redir[line]&(1<<13) != 0 {
-		asserted = !high
-	}
-	if asserted {
+	if high {
 		edge := !a.lineHigh[line]
 		a.lineHigh[line] = true
 		return a.evaluateLocked(line, edge)

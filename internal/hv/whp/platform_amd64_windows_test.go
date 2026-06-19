@@ -49,3 +49,25 @@ func TestBootPICEdgeLineRequiresNewRisingEdge(t *testing.T) {
 		t.Fatalf("new edge ack = vector %#x line %d ok %t, want vector 0x20 line 0", vector, line, ok)
 	}
 }
+
+func TestBootIOAPICActiveLowLevelLineUsesAssertedState(t *testing.T) {
+	var ioapic bootIOAPIC
+	ioapic.init()
+	ioapic.redir[12] = 0x62 | 1<<13 | 1<<15
+
+	route, pending := ioapic.assert(12, true)
+	if !pending {
+		t.Fatalf("assert active-low level line did not produce a pending route")
+	}
+	if route.line != 12 || route.vector != 0x62 || !route.level {
+		t.Fatalf("route = %+v, want line 12 vector 0x62 level", route)
+	}
+	if _, pending := ioapic.deviceHighRoute(12); !pending {
+		t.Fatalf("deviceHighRoute after assert = false, want true")
+	}
+
+	ioapic.assert(12, false)
+	if _, pending := ioapic.deviceHighRoute(12); pending {
+		t.Fatalf("deviceHighRoute after deassert = true, want false")
+	}
+}
