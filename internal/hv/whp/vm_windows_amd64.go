@@ -77,6 +77,10 @@ func newVM(memorySize uint64, localAPIC bool) (*VM, error) {
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
 	}
+	if err := setPartitionProperty(part, partitionPropertyCodeExtendedVMExits, uint64(1<<1)); err != nil {
+		_ = vm.Close()
+		return nil, fmt.Errorf("set extended VM exits: %w", err)
+	}
 	if localAPIC {
 		if err := setPartitionProperty(part, partitionPropertyCodeLocalAPICEmulationMode, localAPICEmulationModeXAPIC); err != nil {
 			_ = vm.Close()
@@ -217,6 +221,54 @@ func (v *VM) SetFlatProtectedMode(entry uint64) error {
 	return nil
 }
 
+func (v *VM) SetProtectedMode32(entry, stack uint64) error {
+	const (
+		cr0PE = 1 << 0
+		cr0MP = 1 << 1
+		cr0ET = 1 << 4
+		cr0NE = 1 << 5
+		cr0PG = 1 << 31
+	)
+	code := x64SegmentRegister{Base: 0, Limit: 0xffffffff, Selector: 0x10, Attributes: segmentAttributes(11, 1, 0, 1, 0, 0, 1, 1)}
+	data := x64SegmentRegister{Base: 0, Limit: 0xffffffff, Selector: 0x18, Attributes: segmentAttributes(3, 1, 0, 1, 0, 0, 1, 1)}
+	names := []registerName{
+		registerCr0,
+		registerCr3,
+		registerCr4,
+		registerEfer,
+		registerCs,
+		registerDs,
+		registerEs,
+		registerFs,
+		registerGs,
+		registerSs,
+		registerRip,
+		registerRsp,
+		registerRflags,
+	}
+	values := make([]registerValue, len(names))
+	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return fmt.Errorf("get protected-mode registers: %w", err)
+	}
+	values[0] = uint64RegisterValue((values[0].uint64() | cr0PE | cr0MP | cr0ET | cr0NE) &^ uint64(cr0PG))
+	values[1] = uint64RegisterValue(0)
+	values[2] = uint64RegisterValue(0)
+	values[3] = uint64RegisterValue(0)
+	values[4] = segmentRegisterValue(code)
+	values[5] = segmentRegisterValue(data)
+	values[6] = segmentRegisterValue(data)
+	values[7] = segmentRegisterValue(data)
+	values[8] = segmentRegisterValue(data)
+	values[9] = segmentRegisterValue(data)
+	values[10] = uint64RegisterValue(entry)
+	values[11] = uint64RegisterValue(stack)
+	values[12] = uint64RegisterValue(0x2)
+	if err := setVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return fmt.Errorf("set protected-mode registers: %w", err)
+	}
+	return nil
+}
+
 func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	if err := v.setupPageTables(pagingBase, 4); err != nil {
 		return err
@@ -275,6 +327,62 @@ func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	return nil
 }
 
+func (v *VM) SetFreeBSDLongMode(entry, stack, pagingBase uint64) error {
+	if err := v.setupFreeBSDPageTables(pagingBase, 4); err != nil {
+		return err
+	}
+	const (
+		cr0PE   = 1 << 0
+		cr0MP   = 1 << 1
+		cr0ET   = 1 << 4
+		cr0NE   = 1 << 5
+		cr0WP   = 1 << 16
+		cr0AM   = 1 << 18
+		cr0PG   = 1 << 31
+		cr4PAE  = 1 << 5
+		eferLME = 1 << 8
+		eferLMA = 1 << 10
+	)
+	code := x64SegmentRegister{Base: 0, Limit: 0xffffffff, Selector: 0x8, Attributes: segmentAttributes(11, 1, 0, 1, 0, 1, 0, 1)}
+	data := x64SegmentRegister{Base: 0, Limit: 0xffffffff, Selector: 0x10, Attributes: segmentAttributes(3, 1, 0, 1, 0, 0, 1, 1)}
+	names := []registerName{
+		registerCr3,
+		registerCr4,
+		registerCr0,
+		registerEfer,
+		registerCs,
+		registerDs,
+		registerEs,
+		registerFs,
+		registerGs,
+		registerSs,
+		registerRip,
+		registerRsp,
+		registerRflags,
+	}
+	values := make([]registerValue, len(names))
+	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return fmt.Errorf("get FreeBSD long-mode registers: %w", err)
+	}
+	values[0] = uint64RegisterValue(pagingBase)
+	values[1] = uint64RegisterValue(values[1].uint64() | cr4PAE)
+	values[2] = uint64RegisterValue(values[2].uint64() | cr0PE | cr0MP | cr0ET | cr0NE | cr0WP | cr0AM | cr0PG)
+	values[3] = uint64RegisterValue(values[3].uint64() | eferLME | eferLMA)
+	values[4] = segmentRegisterValue(code)
+	values[5] = segmentRegisterValue(data)
+	values[6] = segmentRegisterValue(data)
+	values[7] = segmentRegisterValue(data)
+	values[8] = segmentRegisterValue(data)
+	values[9] = segmentRegisterValue(data)
+	values[10] = uint64RegisterValue(entry)
+	values[11] = uint64RegisterValue(stack)
+	values[12] = uint64RegisterValue(0x2)
+	if err := setVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return fmt.Errorf("set FreeBSD long-mode registers: %w", err)
+	}
+	return nil
+}
+
 func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 	needed := pagingBase + uint64(0x3000+giB*0x1000)
 	if needed > v.memSize {
@@ -304,6 +412,34 @@ func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 			phys := (uint64(g) << 30) | (uint64(i) << 21)
 			put64(pd+uint64(i)*8, phys|p|rw|us|ps)
 		}
+	}
+	return nil
+}
+
+func (v *VM) setupFreeBSDPageTables(pagingBase uint64, giB int) error {
+	_ = giB
+	needed := pagingBase + 0x3000
+	if needed > v.memSize {
+		return fmt.Errorf("paging structures require %#x bytes, memory size %#x", needed, v.memSize)
+	}
+	mem := v.Memory()
+	put64 := func(addr, value uint64) {
+		binary.LittleEndian.PutUint64(mem[addr:addr+8], value)
+	}
+	pml4 := pagingBase
+	pdpt := pagingBase + 0x1000
+	pd := pagingBase + 0x2000
+	const (
+		p  = 1 << 0
+		rw = 1 << 1
+		us = 1 << 2
+		ps = 1 << 7
+	)
+	for i := 0; i < 512; i++ {
+		put64(pml4+uint64(i)*8, pdpt|p|rw|us)
+		put64(pdpt+uint64(i)*8, pd|p|rw|us)
+		phys := uint64(i) << 21
+		put64(pd+uint64(i)*8, phys|p|rw|us|ps)
 	}
 	return nil
 }
@@ -352,6 +488,22 @@ func (v *VM) GetRIP() (uint64, error) {
 		return 0, err
 	}
 	return values[0].uint64(), nil
+}
+
+func (v *VM) SetRIP(rip uint64) error {
+	names := []registerName{registerRip}
+	values := []registerValue{uint64RegisterValue(rip)}
+	return setVirtualProcessorRegisters(v.part, 0, names, values)
+}
+
+func (v *VM) SetRegisters(values map[registerName]uint64) error {
+	names := make([]registerName, 0, len(values))
+	regs := make([]registerValue, 0, len(values))
+	for name, value := range values {
+		names = append(names, name)
+		regs = append(regs, uint64RegisterValue(value))
+	}
+	return setVirtualProcessorRegisters(v.part, 0, names, regs)
 }
 
 func (v *VM) RequestInterrupt(vector uint32) error {

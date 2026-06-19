@@ -94,15 +94,48 @@ func (p *bootPIC) Acknowledge(line uint8) (uint8, bool) {
 	chip := &p.master
 	irq := line
 	if line >= 8 {
+		if p.master.mask&(1<<2) != 0 {
+			p.slave.irr |= 1 << (line - 8)
+			return 0, false
+		}
 		chip = &p.slave
 		irq = line - 8
 	}
+	chip.irr |= 1 << irq
 	if chip.mask&(1<<irq) != 0 {
 		return 0, false
 	}
-	chip.irr |= 1 << irq
+	chip.irr &^= 1 << irq
 	chip.isr |= 1 << irq
+	if line >= 8 {
+		p.master.irr &^= 1 << 2
+		p.master.isr |= 1 << 2
+	}
 	return chip.vectorBase + irq, true
+}
+
+func (p *bootPIC) Clear(line uint8) {
+	if line >= 16 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	chip := &p.master
+	irq := line
+	if line >= 8 {
+		chip = &p.slave
+		irq = line - 8
+	}
+	chip.irr &^= 1 << irq
+}
+
+func (p *bootPIC) LevelTriggered(line uint8) bool {
+	if line >= 16 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.elcr[line/8]&(1<<(line%8)) != 0
 }
 
 func (c *bootPICChip) writeCommand(value byte) {
@@ -489,6 +522,19 @@ func (a *bootIOAPIC) deviceHighRoute(line uint8) (bootIOAPICRoute, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if int(line) >= len(a.redir) || !a.lineHigh[line] {
+		return bootIOAPICRoute{}, false
+	}
+	return a.routeForLineLocked(line)
+}
+
+func (a *bootIOAPIC) routeForLine(line uint8) (bootIOAPICRoute, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.routeForLineLocked(line)
+}
+
+func (a *bootIOAPIC) routeForLineLocked(line uint8) (bootIOAPICRoute, bool) {
+	if int(line) >= len(a.redir) {
 		return bootIOAPICRoute{}, false
 	}
 	entry := a.redir[line]

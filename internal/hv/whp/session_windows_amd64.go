@@ -23,8 +23,8 @@ import (
 type ManagedSession struct {
 	cancel     context.CancelFunc
 	doneCh     chan error
-	control    virtio.VsockConn
-	listener   virtio.VsockListener
+	control    io.ReadWriteCloser
+	listener   io.Closer
 	vsock      *virtio.Vsock
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript

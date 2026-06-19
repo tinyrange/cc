@@ -28,12 +28,12 @@ func TestNormalizeLinuxManagedMachineDefaultsSpec(t *testing.T) {
 	}
 }
 
-func TestWHPHostRejectsUnsupportedManagedGuest(t *testing.T) {
+func TestWHPHostDispatchesBSDToAttachmentValidation(t *testing.T) {
 	_, err := (Host{}).Start(context.Background(), managedhost.StartRequest{
 		Spec: machine.Spec{Guest: "FreeBSD", Boot: machine.BootSpec{Kind: "freebsd"}},
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "does not support") {
-		t.Fatalf("Start unsupported guest error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "whp bsd managed attachments") {
+		t.Fatalf("Start BSD attachment error = %v", err)
 	}
 }
 

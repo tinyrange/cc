@@ -19,21 +19,21 @@ func TestWindowsRuntimeBuiltinBSDDoesNotFallThroughToImageStore(t *testing.T) {
 		{
 			name: "start",
 			run: func(ctx context.Context) error {
-				_, err := backend.StartStream(ctx, client.CreateInstanceRequest{Image: "@freebsd"}, nil)
+				_, err := backend.StartStream(ctx, client.CreateInstanceRequest{Image: "@freebsd", Network: &client.NetworkConfig{Enabled: false}}, nil)
 				return err
 			},
 		},
 		{
 			name: "start_blank",
 			run: func(ctx context.Context) error {
-				_, err := backend.StartBlankStream(ctx, client.StartInstanceRequest{Image: "@openbsd"}, nil)
+				_, err := backend.StartBlankStream(ctx, client.StartInstanceRequest{Image: "@openbsd", Network: &client.NetworkConfig{Enabled: false}}, nil)
 				return err
 			},
 		},
 		{
 			name: "run",
 			run: func(ctx context.Context) error {
-				_, err := backend.Run(ctx, client.RunRequest{Image: "@netbsd"})
+				_, err := backend.Run(ctx, client.RunRequest{Image: "@netbsd", Network: &client.NetworkConfig{Enabled: false}})
 				return err
 			},
 		},
@@ -46,8 +46,8 @@ func TestWindowsRuntimeBuiltinBSDDoesNotFallThroughToImageStore(t *testing.T) {
 			if strings.Contains(err.Error(), "image store") || strings.Contains(err.Error(), "image.json") {
 				t.Fatalf("built-in BSD request fell through to image store: %v", err)
 			}
-			if !strings.Contains(err.Error(), "WHP managed BSD guests") {
-				t.Fatalf("built-in BSD request error = %v, want WHP managed BSD blocker", err)
+			if !strings.Contains(err.Error(), "requires virtio-net") {
+				t.Fatalf("built-in BSD request error = %v, want managed BSD network validation", err)
 			}
 		})
 	}

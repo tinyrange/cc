@@ -64,9 +64,11 @@ const capabilityCodeHypervisorPresent capabilityCode = 0
 
 type partitionPropertyCode uint32
 
-const partitionPropertyCodeProcessorCount partitionPropertyCode = 0x00001fff
-
-const partitionPropertyCodeLocalAPICEmulationMode partitionPropertyCode = 0x00001005
+const (
+	partitionPropertyCodeExtendedVMExits        partitionPropertyCode = 0x00000001
+	partitionPropertyCodeLocalAPICEmulationMode partitionPropertyCode = 0x00001005
+	partitionPropertyCodeProcessorCount         partitionPropertyCode = 0x00001fff
+)
 
 type localAPICEmulationMode uint32
 
@@ -285,6 +287,10 @@ func (c *runVPExitContext) memoryAccess() *memoryAccessContext {
 	return (*memoryAccessContext)(unsafe.Pointer(&c.Payload[0]))
 }
 
+func (c *runVPExitContext) instructionLength() uint8 {
+	return uint8(c.VpContext.InstructionLengthCr8 & 0xf)
+}
+
 type x64IOPortAccessInfo struct {
 	AsUint32 uint32
 }
@@ -314,6 +320,25 @@ type x64IOPortAccessContext struct {
 
 func (c *runVPExitContext) ioPortAccess() *x64IOPortAccessContext {
 	return (*x64IOPortAccessContext)(unsafe.Pointer(&c.Payload[0]))
+}
+
+type x64MSRAccessInfo struct {
+	AsUint32 uint32
+}
+
+func (i x64MSRAccessInfo) isWrite() bool {
+	return i.AsUint32&0x1 != 0
+}
+
+type x64MSRAccessContext struct {
+	AccessInfo x64MSRAccessInfo
+	MSRNumber  uint32
+	Rax        uint64
+	Rdx        uint64
+}
+
+func (c *runVPExitContext) msrAccess() *x64MSRAccessContext {
+	return (*x64MSRAccessContext)(unsafe.Pointer(&c.Payload[0]))
 }
 
 type x64ApicEoiContext struct {
