@@ -125,6 +125,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		extraCmdline = append(extraCmdline, "acpi=off", "pci=conf1")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
+	extraCmdline = append(extraCmdline, linuxKVMHostKernelArgs()...)
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,

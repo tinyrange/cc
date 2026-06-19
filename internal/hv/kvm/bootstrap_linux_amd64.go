@@ -148,6 +148,7 @@ func (b *Bootstrap) InitVCPUWithTopology(vmfd, vcpufd, id, cpus int) error {
 	}
 	setCPUIDTopology(cpuid, id, cpus)
 	setCPUIDBrandString(cpuid, hostCPUBrandString())
+	setCPUIDKVMHypervisor(cpuid)
 	if tscKHz, err := getVCPUTSCKHz(vcpufd); err == nil {
 		setCPUIDKVMHypervisorFrequency(cpuid, tscKHz)
 	}

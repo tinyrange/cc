@@ -86,6 +86,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
+	extraCmdline = append(extraCmdline, linuxKVMHostKernelArgs()...)
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		NumCPUs:      cpus,
