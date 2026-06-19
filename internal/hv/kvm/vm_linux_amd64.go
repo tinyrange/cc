@@ -5,6 +5,7 @@ package kvm
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -47,6 +48,7 @@ type MMIOExit struct {
 }
 
 type VM struct {
+	lifecycleMu sync.RWMutex
 	kvm         *Bootstrap
 	vmfd        int
 	vcpufd      int
@@ -135,6 +137,8 @@ func (v *VM) Close() error {
 	if v == nil {
 		return nil
 	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
 	for _, vcpu := range v.vcpus {
 		if vcpu == nil {
 			continue
@@ -313,6 +317,8 @@ func (v *VM) RequestImmediateExit() {
 	if v == nil {
 		return
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	pid := unix.Getpid()
 	for _, vcpu := range v.vcpus {
 		if vcpu == nil || len(vcpu.run) == 0 {
@@ -327,7 +333,12 @@ func (v *VM) RequestImmediateExit() {
 }
 
 func (v *VM) SetVCPUTID(index int, tid int) {
-	if v == nil || index < 0 || index >= len(v.vcpus) || v.vcpus[index] == nil {
+	if v == nil {
+		return
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if index < 0 || index >= len(v.vcpus) || v.vcpus[index] == nil {
 		return
 	}
 	v.vcpus[index].tid.Store(int32(tid))
@@ -337,6 +348,8 @@ func (v *VM) CancelRun() error {
 	if v == nil {
 		return nil
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	for _, vcpu := range v.vcpus {
 		if vcpu == nil || len(vcpu.run) == 0 {
 			continue
@@ -501,6 +514,8 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	if len(dst) == 0 {
 		return nil
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	if err := v.copyFromGuest(addr, dst); err != nil {
 		return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
 	}
@@ -514,6 +529,8 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	if err := v.copyToGuest(addr, data); err != nil {
 		return fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
 	}

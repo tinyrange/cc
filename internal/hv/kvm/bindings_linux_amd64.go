@@ -282,19 +282,34 @@ func setCPUIDBrandString(cpuid *kvmCPUID2, brand string) {
 	}
 }
 
-func setCPUIDKVMHypervisorFrequency(cpuid *kvmCPUID2, tscKHz uint32) {
-	if cpuid == nil || tscKHz == 0 {
+func setCPUIDKVMHypervisor(cpuid *kvmCPUID2) {
+	if cpuid == nil {
 		return
+	}
+	feature := ensureCPUIDEntry(cpuid, 1, 0)
+	if feature != nil {
+		feature.Ecx |= 1 << 31
 	}
 	base := ensureCPUIDEntry(cpuid, 0x40000000, 0)
 	if base == nil {
 		return
 	}
 	base.Flags &^= kvmCPUIDFlagSignificantIndex
-	if base.Eax < 0x40000010 {
-		base.Eax = 0x40000010
+	if base.Eax < 0x40000001 {
+		base.Eax = 0x40000001
 	}
 	copyCPUIDString12(base, "KVMKVMKVM\x00\x00\x00")
+}
+
+func setCPUIDKVMHypervisorFrequency(cpuid *kvmCPUID2, tscKHz uint32) {
+	if cpuid == nil || tscKHz == 0 {
+		return
+	}
+	setCPUIDKVMHypervisor(cpuid)
+	base := ensureCPUIDEntry(cpuid, 0x40000000, 0)
+	if base != nil && base.Eax < 0x40000010 {
+		base.Eax = 0x40000010
+	}
 
 	frequency := ensureCPUIDEntry(cpuid, 0x40000010, 0)
 	if frequency == nil {

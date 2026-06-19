@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -45,15 +46,16 @@ type MMIOExit struct {
 }
 
 type VM struct {
-	kvm       *Bootstrap
-	vmfd      int
-	vcpufd    int
-	vgicfd    int
-	run       []byte
-	mem       []byte
-	extraMem  [][]byte
-	memRegion kvmUserspaceMemoryRegion
-	tid       atomic.Int32
+	lifecycleMu sync.RWMutex
+	kvm         *Bootstrap
+	vmfd        int
+	vcpufd      int
+	vgicfd      int
+	run         []byte
+	mem         []byte
+	extraMem    [][]byte
+	memRegion   kvmUserspaceMemoryRegion
+	tid         atomic.Int32
 }
 
 func NewVM() (*VM, error) {
@@ -116,6 +118,8 @@ func (v *VM) Close() error {
 	if v == nil {
 		return nil
 	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
 	if len(v.run) != 0 {
 		_ = unix.Munmap(v.run)
 		v.run = nil
@@ -299,7 +303,12 @@ func (v *VM) execute(exit *Exit, interruptible bool) error {
 }
 
 func (v *VM) RequestImmediateExit() {
-	if v == nil || len(v.run) == 0 {
+	if v == nil {
+		return
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if len(v.run) == 0 {
 		return
 	}
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
@@ -313,11 +322,18 @@ func (v *VM) SetVCPUTID(tid int) {
 	if v == nil {
 		return
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	v.tid.Store(int32(tid))
 }
 
 func (v *VM) CancelRun() error {
-	if v == nil || len(v.run) == 0 {
+	if v == nil {
+		return nil
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if len(v.run) == 0 {
 		return nil
 	}
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
@@ -381,6 +397,8 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	if len(dst) == 0 {
 		return nil
 	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	start := v.memRegion.GuestPhysAddr
 	end := start + v.memRegion.MemorySize
 	if addr < start || addr+uint64(len(dst)) > end {
@@ -395,6 +413,11 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	if v == nil {
 		return fmt.Errorf("vm is nil")
 	}
+	if len(data) == 0 {
+		return nil
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
 	start := v.memRegion.GuestPhysAddr
 	end := start + v.memRegion.MemorySize
 	if addr < start || addr+uint64(len(data)) > end {
