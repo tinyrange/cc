@@ -1335,10 +1335,19 @@ func (reg *registryContext) authorize(ctx context.Context, header string) error 
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		fmt.Sprintf("%s?service=%s&scope=%s", params["realm"], params["service"], params["scope"]),
-		nil,
-	)
+	tokenURL, err := url.Parse(params["realm"])
+	if err != nil {
+		return fmt.Errorf("parse token realm: %w", err)
+	}
+	query := tokenURL.Query()
+	if service := params["service"]; service != "" {
+		query.Set("service", service)
+	}
+	if scope := params["scope"]; scope != "" {
+		query.Set("scope", scope)
+	}
+	tokenURL.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL.String(), nil)
 	if err != nil {
 		return err
 	}

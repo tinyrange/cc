@@ -162,24 +162,60 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 func ResolvePath(root Directory, guestPath string) (string, Entry, error) {
 	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
 	for depth := 0; depth < 40; depth++ {
-		entry, err := LookupPath(root, clean)
+		resolved, entry, err := resolvePathOnce(root, clean)
 		if err != nil {
 			return "", Entry{}, err
 		}
 		if entry.Symlink == nil {
-			return clean, entry, nil
+			return resolved, entry, nil
 		}
-		target := fsmeta.NormalizeSymlinkTarget(strings.TrimSpace(entry.Symlink.Target()))
-		if target == "" {
-			return "", Entry{}, fmt.Errorf("%q symlink target is empty", clean)
-		}
-		if strings.HasPrefix(target, "/") {
-			clean = path.Clean(target)
-		} else {
-			clean = path.Clean(path.Join(path.Dir(clean), target))
-		}
+		clean = resolved
 	}
 	return "", Entry{}, fmt.Errorf("%q has too many symlink levels", guestPath)
+}
+
+func resolvePathOnce(root Directory, guestPath string) (string, Entry, error) {
+	if root == nil {
+		return "", Entry{}, fmt.Errorf("root filesystem is nil")
+	}
+	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	if clean == "/" {
+		return clean, Entry{Dir: root}, nil
+	}
+	current := root
+	parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	for i, part := range parts {
+		entry, err := current.Lookup(part)
+		if err != nil {
+			return "", Entry{}, err
+		}
+		currentPath := "/" + strings.Join(parts[:i+1], "/")
+		if entry.Symlink != nil {
+			target := fsmeta.NormalizeSymlinkTarget(strings.TrimSpace(entry.Symlink.Target()))
+			if target == "" {
+				return "", Entry{}, fmt.Errorf("%q symlink target is empty", currentPath)
+			}
+			remainder := path.Join(parts[i+1:]...)
+			var next string
+			if strings.HasPrefix(target, "/") {
+				next = target
+			} else {
+				next = path.Join(path.Dir(currentPath), target)
+			}
+			if remainder != "" && remainder != "." {
+				next = path.Join(next, remainder)
+			}
+			return path.Clean(next), entry, nil
+		}
+		if i == len(parts)-1 {
+			return currentPath, entry, nil
+		}
+		if entry.Dir == nil {
+			return "", Entry{}, fmt.Errorf("%q is not a directory", currentPath)
+		}
+		current = entry.Dir
+	}
+	return "", Entry{}, fmt.Errorf("empty path")
 }
 
 type hostFile struct {

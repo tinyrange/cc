@@ -21,6 +21,9 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 	if os.Getenv("CC_TEST_LINUX_KVM_PCI") == "" {
 		t.Skip("set CC_TEST_LINUX_KVM_PCI=1 to run Linux virtio-pci block KVM smoke test")
 	}
+	if hostCPUHasFlag("hypervisor") {
+		t.Skip("legacy virtio-pci block smoke test requires bare-metal KVM")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 

@@ -1634,6 +1634,7 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}()
 
 	err := runner(ctx, req, inputs, func(event client.ExecEvent) error {
+		event = sanitizeExecEventForJSON(event)
 		return websocket.JSON.Send(ws, event)
 	})
 	if err != nil {
@@ -1751,7 +1752,14 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 }
 
 func sanitizeExecEventForJSON(event client.ExecEvent) client.ExecEvent {
-	if len(event.Data) > 0 && !utf8.Valid(event.Data) {
+	if len(event.Data) == 0 {
+		return event
+	}
+	if utf8.Valid(event.Data) {
+		event.Data = nil
+		return event
+	}
+	if event.Output != "" {
 		event.Output = ""
 	}
 	return event
