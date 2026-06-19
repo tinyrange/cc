@@ -47,6 +47,9 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -135,11 +138,29 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
+	}
+	if strings.TrimSpace(req.Image) != "" {
+		return b.StartStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          req.Image,
+			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, onEvent)
 	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
@@ -206,6 +227,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
+	}
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -595,7 +619,11 @@ func (i *windowsInstance) Close() error {
 	if core := i.core(); core != nil {
 		session = core.Session()
 	}
-	return hostmanaged.CloseSessionWithNetwork(session, i.network)
+	var network hostmanaged.NetworkCloser
+	if i.network != nil {
+		network = i.network
+	}
+	return hostmanaged.CloseSessionWithNetwork(session, network)
 }
 
 func (i *windowsInstance) NetworkIPv4() string {

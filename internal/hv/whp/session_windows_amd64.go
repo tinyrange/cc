@@ -40,6 +40,9 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 }
 
 func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
+		return nil, err
+	}
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -138,6 +141,16 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 			_ = bootWriter.Close()
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
+		cancel()
+		_ = control.Close()
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, err
 	}
 
 	return &ManagedSession{

@@ -143,6 +143,7 @@ type bootPIT struct {
 	tickerStop chan struct{}
 	tickerWG   sync.WaitGroup
 	stop       chan struct{}
+	closed     bool
 	channels   [3]bootPITChannel
 	selected   uint8
 	port61     byte
@@ -168,6 +169,7 @@ type bootPITChannel struct {
 
 func (p *bootPIT) Close() {
 	p.mu.Lock()
+	p.closed = true
 	p.stopTickerLocked()
 	select {
 	case <-p.stop:
@@ -300,6 +302,9 @@ func (p *bootPIT) writePort61(value byte) {
 }
 
 func (p *bootPIT) armChannel0Locked() {
+	if p.closed {
+		return
+	}
 	p.stopTickerLocked()
 	reload := p.channels[0].reload
 	if reload == 0 {

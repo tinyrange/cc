@@ -33,10 +33,25 @@ type Exit struct {
 func Supports() error {
 	present, err := isHypervisorPresent()
 	if err != nil {
-		return fmt.Errorf("whp unavailable: query hypervisor presence: %w", err)
+		if probeErr := probePartitionSupport(); probeErr == nil {
+			return nil
+		} else {
+			return fmt.Errorf("whp unavailable: query hypervisor presence: %w; partition probe: %w", err, probeErr)
+		}
 	}
 	if !present {
 		return fmt.Errorf("whp unavailable: hypervisor not present")
+	}
+	return nil
+}
+
+func probePartitionSupport() error {
+	part, err := createPartition()
+	if err != nil {
+		return fmt.Errorf("create partition: %w", err)
+	}
+	if err := deletePartition(part); err != nil {
+		return fmt.Errorf("delete partition: %w", err)
 	}
 	return nil
 }

@@ -32,6 +32,7 @@ func TestBuildFFSWritesOpenBSDRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := map[string]fsmeta.Entry{
+		"/sbin/init":   {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
 		"/dev/console": {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o600), RDev: 0},
 	}
 	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
@@ -83,7 +84,10 @@ func TestBuildFFSRawLayoutStartsAtBlockDeviceRoot(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         16 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,
@@ -113,7 +117,10 @@ func TestBuildFFSRawLayoutLargeCylinderGroupsAtFreeBSDOffsets(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         5 << 30,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,
@@ -180,7 +187,10 @@ func TestBuildFFSDynamicInodeTableKeepsDirectoriesReadable(t *testing.T) {
 	for i := 0; i < 900; i++ {
 		mustMkdir(t, filepath.Join(root, "usr", "share", "dir"+strconv.Itoa(i)))
 	}
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         32 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 	})
