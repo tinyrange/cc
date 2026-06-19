@@ -121,6 +121,9 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	if !strings.Contains(initScript, "route add default 10.42.0.9") {
 		t.Fatalf("init script does not configure gateway: %q", initScript)
 	}
+	if !strings.Contains(initScript, "arp -s 10.42.0.9 02:42:0a:2a:00:01") {
+		t.Fatalf("init script does not configure gateway arp: %q", initScript)
+	}
 	ifconfig := readRootFile(t, root, "/etc/ifconfig.vioif1")
 	if !strings.Contains(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {
 		t.Fatalf("ifconfig file does not contain leased IP: %q", ifconfig)

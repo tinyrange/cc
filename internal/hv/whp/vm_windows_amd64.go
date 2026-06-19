@@ -535,6 +535,36 @@ func (v *VM) SetPendingInterruption(vector uint8) error {
 	return setVirtualProcessorRegisters(v.part, 0, names, values)
 }
 
+func (v *VM) haltedAndInterruptible(vector uint8) (bool, error) {
+	if v == nil || v.part == 0 {
+		return false, nil
+	}
+	names := []registerName{
+		registerRflags,
+		registerPendingInterruption,
+		registerInternalActivityState,
+	}
+	values := make([]registerValue, len(names))
+	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return false, err
+	}
+	const (
+		rflagsInterruptEnable = uint64(1 << 9)
+		haltSuspend           = uint64(1 << 1)
+	)
+	if values[0].uint64()&rflagsInterruptEnable == 0 {
+		return false, nil
+	}
+	if values[1].uint64() != 0 {
+		return false, nil
+	}
+	if values[2].uint64()&haltSuspend == 0 {
+		return false, nil
+	}
+	priority := vector >> 4
+	return priority != 0, nil
+}
+
 func (v *VM) kickOutOfHLT() error {
 	if v == nil || v.part == 0 {
 		return nil
