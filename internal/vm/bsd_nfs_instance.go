@@ -8,7 +8,9 @@ import (
 	"sync"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/nfs"
+	"j5.nz/cc/internal/virtio"
 )
 
 type bsdNFSInstance struct {
@@ -93,6 +95,62 @@ func (i *bsdNFSInstance) AddShare(ctx context.Context, share client.ShareMount) 
 	i.mounted[key] = share
 	i.mu.Unlock()
 	return nil
+}
+
+func (i *bsdNFSInstance) Flush(ctx context.Context) error {
+	flusher, ok := i.Instance.(instanceFlushProvider)
+	if !ok {
+		return fmt.Errorf("root filesystem cannot be flushed")
+	}
+	return flusher.Flush(ctx)
+}
+
+func (i *bsdNFSInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	provider, ok := i.Instance.(consoleHistoryProvider)
+	if !ok {
+		return "", fmt.Errorf("console history is not available")
+	}
+	return provider.ConsoleHistory(ctx)
+}
+
+func (i *bsdNFSInstance) RootSnapshot() (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(rootSnapshotProvider)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return snapshotter.RootSnapshot()
+}
+
+func (i *bsdNFSInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(imageSnapshotProvider)
+	if !ok {
+		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
+	}
+	return snapshotter.SnapshotImage(imageName)
+}
+
+func (i *bsdNFSInstance) NetworkIPv4() string {
+	provider, ok := i.Instance.(networkIPv4Provider)
+	if !ok {
+		return ""
+	}
+	return provider.NetworkIPv4()
+}
+
+func (i *bsdNFSInstance) VirtioFSStats() []virtio.FSStats {
+	provider, ok := i.Instance.(virtioFSStatsProvider)
+	if !ok {
+		return nil
+	}
+	return provider.VirtioFSStats()
+}
+
+func (i *bsdNFSInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	allower, ok := i.Instance.(serviceProxyPortAllower)
+	if !ok {
+		return fmt.Errorf("network does not support service proxy port updates")
+	}
+	return allower.AllowServiceProxyPort(ctx, port)
 }
 
 func (i *bsdNFSInstance) execStreamResponse(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
