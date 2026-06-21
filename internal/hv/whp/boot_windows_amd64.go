@@ -557,7 +557,7 @@ func (p *bootPlatform) WriteIO(port uint16, data []byte) error {
 	}
 	if p.pic.Write(port, data) {
 		p.pic.Resample()
-		p.deliverPICOutput(false)
+		p.deliverPICOutput()
 		return nil
 	}
 	if p.pit.Write(port, data) {
@@ -683,7 +683,7 @@ func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
 	}
 	if level {
 		p.pic.SetIRQ(line, true)
-		p.deliverPICOutput(true)
+		p.deliverPICOutput()
 	} else {
 		p.pic.SetIRQ(line, false)
 	}
@@ -730,7 +730,7 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 		}
 	}
 	p.pic.SetIRQ(line, true)
-	p.deliverPICOutput(false)
+	p.deliverPICOutput()
 	p.pic.SetIRQ(line, false)
 }
 
@@ -799,7 +799,7 @@ func (p *bootPlatform) resampleDeviceIRQs() {
 	}
 }
 
-func (p *bootPlatform) deliverPICOutput(kick bool) bool {
+func (p *bootPlatform) deliverPICOutput() bool {
 	if vector, line, ok := p.pic.AcknowledgePending(); ok {
 		trigger := interruptTriggerEdge
 		if p.pic.LevelTriggered(line) {
@@ -810,10 +810,9 @@ func (p *bootPlatform) deliverPICOutput(kick bool) bool {
 			vector: vector,
 			level:  p.pic.LevelTriggered(line),
 		}, trigger)
+		_ = p.vm.NotifyInterruptWindow()
 		_ = p.vm.kickOutOfHLT()
-		if kick {
-			p.vm.kickIfRunning()
-		}
+		p.vm.kickIfRunning()
 		return true
 	}
 	return false

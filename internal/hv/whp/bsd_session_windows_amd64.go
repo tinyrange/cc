@@ -423,7 +423,6 @@ func attachBSDPCDevices(platform *bootPlatform, root virtio.BlockBackend, extraB
 func answerOpenBSDPrompts(ctx context.Context, uart *serial.UART8250, serialOut *vmruntime.SerialTranscript) {
 	var answeredRoot atomic.Bool
 	var answeredSwap atomic.Bool
-	var fallbackDeadline time.Time
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -432,9 +431,6 @@ func answerOpenBSDPrompts(ctx context.Context, uart *serial.UART8250, serialOut 
 			return
 		case <-ticker.C:
 			serial := serialOut.String()
-			if fallbackDeadline.IsZero() && strings.Contains(serial, "sd0: ") {
-				fallbackDeadline = time.Now().Add(time.Second)
-			}
 			if !answeredRoot.Load() && strings.Contains(serial, "root device:") {
 				answeredRoot.Store(true)
 				_ = uart.InjectRXBytes([]byte("sd0a\n"))
@@ -442,11 +438,6 @@ func answerOpenBSDPrompts(ctx context.Context, uart *serial.UART8250, serialOut 
 			if answeredRoot.Load() && !answeredSwap.Load() && strings.Contains(serial, "swap device") {
 				answeredSwap.Store(true)
 				_ = uart.InjectRXBytes([]byte("\n"))
-			}
-			if !fallbackDeadline.IsZero() && time.Now().After(fallbackDeadline) && !answeredRoot.Load() {
-				answeredRoot.Store(true)
-				answeredSwap.Store(true)
-				_ = uart.InjectRXBytes([]byte("sd0a\n\n"))
 			}
 		}
 	}
