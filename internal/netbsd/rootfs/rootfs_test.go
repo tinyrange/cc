@@ -62,10 +62,11 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 		{name: "dev", mode: 0o755, dir: true},
 		{name: "root", mode: 0o700, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"), defaultArch, machine.NetworkSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	baseTar := strings.TrimSuffix(baseTXZ, filepath.Ext(baseTXZ)) + ".tar"
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)

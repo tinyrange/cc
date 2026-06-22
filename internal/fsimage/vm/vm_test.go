@@ -178,6 +178,12 @@ func TestVirtualMemoryRandomReadWriteConsistency(t *testing.T) {
 	if _, err := vm.WriteSparseTo(out); err != nil {
 		t.Fatalf("write sparse output: %v", err)
 	}
+	if err := backing.Close(); err != nil {
+		t.Fatalf("close backing file: %v", err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatalf("close sparse output: %v", err)
+	}
 	got, err := os.ReadFile(out.Name())
 	if err != nil {
 		t.Fatalf("read sparse output: %v", err)

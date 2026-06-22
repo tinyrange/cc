@@ -42,10 +42,11 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\necho test init\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\necho test init\n"), machine.NetworkSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	baseTar := strings.TrimSuffix(baseTGZ, filepath.Ext(baseTGZ)) + ".tar"
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)

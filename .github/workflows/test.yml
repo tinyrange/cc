@@ -51,18 +51,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends dosfstools musl-tools
 
       - name: Run tests
-        if: runner.os != 'Windows'
         run: go test -short ./... -count=1 -timeout 30m
-
-      - name: Run Windows tests
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          excluded='/(internal/(freebsd/rootfs|fsimage/ffs|fsimage/vm|netbsd/guestinit|netbsd/rootfs|openbsd/rootfs|virtio))$'
-          packages="$(go list ./... | grep -Ev "${excluded}")"
-          go test -short ${packages} -count=1 -timeout 30m
-          go test -run '^$' ./internal/freebsd/rootfs ./internal/fsimage/ffs ./internal/fsimage/vm ./internal/netbsd/guestinit ./internal/netbsd/rootfs ./internal/openbsd/rootfs ./internal/virtio -count=1
 
   kvm-test:
     name: KVM and rootfs tests

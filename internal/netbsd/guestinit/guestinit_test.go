@@ -25,6 +25,11 @@ func TestBuildFindsModuleFromSourceLocation(t *testing.T) {
 	if err := os.Chdir(otherModule); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Errorf("restore cwd before temp cleanup: %v", err)
+		}
+	})
 
 	data, err := Build(context.Background(), t.TempDir())
 	if err != nil {

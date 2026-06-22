@@ -3,6 +3,7 @@ package virtio
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -114,6 +115,9 @@ func TestMountedFSLookupRoutesSyntheticMountPaths(t *testing.T) {
 }
 
 func TestMountedFSPassthroughHardlinkReportsSameInode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows passthrough inode reporting does not expose stable hardlink inode identity")
+	}
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a"), []byte("data"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
