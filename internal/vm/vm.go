@@ -304,10 +304,19 @@ func (m *Manager) StartBlankInstanceStream(
 	m.starting[id] = struct{}{}
 	m.mu.Unlock()
 
+	shares := append([]client.ShareMount(nil), req.Shares...)
+	req.Shares = nil
 	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
 		return client.InstanceState{}, err
+	}
+	for _, share := range shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			_ = inst.Close()
+			m.clearStarting(id)
+			return client.InstanceState{}, err
+		}
 	}
 
 	machine := &Machine{
@@ -439,7 +448,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		return m.host.RunStream(ctx, req, inputs, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
-	if vmhost.IsHostedInstance(machine.instance) || len(req.Shares) != 0 || (targetImage != "" && targetImage != machine.image) {
+	if !sameRuntimeImage(targetImage, machine.image) {
 		return m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	for _, share := range req.Shares {

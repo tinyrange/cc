@@ -28,6 +28,9 @@ const (
 	progMount   = 100005
 	progNFS     = 100003
 
+	ipProtoTCP = 6
+	ipProtoUDP = 17
+
 	portmapVersion  = 2
 	rpcbindVersion3 = 3
 	rpcbindVersion4 = 4

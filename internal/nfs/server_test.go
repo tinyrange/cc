@@ -207,6 +207,25 @@ func TestRPCBindGetAddrReturnsTCPUniversalAddress(t *testing.T) {
 	if addr != "10.42.0.1.78.80" {
 		t.Fatalf("mountd universal address = %q", addr)
 	}
+
+	req = xdrWriter{}
+	req.Uint32(progMount)
+	req.Uint32(mountVersion3)
+	req.String("udp")
+	req.String("")
+	req.String("")
+	body, accept = server.handlePortmap(rpcCall{prog: progPortmap, version: rpcbindVersion4, proc: rpcbindProcGetAddr, body: req.Bytes()})
+	if accept != rpcAcceptSuccess {
+		t.Fatalf("GETADDR mount udp accept = %d", accept)
+	}
+	r = newXDRReader(body)
+	addr, err = r.String(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "10.42.0.1.78.80" {
+		t.Fatalf("mountd udp universal address = %q", addr)
+	}
 }
 
 func TestMountReplyAdvertisesAuthUnix(t *testing.T) {
@@ -253,7 +272,7 @@ func TestMountCommandUsesOSCompatibleOptions(t *testing.T) {
 		avoid  []string
 	}{
 		{osName: "openbsd", want: []string{"tcp", "port=2049"}, avoid: []string{"mountport", "nolock"}},
-		{osName: "freebsd", want: []string{"nfsv3", "tcp", "port=2049", "mountport=20048", "nolockd"}},
+		{osName: "freebsd", want: []string{"nfsv3", "proto=tcp", "soft", "retrycnt=1", "port=2049", "mountport=20048", "nolockd"}},
 		{osName: "netbsd", want: []string{"/sbin/mount_nfs", "-3", "-T", "-p"}, avoid: []string{"mountport", "nolock"}},
 	}
 	for _, tt := range tests {
@@ -301,4 +320,8 @@ type fakeNetwork struct{}
 
 func (fakeNetwork) ListenInternal(network, address string) (net.Listener, error) {
 	return (&net.ListenConfig{}).Listen(context.Background(), network, "127.0.0.1:0")
+}
+
+func (fakeNetwork) ListenPacketInternal(network, address string) (net.PacketConn, error) {
+	return (&net.ListenConfig{}).ListenPacket(context.Background(), network, "127.0.0.1:0")
 }

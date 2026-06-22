@@ -115,13 +115,21 @@ func (s *Server) Start() error {
 		serveRPCListener(ln, spec.fn, &s.wg)
 	}
 	if packetNet, ok := s.network.(packetNetwork); ok {
-		pc, err := packetNet.ListenPacketInternal("udp", fmt.Sprintf(":%d", PortmapPort))
-		if err != nil {
-			s.Close()
-			return fmt.Errorf("listen nfs udp/%d: %w", PortmapPort, err)
+		for _, spec := range []struct {
+			port int
+			fn   rpcHandler
+		}{
+			{PortmapPort, s.handlePortmap},
+			{MountPort, s.handleMount},
+		} {
+			pc, err := packetNet.ListenPacketInternal("udp", fmt.Sprintf(":%d", spec.port))
+			if err != nil {
+				s.Close()
+				return fmt.Errorf("listen nfs udp/%d: %w", spec.port, err)
+			}
+			s.packets = append(s.packets, pc)
+			serveRPCPacketConn(pc, spec.fn, &s.wg)
 		}
-		s.packets = append(s.packets, pc)
-		serveRPCPacketConn(pc, s.handlePortmap, &s.wg)
 	}
 	return nil
 }
@@ -305,15 +313,15 @@ func (s *Server) handlePortmap(call rpcCall) ([]byte, uint32) {
 		if err != nil {
 			return nil, rpcGarbageArgs
 		}
-		_, _ = r.Uint32() // protocol
+		proto, _ := r.Uint32()
 		_, _ = r.Uint32() // port
 		port := uint32(0)
 		switch {
 		case prog == progPortmap && vers == portmapVersion:
 			port = PortmapPort
-		case prog == progMount && vers == mountVersion3:
+		case prog == progMount && vers == mountVersion3 && (proto == ipProtoTCP || proto == ipProtoUDP):
 			port = MountPort
-		case prog == progNFS && vers == nfsVersion3:
+		case prog == progNFS && vers == nfsVersion3 && proto == ipProtoTCP:
 			port = NFSPort
 		}
 		w.Uint32(port)
@@ -331,12 +339,15 @@ func rpcbindUniversalAddress(prog, vers uint32, netid string) string {
 	case prog == progMount && vers == mountVersion3:
 		port = MountPort
 	case prog == progNFS && vers == nfsVersion3:
+		if netid == "udp" || netid == "udp4" {
+			return ""
+		}
 		port = NFSPort
 	default:
 		return ""
 	}
 	switch netid {
-	case "tcp", "tcp4":
+	case "tcp", "tcp4", "udp", "udp4":
 		return fmt.Sprintf("10.42.0.1.%d.%d", port/256, port%256)
 	default:
 		return ""
@@ -1183,7 +1194,7 @@ func MountCommand(osName, serverAddr, exportName, mountPath string) []string {
 	case "openbsd":
 		return []string{"/sbin/mount", "-t", "nfs", "-o", fmt.Sprintf("tcp,port=%d", NFSPort), target, mountPath}
 	case "freebsd":
-		return []string{"/sbin/mount", "-t", "nfs", "-o", fmt.Sprintf("nfsv3,tcp,port=%d,mountport=%d,nolockd", NFSPort, MountPort), target, mountPath}
+		return []string{"/sbin/mount", "-t", "nfs", "-o", fmt.Sprintf("nfsv3,proto=tcp,soft,retrycnt=1,port=%d,mountport=%d,nolockd", NFSPort, MountPort), target, mountPath}
 	case "netbsd":
 		return []string{"/sbin/mount_nfs", "-3", "-T", "-p", "-R", "1", "-t", "1", target, mountPath}
 	default:
@@ -1195,14 +1206,18 @@ func MountShare(ctx context.Context, osName string, exec func(context.Context, c
 	if exp == nil {
 		return fmt.Errorf("nfs export is not configured")
 	}
+	mountCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	mkdir := client.ExecRequest{Command: []string{"/bin/mkdir", "-p", exp.Mount}, SkipResolve: true}
-	if resp, err := exec(ctx, mkdir); err != nil {
+	debugf("mount share mkdir %s", exp.Mount)
+	if resp, err := exec(mountCtx, mkdir); err != nil {
 		return err
 	} else if resp.ExitCode != 0 {
 		return fmt.Errorf("mkdir %s failed: %s", exp.Mount, resp.Output)
 	}
 	req := client.ExecRequest{Command: MountCommand(osName, "10.42.0.1", exp.Name, exp.Mount), SkipResolve: true}
-	resp, err := exec(ctx, req)
+	debugf("mount share command %q", strings.Join(req.Command, " "))
+	resp, err := exec(mountCtx, req)
 	if err != nil {
 		return err
 	}

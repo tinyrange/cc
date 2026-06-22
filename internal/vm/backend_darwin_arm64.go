@@ -133,25 +133,6 @@ func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]strin
 	return configVars, moduleMap
 }
 
-func sameRuntimeImage(targetImage, runningImage string) bool {
-	targetImage = strings.TrimSpace(targetImage)
-	runningImage = strings.TrimSpace(runningImage)
-	if targetImage == "" || targetImage == runningImage {
-		return true
-	}
-	if isBuiltinGuestImage(targetImage) || isBuiltinGuestImage(runningImage) {
-		return canonicalBuiltinRuntimeImage(targetImage) == canonicalBuiltinRuntimeImage(runningImage)
-	}
-	return false
-}
-
-func canonicalBuiltinRuntimeImage(image string) string {
-	if profile, ok := builtinGuestForImage(image); ok {
-		return profile.Canonical
-	}
-	return strings.TrimSpace(image)
-}
-
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
 	return b.StartStream(ctx, req, nil)
 }
