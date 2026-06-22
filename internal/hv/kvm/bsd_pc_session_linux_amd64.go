@@ -232,7 +232,6 @@ func attachBSDPCDevices(vm *VM, root virtio.BlockBackend, extraBlocks []virtio.B
 		extraBlock.Attach(vm, vm)
 		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(dev, ioBase, irq, extraBlock))
 	}
-	netdev.Attach(vm, vm)
 	netIndex := len(pciDevices) + 1
 	if netPCIDev == 0 {
 		netPCIDev = uint8(netIndex)
@@ -243,6 +242,8 @@ func attachBSDPCDevices(vm *VM, root virtio.BlockBackend, extraBlocks []virtio.B
 	if netIRQ == 0 {
 		netIRQ = uint8(10 + netIndex)
 	}
+	netdev.IRQ = uint32(netIRQ)
+	netdev.Attach(vm, vm)
 	pciDevices = append(pciDevices, NewVirtioNetPCIDevice(netPCIDev, netIOBase, netIRQ, netdev))
 	return NewPCIBus(pciDevices...)
 }
