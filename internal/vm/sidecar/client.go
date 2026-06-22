@@ -130,6 +130,11 @@ func (c *Client) Flush(ctx context.Context, id string) error {
 	return c.call(ctx, WorkerFrameFlush, WorkerFlushRequest{ID: id}, nil, &resp)
 }
 
+func (c *Client) AddShare(ctx context.Context, id string, share client.ShareMount) error {
+	var resp map[string]string
+	return c.call(ctx, WorkerFrameAddShare, WorkerAddShareRequest{ID: id, Share: share}, nil, &resp)
+}
+
 func (c *Client) ConsoleHistory(ctx context.Context, id string) (string, error) {
 	var resp WorkerConsoleResponse
 	err := c.call(ctx, WorkerFrameConsole, WorkerConsoleRequest{ID: id}, nil, &resp)

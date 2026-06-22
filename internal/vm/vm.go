@@ -128,6 +128,7 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
 	}
 	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" {
+		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "Windows WHP currently supports one vCPU per instance")
 	}
 	if supported, err := hv.NestedVirtualizationSupported(); err == nil && supported {
@@ -476,6 +477,17 @@ func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecReques
 
 func (m *Manager) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	return m.AddPortForwardTo(ctx, DefaultInstanceID, forward)
+}
+
+func (m *Manager) AddShareTo(ctx context.Context, id string, share client.ShareMount) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM %q is running", id)
+	}
+	return machine.instance.AddShare(ctx, share)
 }
 
 func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward client.PortForward) error {

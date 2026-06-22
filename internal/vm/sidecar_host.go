@@ -596,7 +596,9 @@ func (i *sidecarInstance) addCoordinatorShare(share client.ShareMount) error {
 }
 
 func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount) error {
-	_ = ctx
+	if i != nil && i.sidecar != nil {
+		return i.sidecar.Worker().AddShare(ctx, i.id, share)
+	}
 	return i.addCoordinatorShare(share)
 }
 
@@ -656,7 +658,7 @@ func (i *sidecarInstance) managedCore() *managedInstanceCore {
 }
 
 func sidecarShouldPassthroughToWorker(hasImageRoot bool, core *managedInstanceCore, req client.ExecRequest) bool {
-	return core == nil || (req.Kind == "" && !req.SkipResolve && !hasImageRoot)
+	return core == nil || ((req.Kind == "" || req.Kind == "exec") && !req.SkipResolve && !hasImageRoot)
 }
 
 func (i *sidecarInstance) Flush(ctx context.Context) error {

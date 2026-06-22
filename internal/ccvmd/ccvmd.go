@@ -567,6 +567,17 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				continue
 			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+		case vm.WorkerFrameAddShare:
+			var req vm.WorkerAddShareRequest
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
 		case vm.WorkerFrameConsole:
 			var req vm.WorkerConsoleRequest
 			_ = frame.DecodePayload(&req)
@@ -1277,20 +1288,37 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			}
 		}
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting VM"})
-			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+			var streamMu sync.Mutex
+			streamOpen := true
+			writeStreamEvent := func(event client.BootEvent) error {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if !streamOpen {
+					return nil
+				}
 				return writeBootEvent(w, event)
+			}
+			closeStream := func() {
+				streamMu.Lock()
+				streamOpen = false
+				streamMu.Unlock()
+			}
+			defer closeStream()
+
+			writeStreamEvent(client.BootEvent{Kind: "status", Message: "starting VM"})
+			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeStreamEvent(event)
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+					_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
-				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
-			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm/start total=%s", time.Since(start))
 			return
 		}

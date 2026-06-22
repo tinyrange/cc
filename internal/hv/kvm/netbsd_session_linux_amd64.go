@@ -193,6 +193,9 @@ func newNetBSDManagedNet(guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *
 	stack := netstack.New(slog.Default())
 	_ = stack.SetGuestMAC(mac)
 	_ = stack.SetGuestIPv4(guestIPv4)
+	if hostMAC, err := net.ParseMAC("02:42:0a:2a:00:01"); err == nil {
+		_ = stack.SetHostMAC(hostMAC)
+	}
 	iface, _ := stack.AttachNetworkInterface()
 	dev := virtio.NewNet(0, 0x1000, 11, mac, netBSDManagedNetBackend{iface: iface})
 	dev.DisableMergeRX = true

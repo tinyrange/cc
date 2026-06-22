@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	BuiltInImageName = managedguest.NetBSDImageName
-	defaultVersion   = "10.1"
-	defaultArch      = "amd64"
-	defaultMirror    = "https://mirror.aarnet.edu.au/pub/netbsd"
+	BuiltInImageName  = managedguest.NetBSDImageName
+	defaultVersion    = "10.1"
+	defaultArch       = "amd64"
+	defaultMirror     = "https://mirror.aarnet.edu.au/pub/netbsd"
+	defaultGatewayMAC = "02:42:0a:2a:00:01"
 )
 
 type Config struct {
@@ -172,7 +173,7 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	}
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
+		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))},
 		{"/sbin/cc-netbsd-init", 0o755, initBin},
 		{"/etc/fstab", 0o644, []byte(fmt.Sprintf("/dev/%s / ffs rw 1 1\n", rootDevice))},
 		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("rc_configured=YES\nhostname=\"%s\"\ndefaultroute=\"%s\"\n", network.Hostname, network.GatewayIPv4))},
@@ -291,6 +292,9 @@ func normalizeNetBSDNetwork(network machine.NetworkSpec) machine.NetworkSpec {
 	}
 	if strings.TrimSpace(network.GatewayIPv4) == "" {
 		network.GatewayIPv4 = "10.42.0.1"
+	}
+	if strings.TrimSpace(network.GatewayMAC) == "" {
+		network.GatewayMAC = defaultGatewayMAC
 	}
 	if strings.TrimSpace(network.DNSIPv4) == "" {
 		network.DNSIPv4 = network.GatewayIPv4
@@ -446,6 +450,7 @@ exec >/dev/console 2>&1
 	echo NETBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/usr/sbin/arp -s %s %s >/dev/null 2>&1 || true
 /sbin/route add default %s || true
 exec /sbin/cc-netbsd-init
 `

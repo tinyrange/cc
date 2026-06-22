@@ -62,10 +62,11 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 		{name: "dev", mode: 0o755, dir: true},
 		{name: "root", mode: 0o700, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"), defaultArch, machine.NetworkSpec{}, "ld0a")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	baseTar := strings.TrimSuffix(baseTXZ, filepath.Ext(baseTXZ)) + ".tar"
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
@@ -119,6 +120,9 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	}
 	if !strings.Contains(initScript, "route add default 10.42.0.9") {
 		t.Fatalf("init script does not configure gateway: %q", initScript)
+	}
+	if !strings.Contains(initScript, "arp -s 10.42.0.9 02:42:0a:2a:00:01") {
+		t.Fatalf("init script does not configure gateway arp: %q", initScript)
 	}
 	ifconfig := readRootFile(t, root, "/etc/ifconfig.vioif1")
 	if !strings.Contains(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {

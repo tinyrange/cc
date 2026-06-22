@@ -277,6 +277,10 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 			}
 		case runVPExitReasonX64ApicEoi:
 			platform.HandleEOI(raw.apicEoi().InterruptVector)
+		case runVPExitReasonX64MsrAccess:
+			if err := handleMSRAccess(vm, exit, &raw); err != nil {
+				return out.String(), fmt.Errorf("handle msr at rip=%#x: %w", exit.RIP, err)
+			}
 		case runVPExitReasonX64InterruptWindow:
 		case runVPExitReasonCanceled:
 		default:
@@ -313,6 +317,10 @@ type bootPlatform struct {
 	vsock         *virtio.Vsock
 	rng           *virtio.RNG
 	netdev        *virtio.Net
+	pci           *PCIBus
+	i8042         *I8042
+	rtc           *CMOSRTC
+	acpiPM        *ACPIPM
 	start         time.Time
 	irqAttempts   uint64
 	irqDelivered  uint64
@@ -320,6 +328,7 @@ type bootPlatform struct {
 	irqSuppressed uint64
 	irqLine       [16]uint64
 	deviceIRQLine [ioapicRedirEntries]bool
+	deferredIRQ   [ioapicRedirEntries]bool
 	pendingMu     sync.Mutex
 	pendingIRQ    [256]bool
 	pendingIRQs   []pendingIRQ
@@ -330,6 +339,9 @@ type bootPlatform struct {
 type pendingIRQ struct {
 	route   bootIOAPICRoute
 	trigger interruptTriggerMode
+	device  bool
+	sticky  bool
+	pic     bool
 }
 
 type bootPlatformExitSnapshot struct {
@@ -465,6 +477,24 @@ func (p *bootPlatform) AttachNet(netdev *virtio.Net) {
 	netdev.Attach(p.vm, p)
 }
 
+func (p *bootPlatform) AttachPCI(pci *PCIBus) {
+	p.pci = pci
+	if pci == nil {
+		return
+	}
+	for _, dev := range pci.devices {
+		if dev != nil && dev.IRQLine < ioapicRedirEntries {
+			p.deviceIRQLine[dev.IRQLine] = true
+		}
+	}
+}
+
+func (p *bootPlatform) AttachPCDevices(i8042 *I8042, rtc *CMOSRTC, acpiPM *ACPIPM) {
+	p.i8042 = i8042
+	p.rtc = rtc
+	p.acpiPM = acpiPM
+}
+
 func (p *bootPlatform) markDeviceIRQ(irq uint32) {
 	if irq < ioapicRedirEntries {
 		p.deviceIRQLine[irq] = true
@@ -495,6 +525,18 @@ func (p *bootPlatform) ReadIO(port uint16, data []byte) error {
 	if p.pit.Read(port, data) {
 		return nil
 	}
+	if handled, err := p.pci.ReadIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.i8042.ReadIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.rtc.ReadIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.acpiPM.ReadIO(port, data); handled || err != nil {
+		return err
+	}
 	for i := range data {
 		data[i] = defaultIOReadByte(port + uint16(i))
 	}
@@ -514,10 +556,24 @@ func (p *bootPlatform) WriteIO(port uint16, data []byte) error {
 		return nil
 	}
 	if p.pic.Write(port, data) {
+		p.pic.Resample()
+		p.deliverPICOutput()
 		return nil
 	}
 	if p.pit.Write(port, data) {
 		return nil
+	}
+	if handled, err := p.pci.WriteIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.i8042.WriteIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.rtc.WriteIO(port, data); handled || err != nil {
+		return err
+	}
+	if handled, err := p.acpiPM.WriteIO(port, data); handled || err != nil {
+		return err
 	}
 	return nil
 }
@@ -589,6 +645,7 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 		if pending {
 			p.injectIOAPIC(route, p.isDeviceIRQ(route.line))
 		}
+		p.deliverDeferredDeviceIRQs()
 		return nil
 	}
 	if off, ok := hpetOffset(addr, len(data)); ok {
@@ -606,13 +663,16 @@ func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
 	if level {
 		p.recordIRQAttempt(line)
 	} else {
-		p.clearPendingIRQForLine(line)
+		p.clearPendingIRQForLine(line, p.keepUndeliveredDeviceIRQ(line))
 	}
 	if int(line) < ioapicRedirEntries {
 		ioapicEnabled := p.ioapic.enabled(line)
 		if route, pending := p.ioapic.assert(line, level); pending {
 			p.injectIOAPIC(route, true)
 			return nil
+		}
+		if level && p.isDeviceIRQ(line) {
+			p.markDeferredDeviceIRQ(line)
 		}
 		if !level || ioapicEnabled {
 			if level {
@@ -622,7 +682,10 @@ func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
 		}
 	}
 	if level {
-		p.injectPIC(line, true)
+		p.pic.SetIRQ(line, true)
+		p.deliverPICOutput()
+	} else {
+		p.pic.SetIRQ(line, false)
 	}
 	return nil
 }
@@ -631,9 +694,6 @@ func (p *bootPlatform) raiseTimerIRQ() {
 	if time.Since(p.start) < 500*time.Millisecond {
 		atomic.AddUint64(&p.irqAttempts, 1)
 		atomic.AddUint64(&p.irqSuppressed, 1)
-		return
-	}
-	if p.reassertDeviceIRQ() {
 		return
 	}
 	if p.ioapic.enabled(2) {
@@ -669,23 +729,9 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 			return
 		}
 	}
-	p.injectPIC(line, false)
-}
-
-func (p *bootPlatform) reassertDeviceIRQ() bool {
-	for line, isDevice := range p.deviceIRQLine {
-		if !isDevice {
-			continue
-		}
-		route, ok := p.ioapic.deviceHighRoute(uint8(line))
-		if !ok {
-			continue
-		}
-		p.recordIRQAttempt(uint8(line))
-		p.injectIOAPIC(route, true)
-		return true
-	}
-	return false
+	p.pic.SetIRQ(line, true)
+	p.deliverPICOutput()
+	p.pic.SetIRQ(line, false)
 }
 
 func (p *bootPlatform) recordIRQAttempt(line uint8) {
@@ -698,6 +744,9 @@ func (p *bootPlatform) recordIRQAttempt(line uint8) {
 func (p *bootPlatform) injectIOAPIC(route bootIOAPICRoute, deviceIRQ bool) {
 	if route.vector < 0x10 {
 		atomic.AddUint64(&p.irqSuppressed, 1)
+		if deviceIRQ {
+			p.markDeferredDeviceIRQ(route.line)
+		}
 		p.ioapic.cancel(route)
 		return
 	}
@@ -706,7 +755,8 @@ func (p *bootPlatform) injectIOAPIC(route bootIOAPICRoute, deviceIRQ bool) {
 		trigger = interruptTriggerLevel
 	}
 	if deviceIRQ {
-		p.queuePendingIRQ(route, trigger)
+		p.clearDeferredDeviceIRQ(route.line)
+		p.queuePendingIRQ(route, trigger, true, p.keepUndeliveredDeviceIRQ(route.line))
 		_ = p.vm.kickOutOfHLT()
 		p.vm.kickIfRunning()
 		return
@@ -727,33 +777,58 @@ func (p *bootPlatform) injectIOAPIC(route bootIOAPICRoute, deviceIRQ bool) {
 }
 
 func (p *bootPlatform) armPendingIRQWindow() error {
+	p.resampleDeviceIRQs()
+	p.deliverDeferredDeviceIRQs()
 	if !p.hasPendingIRQ() {
+		return nil
+	}
+	if delivered, err := p.flushHaltedPICIRQ(); err != nil {
+		return err
+	} else if delivered {
 		return nil
 	}
 	return p.vm.NotifyInterruptWindow()
 }
 
-func (p *bootPlatform) injectPIC(line uint8, kick bool) {
-	if vector, ok := p.pic.Acknowledge(line); ok {
-		if err := p.vm.RequestInterrupt(uint32(vector)); err != nil {
-			atomic.AddUint64(&p.irqFailed, 1)
-		} else {
-			atomic.AddUint64(&p.irqDelivered, 1)
-			if kick {
-				p.vm.kickIfRunning()
-			}
+func (p *bootPlatform) resampleDeviceIRQs() {
+	if p.netdev != nil && p.netdev.IRQAsserted() {
+		line := uint8(p.netdev.IRQ)
+		if route, pending := p.ioapic.assert(line, true); pending {
+			p.injectIOAPIC(route, true)
 		}
 	}
 }
 
+func (p *bootPlatform) deliverPICOutput() bool {
+	if vector, line, ok := p.pic.AcknowledgePending(); ok {
+		trigger := interruptTriggerEdge
+		if p.pic.LevelTriggered(line) {
+			trigger = interruptTriggerLevel
+		}
+		p.queuePendingPICIRQ(bootIOAPICRoute{
+			line:   line,
+			vector: vector,
+			level:  p.pic.LevelTriggered(line),
+		}, trigger)
+		_ = p.vm.NotifyInterruptWindow()
+		_ = p.vm.kickOutOfHLT()
+		p.vm.kickIfRunning()
+		return true
+	}
+	return false
+}
+
 func (p *bootPlatform) HandleEOI(vector uint32) {
 	if route, pending := p.ioapic.handleEOI(vector); pending {
+		if p.isDeviceIRQ(route.line) {
+			return
+		}
 		atomic.AddUint64(&p.irqAttempts, 1)
 		p.injectIOAPIC(route, p.isDeviceIRQ(route.line))
 	}
 }
 
-func (p *bootPlatform) queuePendingIRQ(route bootIOAPICRoute, trigger interruptTriggerMode) {
+func (p *bootPlatform) queuePendingIRQ(route bootIOAPICRoute, trigger interruptTriggerMode, device bool, sticky bool) {
 	p.pendingMu.Lock()
 	defer p.pendingMu.Unlock()
 	if p.pendingIRQ[route.vector] {
@@ -763,10 +838,109 @@ func (p *bootPlatform) queuePendingIRQ(route bootIOAPICRoute, trigger interruptT
 	p.pendingIRQs = append(p.pendingIRQs, pendingIRQ{
 		route:   route,
 		trigger: trigger,
+		device:  device,
+		sticky:  sticky,
 	})
 }
 
-func (p *bootPlatform) clearPendingIRQForLine(line uint8) {
+func (p *bootPlatform) queuePendingPICIRQ(route bootIOAPICRoute, trigger interruptTriggerMode) {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	if p.pendingIRQ[route.vector] {
+		return
+	}
+	p.pendingIRQ[route.vector] = true
+	p.pendingIRQs = append(p.pendingIRQs, pendingIRQ{
+		route:   route,
+		trigger: trigger,
+		pic:     true,
+	})
+}
+
+func (p *bootPlatform) flushHaltedPICIRQ() (bool, error) {
+	p.pendingMu.Lock()
+	if len(p.pendingIRQs) == 0 {
+		p.pendingMu.Unlock()
+		return false, nil
+	}
+	pending := p.pendingIRQs[0]
+	if !pending.pic {
+		p.pendingMu.Unlock()
+		return false, nil
+	}
+	route := pending.route
+	p.pendingMu.Unlock()
+
+	ready, err := p.vm.haltedAndInterruptible(route.vector)
+	if err != nil || !ready {
+		return false, err
+	}
+
+	p.pendingMu.Lock()
+	if len(p.pendingIRQs) == 0 || !p.pendingIRQs[0].pic || p.pendingIRQs[0].route.vector != route.vector {
+		p.pendingMu.Unlock()
+		return false, nil
+	}
+	copy(p.pendingIRQs, p.pendingIRQs[1:])
+	p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
+	p.pendingIRQ[route.vector] = false
+	p.pendingMu.Unlock()
+
+	if err := p.vm.SetPendingInterruption(route.vector); err != nil {
+		atomic.AddUint64(&p.irqFailed, 1)
+		return false, err
+	}
+	_ = p.vm.kickOutOfHLT()
+	atomic.AddUint64(&p.irqDelivered, 1)
+	return true, nil
+}
+
+func (p *bootPlatform) markDeferredDeviceIRQ(line uint8) {
+	if int(line) >= len(p.deferredIRQ) {
+		return
+	}
+	p.pendingMu.Lock()
+	p.deferredIRQ[line] = true
+	p.pendingMu.Unlock()
+}
+
+func (p *bootPlatform) clearDeferredDeviceIRQ(line uint8) {
+	if int(line) >= len(p.deferredIRQ) {
+		return
+	}
+	p.pendingMu.Lock()
+	p.deferredIRQ[line] = false
+	p.pendingMu.Unlock()
+}
+
+func (p *bootPlatform) deliverDeferredDeviceIRQs() {
+	var routes []bootIOAPICRoute
+	p.pendingMu.Lock()
+	for line, deferred := range p.deferredIRQ {
+		if !deferred || !p.deviceIRQLine[line] {
+			continue
+		}
+		var route bootIOAPICRoute
+		var pending bool
+		if p.keepUndeliveredDeviceIRQ(uint8(line)) {
+			route, pending = p.ioapic.routeForLine(uint8(line))
+		} else {
+			route, pending = p.ioapic.assert(uint8(line), true)
+		}
+		if !pending {
+			p.deferredIRQ[line] = false
+			continue
+		}
+		p.deferredIRQ[line] = false
+		routes = append(routes, route)
+	}
+	p.pendingMu.Unlock()
+	for _, route := range routes {
+		p.injectIOAPIC(route, true)
+	}
+}
+
+func (p *bootPlatform) clearPendingIRQForLine(line uint8, keepSticky bool) {
 	p.pendingMu.Lock()
 	defer p.pendingMu.Unlock()
 	for i := 0; i < len(p.pendingIRQs); {
@@ -775,10 +949,18 @@ func (p *bootPlatform) clearPendingIRQForLine(line uint8) {
 			i++
 			continue
 		}
+		if keepSticky && pending.sticky {
+			i++
+			continue
+		}
 		p.pendingIRQ[pending.route.vector] = false
 		copy(p.pendingIRQs[i:], p.pendingIRQs[i+1:])
 		p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
 	}
+}
+
+func (p *bootPlatform) keepUndeliveredDeviceIRQ(line uint8) bool {
+	return p.netdev == nil || p.netdev.IRQ != uint32(line)
 }
 
 func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
@@ -797,25 +979,43 @@ func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
-	if pending.route.level {
-		if _, ok := p.ioapic.deviceHighRoute(pending.route.line); !ok {
-			copy(p.pendingIRQs, p.pendingIRQs[1:])
-			p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
-			p.pendingIRQ[pending.route.vector] = false
-			p.pendingMu.Unlock()
-			return false, nil
+	route := pending.route
+	trigger := pending.trigger
+	if route.level {
+		if pending.pic {
+			// The PIC has already latched this interrupt. Further level resampling
+			// happens when the guest EOIs and the current line state is sampled.
+		} else if _, ok := p.ioapic.deviceHighRoute(route.line); !ok {
+			if pending.sticky {
+				route.level = false
+				trigger = interruptTriggerEdge
+			} else {
+				copy(p.pendingIRQs, p.pendingIRQs[1:])
+				p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
+				p.pendingIRQ[route.vector] = false
+				p.pendingMu.Unlock()
+				return false, nil
+			}
 		}
 	}
 	if !windowExit {
+		copy(p.pendingIRQs, p.pendingIRQs[1:])
+		p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
+		p.pendingIRQ[route.vector] = false
 		p.pendingMu.Unlock()
 		var err error
-		if p.usePendingInterruptionFallback(pending.route.line) {
-			err = p.vm.SetPendingInterruption(pending.route.vector)
+		if pending.pic || p.usePendingInterruptionFallback(route.line) {
+			err = p.vm.SetPendingInterruption(route.vector)
 		} else {
-			err = p.vm.RequestInterruptWithTrigger(uint32(pending.route.vector), pending.trigger)
+			if route.level && !p.ioapic.beginInterrupt(route.vector) {
+				atomic.AddUint64(&p.irqSuppressed, 1)
+				return false, nil
+			}
+			err = p.vm.RequestInterruptWithTrigger(uint32(route.vector), trigger)
 		}
 		if err != nil {
 			atomic.AddUint64(&p.irqFailed, 1)
+			p.ioapic.cancel(route)
 			return false, err
 		}
 		atomic.AddUint64(&p.irqDelivered, 1)
@@ -823,17 +1023,25 @@ func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
 	}
 	copy(p.pendingIRQs, p.pendingIRQs[1:])
 	p.pendingIRQs = p.pendingIRQs[:len(p.pendingIRQs)-1]
-	p.pendingIRQ[pending.route.vector] = false
+	p.pendingIRQ[route.vector] = false
 	p.pendingMu.Unlock()
 
 	_ = p.vm.kickOutOfHLT()
-	if pending.route.level && !p.ioapic.beginInterrupt(pending.route.vector) {
+	if pending.pic {
+		if err := p.vm.SetPendingInterruption(route.vector); err != nil {
+			atomic.AddUint64(&p.irqFailed, 1)
+			return false, err
+		}
+		atomic.AddUint64(&p.irqDelivered, 1)
+		return true, nil
+	}
+	if route.level && !p.ioapic.beginInterrupt(route.vector) {
 		atomic.AddUint64(&p.irqSuppressed, 1)
 		return false, nil
 	}
-	if err := p.vm.RequestInterruptWithTrigger(uint32(pending.route.vector), pending.trigger); err != nil {
+	if err := p.vm.RequestInterruptWithTrigger(uint32(route.vector), trigger); err != nil {
 		atomic.AddUint64(&p.irqFailed, 1)
-		p.ioapic.cancel(pending.route)
+		p.ioapic.cancel(route)
 		return false, err
 	}
 	atomic.AddUint64(&p.irqDelivered, 1)
@@ -855,13 +1063,46 @@ func (p *bootPlatform) usePendingInterruptionFallback(line uint8) bool {
 func (p *bootPlatform) hasPendingIRQ() bool {
 	p.pendingMu.Lock()
 	defer p.pendingMu.Unlock()
-	return len(p.pendingIRQs) != 0
+	if len(p.pendingIRQs) != 0 {
+		return true
+	}
+	for _, pending := range p.deferredIRQ {
+		if pending {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *bootPlatform) pendingIRQCount() int {
 	p.pendingMu.Lock()
 	defer p.pendingMu.Unlock()
-	return len(p.pendingIRQs)
+	count := len(p.pendingIRQs)
+	for _, pending := range p.deferredIRQ {
+		if pending {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *bootPlatform) pendingIRQSummary() string {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	var parts []string
+	for _, pending := range p.pendingIRQs {
+		source := "ioapic"
+		if pending.pic {
+			source = "pic"
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d->%#x", source, pending.route.line, pending.route.vector))
+	}
+	for line, pending := range p.deferredIRQ {
+		if pending {
+			parts = append(parts, fmt.Sprintf("deferred:%d", line))
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 func canAcceptInterrupt(ctx *runVPExitContext, vector uint8) bool {
@@ -890,7 +1131,7 @@ func (p *bootPlatform) Summary() string {
 		p.ioapic.summaryForLines(p.activeIRQLines()),
 	)
 	if pending := p.pendingIRQCount(); pending != 0 {
-		summary += fmt.Sprintf(" irq_pending=%d", pending)
+		summary += fmt.Sprintf(" irq_pending=%d[%s]", pending, p.pendingIRQSummary())
 	}
 	if lastExit := p.lastExitSummary(); lastExit != "" {
 		summary += " " + lastExit
@@ -900,6 +1141,9 @@ func (p *bootPlatform) Summary() string {
 	}
 	if p.vsock != nil {
 		summary += " " + p.vsock.Summary()
+	}
+	if p.netdev != nil {
+		summary += " " + p.netdev.Summary()
 	}
 	for _, fsdev := range p.fsdevs {
 		if fsdev != nil {
