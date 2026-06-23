@@ -16,6 +16,9 @@ import (
 	"j5.nz/cc/internal/virtio"
 )
 
+// These KVM boot tests consume unstructured firmware/kernel serial logs.
+// Substring checks here synchronize with guest prompts and markers rather than
+// freezing user-facing copy.
 func TestBootFreeBSDKernelToSerialFromEnv(t *testing.T) {
 	kernelPath := os.Getenv("CC_FREEBSD_KERNEL")
 	if kernelPath == "" {
@@ -186,7 +189,7 @@ func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FreeBSD write/mount exec: %v", err)
 	}
-	if resp.ExitCode != 0 || !strings.Contains(resp.Output, "freebsd-write-ok") {
+	if resp.ExitCode != 0 || resp.Output != "freebsd-write-ok" {
 		t.Fatalf("FreeBSD write/mount response = code %d output:\n%s", resp.ExitCode, resp.Output)
 	}
 
@@ -206,6 +209,8 @@ func assertFreeBSDFsckClean(t *testing.T, label string, resp client.ExecResponse
 	if resp.ExitCode != 0 {
 		t.Fatalf("FreeBSD %s fsck_ffs exit code = %d output:\n%s", label, resp.ExitCode, resp.Output)
 	}
+	// fsck_ffs produces unstructured diagnostic text. These are negative
+	// consistency markers rather than user-facing text contracts.
 	for _, bad := range []string{
 		"BAD SUPER BLOCK",
 		"INCORRECT",

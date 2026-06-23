@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,17 +79,11 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 		}
 	}
 	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "cc-netbsd-init") {
+	if initScript != fmt.Sprintf(managedInitScript, "vioif0", "10.42.0.2", "10.42.0.1", "02:42:0a:2a:00:01", "10.42.0.1") {
 		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
 	}
-	if !strings.Contains(initScript, "ifconfig vioif0 inet 10.42.0.2 ") {
-		t.Fatalf("default init script does not configure default IP: %q", initScript)
-	}
-	if !strings.Contains(initScript, "sysctl -w net.inet.ip.dad_count=0") {
-		t.Fatalf("default init script does not disable IPv4 DAD before static addressing: %q", initScript)
-	}
 	fstab := readRootFile(t, root, "/etc/fstab")
-	if !strings.Contains(fstab, "/dev/ld0a / ffs rw") {
+	if !textHasFields(fstab, "/dev/ld0a", "/", "ffs", "rw", "1", "1") {
 		t.Fatalf("fstab does not mount ld0a: %q", fstab)
 	}
 }
@@ -112,40 +108,31 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	}
 	defer closeRoot()
 	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vioif1 inet 10.42.0.8 ") {
-		t.Fatalf("init script does not configure leased IP: %q", initScript)
-	}
-	if !strings.Contains(initScript, "sysctl -w net.inet.ip.dad_count=0") {
-		t.Fatalf("init script does not disable IPv4 DAD before static addressing: %q", initScript)
-	}
-	if !strings.Contains(initScript, "route add default 10.42.0.9") {
-		t.Fatalf("init script does not configure gateway: %q", initScript)
-	}
-	if !strings.Contains(initScript, "arp -s 10.42.0.9 02:42:0a:2a:00:01") {
-		t.Fatalf("init script does not configure gateway arp: %q", initScript)
+	if initScript != fmt.Sprintf(managedInitScript, "vioif1", "10.42.0.8", "10.42.0.9", "02:42:0a:2a:00:01", "10.42.0.9") {
+		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
 	}
 	ifconfig := readRootFile(t, root, "/etc/ifconfig.vioif1")
-	if !strings.Contains(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {
+	if !textHasLine(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {
 		t.Fatalf("ifconfig file does not contain leased IP: %q", ifconfig)
 	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.8 test-netbsd") {
+	if !textHasLine(hosts, "10.42.0.8 test-netbsd") {
 		t.Fatalf("hosts does not contain leased IP: %q", hosts)
 	}
 	resolv := readRootFile(t, root, "/etc/resolv.conf")
-	if !strings.Contains(resolv, "nameserver 10.42.0.10") {
+	if !textHasLine(resolv, "nameserver 10.42.0.10") {
 		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
 	services := readRootFile(t, root, "/etc/services")
-	if !strings.Contains(services, "nfs") || !strings.Contains(services, "2049/tcp") || !strings.Contains(services, "sunrpc") {
+	if !textHasFields(services, "nfs", "2049/tcp") || !textHasFields(services, "sunrpc", "111/tcp") {
 		t.Fatalf("services does not contain NFS RPC entries: %q", services)
 	}
 	protocols := readRootFile(t, root, "/etc/protocols")
-	if !strings.Contains(protocols, "tcp") || !strings.Contains(protocols, "udp") {
+	if !textHasFields(protocols, "tcp", "6", "TCP") || !textHasFields(protocols, "udp", "17", "UDP") {
 		t.Fatalf("protocols does not contain TCP/UDP entries: %q", protocols)
 	}
 	netconfig := readRootFile(t, root, "/etc/netconfig")
-	if !strings.Contains(netconfig, "tcp") || !strings.Contains(netconfig, "tpi_cots_ord") {
+	if !textHasFields(netconfig, "tcp", "tpi_cots_ord", "v", "inet", "tcp", "-", "-") {
 		t.Fatalf("netconfig does not contain TCP RPC transport: %q", netconfig)
 	}
 }
@@ -238,4 +225,22 @@ func readRootFile(t *testing.T, root imagefs.Directory, guestPath string) string
 		t.Fatalf("read %s: %v", guestPath, err)
 	}
 	return string(data)
+}
+
+func textHasLine(text, want string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+func textHasFields(text string, want ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if reflect.DeepEqual(strings.Fields(line), want) {
+			return true
+		}
+	}
+	return false
 }

@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"strings"
 	"testing"
 
 	"j5.nz/cc/internal/imagefs"
@@ -165,9 +164,6 @@ func TestManagedConformanceMatrixMatchesFeatureGates(t *testing.T) {
 					}
 					if err == nil {
 						t.Fatalf("%s gate allowed unsupported capability", gate.name)
-					}
-					if !strings.Contains(err.Error(), gate.name) && !strings.Contains(err.Error(), "alternate images") {
-						t.Fatalf("%s unsupported error = %v", gate.name, err)
 					}
 				})
 			}

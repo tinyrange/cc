@@ -3,7 +3,6 @@ package sidecar
 import (
 	"context"
 	"net"
-	"strings"
 	"testing"
 )
 
@@ -39,7 +38,7 @@ func TestDialWorkerRejectsNonHello(t *testing.T) {
 	if worker != nil {
 		_ = worker.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "before hello") {
+	if err == nil {
 		t.Fatalf("err = %v", err)
 	}
 	if err := <-done; err != nil {

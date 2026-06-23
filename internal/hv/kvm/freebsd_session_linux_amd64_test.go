@@ -4,7 +4,6 @@ package kvm
 
 import (
 	"net"
-	"strings"
 	"testing"
 )
 
@@ -16,10 +15,10 @@ func (freeBSDManagedTestRoot) Size() int64                        { return 512 }
 
 func TestNormalizeFreeBSDManagedConfig(t *testing.T) {
 	root := freeBSDManagedTestRoot{}
-	if _, err := normalizeFreeBSDManagedConfig(FreeBSDManagedConfig{Root: root}); err == nil || !strings.Contains(err.Error(), "kernel is required") {
+	if _, err := normalizeFreeBSDManagedConfig(FreeBSDManagedConfig{Root: root}); err == nil {
 		t.Fatalf("missing kernel error = %v", err)
 	}
-	if _, err := normalizeFreeBSDManagedConfig(FreeBSDManagedConfig{Kernel: []byte("kernel")}); err == nil || !strings.Contains(err.Error(), "root filesystem is required") {
+	if _, err := normalizeFreeBSDManagedConfig(FreeBSDManagedConfig{Kernel: []byte("kernel")}); err == nil {
 		t.Fatalf("missing root error = %v", err)
 	}
 

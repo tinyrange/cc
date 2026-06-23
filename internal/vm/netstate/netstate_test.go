@@ -2,27 +2,26 @@ package netstate
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
 )
 
 func TestNetworkInstanceHelpersRequireNetwork(t *testing.T) {
-	if err := AddPortForwardToNetwork(nil, client.PortForward{}); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := AddPortForwardToNetwork(nil, client.PortForward{}); err == nil {
 		t.Fatalf("AddPortForwardToNetwork nil error = %v", err)
 	}
-	if err := AllowServiceProxyPortOnNetwork(nil, 8080); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := AllowServiceProxyPortOnNetwork(nil, 8080); err == nil {
 		t.Fatalf("AllowServiceProxyPortOnNetwork nil error = %v", err)
 	}
 }
 
 func TestManagedNetworkStateRequiresNetwork(t *testing.T) {
 	state := State{}
-	if err := state.AddPortForward(client.PortForward{}); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := state.AddPortForward(client.PortForward{}); err == nil {
 		t.Fatalf("AddPortForward nil error = %v", err)
 	}
-	if err := state.AllowServiceProxyPort(8080); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := state.AllowServiceProxyPort(8080); err == nil {
 		t.Fatalf("AllowServiceProxyPort nil error = %v", err)
 	}
 	if got := state.IPv4(); got != "" {
@@ -40,16 +39,16 @@ func TestManagedNetworkStatePortForwardFallback(t *testing.T) {
 	if fallback.calls != 1 || fallback.forward != forward {
 		t.Fatalf("fallback = (%d, %+v), want one call with %+v", fallback.calls, fallback.forward, forward)
 	}
-	if err := state.AddPortForwardWithFallback(context.Background(), forward, nil); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := state.AddPortForwardWithFallback(context.Background(), forward, nil); err == nil {
 		t.Fatalf("nil fallback error = %v", err)
 	}
 }
 
 func TestManagedNetworkWrapperHelpersRequireNetwork(t *testing.T) {
-	if err := AddManagedNetworkPortForward(context.Background(), nil, client.PortForward{}); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := AddManagedNetworkPortForward(context.Background(), nil, client.PortForward{}); err == nil {
 		t.Fatalf("AddManagedNetworkPortForward nil error = %v", err)
 	}
-	if err := AllowManagedNetworkServiceProxyPort(context.Background(), nil, 8080); err == nil || !strings.Contains(err.Error(), "network is not enabled") {
+	if err := AllowManagedNetworkServiceProxyPort(context.Background(), nil, 8080); err == nil {
 		t.Fatalf("AllowManagedNetworkServiceProxyPort nil error = %v", err)
 	}
 	if got := IPv4(nil, "10.42.0.99"); got != "10.42.0.99" {

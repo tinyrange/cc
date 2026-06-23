@@ -31,6 +31,9 @@ import (
 	"j5.nz/cc/internal/virtio"
 )
 
+// These KVM boot tests consume unstructured firmware/kernel serial logs.
+// Substring checks here synchronize with guest prompts and markers rather than
+// freezing user-facing copy.
 func TestBootOpenBSD79BSDRDToSerial(t *testing.T) {
 	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
 		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
