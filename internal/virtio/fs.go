@@ -3092,10 +3092,22 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	rel, ok := cleanChildName(name)
-	if !ok {
+	switch name {
+	case ".":
 		attr, errno := p.GetAttr(parent)
 		return parent, attr, errno
+	case "..":
+		guestPath := path.Dir(guestParent)
+		if guestPath == "." {
+			guestPath = "/"
+		}
+		nodeID := p.ensureNode(guestPath)
+		attr, errno := p.GetAttr(nodeID)
+		return nodeID, attr, errno
+	}
+	rel, ok := cleanChildName(name)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
 	}
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	info, err := os.Lstat(host)
@@ -3371,9 +3383,13 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	if err != nil {
 		return 0, errnoFromError(err)
 	}
+	parentID := nodeID
+	if guest != "/" {
+		parentID = p.ensureNode(path.Dir(guest))
+	}
 	dirEntries := []dirEntry{
 		{name: ".", typ: dirTypeDir, ino: nodeID},
-		{name: "..", typ: dirTypeDir, ino: nodeID},
+		{name: "..", typ: dirTypeDir, ino: parentID},
 	}
 	for _, entry := range entries {
 		childPath := joinGuestChild(guest, entry.Name())
@@ -3871,16 +3887,26 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxENOENT
 	}
+	switch name {
+	case ".":
+		attr := p.attr(parentNode)
+		p.mu.Unlock()
+		return parentNode.id, attr, 0
+	case "..":
+		node := p.nodes[parentNode.parent]
+		if node == nil {
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		attr := p.attr(node)
+		p.mu.Unlock()
+		return node.id, attr, 0
+	}
 	var ok bool
 	name, ok = cleanChildName(name)
 	if !ok {
 		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxEINVAL
-	}
-	if name == "." {
-		attr := p.attr(parentNode)
-		p.mu.Unlock()
-		return parentNode.id, attr, 0
 	}
 	p.debugChildfLocked("lookup", parent, name, "")
 	childID, ok := parentNode.entries[name]
