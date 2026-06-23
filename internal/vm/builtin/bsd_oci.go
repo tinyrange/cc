@@ -19,6 +19,7 @@ import (
 )
 
 const bsdKernelMediaType = "application/vnd.tinyrange.bsd.kernel.v1"
+const customKernelFilePrefix = "file:"
 
 type bsdOCIManifest struct {
 	Layers []struct {
@@ -28,45 +29,49 @@ type bsdOCIManifest struct {
 	} `json:"layers"`
 }
 
-func buildOpenBSDArtifact(ctx context.Context, cacheDir, arch string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-	if artifact, ok, err := buildBSDOCIArtifact(ctx, "openbsd", openBSDOCITag(arch), cacheDir, arch, network); ok || err != nil {
+func buildOpenBSDArtifact(ctx context.Context, cacheDir, arch, kernelFlavor string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	if artifact, ok, err := buildBSDOCIArtifact(ctx, "openbsd", openBSDOCITag(arch), cacheDir, arch, kernelFlavor, network); ok || err != nil {
 		return artifact, err
 	}
 	rt, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
 	if err != nil {
 		return rootartifact.Artifact{}, err
 	}
-	return rt.Artifact(), nil
+	return bsdArtifactWithCustomKernel(rt.Artifact(), kernelFlavor)
 }
 
-func buildFreeBSDArtifact(ctx context.Context, cacheDir, arch string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-	if artifact, ok, err := buildBSDOCIArtifact(ctx, "freebsd", freeBSDOCITag(arch), cacheDir, arch, network); ok || err != nil {
+func buildFreeBSDArtifact(ctx context.Context, cacheDir, arch, kernelFlavor string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	if artifact, ok, err := buildBSDOCIArtifact(ctx, "freebsd", freeBSDOCITag(arch), cacheDir, arch, kernelFlavor, network); ok || err != nil {
 		return artifact, err
 	}
 	rt, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
 	if err != nil {
 		return rootartifact.Artifact{}, err
 	}
-	return rt.Artifact(), nil
+	return bsdArtifactWithCustomKernel(rt.Artifact(), kernelFlavor)
 }
 
-func buildNetBSDArtifact(ctx context.Context, cacheDir, arch string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-	if artifact, ok, err := buildBSDOCIArtifact(ctx, "netbsd", netBSDOCITag(arch), cacheDir, arch, network); ok || err != nil {
+func buildNetBSDArtifact(ctx context.Context, cacheDir, arch, kernelFlavor string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	if artifact, ok, err := buildBSDOCIArtifact(ctx, "netbsd", netBSDOCITag(arch), cacheDir, arch, kernelFlavor, network); ok || err != nil {
 		return artifact, err
 	}
 	rt, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
 	if err != nil {
 		return rootartifact.Artifact{}, err
 	}
-	return rt.Artifact(), nil
+	return bsdArtifactWithCustomKernel(rt.Artifact(), kernelFlavor)
 }
 
-func buildBSDOCIArtifact(ctx context.Context, family, tag, cacheDir, arch string, network machine.NetworkSpec) (rootartifact.Artifact, bool, error) {
+func buildBSDOCIArtifact(ctx context.Context, family, tag, cacheDir, arch, kernelFlavor string, network machine.NetworkSpec) (rootartifact.Artifact, bool, error) {
 	if strings.TrimSpace(os.Getenv("CC_BSD_OCI_DISABLE")) != "" {
 		return rootartifact.Artifact{}, false, nil
 	}
 	repo := "tinyrange/cc-" + family
 	rootLayer, kernel, err := ensureBSDOCIArtifact(ctx, filepath.Join(cacheDir, "oci"), repo, tag)
+	if err != nil {
+		return rootartifact.Artifact{}, false, err
+	}
+	kernel, err = bsdKernelBytes(kernelFlavor, kernel)
 	if err != nil {
 		return rootartifact.Artifact{}, false, err
 	}
@@ -92,6 +97,37 @@ func buildBSDOCIArtifact(ctx context.Context, family, tag, cacheDir, arch string
 	default:
 		return rootartifact.Artifact{}, false, fmt.Errorf("unsupported BSD OCI family %q", family)
 	}
+}
+
+func bsdArtifactWithCustomKernel(artifact rootartifact.Artifact, kernelFlavor string) (rootartifact.Artifact, error) {
+	kernel, err := bsdKernelBytes(kernelFlavor, artifact.Kernel)
+	if err != nil {
+		if artifact.Cleanup != nil {
+			_ = artifact.Cleanup()
+		}
+		return rootartifact.Artifact{}, err
+	}
+	artifact.Kernel = kernel
+	return artifact, nil
+}
+
+func bsdKernelBytes(kernelFlavor string, packaged []byte) ([]byte, error) {
+	kernelFlavor = strings.TrimSpace(kernelFlavor)
+	if path, ok := strings.CutPrefix(kernelFlavor, customKernelFilePrefix); ok {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return nil, fmt.Errorf("custom BSD kernel path is empty")
+		}
+		kernel, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read custom BSD kernel %s: %w", path, err)
+		}
+		if len(kernel) == 0 {
+			return nil, fmt.Errorf("custom BSD kernel %s is empty", path)
+		}
+		return kernel, nil
+	}
+	return append([]byte(nil), packaged...), nil
 }
 
 func openBSDOCITag(arch string) string {

@@ -305,7 +305,11 @@ func (m *Manager) StartBlankInstanceStream(
 	m.mu.Unlock()
 
 	shares := append([]client.ShareMount(nil), req.Shares...)
-	req.Shares = nil
+	if isBuiltinGuestImage(req.Image) {
+		shares = nil
+	} else {
+		req.Shares = nil
+	}
 	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
@@ -457,6 +461,17 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		}
 	}
 	return machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+}
+
+func (m *Manager) AddShareTo(ctx context.Context, id string, share client.ShareMount) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("VM %q is not running", id)
+	}
+	return machine.instance.AddShare(ctx, share)
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {

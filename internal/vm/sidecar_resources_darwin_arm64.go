@@ -146,6 +146,12 @@ func sidecarSnapshotRoot(backend virtio.FSBackend) (sidecarRootFS, error) {
 }
 
 func sidecarKernelProvider(h *sidecarVMHost, flavor string) runtimeKernelProvider {
+	if path, ok := customKernelPath(flavor); ok {
+		if h == nil {
+			return customKernelProvider{path: path}
+		}
+		return customKernelProvider{path: path, modules: h.kernel}
+	}
 	if h != nil && h.images != nil && normalizeRuntimeKernel(flavor) == "ubuntu" {
 		return ubuntu.NewManager(filepath.Join(h.images.Root(), "_kernels", "ubuntu"))
 	}

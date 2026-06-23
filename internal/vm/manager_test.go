@@ -107,6 +107,32 @@ func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
 	}
 }
 
+func TestManagerBlankStartPassesBuiltinGuestSharesToHost(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	share := client.ShareMount{Source: "/tmp/host", Mount: "/host", Writable: true}
+	if _, err := manager.StartBlankInstanceStream(ctx, "openbsd", client.StartInstanceRequest{
+		Image:  "@openbsd",
+		Shares: []client.ShareMount{share},
+	}, nil); err != nil {
+		t.Fatalf("start blank built-in guest: %v", err)
+	}
+	if len(host.blankStarts) != 1 {
+		t.Fatalf("blank starts = %+v, want one start", host.blankStarts)
+	}
+	if got := host.blankStarts[0].Shares; len(got) != 1 || got[0] != share {
+		t.Fatalf("host blank start shares = %+v, want startup share", got)
+	}
+	if len(inst.shares) != 0 {
+		t.Fatalf("replayed shares = %+v, want none", inst.shares)
+	}
+}
+
 func TestManagerRunWithoutInstanceRequiresOrUsesImage(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})

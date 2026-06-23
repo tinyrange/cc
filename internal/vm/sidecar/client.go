@@ -136,6 +136,11 @@ func (c *Client) ConsoleHistory(ctx context.Context, id string) (string, error) 
 	return resp.History, err
 }
 
+func (c *Client) AddShare(ctx context.Context, id string, share client.ShareMount) error {
+	var resp map[string]string
+	return c.call(ctx, WorkerFrameAddShare, WorkerAddShareRequest{ID: id, Share: share}, nil, &resp)
+}
+
 func (c *Client) Exec(ctx context.Context, id string, req client.ExecRequest) ([]client.ExecEvent, error) {
 	var events []client.ExecEvent
 	err := c.ExecStream(ctx, id, req, nil, func(event client.ExecEvent) error {

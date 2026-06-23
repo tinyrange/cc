@@ -55,7 +55,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("linux arm64 runtime currently supports only 1 CPU")
 	}
-	kernel, err := b.kernel.ReadKernel()
+	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +64,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +147,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("linux arm64 runtime currently supports only 1 CPU")
 	}
-	kernel, err := b.kernel.ReadKernel()
+	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +160,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		}
 		image = withLinuxRuntimeMountDirs(image)
 	}
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		return client.ExecResponse{}, fmt.Errorf("linux arm64 runtime currently supports only 1 CPU")
 	}
 
-	kernel, err := b.kernel.ReadKernel()
+	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
@@ -257,7 +257,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		image = withLinuxRuntimeMountDirs(image)
-		modules, err = b.kernel.PlanModuleLoad(
+		modules, err = planRuntimeKernelModules(
+			b.kernel,
+			req.Kernel,
 			linuxRuntimeConfigVars(image, req.KernelModules...),
 			linuxRuntimeModuleMap(),
 		)

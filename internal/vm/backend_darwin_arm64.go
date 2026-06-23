@@ -58,6 +58,9 @@ func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache
 }
 
 func (b *runtimeBackend) kernelProvider(flavor string) runtimeKernelProvider {
+	if path, ok := customKernelPath(flavor); ok {
+		return customKernelProvider{path: path, modules: b.kernel}
+	}
 	if normalizeRuntimeKernel(flavor) == "ubuntu" && b.images != nil {
 		return ubuntu.NewManager(filepath.Join(b.images.Root(), "_kernels", "ubuntu"))
 	}

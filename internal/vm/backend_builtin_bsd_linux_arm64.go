@@ -189,7 +189,7 @@ func (b *runtimeBackend) startBSDArm64ManagedStream(ctx context.Context, req cli
 		Interface:   def.Interface,
 		MAC:         network.mac.String(),
 	}
-	artifact, err := def.BuildArtifact(ctx, def.CacheDir, networkSpec)
+	artifact, err := def.BuildArtifact(ctx, def.CacheDir, req.Kernel, networkSpec)
 	if err != nil {
 		return nil, err
 	}

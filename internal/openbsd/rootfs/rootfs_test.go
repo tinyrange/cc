@@ -139,6 +139,43 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {
 	}
 }
 
+func TestBuildManagedRootFromOpenBSDBaseSetExtractsEtcSet(t *testing.T) {
+	etcTGZ := buildTGZFixtureData(t, []tarFixtureEntry{
+		{name: ".profile", mode: 0o644, data: []byte("root profile\n")},
+		{name: "etc", mode: 0o755, dir: true},
+		{name: "etc/ssl", mode: 0o755, dir: true},
+		{name: "etc/ssl/cert.pem", mode: 0o644, data: []byte("test certificate bundle\n")},
+		{name: "etc/resolv.conf", mode: 0o644, data: []byte("nameserver 192.0.2.1\n")},
+	})
+	baseTGZ := writeTGZFixture(t, []tarFixtureEntry{
+		{name: "sbin", mode: 0o755, dir: true},
+		{name: "sbin/init", mode: 0o555, data: []byte("base init\n")},
+		{name: "usr", mode: 0o755, dir: true},
+		{name: "usr/lib", mode: 0o755, dir: true},
+		{name: "usr/lib/libc.so.99.0", mode: 0o444, data: []byte("libc")},
+		{name: "usr/lib/libpthread.so.99.0", mode: 0o444, data: []byte("libpthread")},
+		{name: "var", mode: 0o755, dir: true},
+		{name: "var/sysmerge", mode: 0o755, dir: true},
+		{name: "var/sysmerge/etc.tgz", mode: 0o644, data: etcTGZ},
+		{name: "etc", mode: 0o755, dir: true},
+		{name: "dev", mode: 0o755, dir: true},
+	})
+	root, err := BuildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readRootFile(t, root, "/etc/ssl/cert.pem"); got != "test certificate bundle\n" {
+		t.Fatalf("cert.pem = %q, want etc set certificate bundle", got)
+	}
+	if got := readRootFile(t, root, "/.profile"); got != "root profile\n" {
+		t.Fatalf(".profile = %q, want root profile from etc set", got)
+	}
+	resolv := readRootFile(t, root, "/etc/resolv.conf")
+	if strings.Contains(resolv, "192.0.2.1") || !strings.Contains(resolv, "nameserver 10.42.0.1") {
+		t.Fatalf("resolv.conf = %q, want generated DNS override", resolv)
+	}
+}
+
 func TestBuildManagedRootFromOpenBSDBaseSetUsesStructuredNetwork(t *testing.T) {
 	baseTGZ := writeTGZFixture(t, []tarFixtureEntry{
 		{name: "sbin", mode: 0o755, dir: true},
@@ -183,6 +220,16 @@ type tarFixtureEntry struct {
 
 func writeTGZFixture(t *testing.T, entries []tarFixtureEntry) string {
 	t.Helper()
+	gzData := buildTGZFixtureData(t, entries)
+	tgzPath := filepath.Join(t.TempDir(), "base79.tgz")
+	if err := os.WriteFile(tgzPath, gzData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return tgzPath
+}
+
+func buildTGZFixtureData(t *testing.T, entries []tarFixtureEntry) []byte {
+	t.Helper()
 	var tarBuf bytes.Buffer
 	tw := tar.NewWriter(&tarBuf)
 	for _, entry := range entries {
@@ -220,11 +267,7 @@ func writeTGZFixture(t *testing.T, entries []tarFixtureEntry) string {
 	if err := gzw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	tgzPath := filepath.Join(t.TempDir(), "base79.tgz")
-	if err := os.WriteFile(tgzPath, gzBuf.Bytes(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return tgzPath
+	return gzBuf.Bytes()
 }
 
 func readRootFile(t *testing.T, root imagefs.Directory, guestPath string) string {

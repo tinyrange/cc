@@ -84,7 +84,7 @@ func TestRuntimeBootsTrimmedBSDSourceCachePackageManagers(t *testing.T) {
 func trimmedOpenBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.OpenBSDDefinitionForArch("", "arm64")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir, Arch: "arm64", Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err
@@ -97,7 +97,7 @@ func trimmedOpenBSDDefinition(cacheDir string) builtin.BSDDefinition {
 func trimmedFreeBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.FreeBSDDefinitionForArch("", "arm64")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{CacheDir: cacheDir, Arch: "arm64", Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err
@@ -110,7 +110,7 @@ func trimmedFreeBSDDefinition(cacheDir string) builtin.BSDDefinition {
 func trimmedNetBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.NetBSDDefinitionForArch("", "evbarm-aarch64")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Arch: "evbarm-aarch64", Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err

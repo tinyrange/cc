@@ -20,6 +20,7 @@ const (
 	WorkerFrameWait         = sidecarproto.WorkerFrameWait
 	WorkerFrameStatus       = sidecarproto.WorkerFrameStatus
 	WorkerFrameExec         = sidecarproto.WorkerFrameExec
+	WorkerFrameAddShare     = sidecarproto.WorkerFrameAddShare
 	WorkerFrameExecInput    = sidecarproto.WorkerFrameExecInput
 	WorkerFrameCancel       = sidecarproto.WorkerFrameCancel
 	WorkerFrameFlush        = sidecarproto.WorkerFrameFlush
@@ -43,6 +44,7 @@ type WorkerFlushRequest = sidecarproto.WorkerFlushRequest
 type WorkerConsoleRequest = sidecarproto.WorkerConsoleRequest
 type WorkerConsoleResponse = sidecarproto.WorkerConsoleResponse
 type WorkerExecRequest = sidecarproto.WorkerExecRequest
+type WorkerAddShareRequest = sidecarproto.WorkerAddShareRequest
 type WorkerExecInput = sidecarproto.WorkerExecInput
 type WorkerCancelRequest = sidecarproto.WorkerCancelRequest
 type WorkerError = sidecarproto.WorkerError

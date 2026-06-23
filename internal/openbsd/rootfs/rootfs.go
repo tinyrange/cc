@@ -1,12 +1,15 @@
 package rootfs
 
 import (
+	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -119,7 +122,7 @@ func BuildManagedRuntimeFromOCI(ctx context.Context, cfg Config, kernel []byte, 
 		_ = tfs.Close()
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRootFromBase(tfs.Root(), tfs.Close, initBin, openBSDNetworkSpec(cfg))
+	root, closeRoot, err := buildManagedRootFromBase(ctx, tfs.Root(), tfs.Close, initBin, openBSDNetworkSpec(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -141,16 +144,20 @@ func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 
 func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
 	network = normalizeOpenBSDNetwork(network)
-	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4)))
+	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, managedInitDate(), network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4)))
 	if err != nil {
 		return nil, nil, err
 	}
 	return buildManagedRootFromPreparedBase(root, closeRoot, initBin, network)
 }
 
-func buildManagedRootFromBase(base imagefs.Directory, closeBase func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
+func buildManagedRootFromBase(ctx context.Context, base imagefs.Directory, closeBase func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
 	network = normalizeOpenBSDNetwork(network)
 	overlay := imagefs.NewOverlay(base)
+	if err := overlayOpenBSDEtcSet(ctx, overlay, base); err != nil {
+		_ = closeBase()
+		return nil, nil, err
+	}
 	if err := addRuntimeLibraryLinks(overlay, base); err != nil {
 		_ = closeBase()
 		return nil, nil, err
@@ -167,7 +174,7 @@ func buildManagedRootFromBase(base imagefs.Directory, closeBase func() error, in
 		_ = closeBase()
 		return nil, nil, err
 	}
-	if err := overlay.AddFile("/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))); err != nil {
+	if err := overlay.AddFile("/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, managedInitDate(), network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))); err != nil {
 		_ = closeBase()
 		return nil, nil, fmt.Errorf("overlay /sbin/init: %w", err)
 	}
@@ -188,6 +195,75 @@ func buildManagedRootFromPreparedBase(root imagefs.Directory, closeRoot func() e
 		return nil, nil, err
 	}
 	return overlay.Root(), closeRoot, nil
+}
+
+func overlayOpenBSDEtcSet(ctx context.Context, overlay *imagefs.Overlay, root imagefs.Directory) error {
+	entry, err := imagefs.LookupPath(root, "/var/sysmerge/etc.tgz")
+	if err != nil {
+		return nil
+	}
+	if entry.File == nil {
+		return fmt.Errorf("OpenBSD /var/sysmerge/etc.tgz is not a file")
+	}
+	size, _ := entry.File.Stat()
+	if size > uint64(^uint32(0)) {
+		return fmt.Errorf("OpenBSD /var/sysmerge/etc.tgz is too large: %d bytes", size)
+	}
+	data, err := entry.File.ReadAt(0, uint32(size))
+	if err != nil {
+		return fmt.Errorf("read OpenBSD /var/sysmerge/etc.tgz: %w", err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("read OpenBSD /var/sysmerge/etc.tgz gzip: %w", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read OpenBSD etc set: %w", err)
+		}
+		guestPath := openBSDEtcSetPath(hdr.Name)
+		if guestPath == "" {
+			continue
+		}
+		mode := fs.FileMode(hdr.Mode) & 0o7777
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := overlay.AddDir(guestPath, mode); err != nil {
+				return fmt.Errorf("overlay OpenBSD etc dir %s: %w", guestPath, err)
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			fileData, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("read OpenBSD etc file %s: %w", guestPath, err)
+			}
+			if err := overlay.AddFile(guestPath, mode, fileData); err != nil {
+				return fmt.Errorf("overlay OpenBSD etc file %s: %w", guestPath, err)
+			}
+		case tar.TypeSymlink:
+			if err := overlay.AddSymlink(guestPath, hdr.Linkname); err != nil {
+				return fmt.Errorf("overlay OpenBSD etc symlink %s: %w", guestPath, err)
+			}
+		}
+	}
+}
+
+func openBSDEtcSetPath(name string) string {
+	name = strings.TrimPrefix(name, "./")
+	name = strings.TrimPrefix(name, "/")
+	clean := path.Clean("/" + name)
+	if clean == "/" || clean == "/." {
+		return ""
+	}
+	return clean
 }
 
 const bsdNetworkServices = `sunrpc		111/tcp
@@ -245,6 +321,10 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		return nil, nil, fmt.Errorf("read OpenBSD base set %s: %w", baseTar, err)
 	}
 	overlay := imagefs.NewOverlay(tfs.Root())
+	if err := overlayOpenBSDEtcSet(ctx, overlay, tfs.Root()); err != nil {
+		_ = tfs.Close()
+		return nil, nil, err
+	}
 	if err := addRuntimeLibraryLinks(overlay, tfs.Root()); err != nil {
 		_ = tfs.Close()
 		return nil, nil, err
@@ -357,12 +437,17 @@ func versionNoDot(version string) string {
 	return strings.ReplaceAll(version, ".", "")
 }
 
+func managedInitDate() string {
+	return time.Now().UTC().Format("200601021504.05")
+}
+
 const managedInitScript = `#!/bin/sh
 exec >/dev/console 2>&1
 /sbin/mount -uw / || {
 	echo OPENBSD_MANAGED_REMOUNT_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/bin/date -u %s >/dev/null 2>&1 || true
 /sbin/ifconfig %s inet %s netmask 255.255.255.0 up || {
 	echo OPENBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done

@@ -576,6 +576,17 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				continue
 			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+		case vm.WorkerFrameAddShare:
+			var req vm.WorkerAddShareRequest
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "ok"})
 		case vm.WorkerFrameExec:
 			if err := serveWorkerExec(codec, srvState, frame, &activeMu, activeExecs); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
