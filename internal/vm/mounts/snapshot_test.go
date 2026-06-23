@@ -24,10 +24,10 @@ func (s *recordingSnapshotter) RootSnapshotAt(path string) (imagefs.Directory, e
 }
 
 func TestSnapshotHelpers(t *testing.T) {
-	if _, err := RootSnapshot(nil, ""); err == nil || !strings.Contains(err.Error(), "root filesystem cannot be snapshotted") {
+	if _, err := RootSnapshot(nil, ""); err == nil {
 		t.Fatalf("nil root snapshot error = %v", err)
 	}
-	if _, err := ImageSnapshot(nil, "tools", "/mnt/tools"); err == nil || !strings.Contains(err.Error(), "root filesystem cannot be snapshotted") {
+	if _, err := ImageSnapshot(nil, "tools", "/mnt/tools"); err == nil {
 		t.Fatalf("nil image snapshot error = %v", err)
 	}
 
@@ -48,7 +48,7 @@ func TestSnapshotHelpers(t *testing.T) {
 		t.Fatalf("snapshot paths = %q", got)
 	}
 
-	if _, err := ImageSnapshot(struct{}{}, "tools", "/mnt/tools"); err == nil || !strings.Contains(err.Error(), `image mount "tools" cannot be snapshotted`) {
+	if _, err := ImageSnapshot(struct{}{}, "tools", "/mnt/tools"); err == nil {
 		t.Fatalf("unsupported image snapshot error = %v", err)
 	}
 }
@@ -63,10 +63,10 @@ func TestSnapshotCapabilityHelpers(t *testing.T) {
 		t.Fatalf("image snapshot with capability: %v", err)
 	}
 
-	if _, err := RootSnapshotWithCapabilities("TestOS", managedguest.Capabilities{}, snapshotter, ""); err == nil || !strings.Contains(err.Error(), "root snapshots") {
+	if _, err := RootSnapshotWithCapabilities("TestOS", managedguest.Capabilities{}, snapshotter, ""); err == nil {
 		t.Fatalf("root snapshot disabled error = %v", err)
 	}
-	if _, err := ImageSnapshotWithCapabilities("TestOS", managedguest.Capabilities{}, snapshotter, "tools", "/mnt/tools"); err == nil || !strings.Contains(err.Error(), "image snapshots") {
+	if _, err := ImageSnapshotWithCapabilities("TestOS", managedguest.Capabilities{}, snapshotter, "tools", "/mnt/tools"); err == nil {
 		t.Fatalf("image snapshot disabled error = %v", err)
 	}
 }

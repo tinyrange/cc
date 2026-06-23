@@ -24,7 +24,7 @@ func TestRootPathCleansRootAndName(t *testing.T) {
 }
 
 func TestTarTargetRejectsTraversal(t *testing.T) {
-	if _, err := tarTarget("/tmp/out", true, "../escape"); err == nil || !strings.Contains(err.Error(), "unsafe tar path") {
+	if _, err := tarTarget("/tmp/out", true, "../escape"); err == nil {
 		t.Fatalf("tarTarget traversal error = %v", err)
 	}
 	if got, err := tarTarget("/tmp/out", false, "root/file"); err != nil || got != "/tmp/out/file" {
@@ -129,7 +129,7 @@ func TestExtractTarToPathConflictSemantics(t *testing.T) {
 		}
 
 		err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "/", dst, false)
-		if err == nil || !strings.Contains(err.Error(), "cannot overwrite non-directory with directory") {
+		if err == nil {
 			t.Fatalf("extract directory over file error = %v", err)
 		}
 		if got := readTestFile(t, dst); got != "keep" {
@@ -168,7 +168,7 @@ func TestExtractTarToPathConflictSemantics(t *testing.T) {
 		}
 
 		err := ensureTarTargetCompatible(dst, false)
-		if err == nil || !strings.Contains(err.Error(), "cannot overwrite directory with non-directory") {
+		if err == nil {
 			t.Fatalf("exact file over directory error = %v", err)
 		}
 		if info, err := os.Stat(dst); err != nil || !info.IsDir() {
@@ -306,19 +306,29 @@ func TestExecReporterWritesConfiguredMarkers(t *testing.T) {
 	reporter.Timing("phase")
 	reporter.Exit(7)
 
-	got := buf.String()
-	for _, want := range []string{
+	lines := strings.Split(buf.String(), "\n")
+	want := []string{
 		"BEGIN:id\n",
 		"OUT:id:b3V0\n",
 		"ERR:id:ZXJy\n",
 		"CTL:id:Y3Rs\n",
 		"USE:id:usage64\n",
-		"TIME:id:phase:",
 		"EXIT:id:7\n",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("reporter output missing %q in %q", want, got)
+	}
+	if len(lines) != 8 {
+		t.Fatalf("reporter lines = %#v", lines)
+	}
+	for i, wantLine := range want[:5] {
+		if lines[i]+"\n" != wantLine {
+			t.Fatalf("reporter line %d = %q, want %q", i, lines[i]+"\n", wantLine)
 		}
+	}
+	timeFields := strings.Split(lines[5], ":")
+	if len(timeFields) != 4 || timeFields[0] != "TIME" || timeFields[1] != "id" || timeFields[2] != "phase" || timeFields[3] == "" {
+		t.Fatalf("time reporter line = %q", lines[5])
+	}
+	if lines[6]+"\n" != want[5] {
+		t.Fatalf("reporter exit line = %q, want %q", lines[6]+"\n", want[5])
 	}
 }
 

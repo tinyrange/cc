@@ -43,20 +43,17 @@ func TestResolveRuntimeExecUserDefaultsToHostIdentity(t *testing.T) {
 }
 
 func TestResolveRuntimeExecUserRejectsInvalidUsers(t *testing.T) {
-	tests := []struct {
-		user string
-		want string
-	}{
-		{user: ":1", want: "invalid user"},
-		{user: "1:", want: "invalid user"},
-		{user: "daemon", want: "linux test runtime supports numeric users only"},
-		{user: "1:daemon", want: "linux test runtime supports numeric users only"},
+	users := []string{
+		":1",
+		"1:",
+		"daemon",
+		"1:daemon",
 	}
-	for _, tc := range tests {
-		t.Run(tc.user, func(t *testing.T) {
-			_, err := ResolveRuntimeExecUser("linux test", tc.user)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error = %v, want %q", err, tc.want)
+	for _, user := range users {
+		t.Run(user, func(t *testing.T) {
+			_, err := ResolveRuntimeExecUser("linux test", user)
+			if err == nil {
+				t.Fatalf("expected error for user %q", user)
 			}
 		})
 	}

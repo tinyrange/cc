@@ -124,10 +124,10 @@ func TestRunDryRunPushesToGHCR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "dry-run push manifest ghcr.io/tinyrange/cc-openbsd:7.9") {
+	if !textHasFields(stdout.String(), "dry-run", "push", "manifest", "ghcr.io/tinyrange/cc-openbsd:7.9") {
 		t.Fatalf("dry-run output missing GHCR manifest push:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), bsdKernelMediaType) {
+	if !textHasFields(stdout.String(), "dry-run", "push", "blob", bsdKernelMediaType) {
 		t.Fatalf("dry-run output missing kernel blob media type:\n%s", stdout.String())
 	}
 }
@@ -433,6 +433,26 @@ func readLayoutManifest(t *testing.T, outDir string) manifest {
 
 func blobPath(outDir, digest string) string {
 	return filepath.Join(outDir, "blobs", "sha256", strings.TrimPrefix(digest, "sha256:"))
+}
+
+func textHasFields(text string, want ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < len(want) {
+			continue
+		}
+		matched := true
+		for i := range want {
+			if fields[i] != want[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func tarGzipContains(t *testing.T, source, want string) bool {

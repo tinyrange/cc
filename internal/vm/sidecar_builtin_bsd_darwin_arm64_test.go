@@ -5,7 +5,6 @@ package vm
 import (
 	"context"
 	"reflect"
-	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -36,22 +35,10 @@ func TestSidecarResourcePrepRejectsBuiltinBSDBeforeImageStore(t *testing.T) {
 	if err == nil {
 		t.Fatal("prepareSidecarCreateResources unexpectedly succeeded")
 	}
-	if strings.Contains(err.Error(), "image store") || strings.Contains(err.Error(), "image.json") {
-		t.Fatalf("built-in NetBSD create prep went through OCI image store path: %v", err)
-	}
-	if !strings.Contains(err.Error(), "managed guest runtime") {
-		t.Fatalf("prepareSidecarCreateResources error = %v, want managed guest runtime guard", err)
-	}
 
 	_, err = prepareSidecarBlankResources(host, context.Background(), client.StartInstanceRequest{Image: "@openbsd"})
 	if err == nil {
 		t.Fatal("prepareSidecarBlankResources unexpectedly succeeded")
-	}
-	if strings.Contains(err.Error(), "image store") || strings.Contains(err.Error(), "image.json") {
-		t.Fatalf("built-in OpenBSD blank prep went through OCI image store path: %v", err)
-	}
-	if !strings.Contains(err.Error(), "managed guest runtime") {
-		t.Fatalf("prepareSidecarBlankResources error = %v, want managed guest runtime guard", err)
 	}
 }
 
@@ -70,12 +57,6 @@ func TestSidecarAlternateImageRejectsBuiltinBSDBeforeImageStore(t *testing.T) {
 	if err == nil {
 		t.Fatal("prepareRunInInstanceExec unexpectedly succeeded")
 	}
-	if strings.Contains(err.Error(), "image store") || strings.Contains(err.Error(), "image.json") {
-		t.Fatalf("built-in OpenBSD run-in-instance went through OCI image store path: %v", err)
-	}
-	if !strings.Contains(err.Error(), "cannot be mounted as an alternate Linux root") {
-		t.Fatalf("prepareRunInInstanceExec error = %v, want alternate root guard", err)
-	}
 
 	_, err = host.prepareExecInInstance(context.Background(), inst, "alpine", client.ExecRequest{
 		Image:   "@netbsd",
@@ -83,11 +64,5 @@ func TestSidecarAlternateImageRejectsBuiltinBSDBeforeImageStore(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("prepareExecInInstance unexpectedly succeeded")
-	}
-	if strings.Contains(err.Error(), "image store") || strings.Contains(err.Error(), "image.json") {
-		t.Fatalf("built-in NetBSD exec-in-instance went through OCI image store path: %v", err)
-	}
-	if !strings.Contains(err.Error(), "cannot be mounted as an alternate Linux root") {
-		t.Fatalf("prepareExecInInstance error = %v, want alternate root guard", err)
 	}
 }

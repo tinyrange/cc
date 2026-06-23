@@ -15,6 +15,9 @@ import (
 	"j5.nz/cc/internal/virtio"
 )
 
+// These KVM boot tests consume unstructured firmware/kernel serial logs.
+// Substring checks here synchronize with guest prompts and markers rather than
+// freezing user-facing copy.
 func TestNetBSDManagedSessionExec(t *testing.T) {
 	if os.Getenv("CC_TEST_NETBSD_ROOTFS") == "" {
 		t.Skip("set CC_TEST_NETBSD_ROOTFS=1 to build and boot the full NetBSD rootfs")
