@@ -1,12 +1,30 @@
 package vm
 
 import (
+	"os"
+	"strconv"
+	"sync/atomic"
+
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/vmruntime"
 )
 
+var guestExecCounter atomic.Uint64
+
+func guestExecID() string {
+	return "exec-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(guestExecCounter.Add(1), 36)
+}
+
+func guestExecIDFor(id string) string {
+	if id != "" {
+		return id
+	}
+	return guestExecID()
+}
+
 func runExecRequest(req client.RunRequest) client.ExecRequest {
 	return client.ExecRequest{
+		ID:         guestExecIDFor(req.ID),
 		Command:    append([]string(nil), req.Command...),
 		Env:        append([]string(nil), req.Env...),
 		RootDir:    req.RootDir,

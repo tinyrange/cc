@@ -13,6 +13,7 @@ import (
 
 func TestResolveExecRequest(t *testing.T) {
 	got, err := ResolveExecRequest(client.ExecRequest{
+		ID:      "exec-7",
 		Command: []string{"tool", "arg"},
 		Env:     []string{"EXTRA=1"},
 		Stdin:   []byte("input"),
@@ -36,6 +37,9 @@ func TestResolveExecRequest(t *testing.T) {
 	}
 	if strings.Join(got.Command, " ") != "/bin/tool arg" {
 		t.Fatalf("command = %#v", got.Command)
+	}
+	if got.ID != "exec-7" {
+		t.Fatalf("id = %q", got.ID)
 	}
 	if got.WorkDir != "/work" {
 		t.Fatalf("workdir = %q", got.WorkDir)
@@ -90,6 +94,7 @@ func TestResolveExecRequestCanMarkHostResolved(t *testing.T) {
 
 func TestResolveRunRequestMarksResolvedAlternateRoot(t *testing.T) {
 	got, err := ResolveRunRequest(client.RunRequest{
+		ID:      "exec-9",
 		Command: []string{"tool"},
 		Env:     []string{"EXTRA=1"},
 		Stdin:   []byte("input"),
@@ -106,6 +111,9 @@ func TestResolveRunRequestMarksResolvedAlternateRoot(t *testing.T) {
 	}
 	if strings.Join(got.Command, " ") != "/bin/tool" {
 		t.Fatalf("command = %#v", got.Command)
+	}
+	if got.ID != "exec-9" {
+		t.Fatalf("id = %q", got.ID)
 	}
 	if got.RootDir != "/run/image" {
 		t.Fatalf("rootdir = %q", got.RootDir)

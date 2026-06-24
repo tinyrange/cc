@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"runtime"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"j5.nz/cc/internal/hv"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/builtin"
 	vmhost "j5.nz/cc/internal/vm/host"
 )
 
@@ -58,12 +60,13 @@ type imageSnapshotProvider interface {
 }
 
 type Manager struct {
-	mu           sync.Mutex
-	host         VMHost
-	supports     func() error
-	capabilities func() client.CapabilitiesResponse
-	running      map[string]*Machine
-	starting     map[string]struct{}
+	mu            sync.Mutex
+	host          VMHost
+	supports      func() error
+	capabilities  func() client.CapabilitiesResponse
+	running       map[string]*Machine
+	starting      map[string]struct{}
+	networkLeases map[string]managerNetworkLease
 }
 
 type Machine struct {
@@ -81,6 +84,11 @@ type Machine struct {
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
 	stopping     bool
+}
+
+type managerNetworkLease struct {
+	ip  net.IP
+	mac net.HardwareAddr
 }
 
 func NewManager() *Manager {
@@ -222,11 +230,13 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		return client.InstanceState{}, err
 	}
 	m.starting[id] = struct{}{}
+	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
 	inst, err := m.host.StartStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
+		m.releaseNetworkLease(id)
 		return client.InstanceState{}, err
 	}
 
@@ -303,6 +313,7 @@ func (m *Manager) StartBlankInstanceStream(
 		return client.InstanceState{}, err
 	}
 	m.starting[id] = struct{}{}
+	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
 	shares := append([]client.ShareMount(nil), req.Shares...)
@@ -310,12 +321,14 @@ func (m *Manager) StartBlankInstanceStream(
 	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
+		m.releaseNetworkLease(id)
 		return client.InstanceState{}, err
 	}
 	for _, share := range shares {
 		if err := inst.AddShare(ctx, share); err != nil {
 			_ = inst.Close()
 			m.clearStarting(id)
+			m.releaseNetworkLease(id)
 			return client.InstanceState{}, err
 		}
 	}
@@ -401,6 +414,7 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 	if m.running != nil && m.running[id] == machine {
 		delete(m.running, id)
 	}
+	delete(m.networkLeases, id)
 	m.mu.Unlock()
 	return nil
 }
@@ -438,6 +452,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 	id = instanceID(id)
 	m.mu.Lock()
 	machine := m.running[id]
+	stopping := machine != nil && machine.stopping
 	m.mu.Unlock()
 	if machine == nil {
 		if req.Image == "" {
@@ -448,31 +463,77 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		}
 		return m.host.RunStream(ctx, req, inputs, onEvent)
 	}
+	if stopping {
+		return stoppedVMError(id)
+	}
+	req.ID = guestExecID()
 	targetImage := strings.TrimSpace(req.Image)
 	if !sameRuntimeImage(targetImage, machine.image) {
-		return m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
+		err := m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
+		if err != nil && m.instanceIsStopping(id, machine) {
+			return stoppedVMError(id)
+		}
+		return err
 	}
 	for _, share := range req.Shares {
 		if err := machine.instance.AddShare(ctx, share); err != nil {
+			if m.instanceIsStopping(id, machine) {
+				return stoppedVMError(id)
+			}
 			return err
 		}
 	}
-	return machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	err := machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	if err != nil && m.instanceIsStopping(id, machine) {
+		return stoppedVMError(id)
+	}
+	return err
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	id = instanceID(id)
 	m.mu.Lock()
 	machine := m.running[id]
+	stopping := machine != nil && machine.stopping
 	m.mu.Unlock()
 	if machine == nil {
 		return fmt.Errorf("no VM %q is running", id)
 	}
+	if stopping {
+		return stoppedVMError(id)
+	}
+	req.ID = guestExecID()
 	targetImage := strings.TrimSpace(req.Image)
 	if vmhost.IsHostedInstance(machine.instance) || targetImage != "" {
-		return m.host.ExecInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
+		err := m.host.ExecInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
+		if err != nil && m.instanceIsStopping(id, machine) {
+			return stoppedVMError(id)
+		}
+		return err
 	}
-	return machine.instance.ExecStream(ctx, req, inputs, onEvent)
+	err := machine.instance.ExecStream(ctx, req, inputs, onEvent)
+	if err != nil && m.instanceIsStopping(id, machine) {
+		return stoppedVMError(id)
+	}
+	return err
+}
+
+func (m *Manager) instanceIsStopping(id string, machine *Machine) bool {
+	if machine == nil {
+		return false
+	}
+	select {
+	case <-machine.shutdownCh:
+		return true
+	default:
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return machine.stopping || m.running[id] != machine
+}
+
+func stoppedVMError(id string) error {
+	return fmt.Errorf("VM %q stopped", id)
 }
 
 func (m *Manager) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -666,6 +727,7 @@ func (m *Manager) watch(machine *Machine) {
 	if m.running != nil && m.running[machine.id] == machine {
 		delete(m.running, machine.id)
 	}
+	delete(m.networkLeases, machine.id)
 	machine.lastErr = err
 	machine.exitedAt = time.Now().UTC()
 }
@@ -682,6 +744,60 @@ func (m *Manager) clearStarting(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.starting, id)
+}
+
+func (m *Manager) ensureNetworkLeaseLocked(id, image string, cfg *client.NetworkConfig) *client.NetworkConfig {
+	if cfg == nil {
+		if !builtin.IsGuestImage(image) {
+			return nil
+		}
+		cfg = &client.NetworkConfig{Enabled: true}
+	}
+	if !cfg.Enabled {
+		return cfg
+	}
+	if strings.TrimSpace(cfg.GuestIPv4) != "" && strings.TrimSpace(cfg.GuestMAC) != "" {
+		return cfg
+	}
+	id = instanceID(id)
+	if m.networkLeases == nil {
+		m.networkLeases = make(map[string]managerNetworkLease)
+	}
+	lease, ok := m.networkLeases[id]
+	if !ok {
+		used := map[byte]bool{1: true}
+		for _, existing := range m.networkLeases {
+			if ip4 := existing.ip.To4(); ip4 != nil {
+				used[ip4[3]] = true
+			}
+		}
+		host := byte(2)
+		for ; host <= 254; host++ {
+			if !used[host] {
+				break
+			}
+		}
+		lease = managerNetworkLease{
+			ip:  net.IPv4(10, 42, 0, host),
+			mac: net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, host},
+		}
+		m.networkLeases[id] = lease
+	}
+	next := *cfg
+	if strings.TrimSpace(next.GuestIPv4) == "" {
+		next.GuestIPv4 = lease.ip.String()
+	}
+	if strings.TrimSpace(next.GuestMAC) == "" {
+		next.GuestMAC = lease.mac.String()
+	}
+	return &next
+}
+
+func (m *Manager) releaseNetworkLease(id string) {
+	id = instanceID(id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.networkLeases, id)
 }
 
 func instanceID(id string) string {

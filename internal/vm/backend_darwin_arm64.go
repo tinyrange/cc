@@ -146,7 +146,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return inst, err
 	}
 	start := time.Now()
-	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	network, err := newDarwinARM64NetworkRuntime(req.ID, req.Network)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +189,7 @@ func (b *runtimeBackend) StartBlankStream(
 		return inst, err
 	}
 	start := time.Now()
-	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	network, err := newDarwinARM64NetworkRuntime(req.ID, req.Network)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
 		return resp, err
 	}
-	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	network, err := newDarwinARM64NetworkRuntime(req.ID, req.Network)
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
