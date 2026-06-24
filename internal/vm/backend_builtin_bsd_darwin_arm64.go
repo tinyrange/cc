@@ -172,7 +172,7 @@ func (b *runtimeBackend) startBSDArm64ManagedStream(ctx context.Context, req cli
 	if def.BuildArtifact == nil {
 		return nil, fmt.Errorf("%s runtime root builder is not configured", displayName)
 	}
-	network, err := newDarwinARM64NetworkRuntime(managedBSDNetworkConfig(req.Network))
+	network, err := newDarwinARM64NetworkRuntime(req.ID, managedBSDNetworkConfig(req.Network))
 	if err != nil {
 		return nil, err
 	}

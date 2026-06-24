@@ -17,24 +17,49 @@ import (
 
 type darwinNetworkRuntime struct {
 	*networkRuntime
+	switchID string
+	closeFn  func() error
 }
 
-func newDarwinARM64NetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRuntime, error) {
+func newDarwinARM64NetworkRuntime(id string, cfg *client.NetworkConfig) (*darwinNetworkRuntime, error) {
 	if remote, err := newDarwinRemoteNetworkRuntime(cfg); err != nil || remote != nil {
 		return remote, err
 	}
+	lease, explicit := darwinSidecarLeaseFromConfig(id, cfg)
+	if !explicit {
+		lease = defaultDarwinSidecarSwitch.Register(id)
+	}
 	common, err := newNetworkRuntime(networkDeviceConfig{
+		ID:     lease.id,
 		Config: cfg,
-		IP:     net.IPv4(10, 42, 0, 2),
-		MAC:    net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02},
+		IP:     lease.ip,
+		MAC:    lease.mac,
 		Base:   arm64vm.NetBase,
 		Size:   arm64vm.NetSize,
 		IRQ:    arm64vm.NetIRQ,
+		TXHook: func(packet []byte) {
+			defaultDarwinSidecarSwitch.Forward(lease.id, packet)
+		},
 	})
 	if err != nil || common == nil {
+		if !explicit {
+			defaultDarwinSidecarSwitch.Unregister(lease.id)
+		}
 		return nil, err
 	}
-	return &darwinNetworkRuntime{networkRuntime: common}, nil
+	runtime := &darwinNetworkRuntime{networkRuntime: common, switchID: lease.id}
+	defaultDarwinSidecarSwitch.Attach(darwinSidecarEndpoint{
+		id:  lease.id,
+		ip:  lease.ip,
+		mac: lease.mac,
+		rx: func(frame []byte) {
+			copied := append([]byte(nil), frame...)
+			go func() {
+				_ = common.dev.EnqueueRxPacketOwned(copied)
+			}()
+		},
+	})
+	return runtime, nil
 }
 
 func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRuntime, error) {
@@ -58,6 +83,40 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 		return nil, fmt.Errorf("dial coordinator net backend: %w", err)
 	}
 	codec := virtio.NewNetPacketCodec(conn)
+	if strings.TrimSpace(os.Getenv(sidecarNetModeEnv)) == "bridge" {
+		common, err := newNetworkRuntime(networkDeviceConfig{
+			ID:     DefaultInstanceID,
+			Config: cfg,
+			IP:     ip,
+			MAC:    mac,
+			Base:   arm64vm.NetBase,
+			Size:   arm64vm.NetSize,
+			IRQ:    arm64vm.NetIRQ,
+			TXHook: func(packet []byte) {
+				_ = codec.Send(virtio.NetPacket{
+					Kind:     virtio.NetPacketTX,
+					VMID:     DefaultInstanceID,
+					DeviceID: "eth0",
+					Frame:    append([]byte(nil), packet...),
+				})
+			},
+		})
+		if err != nil {
+			_ = codec.Close()
+			return nil, err
+		}
+		if common == nil {
+			_ = codec.Close()
+			return nil, nil
+		}
+		go func() {
+			_ = virtio.ReceiveNetRXPackets(context.Background(), codec, common.dev)
+		}()
+		return &darwinNetworkRuntime{
+			networkRuntime: common,
+			closeFn:        codec.Close,
+		}, nil
+	}
 	dev := virtio.NewNet(arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ, mac, virtio.NewNetRemoteBackend(codec, DefaultInstanceID, "eth0"))
 	go func() {
 		_ = virtio.ReceiveNetRXPackets(context.Background(), codec, dev)
@@ -66,7 +125,30 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 		ip:  ip,
 		mac: mac,
 		dev: dev,
-	}}, nil
+	}, closeFn: codec.Close}, nil
+}
+
+func (n *darwinNetworkRuntime) Close() error {
+	if n == nil {
+		return nil
+	}
+	if n.switchID != "" {
+		defaultDarwinSidecarSwitch.Unregister(n.switchID)
+		n.switchID = ""
+	}
+	if n.networkRuntime == nil {
+		if n.closeFn != nil {
+			return n.closeFn()
+		}
+		return nil
+	}
+	err := n.networkRuntime.Close()
+	if n.closeFn != nil {
+		if closeErr := n.closeFn(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 func (n *darwinNetworkRuntime) guestInitConfig() *vmruntime.GuestNetworkConfig {

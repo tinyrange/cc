@@ -66,6 +66,7 @@ func ResolveExecRequest(req client.ExecRequest, resolver Resolver) (client.ExecR
 		skipResolve = true
 	}
 	return client.ExecRequest{
+		ID:          req.ID,
 		Kind:        req.Kind,
 		Command:     command,
 		Env:         env,
@@ -86,6 +87,7 @@ func ResolveExecRequest(req client.ExecRequest, resolver Resolver) (client.ExecR
 
 func ResolveRunRequest(req client.RunRequest, rootDir string, resolver Resolver) (client.ExecRequest, error) {
 	execReq := client.ExecRequest{
+		ID:         req.ID,
 		Command:    append([]string(nil), req.Command...),
 		Env:        append([]string(nil), req.Env...),
 		RootDir:    rootDir,
@@ -113,6 +115,7 @@ func ControlRequest(req client.ExecRequest, defaultWorkDir string) client.ExecRe
 		workDir = defaultWorkDir
 	}
 	return client.ExecRequest{
+		ID:        req.ID,
 		Kind:      req.Kind,
 		RootDir:   req.RootDir,
 		Path:      req.Path,
