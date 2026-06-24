@@ -129,7 +129,7 @@ def has_embedded_guestinit(binary: Path) -> bool:
     except OSError:
         return False
     # A wheel ccvm must not need a source checkout at runtime to boot a VM.
-    return data.count(b"\x7fELF") >= 2
+    return data.count(b"\x7fELF") >= 5
 
 
 def build_embedded_ccvm(destination: Path, root: Path) -> None:
@@ -137,8 +137,10 @@ def build_embedded_ccvm(destination: Path, root: Path) -> None:
     goarch = python_goarch()
     if goos is None or goarch is None:
         raise RuntimeError(f"cannot infer Go target for {platform.system()}/{platform.machine()}")
-    build_guestinit_payload(root, "arm64")
-    build_guestinit_payload(root, "amd64")
+    build_linux_guestinit_payload(root, "arm64")
+    build_linux_guestinit_payload(root, "amd64")
+    for bsd in ("openbsd", "freebsd", "netbsd"):
+        build_bsd_guestinit_payload(root, bsd, goarch)
     env = os.environ.copy()
     env.update({"CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch})
     proc = subprocess.run(
@@ -154,7 +156,7 @@ def build_embedded_ccvm(destination: Path, root: Path) -> None:
         raise RuntimeError(f"failed to build embedded ccvm binary: {detail}")
 
 
-def build_guestinit_payload(root: Path, goarch: str) -> None:
+def build_linux_guestinit_payload(root: Path, goarch: str) -> None:
     out_path = root / "build" / f"init-linux-{goarch}"
     embed_path = root / "internal" / "guestinit" / f"guest-init-linux-{goarch}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +173,26 @@ def build_guestinit_payload(root: Path, goarch: str) -> None:
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or f"exit status {proc.returncode}"
         raise RuntimeError(f"failed to build guest-init payload for {goarch}: {detail}")
+    shutil.copy2(out_path, embed_path)
+
+
+def build_bsd_guestinit_payload(root: Path, bsd: str, goarch: str) -> None:
+    out_path = root / "build" / f"guest-init-{bsd}-{goarch}"
+    embed_path = root / "internal" / bsd / "guestinit" / f"guest-init-{bsd}-{goarch}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update({"CGO_ENABLED": "0", "GOOS": bsd, "GOARCH": goarch})
+    proc = subprocess.run(
+        ["go", "build", "-o", str(out_path), f"./internal/cmd/{bsd}-init"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit status {proc.returncode}"
+        raise RuntimeError(f"failed to build {bsd}/{goarch} guest-init payload: {detail}")
     shutil.copy2(out_path, embed_path)
 
 

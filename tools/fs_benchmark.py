@@ -458,6 +458,23 @@ def build_guestinit_payloads() -> None:
         env.update({"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": goarch})
         subprocess.run(["go", "build", "-o", str(out), "./internal/cmd/init"], cwd=REPO_ROOT, env=env, check=True)
         embed.write_bytes(out.read_bytes())
+    goarch = host_goarch()
+    for bsd in ("openbsd", "freebsd", "netbsd"):
+        out = build_dir / f"guest-init-{bsd}-{goarch}"
+        embed = REPO_ROOT / "internal" / bsd / "guestinit" / f"guest-init-{bsd}-{goarch}"
+        env = os.environ.copy()
+        env.update({"CGO_ENABLED": "0", "GOOS": bsd, "GOARCH": goarch})
+        subprocess.run(["go", "build", "-o", str(out), f"./internal/cmd/{bsd}-init"], cwd=REPO_ROOT, env=env, check=True)
+        embed.write_bytes(out.read_bytes())
+
+
+def host_goarch() -> str:
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        return "amd64"
+    if machine in {"aarch64", "arm64"}:
+        return "arm64"
+    raise RuntimeError(f"unsupported host architecture for bundled BSD guest init: {platform.machine()}")
 
 
 def benchmark_args(label: str, work_dir: str, args: argparse.Namespace) -> list[str]:
