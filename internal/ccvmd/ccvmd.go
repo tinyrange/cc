@@ -77,6 +77,13 @@ type server struct {
 	cvmfsCacheDir string
 }
 
+type ServerOptions struct {
+	Kind             string
+	TokenPath        string
+	RegisterHandlers func(*http.ServeMux)
+	WrapHandler      func(http.Handler) http.Handler
+}
+
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
@@ -288,7 +295,7 @@ func newWatchdogLeaseID() (string, error) {
 }
 
 func Main(args []string) {
-	started, err := run(args)
+	started, err := RunServer(args, ServerOptions{})
 	if err == nil {
 		return
 	}
@@ -299,7 +306,7 @@ func Main(args []string) {
 	os.Exit(1)
 }
 
-func run(args []string) (bool, error) {
+func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
 	}
@@ -343,9 +350,12 @@ func run(args []string) (bool, error) {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{
-		Addr: l.Addr().String(),
-	}); err != nil {
+	hello := client.ServerHello{
+		Addr:      l.Addr().String(),
+		Kind:      opts.Kind,
+		TokenPath: opts.TokenPath,
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}
@@ -356,8 +366,15 @@ func run(args []string) (bool, error) {
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
+	if opts.RegisterHandlers != nil {
+		opts.RegisterHandlers(mux)
+	}
 
-	httpServer = http.Server{Handler: mux}
+	var handler http.Handler = mux
+	if opts.WrapHandler != nil {
+		handler = opts.WrapHandler(handler)
+	}
+	httpServer = http.Server{Handler: handler}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return true, fmt.Errorf("serve daemon API: %w", err)
 	}

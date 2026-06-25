@@ -15,23 +15,49 @@ import (
 )
 
 type Client struct {
-	url    string
-	dialer func() (net.Conn, error)
-	client http.Client
+	url       string
+	dialer    func() (net.Conn, error)
+	authToken string
+	client    http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
-	return &Client{
+	c := &Client{
 		url:    url,
 		dialer: dialer,
-		client: http.Client{
-			Transport: &http.Transport{
+	}
+	c.client = http.Client{
+		Transport: &authTransport{
+			base: &http.Transport{
 				Dial: func(_, _ string) (net.Conn, error) {
-					return dialer()
+					return c.dialer()
 				},
+			},
+			token: func() string {
+				return c.authToken
 			},
 		},
 	}
+	return c
+}
+
+type authTransport struct {
+	base  http.RoundTripper
+	token func() string
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != nil {
+		if token := strings.TrimSpace(t.token()); token != "" {
+			req = req.Clone(req.Context())
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
+func (c *Client) SetBearerToken(token string) {
+	c.authToken = strings.TrimSpace(token)
 }
 
 func (c *Client) HealthCheck() error {
@@ -62,6 +88,15 @@ func (c *Client) Shutdown() error {
 		return decodeErrorResponse(resp)
 	}
 	return nil
+}
+
+func (c *Client) RouteExists(path string) bool {
+	resp, err := c.client.Get(c.url + path)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode != http.StatusNotFound
 }
 
 func (c *Client) KernelStatus() (KernelState, error) {
@@ -386,6 +421,7 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 	if err != nil {
 		return err
 	}
+	c.applyWebSocketAuth(cfg)
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
@@ -539,6 +575,7 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 	if err != nil {
 		return err
 	}
+	c.applyWebSocketAuth(cfg)
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
@@ -572,6 +609,18 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		return sendErrValue
 	}
 	return err
+}
+
+func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
+	if cfg == nil {
+		return
+	}
+	if token := strings.TrimSpace(c.authToken); token != "" {
+		if cfg.Header == nil {
+			cfg.Header = http.Header{}
+		}
+		cfg.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 func (c *Client) ExecStreamIn(id string, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
