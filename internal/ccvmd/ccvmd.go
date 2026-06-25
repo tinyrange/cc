@@ -80,8 +80,19 @@ type server struct {
 type ServerOptions struct {
 	Kind             string
 	TokenPath        string
-	RegisterHandlers func(*http.ServeMux)
+	RegisterHandlers func(*http.ServeMux, RuntimeView)
 	WrapHandler      func(http.Handler) http.Handler
+}
+
+type RuntimeView interface {
+	InstanceStatuses() []client.InstanceState
+}
+
+func (s *server) InstanceStatuses() []client.InstanceState {
+	if s == nil || s.vms == nil {
+		return nil
+	}
+	return s.vms.Statuses()
 }
 
 type watchdogController struct {
@@ -310,6 +321,9 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
 	}
+	if strings.TrimSpace(opts.TokenPath) != "" {
+		defer os.Remove(opts.TokenPath)
+	}
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 
@@ -367,7 +381,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
 	if opts.RegisterHandlers != nil {
-		opts.RegisterHandlers(mux)
+		opts.RegisterHandlers(mux, srvState)
 	}
 
 	var handler http.Handler = mux
