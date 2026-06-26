@@ -1,6 +1,7 @@
 package ccvmd
 
 import (
+	"context"
 	"net/http"
 
 	"j5.nz/cc/client"
@@ -16,6 +17,7 @@ type ServerOptions struct {
 
 type RuntimeView interface {
 	InstanceStatuses() []client.InstanceState
+	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 func Main(args []string) {
