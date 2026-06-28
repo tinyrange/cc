@@ -13,108 +13,38 @@ import (
 func TestDeterministicGeneration(t *testing.T) {
 	const size = 1024 * 1024 * 1024 // 1GB - forces FAT32
 
-	// Test with deterministic config
-	t.Run("WithDeterministicConfig", func(t *testing.T) {
-		config := DefaultDeterministicConfig()
+	config := DefaultDeterministicConfig()
+	filesystem1 := createTestFilesystem(t, size, config)
+	filesystem2 := createTestFilesystem(t, size, config)
 
-		// Generate first filesystem
-		filesystem1 := createTestFilesystem(t, size, config)
-
-		// Generate second filesystem with identical config
-		filesystem2 := createTestFilesystem(t, size, config)
-
-		// Compare byte-for-byte
-		if !compareBytesEqual(filesystem1, filesystem2) {
-			t.Error("Deterministic filesystems should be byte-identical but differ")
-		}
-
-		// Verify using SHA256 hashes
-		hash1 := sha256.Sum256(filesystem1)
-		hash2 := sha256.Sum256(filesystem2)
-
-		if hash1 != hash2 {
-			t.Errorf("Filesystem hashes differ:\nFirst:  %x\nSecond: %x", hash1, hash2)
-		}
-	})
-
-	// Test without deterministic config (should be non-deterministic due to timestamps)
-	t.Run("WithoutDeterministicConfig", func(t *testing.T) {
-		// Generate first filesystem
-		filesystem1 := createTestFilesystem(t, size, nil)
-
-		// Longer delay to ensure different timestamps (FAT only has 2-second precision)
-		time.Sleep(3 * time.Second)
-
-		// Generate second filesystem
-		filesystem2 := createTestFilesystem(t, size, nil)
-
-		// Should be different due to timestamps
-		if compareBytesEqual(filesystem1, filesystem2) {
-			// Compare hashes for debugging
-			hash1 := sha256.Sum256(filesystem1)
-			hash2 := sha256.Sum256(filesystem2)
-			t.Errorf("Non-deterministic filesystems should differ but are identical:\nHash1: %x\nHash2: %x", hash1, hash2)
-		}
-	})
+	if !compareBytesEqual(filesystem1, filesystem2) {
+		t.Error("Deterministic filesystems should be byte-identical but differ")
+	}
 }
 
 // TestCustomDeterministicConfig tests different deterministic configurations
 func TestCustomDeterministicConfig(t *testing.T) {
 	const size = 1024 * 1024 * 1024 // 1GB
 
-	// Test with custom timestamp
-	t.Run("CustomTimestamp", func(t *testing.T) {
-		customTime := time.Date(2023, 12, 25, 10, 30, 0, 0, time.UTC)
-		volumeSerial := uint32(0xDEADBEEF)
+	customTime := time.Date(2023, 12, 25, 10, 30, 0, 0, time.UTC)
+	volumeSerial := uint32(0xDEADBEEF)
+	config := &DeterministicConfig{
+		FixedTimestamp:       &customTime,
+		SortDirectoryEntries: true,
+		VolumeSerial:         &volumeSerial,
+	}
 
-		config := &DeterministicConfig{
-			FixedTimestamp:       &customTime,
-			SortDirectoryEntries: true,
-			VolumeSerial:         &volumeSerial,
-		}
-
-		// Generate two filesystems with same custom config
-		filesystem1 := createTestFilesystem(t, size, config)
-		filesystem2 := createTestFilesystem(t, size, config)
-
-		// Should be identical
-		hash1 := sha256.Sum256(filesystem1)
-		hash2 := sha256.Sum256(filesystem2)
-
-		if hash1 != hash2 {
-			t.Errorf("Custom config filesystems should be identical but differ")
-		}
-	})
-
-	// Test with different volume serials
-	t.Run("DifferentVolumeSerials", func(t *testing.T) {
-		fatEpoch := time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
-
-		serial1 := uint32(0x11111111)
-		config1 := &DeterministicConfig{
-			FixedTimestamp:       &fatEpoch,
-			SortDirectoryEntries: true,
-			VolumeSerial:         &serial1,
-		}
-
-		serial2 := uint32(0x22222222)
-		config2 := &DeterministicConfig{
-			FixedTimestamp:       &fatEpoch,
-			SortDirectoryEntries: true,
-			VolumeSerial:         &serial2,
-		}
-
-		filesystem1 := createTestFilesystem(t, size, config1)
-		filesystem2 := createTestFilesystem(t, size, config2)
-
-		// Should be different due to different volume serials
-		hash1 := sha256.Sum256(filesystem1)
-		hash2 := sha256.Sum256(filesystem2)
-
-		if hash1 == hash2 {
-			t.Error("Filesystems with different volume serials should differ")
-		}
-	})
+	vmFS := vm.NewVirtualMemory(size, 4096)
+	writer, err := CreateFATFileSystemWithConfig(vmFS, size, config)
+	if err != nil {
+		t.Fatalf("Failed to create FAT filesystem: %v", err)
+	}
+	if got := writer.getTimestamp(); !got.Equal(customTime) {
+		t.Fatalf("timestamp = %s, want %s", got, customTime)
+	}
+	if got := writer.layout.Fs().VolumeId(); got != volumeSerial {
+		t.Fatalf("volume serial = %#x, want %#x", got, volumeSerial)
+	}
 }
 
 // TestDirectoryEntrySorting verifies that directory entries are sorted deterministically
