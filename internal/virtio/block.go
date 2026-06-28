@@ -29,6 +29,8 @@ const (
 	blockStatusOK     = 0
 	blockStatusIOErr  = 1
 	blockStatusUnsupp = 2
+
+	virtqAvailNoInterrupt = 1
 )
 
 type BlockBackend interface {
@@ -59,6 +61,7 @@ type Block struct {
 	configGeneration uint32
 	queue            queue
 	legacy           bool
+	scratch          []byte
 }
 
 func NewBlock(base, size uint64, irq uint32, backend BlockBackend) *Block {
@@ -191,6 +194,9 @@ func (b *Block) Write(addr uint64, size int, value uint64) error {
 			if value == 0 {
 				b.queue.lastAvailIdx = 0
 				b.queue.usedIdx = 0
+				b.queue.noNotify = false
+			} else if b.driverFeatures&featureRingEventIdx != 0 {
+				return b.writeAvailEventLocked(&b.queue)
 			}
 		}
 	case regGuestPageSize, regQueueAlign:
@@ -332,34 +338,72 @@ func (b *Block) processQueueLocked() error {
 		return errors.New("virtio-block backend is nil")
 	}
 
-	header, err := b.mem.ReadIPA(q.availAddr, 4)
-	if err != nil {
-		return err
-	}
-	availIdx := binary.LittleEndian.Uint16(header[2:4])
-	for q.lastAvailIdx != availIdx {
-		slot := q.lastAvailIdx % q.size
-		entry, err := b.mem.ReadIPA(q.availAddr+4+uint64(slot)*2, 2)
+	oldUsedIdx := q.usedIdx
+	interruptNeeded := false
+	availFlags := uint16(0)
+	for {
+		flags, availIdx, err := b.readAvailHeaderLocked(q)
 		if err != nil {
 			return err
 		}
-		head := binary.LittleEndian.Uint16(entry)
-		written, err := b.processChainLocked(q, head)
+		availFlags = flags
+		for q.lastAvailIdx != availIdx {
+			slot := q.lastAvailIdx % q.size
+			head, err := b.readAvailRingEntryLocked(q, slot)
+			if err != nil {
+				return err
+			}
+			written, err := b.processChainLocked(q, head)
+			if err != nil {
+				return err
+			}
+			if err := b.writeUsedLocked(q, head, written); err != nil {
+				return err
+			}
+			q.lastAvailIdx++
+			interruptNeeded = true
+		}
+		if b.driverFeatures&featureRingEventIdx == 0 {
+			break
+		}
+		if err := b.writeAvailEventLocked(q); err != nil {
+			return err
+		}
+		_, latestAvailIdx, err := b.readAvailHeaderLocked(q)
 		if err != nil {
 			return err
 		}
-		if err := b.writeUsedLocked(q, head, written); err != nil {
-			return err
+		if q.lastAvailIdx == latestAvailIdx {
+			break
 		}
-		q.lastAvailIdx++
 	}
 
+	if !interruptNeeded || !b.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
+		return nil
+	}
 	b.interruptStatus |= intVring
 	return b.updateIRQLocked()
 }
 
+func (b *Block) readAvailHeaderLocked(q *queue) (uint16, uint16, error) {
+	raw, err := b.mem.ReadIPA(q.availAddr, 4)
+	if err != nil {
+		return 0, 0, err
+	}
+	return binary.LittleEndian.Uint16(raw[0:2]), binary.LittleEndian.Uint16(raw[2:4]), nil
+}
+
+func (b *Block) readAvailRingEntryLocked(q *queue, slot uint16) (uint16, error) {
+	raw, err := b.mem.ReadIPA(q.availAddr+4+uint64(slot)*2, 2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(raw), nil
+}
+
 func (b *Block) processChainLocked(q *queue, head uint16) (uint32, error) {
-	descs, err := b.descriptorChainLocked(q, head)
+	var descStorage [8]descriptor
+	descs, err := b.descriptorChainLocked(q, head, descStorage[:0])
 	if err != nil {
 		return 0, err
 	}
@@ -394,7 +438,7 @@ func (b *Block) processChainLocked(q *queue, head uint16) (uint32, error) {
 				status = blockStatusIOErr
 				break
 			}
-			buf := make([]byte, desc.length)
+			buf := b.scratchLocked(int(desc.length))
 			n, readErr := b.backend.ReadAt(buf, offset)
 			if readErr != nil && !errors.Is(readErr, io.EOF) {
 				status = blockStatusIOErr
@@ -416,9 +460,27 @@ func (b *Block) processChainLocked(q *queue, head uint16) (uint32, error) {
 				status = blockStatusIOErr
 				break
 			}
-			buf, err := b.mem.ReadIPA(desc.addr, int(desc.length))
-			if err != nil {
-				return used, err
+			var buf []byte
+			if mem, ok := b.mem.(guestMemorySlicer); ok {
+				var err error
+				buf, err = mem.SliceIPA(desc.addr, int(desc.length))
+				if err != nil {
+					buf = nil
+				}
+			}
+			if buf == nil {
+				if mem, ok := b.mem.(guestMemoryReaderInto); ok {
+					buf = b.scratchLocked(int(desc.length))
+					if err := mem.ReadIPAInto(desc.addr, buf); err != nil {
+						return used, err
+					}
+				} else {
+					var err error
+					buf, err = b.mem.ReadIPA(desc.addr, int(desc.length))
+					if err != nil {
+						return used, err
+					}
+				}
 			}
 			n, writeErr := b.backend.WriteAt(buf, offset)
 			if writeErr != nil || n != len(buf) {
@@ -436,7 +498,8 @@ func (b *Block) processChainLocked(q *queue, head uint16) (uint32, error) {
 				status = blockStatusIOErr
 				break
 			}
-			buf := make([]byte, desc.length)
+			buf := b.scratchLocked(int(desc.length))
+			clear(buf)
 			copy(buf, id)
 			if err := b.mem.WriteIPA(desc.addr, buf); err != nil {
 				return used, err
@@ -454,13 +517,24 @@ func (b *Block) processChainLocked(q *queue, head uint16) (uint32, error) {
 	return used, nil
 }
 
-func (b *Block) descriptorChainLocked(q *queue, head uint16) ([]descriptor, error) {
+func (b *Block) scratchLocked(size int) []byte {
+	if cap(b.scratch) < size {
+		b.scratch = make([]byte, size)
+	}
+	return b.scratch[:size]
+}
+
+func (b *Block) descriptorChainLocked(q *queue, head uint16, descs []descriptor) ([]descriptor, error) {
 	index := head
-	descs := make([]descriptor, 0, 4)
 	for i := uint16(0); i < q.size; i++ {
 		desc, err := b.readDescriptorLocked(q, index)
 		if err != nil {
 			return nil, err
+		}
+		if len(descs) == cap(descs) {
+			grown := make([]descriptor, len(descs), len(descs)*2)
+			copy(grown, descs)
+			descs = grown
 		}
 		descs = append(descs, desc)
 		if desc.flags&descFNext == 0 {
@@ -489,16 +563,40 @@ func (b *Block) readDescriptorLocked(q *queue, index uint16) (descriptor, error)
 
 func (b *Block) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	slot := q.usedIdx % q.size
-	elem := make([]byte, 8)
+	var elem [8]byte
 	binary.LittleEndian.PutUint32(elem[0:4], uint32(head))
 	binary.LittleEndian.PutUint32(elem[4:8], usedLen)
-	if err := b.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem); err != nil {
+	if err := b.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem[:]); err != nil {
 		return err
 	}
 	q.usedIdx++
-	idx := make([]byte, 2)
-	binary.LittleEndian.PutUint16(idx, q.usedIdx)
-	return b.mem.WriteIPA(q.usedAddr+2, idx)
+	var idx [2]byte
+	binary.LittleEndian.PutUint16(idx[:], q.usedIdx)
+	return b.mem.WriteIPA(q.usedAddr+2, idx[:])
+}
+
+func (b *Block) writeAvailEventLocked(q *queue) error {
+	if q.size == 0 || q.usedAddr == 0 {
+		return nil
+	}
+	var raw [2]byte
+	binary.LittleEndian.PutUint16(raw[:], q.lastAvailIdx)
+	return b.mem.WriteIPA(q.usedAddr+4+uint64(q.size)*8, raw[:])
+}
+
+func (b *Block) shouldInterruptLocked(q *queue, oldUsedIdx, newUsedIdx, availFlags uint16) bool {
+	if oldUsedIdx == newUsedIdx {
+		return false
+	}
+	if b.driverFeatures&featureRingEventIdx == 0 {
+		return availFlags&virtqAvailNoInterrupt == 0
+	}
+	raw, err := b.mem.ReadIPA(q.availAddr+4+uint64(q.size)*2, 2)
+	if err != nil {
+		return true
+	}
+	usedEvent := binary.LittleEndian.Uint16(raw)
+	return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
 }
 
 func (b *Block) configureLegacyQueueLocked(pfn uint32) {
@@ -526,11 +624,11 @@ func (b *Block) configBytesLocked() []byte {
 }
 
 func (b *Block) legacyFeaturesLocked() uint64 {
-	return b.deviceFeaturesLocked() &^ featureVersion1
+	return b.deviceFeaturesLocked() &^ featureVersion1 &^ featureRingEventIdx
 }
 
 func (b *Block) deviceFeaturesLocked() uint64 {
-	features := featureVersion1 | blockFeatureSegMax | blockFeatureFlush
+	features := featureVersion1 | featureRingEventIdx | blockFeatureSegMax | blockFeatureFlush
 	if !b.DisableSizeMax {
 		features |= blockFeatureSizeMax
 	}

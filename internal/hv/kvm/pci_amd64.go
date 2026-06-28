@@ -5,6 +5,7 @@ package kvm
 import (
 	"encoding/binary"
 
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -15,14 +16,21 @@ const (
 	pciConfigType2Size   = 0x1000
 
 	pciVendorQumranet = 0x1af4
+	pciVendorRedHat   = 0x1b36
 
 	pciVirtioNetDeviceID   = 0x1000
 	pciVirtioBlockDeviceID = 0x1001
+	pciNVMeDeviceID        = 0x0010
 )
 
 type pciIOHandler interface {
 	ReadLegacy(offset uint16, size int) (uint64, error)
 	WriteLegacy(offset uint16, size int, value uint64) error
+}
+
+type pciMMIOHandler interface {
+	ReadMMIO(offset uint64, size int) (uint64, error)
+	WriteMMIO(offset uint64, size int, value uint64) error
 }
 
 type PCIBus struct {
@@ -47,8 +55,11 @@ type PCIDevice struct {
 	IRQPin        uint8
 	IOBAR         uint32
 	IOSize        uint32
+	MMIOBAR       uint64
+	MMIOSize      uint64
 	Command       uint16
 	legacyIO      pciIOHandler
+	mmio          pciMMIOHandler
 	barProbeValue bool
 }
 
@@ -91,6 +102,28 @@ func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.N
 		IOBAR:       uint32(ioBase),
 		IOSize:      0x100,
 		legacyIO:    netdev,
+	}
+}
+
+func NewNVMePCIDevice(dev uint8, mmioBase uint64, irq uint8, ctrl *nvme.Controller) *PCIDevice {
+	if ctrl != nil {
+		ctrl.IRQ = uint32(irq)
+		ctrl.Base = mmioBase
+		ctrl.Size = nvme.MMIOSize
+	}
+	return &PCIDevice{
+		Device:      dev,
+		VendorID:    pciVendorRedHat,
+		DeviceID:    pciNVMeDeviceID,
+		SubsystemID: pciNVMeDeviceID,
+		Class:       0x01,
+		Subclass:    0x08,
+		ProgIF:      0x02,
+		IRQLine:     irq,
+		IRQPin:      1,
+		MMIOBAR:     mmioBase,
+		MMIOSize:    nvme.MMIOSize,
+		mmio:        ctrl,
 	}
 }
 
@@ -180,6 +213,27 @@ func (b *PCIBus) HandleIO(ioExit IOExit) (bool, error) {
 	return false, nil
 }
 
+func (b *PCIBus) HandleMMIO(mmio MMIOExit) (bool, uint64, error) {
+	if b == nil {
+		return false, 0, nil
+	}
+	for _, dev := range b.devices {
+		if dev == nil || dev.mmio == nil || dev.MMIOSize == 0 {
+			continue
+		}
+		if mmio.Addr < dev.MMIOBAR || mmio.Addr+uint64(mmio.Len) > dev.MMIOBAR+dev.MMIOSize {
+			continue
+		}
+		offset := mmio.Addr - dev.MMIOBAR
+		if mmio.Write {
+			return true, 0, dev.mmio.WriteMMIO(offset, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := dev.mmio.ReadMMIO(offset, int(mmio.Len))
+		return true, value, err
+	}
+	return false, 0, nil
+}
+
 func (b *PCIBus) readConfig(offset uint8, dst []byte) {
 	dev := b.selectedDevice()
 	b.readDeviceConfig(dev, offset, dst)
@@ -247,7 +301,13 @@ func (d *PCIDevice) buildConfig(cfg []byte) {
 	cfg[0x0b] = d.Class
 	cfg[0x0e] = 0
 	if d.barProbeValue {
-		binary.LittleEndian.PutUint32(cfg[0x10:0x14], ^(d.IOSize-1)|0x1)
+		if d.MMIOSize != 0 {
+			binary.LittleEndian.PutUint32(cfg[0x10:0x14], uint32(^(d.MMIOSize-1)&0xfffffff0))
+		} else {
+			binary.LittleEndian.PutUint32(cfg[0x10:0x14], ^(d.IOSize-1)|0x1)
+		}
+	} else if d.MMIOSize != 0 {
+		binary.LittleEndian.PutUint32(cfg[0x10:0x14], uint32(d.MMIOBAR&0xfffffff0))
 	} else {
 		binary.LittleEndian.PutUint32(cfg[0x10:0x14], d.IOBAR|0x1)
 	}
@@ -269,6 +329,18 @@ func (d *PCIDevice) writeConfigByte(offset uint8, value byte) {
 			return
 		}
 		d.barProbeValue = false
+		if d.MMIOSize != 0 {
+			if offset == 0x10 {
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffffffff00) | uint64(value&0xf0)
+			} else if offset == 0x11 {
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffffff00ff) | uint64(value)<<8
+			} else if offset == 0x12 {
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffff00ffff) | uint64(value)<<16
+			} else if offset == 0x13 {
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffff00ffffff) | uint64(value)<<24
+			}
+			return
+		}
 		if offset == 0x10 {
 			d.IOBAR = (d.IOBAR & 0xffffff00) | uint32(value&0xfc)
 		} else if offset == 0x11 {
@@ -288,6 +360,19 @@ func handleBootIOWithPCI(uartIO func(IOExit) error, pci *PCIBus, ioExit IOExit) 
 		return err
 	}
 	return uartIO(ioExit)
+}
+
+func handleBootMMIOWithPCI(vm *VM, vcpuIndex int, pci *PCIBus, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+	if handled, value, err := pci.HandleMMIO(mmio); handled || err != nil {
+		if err != nil {
+			return err
+		}
+		if !mmio.Write {
+			vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
+		}
+		return nil
+	}
+	return handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, netdev, mmio)
 }
 
 func readLittleValue(data []byte) uint64 {

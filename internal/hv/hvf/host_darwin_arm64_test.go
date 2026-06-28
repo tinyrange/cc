@@ -28,16 +28,56 @@ func TestNormalizeLinuxManagedMachineDefaultsSpec(t *testing.T) {
 
 func TestHVFHostRejectsUnsupportedManagedGuest(t *testing.T) {
 	_, err := (Host{}).Start(context.Background(), managedhost.StartRequest{
-		Spec: machine.Spec{Guest: "FreeBSD", Boot: machine.BootSpec{Kind: "freebsd"}},
+		Spec: machine.Spec{Guest: "Plan9", Boot: machine.BootSpec{Kind: "plan9"}},
 	}, nil)
 	if err == nil {
 		t.Fatalf("Start unsupported guest error = %v", err)
 	}
 }
 
+func TestHVFManagedGuestKindRecognizesBSD(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec machine.Spec
+		want string
+	}{
+		{
+			name: "openbsd guest",
+			spec: machine.Spec{Guest: "OpenBSD"},
+			want: "openbsd",
+		},
+		{
+			name: "freebsd boot",
+			spec: machine.Spec{Boot: machine.BootSpec{Kind: "freebsd"}},
+			want: "freebsd",
+		},
+		{
+			name: "netbsd guest with boot",
+			spec: machine.Spec{Guest: "NetBSD", Boot: machine.BootSpec{Kind: "netbsd"}},
+			want: "netbsd",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedGuestKind(tc.spec); got != tc.want {
+				t.Fatalf("managedGuestKind = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHVFHostRejectsUnexpectedLinuxAttachments(t *testing.T) {
 	_, err := (Host{}).Start(context.Background(), managedhost.StartRequest{
 		Spec:        machine.Spec{Guest: "Linux", Boot: machine.BootSpec{Kind: "linux"}},
+		Attachments: "bad",
+	}, nil)
+	if err == nil {
+		t.Fatalf("Start unexpected attachments error = %v", err)
+	}
+}
+
+func TestHVFHostRejectsUnexpectedBSDAttachments(t *testing.T) {
+	_, err := (Host{}).Start(context.Background(), managedhost.StartRequest{
+		Spec:        machine.Spec{Guest: "FreeBSD", Boot: machine.BootSpec{Kind: "freebsd"}},
 		Attachments: "bad",
 	}, nil)
 	if err == nil {

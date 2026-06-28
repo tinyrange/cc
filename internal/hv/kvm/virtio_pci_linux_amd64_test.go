@@ -14,6 +14,7 @@ import (
 
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/linux/initramfs"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -104,6 +105,92 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 	}
 }
 
+func TestLinuxBootsWithNVMeBlock(t *testing.T) {
+	if os.Getenv("CC_TEST_LINUX_KVM_NVME") == "" {
+		t.Skip("set CC_TEST_LINUX_KVM_NVME=1 to run Linux NVMe block KVM smoke test")
+	}
+	if hostCPUHasFlag("hypervisor") {
+		t.Skip("NVMe block smoke test requires bare-metal KVM")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cacheRoot := filepath.Join(t.TempDir(), "kernel")
+	if existing := strings.TrimSpace(os.Getenv("CC_TEST_KERNEL_CACHE")); existing != "" {
+		cacheRoot = existing
+	}
+	kernelManager := alpine.NewManager(cacheRoot)
+	if err := kernelManager.EnsureWithProgress(ctx, nil); err != nil {
+		t.Fatalf("prepare Alpine Linux kernel: %v", err)
+	}
+	kernel, err := kernelManager.ReadKernel()
+	if err != nil {
+		t.Fatalf("read kernel: %v", err)
+	}
+	modules, err := kernelManager.PlanModuleLoad(
+		[]string{"CONFIG_BLK_DEV_NVME"},
+		map[string]string{
+			"CONFIG_BLK_DEV_NVME": "kernel/drivers/nvme/host/nvme.ko.gz",
+		},
+	)
+	if err != nil {
+		t.Fatalf("plan NVMe block modules: %v", err)
+	}
+
+	initBin := buildBlockInit(t, nvmeBlockInitSource)
+	files := []initramfs.File{
+		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/sys", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/modules", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
+		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
+		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
+		{Path: "/init", Mode: 0o755, Data: initBin, Type: initramfs.TypeRegular},
+	}
+	for _, mod := range modules {
+		files = append(files, initramfs.File{
+			Path: "/modules/" + mod.Name + ".ko",
+			Mode: 0o644,
+			Data: mod.Data,
+			Type: initramfs.TypeRegular,
+		})
+	}
+	var loadOrder strings.Builder
+	for _, mod := range modules {
+		loadOrder.WriteString(mod.Name)
+		loadOrder.WriteString(".ko\n")
+	}
+	files = append(files, initramfs.File{
+		Path: "/modules/load-order",
+		Mode: 0o644,
+		Data: []byte(loadOrder.String()),
+		Type: initramfs.TypeRegular,
+	})
+	initrd, err := initramfs.Build(files)
+	if err != nil {
+		t.Fatalf("build initramfs: %v", err)
+	}
+
+	disk := newTestDisk(16 * 1024 * 1024)
+	ctrl := nvme.NewController(disk)
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bootCancel()
+	success := "NVME_BLOCK_OK\n"
+	serial, err := bootToConditionWithBlockDevices(bootCtx, kernel, initrd, 512, true, nil, nil, nil, nil, ctrl, func(serial string) bool {
+		return disk.hasAt(1024, success)
+	})
+	if err != nil {
+		t.Fatalf("boot Linux with NVMe block: %v\nserial:\n%s", err, serial)
+	}
+	if !disk.hasAt(1024, success) {
+		t.Fatalf("disk missing success marker; serial:\n%s", serial)
+	}
+	if got := disk.stringAt(512, 14); got != "cc-nvme-block\n" {
+		t.Fatalf("disk write = %q", got)
+	}
+}
+
 type testDisk struct {
 	mu   sync.Mutex
 	data []byte
@@ -149,10 +236,14 @@ func (d *testDisk) stringAt(off int64, size int) string {
 }
 
 func buildVirtioPCIBlockInit(t *testing.T) []byte {
+	return buildBlockInit(t, virtioPCIBlockInitSource)
+}
+
+func buildBlockInit(t *testing.T, source string) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "init.c")
-	if err := os.WriteFile(src, []byte(virtioPCIBlockInitSource), 0o644); err != nil {
+	if err := os.WriteFile(src, []byte(source), 0o644); err != nil {
 		t.Fatalf("write init source: %v", err)
 	}
 	out := filepath.Join(dir, "init")
@@ -166,6 +257,19 @@ func buildVirtioPCIBlockInit(t *testing.T) []byte {
 	}
 	return data
 }
+
+var nvmeBlockInitSource = strings.NewReplacer(
+	`strncmp(entry->d_name, "vd", 2)`,
+	`strncmp(entry->d_name, "nvme", 4)`,
+	"virtio block device not found",
+	"NVMe block device not found",
+	"cc-pci-block\n",
+	"cc-nvme-block\n",
+	"VIRTIO_PCI_BLOCK_OK\n",
+	"NVME_BLOCK_OK\n",
+	"VIRTIO_PCI_BLOCK_OK",
+	"NVME_BLOCK_OK",
+).Replace(virtioPCIBlockInitSource)
 
 const virtioPCIBlockInitSource = `#define _GNU_SOURCE
 #include <dirent.h>
