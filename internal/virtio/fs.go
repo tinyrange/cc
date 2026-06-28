@@ -531,6 +531,7 @@ func (f *FS) Close() error {
 			irq := f.irq
 			f.irq = nil
 			f.mem = nil
+			f.clearQueueCachesLocked()
 			f.interruptStatus = 0
 			f.irqHigh = false
 			f.mu.Unlock()
@@ -655,6 +656,7 @@ func (f *FS) Attach(mem GuestMemory, irq IRQController) {
 	defer f.mu.Unlock()
 	f.mem = mem
 	f.irq = irq
+	f.clearQueueCachesLocked()
 }
 
 func (f *FS) Contains(addr uint64, size int) bool {
@@ -2786,6 +2788,14 @@ func (f *FS) resetLocked() {
 	f.configGeneration++
 	f.kickPollActive = false
 	f.resetQueueStateLocked()
+}
+
+func (f *FS) clearQueueCachesLocked() {
+	for i := range f.queues {
+		f.queues[i].descMem = nil
+		f.queues[i].availMem = nil
+		f.queues[i].usedMem = nil
+	}
 }
 
 func (f *FS) deviceFeaturesLocked() uint64 {

@@ -92,6 +92,7 @@ func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []b
 		return "", err
 	}
 	defer vm.Close()
+	defer closeFSDevices(fsdevs)
 
 	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {

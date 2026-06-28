@@ -214,6 +214,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		return "", err
 	}
 	defer vm.Close()
+	defer closeFSDevices(fsdevs)
 
 	mem, err := vm.MapAnonymousMemory(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
 	if err != nil {
