@@ -148,8 +148,8 @@ func buildLinuxKVMNVMeInit(t *testing.T) []byte {
 func findKVMNVMePerfSerialLine(serial, prefix string) string {
 	for _, line := range strings.Split(serial, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, prefix) {
-			return line
+		if idx := strings.Index(line, prefix); idx >= 0 {
+			return line[idx:]
 		}
 	}
 	return ""
