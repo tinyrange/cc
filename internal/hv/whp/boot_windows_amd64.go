@@ -613,6 +613,9 @@ func (p *bootPlatform) ReadMMIO(addr uint64, data []byte) error {
 		putUint64(data, value)
 		return nil
 	}
+	if handled, err := p.pci.ReadMMIO(addr, data); handled || err != nil {
+		return err
+	}
 	if p.ioapic.Read(addr, data) {
 		return nil
 	}
@@ -640,6 +643,9 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	}
 	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
 		return p.netdev.Write(addr, len(data), readUint64(data))
+	}
+	if handled, err := p.pci.WriteMMIO(addr, data); handled || err != nil {
+		return err
 	}
 	if handled, route, pending := p.ioapic.Write(addr, data); handled {
 		if pending {

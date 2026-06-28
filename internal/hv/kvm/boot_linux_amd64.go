@@ -55,7 +55,7 @@ func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []by
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -64,16 +64,7 @@ func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initr
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, nil, func(serial string) bool {
-		return strings.Contains(serial, marker)
-	})
-}
-
-func BootInitramfsToMarkerWithPCIBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *virtio.Block) (string, error) {
-	if strings.TrimSpace(marker) == "" {
-		return "", fmt.Errorf("boot marker is required")
-	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -82,20 +73,20 @@ func BootInitramfsToMarkerWithNVMeBlock(ctx context.Context, kernel []byte, init
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithBlockDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, nil, block, func(serial string) bool {
+	return bootToConditionWithNVMeBlock(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, nil, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, done)
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, block *virtio.Block, done func(string) bool) (string, error) {
-	return bootToConditionWithBlockDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, block, nil, done)
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, done func(string) bool) (string, error) {
+	return bootToConditionWithNVMeBlock(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, nil, done)
 }
 
-func bootToConditionWithBlockDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, block *virtio.Block, nvmeBlock *nvme.Controller, done func(string) bool) (string, error) {
+func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, nvmeBlock *nvme.Controller, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -121,10 +112,6 @@ func bootToConditionWithBlockDevices(ctx context.Context, kernel []byte, initrd 
 		netdev.Attach(vm, vm)
 	}
 	var pci *PCIBus
-	if block != nil {
-		block.Attach(vm, vm)
-		pci = NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
-	}
 	if nvmeBlock != nil {
 		nvmeBlock.Attach(vm, vm)
 		pci = NewPCIBus(NewNVMePCIDevice(1, 0xfeb00000, 10, nvmeBlock))
@@ -139,11 +126,11 @@ func bootToConditionWithBlockDevices(ctx context.Context, kernel []byte, initrd 
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
-	if block != nil || nvmeBlock != nil {
+	if nvmeBlock != nil {
 		extraCmdline = append(extraCmdline, "acpi=off", "pci=conf1")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
-	if block == nil && nvmeBlock == nil {
+	if nvmeBlock == nil {
 		extraCmdline = append(extraCmdline, linuxKVMHostKernelArgs()...)
 	}
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{

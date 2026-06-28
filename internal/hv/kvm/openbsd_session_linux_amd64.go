@@ -51,7 +51,7 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 			Control:  machine.ControlSpec{Kind: "tcp", Port: bsdControlPort},
 			Network:  &machine.NetworkSpec{GuestIPv4: cfg.GuestIPv4.String(), MAC: cfg.GuestMAC.String()},
 			Devices: []machine.DeviceSpec{
-				{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10},
+				{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10},
 				{Kind: "virtio-net", Name: "net0", Bus: "pci", Slot: 2, IOBase: 0x1100, IRQ: 11},
 			},
 		},
@@ -171,7 +171,9 @@ func runOpenBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci
 				return err
 			}
 		case ExitMMIO:
-			return fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write)
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+				return fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
+			}
 		case ExitHLT:
 			return fmt.Errorf("OpenBSD guest halted\nserial:\n%s", serialOut.String())
 		case ExitShutdown:

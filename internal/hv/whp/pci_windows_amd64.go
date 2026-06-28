@@ -5,6 +5,7 @@ package whp
 import (
 	"encoding/binary"
 
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -15,14 +16,20 @@ const (
 	pciConfigType2Size   = 0x1000
 
 	pciVendorQumranet = 0x1af4
+	pciVendorRedHat   = 0x1b36
 
-	pciVirtioNetDeviceID   = 0x1000
-	pciVirtioBlockDeviceID = 0x1001
+	pciVirtioNetDeviceID = 0x1000
+	pciNVMeDeviceID      = 0x0010
 )
 
 type pciIOHandler interface {
 	ReadLegacy(offset uint16, size int) (uint64, error)
 	WriteLegacy(offset uint16, size int, value uint64) error
+}
+
+type pciMMIOHandler interface {
+	ReadMMIO(offset uint64, size int) (uint64, error)
+	WriteMMIO(offset uint64, size int, value uint64) error
 }
 
 type PCIBus struct {
@@ -47,32 +54,16 @@ type PCIDevice struct {
 	IRQPin        uint8
 	IOBAR         uint32
 	IOSize        uint32
+	MMIOBAR       uint64
+	MMIOSize      uint64
 	Command       uint16
 	legacyIO      pciIOHandler
+	mmio          pciMMIOHandler
 	barProbeValue bool
 }
 
 func NewPCIBus(devices ...*PCIDevice) *PCIBus {
 	return &PCIBus{devices: devices}
-}
-
-func NewVirtioBlockPCIDevice(dev uint8, ioBase uint16, irq uint8, block *virtio.Block) *PCIDevice {
-	if block != nil {
-		block.IRQ = uint32(irq)
-	}
-	return &PCIDevice{
-		Device:      dev,
-		VendorID:    pciVendorQumranet,
-		DeviceID:    pciVirtioBlockDeviceID,
-		SubsystemID: 2,
-		Class:       0x01,
-		Subclass:    0x80,
-		IRQLine:     irq,
-		IRQPin:      1,
-		IOBAR:       uint32(ioBase),
-		IOSize:      0x100,
-		legacyIO:    block,
-	}
 }
 
 func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.Net) *PCIDevice {
@@ -91,6 +82,28 @@ func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.N
 		IOBAR:       uint32(ioBase),
 		IOSize:      0x100,
 		legacyIO:    netdev,
+	}
+}
+
+func NewNVMePCIDevice(dev uint8, mmioBase uint64, irq uint8, ctrl *nvme.Controller) *PCIDevice {
+	if ctrl != nil {
+		ctrl.IRQ = uint32(irq)
+		ctrl.Base = mmioBase
+		ctrl.Size = nvme.MMIOSize
+	}
+	return &PCIDevice{
+		Device:      dev,
+		VendorID:    pciVendorRedHat,
+		DeviceID:    pciNVMeDeviceID,
+		SubsystemID: pciNVMeDeviceID,
+		Class:       0x01,
+		Subclass:    0x08,
+		ProgIF:      0x02,
+		IRQLine:     irq,
+		IRQPin:      1,
+		MMIOBAR:     mmioBase,
+		MMIOSize:    nvme.MMIOSize,
+		mmio:        ctrl,
 	}
 }
 
@@ -182,6 +195,43 @@ func (b *PCIBus) handleIO(port uint16, data []byte, write bool) (bool, error) {
 	return false, nil
 }
 
+func (b *PCIBus) ReadMMIO(addr uint64, data []byte) (bool, error) {
+	if b == nil {
+		return false, nil
+	}
+	for _, dev := range b.devices {
+		if dev == nil || dev.mmio == nil || dev.MMIOSize == 0 {
+			continue
+		}
+		if addr < dev.MMIOBAR || addr+uint64(len(data)) > dev.MMIOBAR+dev.MMIOSize {
+			continue
+		}
+		value, err := dev.mmio.ReadMMIO(addr-dev.MMIOBAR, len(data))
+		if err != nil {
+			return true, err
+		}
+		writeLittleValue(data, value)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (b *PCIBus) WriteMMIO(addr uint64, data []byte) (bool, error) {
+	if b == nil {
+		return false, nil
+	}
+	for _, dev := range b.devices {
+		if dev == nil || dev.mmio == nil || dev.MMIOSize == 0 {
+			continue
+		}
+		if addr < dev.MMIOBAR || addr+uint64(len(data)) > dev.MMIOBAR+dev.MMIOSize {
+			continue
+		}
+		return true, dev.mmio.WriteMMIO(addr-dev.MMIOBAR, len(data), readLittleValue(data))
+	}
+	return false, nil
+}
+
 func (b *PCIBus) readConfig(offset uint8, dst []byte) {
 	b.readDeviceConfig(b.selectedDevice(), offset, dst)
 }
@@ -248,7 +298,13 @@ func (d *PCIDevice) buildConfig(cfg []byte) {
 	cfg[0x0b] = d.Class
 	cfg[0x0e] = 0
 	if d.barProbeValue {
-		binary.LittleEndian.PutUint32(cfg[0x10:0x14], ^(d.IOSize-1)|0x1)
+		if d.MMIOSize != 0 {
+			binary.LittleEndian.PutUint32(cfg[0x10:0x14], uint32(^(d.MMIOSize-1)&0xfffffff0))
+		} else {
+			binary.LittleEndian.PutUint32(cfg[0x10:0x14], ^(d.IOSize-1)|0x1)
+		}
+	} else if d.MMIOSize != 0 {
+		binary.LittleEndian.PutUint32(cfg[0x10:0x14], uint32(d.MMIOBAR&0xfffffff0))
 	} else {
 		binary.LittleEndian.PutUint32(cfg[0x10:0x14], d.IOBAR|0x1)
 	}
@@ -270,6 +326,19 @@ func (d *PCIDevice) writeConfigByte(offset uint8, value byte) {
 			return
 		}
 		d.barProbeValue = false
+		if d.MMIOSize != 0 {
+			switch offset {
+			case 0x10:
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffffffff00) | uint64(value&0xf0)
+			case 0x11:
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffffff00ff) | uint64(value)<<8
+			case 0x12:
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffffff00ffff) | uint64(value)<<16
+			case 0x13:
+				d.MMIOBAR = (d.MMIOBAR & 0xffffffff00ffffff) | uint64(value)<<24
+			}
+			return
+		}
 		switch offset {
 		case 0x10:
 			d.IOBAR = (d.IOBAR & 0xffffff00) | uint32(value&0xfc)

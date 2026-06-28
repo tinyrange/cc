@@ -77,40 +77,7 @@ func TestLinuxHVFNVMeBlockPerformance(t *testing.T) {
 	t.Log(disk.stats("NVMe"))
 }
 
-func TestLinuxHVFVirtioBlockPerformance(t *testing.T) {
-	if os.Getenv("CC_TEST_DARWIN_HVF_VIRTIO_BLOCK_LINUX_PERF") == "" {
-		t.Skip("set CC_TEST_DARWIN_HVF_VIRTIO_BLOCK_LINUX_PERF=1 to run Darwin HVF Linux virtio-block performance test")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	kernel, modules := prepareLinuxBlockKernel(t, ctx, blockDeviceVirtio)
-	initrd := buildLinuxBlockInitramfs(t, modules, true, "vd")
-
-	disk := newHVFNVMeLinuxDisk(512 * 1024 * 1024)
-	block := virtio.NewBlock(arm64vm.RootFSBase, arm64vm.RootFSSize, arm64vm.RootFSIRQ, disk)
-	serialOut, err := bootLinuxArm64WithHVFVirtioBlock(ctx, kernel, initrd, block, func(serial string) bool {
-		return strings.Contains(serial, "HVF_NVME_LINUX_PERF_OK")
-	})
-	if err != nil {
-		t.Fatalf("boot Linux with HVF virtio-block perf: %v\nserial:\n%s", err, serialOut)
-	}
-	if line := findSerialLine(serialOut, "BLOCK_PERF "); line != "" {
-		t.Log(strings.Replace(line, "BLOCK_PERF", "VIRTIO_BLOCK_PERF", 1))
-	} else {
-		t.Fatalf("missing BLOCK_PERF line\nserial:\n%s", serialOut)
-	}
-	t.Log(disk.stats("virtio-block"))
-}
-
-type linuxBlockDevice string
-
-const (
-	blockDeviceNVMe   linuxBlockDevice = "nvme"
-	blockDeviceVirtio linuxBlockDevice = "virtio"
-)
-
-func prepareLinuxBlockKernel(t *testing.T, ctx context.Context, device linuxBlockDevice) ([]byte, []alpine.Module) {
+func prepareLinuxBlockKernel(t *testing.T, ctx context.Context) ([]byte, []alpine.Module) {
 	t.Helper()
 	cacheRoot := filepath.Join(t.TempDir(), "kernel")
 	if existing := strings.TrimSpace(os.Getenv("CC_TEST_KERNEL_CACHE")); existing != "" {
@@ -124,20 +91,9 @@ func prepareLinuxBlockKernel(t *testing.T, ctx context.Context, device linuxBloc
 	if err != nil {
 		t.Fatalf("read kernel: %v", err)
 	}
-	configVars := []string{"CONFIG_BLK_DEV_NVME"}
-	moduleMap := map[string]string{
-		"CONFIG_BLK_DEV_NVME": "kernel/drivers/nvme/host/nvme.ko.gz",
-	}
-	if device == blockDeviceVirtio {
-		configVars = []string{"CONFIG_VIRTIO_MMIO", "CONFIG_VIRTIO_BLK"}
-		moduleMap = map[string]string{
-			"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
-			"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
-		}
-	}
 	modules, err := kernelManager.PlanModuleLoad(
-		configVars,
-		moduleMap,
+		[]string{"CONFIG_BLK_DEV_NVME"},
+		map[string]string{"CONFIG_BLK_DEV_NVME": "kernel/drivers/nvme/host/nvme.ko.gz"},
 	)
 	if err != nil {
 		t.Fatalf("plan Linux block modules: %v", err)
@@ -214,7 +170,7 @@ func buildLinuxBlockInitramfs(t *testing.T, modules []alpine.Module, perf bool, 
 
 func prepareLinuxNVMeKernel(t *testing.T, ctx context.Context) ([]byte, []alpine.Module) {
 	t.Helper()
-	return prepareLinuxBlockKernel(t, ctx, blockDeviceNVMe)
+	return prepareLinuxBlockKernel(t, ctx)
 }
 
 func buildLinuxNVMeInitramfs(t *testing.T, modules []alpine.Module, perf bool) []byte {
@@ -328,113 +284,6 @@ func bootLinuxArm64WithHVFNVMe(ctx context.Context, kernel, initrd []byte, ctrl 
 			}
 			if halt {
 				return serialOut.String(), fmt.Errorf("guest halted before NVMe marker")
-			}
-		default:
-			pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
-			return serialOut.String(), fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x",
-				DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress))
-		}
-		if done(serialOut.String()) {
-			return serialOut.String(), nil
-		}
-	}
-}
-
-func bootLinuxArm64WithHVFVirtioBlock(ctx context.Context, kernel, initrd []byte, block *virtio.Block, done func(string) bool) (string, error) {
-	vm, err := NewVMWithOptions(ctx, VMOptions{CPUs: 1})
-	if err != nil {
-		return "", err
-	}
-	defer vm.Close()
-
-	mem, err := vm.MapAnonymousMemory(uintptr(arm64vm.MemorySizeBytes(512)), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
-	if err != nil {
-		return "", fmt.Errorf("map guest memory: %w", err)
-	}
-
-	var serialOut bytes.Buffer
-	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, &serialOut)
-	uart.AttachIRQ(vm, arm64vm.UARTSPI)
-	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
-	rng.Attach(vm, vm)
-	block.Attach(vm, vm)
-
-	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
-		MemoryMB:   512,
-		NumCPUs:    1,
-		Dmesg:      true,
-		ExtraNodes: []fdt.Node{block.DeviceTreeNode(), rng.DeviceTreeNode()},
-	})
-	if err != nil {
-		return "", fmt.Errorf("prepare boot: %w", err)
-	}
-	if err := vm.ConfigureLinuxBootState(plan.EntryGPA, plan.StackTopGPA, plan.DeviceTreeGPA); err != nil {
-		return "", err
-	}
-
-	runner := newVMRunManager(vm)
-	for {
-		if err := ctx.Err(); err != nil {
-			if done(serialOut.String()) {
-				return serialOut.String(), nil
-			}
-			return serialOut.String(), err
-		}
-		runRes, err, stalled := runner.Run(ctx, 5*time.Second)
-		if stalled {
-			continue
-		}
-		if err != nil {
-			return serialOut.String(), err
-		}
-		if done(serialOut.String()) {
-			return serialOut.String(), nil
-		}
-		if runRes == nil || runRes.exit == nil {
-			return serialOut.String(), fmt.Errorf("vcpu returned nil exit info")
-		}
-		exitInfo := runRes.exit
-		vcpuIndex := runRes.index
-		if exitInfo.Reason == hvExitReasonVTimerActivated {
-			if err := injectVirtualTimerPPI(vm, vcpuIndex); err != nil {
-				return serialOut.String(), err
-			}
-			continue
-		}
-		if exitInfo.Reason == hvExitReasonCanceled {
-			continue
-		}
-		if exitInfo.Reason != hvExitReasonException {
-			return serialOut.String(), fmt.Errorf("unexpected exit reason %v", exitInfo.Reason)
-		}
-		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
-		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, nil, exitInfo); err != nil {
-				addr := uint64(exitInfo.Exception.PhysicalAddress)
-				if block.Contains(addr, 1) {
-					if err := handleBSDBlockDataAbort(vm, vcpuIndex, block, exitInfo); err != nil {
-						return serialOut.String(), err
-					}
-					continue
-				}
-				return serialOut.String(), err
-			}
-		case ExceptionClassSystemRegister:
-			handled, err := vm.HandleSystemInstructionForVCPU(vcpuIndex, exitInfo.Exception.Syndrome)
-			if err != nil {
-				return serialOut.String(), err
-			}
-			if !handled {
-				pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
-				return serialOut.String(), fmt.Errorf("unsupported system instruction pc=%#x syndrome=%#x", pc, exitInfo.Exception.Syndrome)
-			}
-		case ExceptionClassHVC64:
-			halt, err := handleContainerHVC(vm, vcpuIndex)
-			if err != nil {
-				return serialOut.String(), err
-			}
-			if halt {
-				return serialOut.String(), fmt.Errorf("guest halted before virtio-block marker")
 			}
 		default:
 			pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)

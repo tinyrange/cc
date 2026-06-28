@@ -7,59 +7,7 @@ import (
 	"testing"
 
 	"j5.nz/cc/internal/nvme"
-	"j5.nz/cc/internal/virtio"
 )
-
-func TestPCIBusExposesVirtioBlockLegacyIOBAR(t *testing.T) {
-	block := virtio.NewBlock(0, 0x1000, 10, nil)
-	bus := NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
-
-	writePCIAddress(t, bus, 0, 1, 0, 0)
-	data := readPort(t, bus, pciConfigDataPort, 4)
-	if vendor := binary.LittleEndian.Uint16(data[0:2]); vendor != pciVendorQumranet {
-		t.Fatalf("vendor = %#x", vendor)
-	}
-	if device := binary.LittleEndian.Uint16(data[2:4]); device != pciVirtioBlockDeviceID {
-		t.Fatalf("device = %#x", device)
-	}
-
-	writePCIAddress(t, bus, 0, 1, 0, 0x10)
-	data = readPort(t, bus, pciConfigDataPort, 4)
-	if bar := binary.LittleEndian.Uint32(data); bar != 0x1001 {
-		t.Fatalf("bar = %#x", bar)
-	}
-
-	writePort(t, bus, pciConfigDataPort, []byte{0xff, 0xff, 0xff, 0xff})
-	data = readPort(t, bus, pciConfigDataPort, 4)
-	if mask := binary.LittleEndian.Uint32(data); mask != 0xffffff01 {
-		t.Fatalf("bar mask = %#x", mask)
-	}
-
-	writePCIAddress(t, bus, 0, 1, 0, 0x3c)
-	data = readPort(t, bus, pciConfigDataPort, 2)
-	if data[0] != 10 || data[1] != 1 {
-		t.Fatalf("interrupt line/pin = %v", data[:2])
-	}
-}
-
-func TestPCIBusExposesType2ConfigSpace(t *testing.T) {
-	block := virtio.NewBlock(0, 0x1000, 10, nil)
-	bus := NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
-
-	writePort(t, bus, pciConfigAddressPort, []byte{0xf0})
-	writePort(t, bus, pciConfigAddressPort+2, []byte{0})
-	data := readPort(t, bus, pciConfigType2Port|0x100, 4)
-	if vendor := binary.LittleEndian.Uint16(data[0:2]); vendor != pciVendorQumranet {
-		t.Fatalf("type 2 vendor = %#x", vendor)
-	}
-	if device := binary.LittleEndian.Uint16(data[2:4]); device != pciVirtioBlockDeviceID {
-		t.Fatalf("type 2 device = %#x", device)
-	}
-	data = readPort(t, bus, pciConfigType2Port|0x110, 4)
-	if bar := binary.LittleEndian.Uint32(data); bar != 0x1001 {
-		t.Fatalf("type 2 bar = %#x", bar)
-	}
-}
 
 func TestNVMePCIDeviceConfigUsesMemoryBAR(t *testing.T) {
 	ctrl := nvme.NewController(nil)

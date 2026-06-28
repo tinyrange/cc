@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -73,7 +72,6 @@ type bsdManagedConfig struct {
 	BootKind            string
 	MemoryBase          uint64
 	BootArgs            string
-	NVMeRoot            bool
 	FreeBSDVirtioQuirks bool
 	NetBSDVirtioQuirks  bool
 }
@@ -100,7 +98,6 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 		OwnNetStack: ownStack,
 		BootKind:    "openbsd",
 		MemoryBase:  arm64vm.MemoryBase,
-		NVMeRoot:    darwinArm64NVMeRootEnabled(),
 	}, onEvent)
 }
 
@@ -126,7 +123,6 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		OwnNetStack:         ownStack,
 		BootKind:            "freebsd",
 		MemoryBase:          arm64vm.MemoryBase,
-		NVMeRoot:            darwinArm64NVMeRootEnabled(),
 		FreeBSDVirtioQuirks: true,
 	}, onEvent)
 }
@@ -153,7 +149,6 @@ func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onE
 		OwnNetStack:        ownStack,
 		BootKind:           "netbsd",
 		MemoryBase:         netBSDArm64MemoryBase,
-		NVMeRoot:           darwinArm64NVMeRootEnabled(),
 		NetBSDVirtioQuirks: true,
 	}, onEvent)
 }
@@ -225,17 +220,9 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	}
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
-	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, cfg.Root)
-	block.DisableSizeMax = cfg.FreeBSDVirtioQuirks
-	block.LegacyMMIO = cfg.NetBSDVirtioQuirks
-	block.Attach(vm, vm)
-	var pci *hvfPCIHost
-	var nvmeBlock *nvme.Controller
-	if cfg.NVMeRoot {
-		nvmeBlock = nvme.NewController(cfg.Root)
-		nvmeBlock.Attach(vm, vm)
-		pci = newHVFPCIHost(newHVFNVMePCIDevice(1, arm64vm.NVMeBase, arm64vm.NVMeIRQ, nvmeBlock))
-	}
+	nvmeBlock := nvme.NewController(cfg.Root)
+	nvmeBlock.Attach(vm, vm)
+	pci := newHVFPCIHost(newHVFNVMePCIDevice(1, arm64vm.NVMeBase, arm64vm.NVMeIRQ, nvmeBlock))
 	if cfg.FreeBSDVirtioQuirks {
 		cfg.NetDevice.DisableMergeRX = true
 		cfg.NetDevice.HeaderLength = 12
@@ -248,7 +235,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.LegacyMMIO = cfg.NetBSDVirtioQuirks
 	rng.Attach(vm, vm)
-	rootNodes := bsdRootBlockNodes(block, pci)
+	rootNodes := []fdt.Node{pci.DeviceTreeNode()}
 
 	switch cfg.BootKind {
 	case "openbsd":
@@ -321,7 +308,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	go func() {
 		defer close(closeDone)
 		defer vmForRun.Close()
-		done.finish(runBSDManagedVM(runCtx, vmForRun, cfg.GuestName, uart, block, pci, cfg.NetDevice, rng, serialOut))
+		done.finish(runBSDManagedVM(runCtx, vmForRun, cfg.GuestName, uart, pci, cfg.NetDevice, rng, serialOut))
 	}()
 
 	var control net.Conn
@@ -486,7 +473,7 @@ func setupNetBSDBootState(vm *VM, plan *netbsdarm64.BootPlan) error {
 	return nil
 }
 
-func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial.UART8250, block *virtio.Block, pci *hvfPCIHost, netdev *virtio.Net, rng *virtio.RNG, serialOut *serialTranscript) error {
+func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial.UART8250, pci *hvfPCIHost, netdev *virtio.Net, rng *virtio.RNG, serialOut *serialTranscript) error {
 	cancelDone := make(chan struct{})
 	defer close(cancelDone)
 	go func() {
@@ -497,7 +484,7 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 		}
 	}()
 
-	go answerBSDPrompts(ctx, guestName, uart, serialOut, pci != nil)
+	go answerBSDPrompts(ctx, guestName, uart, serialOut)
 
 	runner := newVMRunManager(vm)
 	for {
@@ -539,12 +526,7 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 					}
 					continue
 				}
-				if !block.Contains(addr, 1) {
-					return err
-				}
-				if err := handleBSDBlockDataAbort(vm, vcpuIndex, block, exitInfo); err != nil {
-					return err
-				}
+				return err
 			}
 		case ExceptionClassSystemRegister:
 			handled, err := vm.HandleSystemInstructionForVCPU(vcpuIndex, exitInfo.Exception.Syndrome)
@@ -570,22 +552,6 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 			return fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x\nserial:\n%s",
 				DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String())
 		}
-	}
-}
-
-func bsdRootBlockNodes(block *virtio.Block, pci *hvfPCIHost) []fdt.Node {
-	if pci != nil {
-		return []fdt.Node{pci.DeviceTreeNode()}
-	}
-	return []fdt.Node{block.DeviceTreeNode()}
-}
-
-func darwinArm64NVMeRootEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CC_DARWIN_ARM64_NVME_ROOT"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
 	}
 }
 
@@ -618,36 +584,7 @@ func handleBSDPCIDataAbort(vm *VM, vcpuIndex int, pci *hvfPCIHost, exitInfo *Vcp
 	return vm.AdvanceProgramCounterForVCPU(vcpuIndex)
 }
 
-func handleBSDBlockDataAbort(vm *VM, vcpuIndex int, block *virtio.Block, exitInfo *VcpuExit) error {
-	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
-	if err != nil {
-		return err
-	}
-	addr := uint64(exitInfo.Exception.PhysicalAddress)
-	if !block.Contains(addr, info.SizeBytes) {
-		return fmt.Errorf("unhandled MMIO access addr=%#x size=%d write=%v", addr, info.SizeBytes, info.Write)
-	}
-	if info.Write {
-		value, err := readAbortValue(vm, vcpuIndex, info)
-		if err != nil {
-			return err
-		}
-		if err := block.Write(addr, info.SizeBytes, value); err != nil {
-			return err
-		}
-	} else {
-		value, err := block.Read(addr, info.SizeBytes)
-		if err != nil {
-			return err
-		}
-		if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
-			return err
-		}
-	}
-	return vm.AdvanceProgramCounterForVCPU(vcpuIndex)
-}
-
-func answerBSDPrompts(ctx context.Context, guestName string, uart *serial.UART8250, serialOut *serialTranscript, nvmeRoot bool) {
+func answerBSDPrompts(ctx context.Context, guestName string, uart *serial.UART8250, serialOut *serialTranscript) {
 	var answeredRoot atomic.Bool
 	var answeredSwap atomic.Bool
 	var answeredMountroot atomic.Bool
@@ -679,11 +616,7 @@ func answerBSDPrompts(ctx context.Context, guestName string, uart *serial.UART82
 			}
 			if !answeredMountroot.Load() && strings.Contains(serial, "mountroot>") {
 				answeredMountroot.Store(true)
-				root := "ufs:/dev/vtbd0\n"
-				if nvmeRoot {
-					root = "ufs:/dev/nda0\n"
-				}
-				_ = uart.InjectRXBytes([]byte(root))
+				_ = uart.InjectRXBytes([]byte("ufs:/dev/nda0\n"))
 			}
 		}
 	}

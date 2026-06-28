@@ -18,9 +18,8 @@ const (
 	pciVendorQumranet = 0x1af4
 	pciVendorRedHat   = 0x1b36
 
-	pciVirtioNetDeviceID   = 0x1000
-	pciVirtioBlockDeviceID = 0x1001
-	pciNVMeDeviceID        = 0x0010
+	pciVirtioNetDeviceID = 0x1000
+	pciNVMeDeviceID      = 0x0010
 )
 
 type pciIOHandler interface {
@@ -65,25 +64,6 @@ type PCIDevice struct {
 
 func NewPCIBus(devices ...*PCIDevice) *PCIBus {
 	return &PCIBus{devices: devices}
-}
-
-func NewVirtioBlockPCIDevice(dev uint8, ioBase uint16, irq uint8, block *virtio.Block) *PCIDevice {
-	if block != nil {
-		block.IRQ = uint32(irq)
-	}
-	return &PCIDevice{
-		Device:      dev,
-		VendorID:    pciVendorQumranet,
-		DeviceID:    pciVirtioBlockDeviceID,
-		SubsystemID: 2,
-		Class:       0x01,
-		Subclass:    0x80,
-		IRQLine:     irq,
-		IRQPin:      1,
-		IOBAR:       uint32(ioBase),
-		IOSize:      0x100,
-		legacyIO:    block,
-	}
 }
 
 func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.Net) *PCIDevice {

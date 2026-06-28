@@ -184,7 +184,7 @@ func bootBSDArm64WithHVFNVMeRoot(ctx context.Context, guestName string, kernel [
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- runBSDManagedVM(runCtx, vm, guestName, uart, nil, pci, nil, rng, serialOut)
+		done <- runBSDManagedVM(runCtx, vm, guestName, uart, pci, nil, rng, serialOut)
 	}()
 	defer func() {
 		cancel()

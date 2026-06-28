@@ -26,6 +26,7 @@ import (
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/nvme"
 	openbsdguestinit "j5.nz/cc/internal/openbsd/guestinit"
 	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/virtio"
@@ -57,7 +58,7 @@ func TestBootOpenBSD79BSDRDToSerial(t *testing.T) {
 	}
 }
 
-func TestBootOpenBSD79BSDRDWithVirtioPCIBlock(t *testing.T) {
+func TestBootOpenBSD79BSDRDWithNVMe(t *testing.T) {
 	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
 		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
 	}
@@ -81,19 +82,19 @@ func TestBootOpenBSD79BSDRDWithVirtioPCIBlock(t *testing.T) {
 	if n, err := disk.WriteAt(diskData, 0); err != nil || n != len(diskData) {
 		t.Fatalf("seed disk: n=%d err=%v", n, err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, disk)
+	block := nvme.NewController(disk)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlock(ctx, kernel, 256, "vioblk0 at virtio", block)
+	serial, err := BootOpenBSDKernelToMarkerWithNVMe(ctx, kernel, 256, "nvme0 at pci", block)
 	if err != nil {
-		t.Fatalf("boot OpenBSD with virtio-pci block: %v\nserial:\n%s", err, serial)
+		t.Fatalf("boot OpenBSD with NVMe block: %v\nserial:\n%s", err, serial)
 	}
-	if !strings.Contains(serial, "vioblk0 at virtio") {
-		t.Fatalf("serial did not contain vioblk attachment:\n%s", serial)
+	if !strings.Contains(serial, "nvme0 at pci") {
+		t.Fatalf("serial did not contain NVMe attachment:\n%s", serial)
 	}
 }
 
-func TestBootOpenBSD79RegularKernelWithVirtioPCIBlock(t *testing.T) {
+func TestBootOpenBSD79RegularKernelWithNVMe(t *testing.T) {
 	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
 		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
 	}
@@ -117,13 +118,13 @@ func TestBootOpenBSD79RegularKernelWithVirtioPCIBlock(t *testing.T) {
 	if n, err := disk.WriteAt(diskData, 0); err != nil || n != len(diskData) {
 		t.Fatalf("seed disk: n=%d err=%v", n, err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, disk)
+	block := nvme.NewController(disk)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
 	answeredDump := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 256, "Automatic boot in progress", block, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMeConsole(ctx, kernel, 256, "Automatic boot in progress", block, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -168,13 +169,13 @@ func TestBootOpenBSD79RegularKernelWithGeneratedFFSRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build FFS root: %v", err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
 	answeredDump := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 512, "OPENBSD_GO_INIT_OK", block, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMeConsole(ctx, kernel, 512, "OPENBSD_GO_INIT_OK", block, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -216,14 +217,14 @@ func TestBootOpenBSD79RegularKernelWithVirtioPCINet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build FFS root: %v", err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	netdev := virtio.NewNet(0, 0x1000, 11, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
 	answeredDump := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockNetConsole(ctx, kernel, 512, "OPENBSD_VIO0_FOUND", block, netdev, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMENetConsole(ctx, kernel, 512, "OPENBSD_VIO0_FOUND", block, netdev, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -299,12 +300,12 @@ func TestBootOpenBSD79RegularKernelWithVirtioPCINetControl(t *testing.T) {
 		}
 		accepted <- string(buf[:n])
 	}()
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockNetConsole(ctx, kernel, 768, "OPENBSD_NET_CONTROL_OK", block, netdev, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMENetConsole(ctx, kernel, 768, "OPENBSD_NET_CONTROL_OK", block, netdev, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device:") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -621,13 +622,13 @@ func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build FFS root: %v", err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
 	answeredDump := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 512, "OPENBSD_GO_INIT_OK", block, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMeConsole(ctx, kernel, 512, "OPENBSD_GO_INIT_OK", block, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -668,12 +669,12 @@ func TestBootOpenBSD79RegularKernelWithFullBaseSetRootAndShellInit(t *testing.T)
 	if err != nil {
 		t.Fatalf("build full base-set FFS root: %v", err)
 	}
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	answeredRoot := false
 	answeredSwap := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 768, "OPENBSD_FULL_BASE_INIT_OK", block, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMeConsole(ctx, kernel, 768, "OPENBSD_FULL_BASE_INIT_OK", block, func(serial string) []byte {
 		if !answeredRoot && strings.Contains(serial, "root device:") {
 			answeredRoot = true
 			return []byte("sd0a\n")
@@ -745,12 +746,12 @@ func TestOpenBSD79FsckFFSGeneratedFullBaseSetRoot(t *testing.T) {
 
 func assertOpenBSDFFSReadOnlyFsckClean(t *testing.T, kernel []byte, region fsimage.FilesystemRegion, memoryMB uint64, marker string) {
 	t.Helper()
-	block := virtio.NewBlock(0, 0x1000, 10, region)
+	block := nvme.NewController(region)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	answeredShell := false
 	ranFsck := false
-	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, memoryMB, marker, block, func(serial string) []byte {
+	serial, err := BootOpenBSDKernelToMarkerWithNVMeConsole(ctx, kernel, memoryMB, marker, block, func(serial string) []byte {
 		if !answeredShell && strings.Contains(serial, "(I)nstall") {
 			answeredShell = true
 			return []byte("S\n")
@@ -1418,3 +1419,29 @@ func main() {
 	}
 }
 `
+
+type openBSDTestDisk struct {
+	data []byte
+}
+
+func newTestDisk(size int) *openBSDTestDisk {
+	return &openBSDTestDisk{data: make([]byte, size)}
+}
+
+func (d *openBSDTestDisk) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(d.data)) {
+		return 0, io.EOF
+	}
+	return copy(p, d.data[off:]), nil
+}
+
+func (d *openBSDTestDisk) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(d.data)) {
+		return 0, io.EOF
+	}
+	return copy(d.data[off:], p), nil
+}
+
+func (d *openBSDTestDisk) Size() int64 {
+	return int64(len(d.data))
+}

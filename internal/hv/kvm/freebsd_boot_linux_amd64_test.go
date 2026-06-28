@@ -13,6 +13,7 @@ import (
 	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/fsimage"
 	ffsimage "j5.nz/cc/internal/fsimage/ffs"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -55,15 +56,14 @@ func TestBootFreeBSDFullBaseRootFromReleaseSets(t *testing.T) {
 		t.Fatalf("build FreeBSD runtime: %v", err)
 	}
 	defer rt.Close()
-	block := virtio.NewBlock(0, 0x1000, 10, rt.Root)
-	block.DisableSizeMax = true
-	serial, err := BootFreeBSDKernelToMarkerWithPCIBlockNetConsole(ctx, rt.Kernel, 1024, "Dual Console: Serial Primary", block, nil, nil)
+	block := nvme.NewController(rt.Root)
+	serial, err := BootFreeBSDKernelToMarkerWithNVMENetConsole(ctx, rt.Kernel, 1024, "Dual Console: Serial Primary", block, nil, nil)
 	t.Logf("serial tail:\n%s", tailString(serial, 8192))
 	if err != nil {
 		t.Fatalf("boot FreeBSD full base root: %v\nserial:\n%s", err, serial)
 	}
-	if !strings.Contains(serial, "vtblk0: <VirtIO Block Adapter>") || !strings.Contains(serial, "Trying to mount root from ufs:/dev/vtbd0") {
-		t.Fatalf("FreeBSD did not attach and mount root block device:\n%s", serial)
+	if !strings.Contains(serial, "nvme0:") || !strings.Contains(serial, "Trying to mount root from ufs:/dev/nda0") {
+		t.Fatalf("FreeBSD did not attach and mount root NVMe device:\n%s", serial)
 	}
 	if strings.Contains(serial, "mountroot>") || strings.Contains(serial, "failed with error") {
 		t.Fatalf("FreeBSD failed to mount root block device:\n%s", serial)
@@ -148,7 +148,7 @@ func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
 		t.Fatalf("build FreeBSD fsck candidate root: %v", err)
 	}
 
-	t.Log("booting FreeBSD managed session with candidate root on vtbd1")
+	t.Log("booting FreeBSD managed session with candidate root on nda1")
 	session, err := StartFreeBSDManagedSession(ctx, FreeBSDManagedConfig{
 		Kernel:      rt.Kernel,
 		Root:        rt.Root,
@@ -161,7 +161,7 @@ func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
 	defer session.Close()
 
 	resp, err := session.Exec(ctx, client.ExecRequest{
-		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/vtbd1"},
+		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/nda1"},
 		WorkDir: "/tmp",
 	})
 	if err != nil {
@@ -173,7 +173,7 @@ func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
 		Command: []string{"/bin/sh", "-c", strings.Join([]string{
 			"set -eu",
 			"mkdir -p /tmp/cc-ufs-write",
-			"mount -t ufs /dev/vtbd1 /tmp/cc-ufs-write",
+			"mount -t ufs /dev/nda1 /tmp/cc-ufs-write",
 			"trap 'umount /tmp/cc-ufs-write || true' EXIT",
 			"mkdir -p /tmp/cc-ufs-write/cc-write-test/nested",
 			"printf 'freebsd-write-ok' > /tmp/cc-ufs-write/cc-write-test/nested/payload.txt",
@@ -194,7 +194,7 @@ func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
 	}
 
 	resp, err = session.Exec(ctx, client.ExecRequest{
-		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/vtbd1"},
+		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/nda1"},
 		WorkDir: "/tmp",
 	})
 	if err != nil {
