@@ -77,6 +77,42 @@ type server struct {
 	cvmfsCacheDir string
 }
 
+type ServerOptions struct {
+	Kind             string
+	TokenPath        string
+	RegisterHandlers func(*http.ServeMux, RuntimeView)
+	WrapHandler      func(http.Handler) http.Handler
+}
+
+type RuntimeView interface {
+	InstanceStatuses() []client.InstanceState
+	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ShutdownInstance(context.Context, string) error
+}
+
+func (s *server) InstanceStatuses() []client.InstanceState {
+	if s == nil || s.vms == nil {
+		return nil
+	}
+	return s.vms.Statuses()
+}
+
+func (s *server) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	runCtx, cancel := runRequestContext(ctx, req)
+	defer cancel()
+	return s.vms.RunStreamIn(runCtx, id, req, inputs, onEvent)
+}
+
+func (s *server) ShutdownInstance(ctx context.Context, id string) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.ShutdownInstance(ctx, id)
+}
+
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
@@ -288,7 +324,7 @@ func newWatchdogLeaseID() (string, error) {
 }
 
 func Main(args []string) {
-	started, err := run(args)
+	started, err := RunServer(args, ServerOptions{})
 	if err == nil {
 		return
 	}
@@ -299,9 +335,12 @@ func Main(args []string) {
 	os.Exit(1)
 }
 
-func run(args []string) (bool, error) {
+func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
+	}
+	if strings.TrimSpace(opts.TokenPath) != "" {
+		defer os.Remove(opts.TokenPath)
 	}
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -343,9 +382,12 @@ func run(args []string) (bool, error) {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{
-		Addr: l.Addr().String(),
-	}); err != nil {
+	hello := client.ServerHello{
+		Addr:      l.Addr().String(),
+		Kind:      opts.Kind,
+		TokenPath: opts.TokenPath,
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}
@@ -356,8 +398,15 @@ func run(args []string) (bool, error) {
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
+	if opts.RegisterHandlers != nil {
+		opts.RegisterHandlers(mux, srvState)
+	}
 
-	httpServer = http.Server{Handler: mux}
+	var handler http.Handler = mux
+	if opts.WrapHandler != nil {
+		handler = opts.WrapHandler(handler)
+	}
+	httpServer = http.Server{Handler: handler}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return true, fmt.Errorf("serve daemon API: %w", err)
 	}

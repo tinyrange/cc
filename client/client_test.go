@@ -74,6 +74,32 @@ func TestClientRunForwardStatusAndErrorDecoding(t *testing.T) {
 	}
 }
 
+func TestClientBearerTokenIsSent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		writeTestJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		url:       srv.URL,
+		authToken: "secret",
+		client: http.Client{
+			Transport: &authTransport{
+				base: srv.Client().Transport,
+				token: func() string {
+					return "secret"
+				},
+			},
+		},
+	}
+	if err := c.HealthCheck(); err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+}
+
 func TestClientRunStreamDecodesNDJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/vm/run" || r.URL.Query().Get("stream") != "1" {
