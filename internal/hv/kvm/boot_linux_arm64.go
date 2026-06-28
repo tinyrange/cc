@@ -12,6 +12,7 @@ import (
 
 	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/fdt"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -44,6 +45,15 @@ func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []by
 		nodes = append(nodes, fsdev.DeviceTreeNode())
 	}
 	return bootToCondition(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nodes, func(serial string) bool {
+		return strings.Contains(serial, marker)
+	})
+}
+
+func BootInitramfsToMarkerWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *nvme.Controller) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootToConditionWithNVMeBlock(ctx, kernel, initrd, memoryMB, dmesg, block, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -104,6 +114,98 @@ func BootInitramfsToVsockMarkerWithFS(ctx context.Context, kernel []byte, initrd
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, extraNodes []fdt.Node, done func(string) bool) (string, error) {
 	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, extraNodes, done)
+}
+
+func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, block *nvme.Controller, done func(string) bool) (string, error) {
+	vm, err := NewVM()
+	if err != nil {
+		return "", err
+	}
+	defer vm.Close()
+
+	mem, err := vm.MapAnonymousMemory(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
+	if err != nil {
+		return "", fmt.Errorf("map guest memory: %w", err)
+	}
+
+	var serialOut bytes.Buffer
+	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, &serialOut)
+	uart.AttachIRQ(vm, arm64vm.UARTSPI)
+	block.Attach(vm, vm)
+	pci := NewArm64PCIHost(NewArm64NVMePCIDevice(1, arm64vm.NVMeBase, arm64vm.NVMeIRQ, block))
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.Attach(vm, vm)
+
+	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
+		MemoryMB:   memoryMB,
+		GICVersion: arm64vm.GICVersionV2,
+		Dmesg:      dmesg,
+		ExtraNodes: []fdt.Node{pci.DeviceTreeNode(), rng.DeviceTreeNode()},
+	})
+	if err != nil {
+		return "", fmt.Errorf("prepare boot: %w", err)
+	}
+
+	if err := vm.SetPC(plan.EntryGPA); err != nil {
+		return "", fmt.Errorf("set PC: %w", err)
+	}
+	if err := vm.SetPState(arm64vm.DefaultPStateBits); err != nil {
+		return "", fmt.Errorf("set PSTATE: %w", err)
+	}
+	if err := vm.SetSpEl1(plan.StackTopGPA); err != nil {
+		return "", fmt.Errorf("set SP_EL1: %w", err)
+	}
+	if err := vm.SetX(0, plan.DeviceTreeGPA); err != nil {
+		return "", fmt.Errorf("set X0: %w", err)
+	}
+	for reg := 1; reg <= 3; reg++ {
+		if err := vm.SetX(reg, 0); err != nil {
+			return "", fmt.Errorf("set X%d: %w", reg, err)
+		}
+	}
+
+	var exit Exit
+	for step := 0; ; step++ {
+		if err := ctx.Err(); err != nil {
+			if done(serialOut.String()) {
+				return serialOut.String(), nil
+			}
+			return serialOut.String(), err
+		}
+
+		if err := vm.Run(&exit); err != nil {
+			return serialOut.String(), fmt.Errorf("run step %d: %w", step, err)
+		}
+		if done(serialOut.String()) {
+			return serialOut.String(), nil
+		}
+
+		switch exit.Reason {
+		case ExitMMIO:
+			if uart.Contains(exit.MMIO.Addr, int(exit.MMIO.Len)) {
+				if err := handleUARTExit(vm, uart, exit.MMIO); err != nil {
+					return serialOut.String(), err
+				}
+				continue
+			}
+			if handled, err := pci.HandleMMIO(vm, exit.MMIO); handled || err != nil {
+				if err != nil {
+					return serialOut.String(), err
+				}
+				continue
+			}
+			if err := handleBootMMIO(vm, uart, nil, nil, rng, exit.MMIO); err != nil {
+				return serialOut.String(), err
+			}
+		case ExitShutdown:
+			return serialOut.String(), fmt.Errorf("guest shut down before serial output")
+		case ExitSystemEvent:
+			return serialOut.String(), fmt.Errorf("unexpected system event %d before serial output", exit.SystemEvent)
+		default:
+			pc, _ := vm.GetPC()
+			return serialOut.String(), fmt.Errorf("unexpected exit reason %d at pc=%#x", exit.Reason, pc)
+		}
+	}
 }
 
 func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, extraNodes []fdt.Node, done func(string) bool) (string, error) {
