@@ -87,6 +87,7 @@ type ServerOptions struct {
 type RuntimeView interface {
 	InstanceStatuses() []client.InstanceState
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ShutdownInstance(context.Context, string) error
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -103,6 +104,13 @@ func (s *server) RunStreamIn(ctx context.Context, id string, req client.RunReque
 	runCtx, cancel := runRequestContext(ctx, req)
 	defer cancel()
 	return s.vms.RunStreamIn(runCtx, id, req, inputs, onEvent)
+}
+
+func (s *server) ShutdownInstance(ctx context.Context, id string) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.ShutdownInstance(ctx, id)
 }
 
 type watchdogController struct {
