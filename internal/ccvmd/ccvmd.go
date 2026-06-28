@@ -77,6 +77,42 @@ type server struct {
 	cvmfsCacheDir string
 }
 
+type ServerOptions struct {
+	Kind             string
+	TokenPath        string
+	RegisterHandlers func(*http.ServeMux, RuntimeView)
+	WrapHandler      func(http.Handler) http.Handler
+}
+
+type RuntimeView interface {
+	InstanceStatuses() []client.InstanceState
+	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ShutdownInstance(context.Context, string) error
+}
+
+func (s *server) InstanceStatuses() []client.InstanceState {
+	if s == nil || s.vms == nil {
+		return nil
+	}
+	return s.vms.Statuses()
+}
+
+func (s *server) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	runCtx, cancel := runRequestContext(ctx, req)
+	defer cancel()
+	return s.vms.RunStreamIn(runCtx, id, req, inputs, onEvent)
+}
+
+func (s *server) ShutdownInstance(ctx context.Context, id string) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.ShutdownInstance(ctx, id)
+}
+
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
@@ -288,7 +324,7 @@ func newWatchdogLeaseID() (string, error) {
 }
 
 func Main(args []string) {
-	started, err := run(args)
+	started, err := RunServer(args, ServerOptions{})
 	if err == nil {
 		return
 	}
@@ -299,9 +335,12 @@ func Main(args []string) {
 	os.Exit(1)
 }
 
-func run(args []string) (bool, error) {
+func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
+	}
+	if strings.TrimSpace(opts.TokenPath) != "" {
+		defer os.Remove(opts.TokenPath)
 	}
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -343,9 +382,12 @@ func run(args []string) (bool, error) {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{
-		Addr: l.Addr().String(),
-	}); err != nil {
+	hello := client.ServerHello{
+		Addr:      l.Addr().String(),
+		Kind:      opts.Kind,
+		TokenPath: opts.TokenPath,
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}
@@ -356,8 +398,15 @@ func run(args []string) (bool, error) {
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
+	if opts.RegisterHandlers != nil {
+		opts.RegisterHandlers(mux, srvState)
+	}
 
-	httpServer = http.Server{Handler: mux}
+	var handler http.Handler = mux
+	if opts.WrapHandler != nil {
+		handler = opts.WrapHandler(handler)
+	}
+	httpServer = http.Server{Handler: handler}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return true, fmt.Errorf("serve daemon API: %w", err)
 	}
@@ -567,6 +616,17 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				continue
 			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+		case vm.WorkerFrameAddShare:
+			var req vm.WorkerAddShareRequest
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
 		case vm.WorkerFrameConsole:
 			var req vm.WorkerConsoleRequest
 			_ = frame.DecodePayload(&req)
@@ -1277,20 +1337,37 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			}
 		}
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting VM"})
-			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+			var streamMu sync.Mutex
+			streamOpen := true
+			writeStreamEvent := func(event client.BootEvent) error {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if !streamOpen {
+					return nil
+				}
 				return writeBootEvent(w, event)
+			}
+			closeStream := func() {
+				streamMu.Lock()
+				streamOpen = false
+				streamMu.Unlock()
+			}
+			defer closeStream()
+
+			writeStreamEvent(client.BootEvent{Kind: "status", Message: "starting VM"})
+			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeStreamEvent(event)
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+					_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
-				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
-			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm/start total=%s", time.Since(start))
 			return
 		}

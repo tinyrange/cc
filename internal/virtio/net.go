@@ -739,6 +739,37 @@ func (n *Net) updateIRQLocked() error {
 	return n.irq.SetIRQ(n.IRQ, level)
 }
 
+func (n *Net) Summary() string {
+	if n == nil {
+		return "virtio-net=<nil>"
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return fmt.Sprintf(
+		"virtio-net status=%#x legacy=%t interrupt_status=%#x irq_high=%t pending_rx=%d q0_ready=%t q0_last=%d q0_used=%d q1_ready=%t q1_last=%d q1_used=%d",
+		n.status,
+		n.legacy,
+		n.interruptStatus,
+		n.irqHigh,
+		len(n.pendingRx),
+		n.queues[netQueueRX].ready,
+		n.queues[netQueueRX].lastAvailIdx,
+		n.queues[netQueueRX].usedIdx,
+		n.queues[netQueueTX].ready,
+		n.queues[netQueueTX].lastAvailIdx,
+		n.queues[netQueueTX].usedIdx,
+	)
+}
+
+func (n *Net) IRQAsserted() bool {
+	if n == nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.irqHigh
+}
+
 func (n *Net) configBytesLocked() []byte {
 	var cfg [8]byte
 	copy(cfg[0:6], n.MAC)

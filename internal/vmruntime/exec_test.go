@@ -54,11 +54,14 @@ func TestExtractManagedExecResultDmesgReturnsTranscriptSegment(t *testing.T) {
 	if !ok || code != 0 {
 		t.Fatalf("result = (%d, %v), want successful result", code, ok)
 	}
-	if !strings.Contains(output, CommandBeginMarker+"abc") || !strings.Contains(output, CommandOutputMarker+"abc") {
-		t.Fatalf("dmesg output did not include transcript markers:\n%s", output)
-	}
-	if !strings.Contains(output, "guest output") {
-		t.Fatalf("dmesg output did not include decoded command output:\n%s", output)
+	wantOutput := strings.Join([]string{
+		CommandBeginMarker + "abc",
+		CommandOutputMarker + "abc:" + b64("guest output\n"),
+		CommandExitMarkerPref + "abc:0",
+		"guest output",
+	}, "\n")
+	if output != wantOutput {
+		t.Fatalf("dmesg output = %q, want %q", output, wantOutput)
 	}
 }
 
@@ -151,7 +154,7 @@ func TestSerialTranscriptWaitFor(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		text, err := transcript.WaitFor(ctx, start, func(text string) bool {
-			return strings.Contains(text, "ready")
+			return text == "boot ready\n"
 		})
 		if err == nil && text != "boot ready\n" {
 			err = errors.New("unexpected transcript segment: " + text)

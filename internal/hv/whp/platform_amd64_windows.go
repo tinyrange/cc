@@ -11,10 +11,11 @@ import (
 )
 
 type bootPIC struct {
-	mu     sync.Mutex
-	master bootPICChip
-	slave  bootPICChip
-	elcr   [2]byte
+	mu       sync.Mutex
+	master   bootPICChip
+	slave    bootPICChip
+	elcr     [2]byte
+	lineHigh [16]bool
 }
 
 type bootPICChip struct {
@@ -24,6 +25,7 @@ type bootPICChip struct {
 	ocw3       byte
 	irr        byte
 	isr        byte
+	lastIRR    byte
 }
 
 func (p *bootPIC) Read(port uint16, data []byte) bool {
@@ -85,24 +87,205 @@ func (p *bootPIC) Write(port uint16, data []byte) bool {
 	return true
 }
 
-func (p *bootPIC) Acknowledge(line uint8) (uint8, bool) {
+func (p *bootPIC) SetIRQ(line uint8, level bool) {
 	if line >= 16 {
-		return 0, false
+		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.lineHigh[line] = level
+	p.setLineLocked(line, level)
+}
+
+func (p *bootPIC) setLineLocked(line uint8, level bool) {
+	chip := &p.master
+	irq := line
+	if line >= 8 {
+		if p.master.mask&(1<<2) != 0 {
+			// Keep the slave line state; it will be visible once cascade unmasks.
+			chip = &p.slave
+			irq = line - 8
+		} else {
+			chip = &p.slave
+			irq = line - 8
+		}
+	}
+	mask := byte(1 << irq)
+	levelTriggered := p.elcr[line/8]&mask != 0
+	if levelTriggered {
+		if level {
+			chip.irr |= mask
+			chip.lastIRR |= mask
+		} else {
+			chip.irr &^= mask
+			chip.lastIRR &^= mask
+		}
+		return
+	}
+	if level {
+		if chip.lastIRR&mask == 0 {
+			chip.irr |= mask
+		}
+		chip.lastIRR |= mask
+	} else {
+		chip.lastIRR &^= mask
+	}
+}
+
+func (p *bootPIC) AcknowledgePending() (uint8, uint8, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.slave.pendingIRQ() >= 0 {
+		p.master.irr |= 1 << 2
+	}
+	masterIRQ := p.master.pendingIRQ()
+	if masterIRQ < 0 {
+		return 0, 0, false
+	}
+	if masterIRQ == 2 {
+		slaveIRQ := p.slave.pendingIRQ()
+		if slaveIRQ >= 0 {
+			p.ackLocked(&p.master, 2, 2)
+			line := uint8(8 + slaveIRQ)
+			return p.ackLocked(&p.slave, uint8(slaveIRQ), line), line, true
+		}
+	}
+	line := uint8(masterIRQ)
+	return p.ackLocked(&p.master, line, line), line, true
+}
+
+func (p *bootPIC) EndOfInterrupt(vector uint8) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case vector >= p.slave.vectorBase && vector < p.slave.vectorBase+8:
+		irq := vector - p.slave.vectorBase
+		mask := byte(1 << irq)
+		if p.slave.isr&mask == 0 {
+			return false
+		}
+		p.slave.isr &^= mask
+		p.master.isr &^= 1 << 2
+		p.setLineLocked(8+irq, p.lineHigh[8+irq])
+		return true
+	case vector >= p.master.vectorBase && vector < p.master.vectorBase+8:
+		irq := vector - p.master.vectorBase
+		mask := byte(1 << irq)
+		if p.master.isr&mask == 0 {
+			return false
+		}
+		p.master.isr &^= mask
+		p.setLineLocked(irq, p.lineHigh[irq])
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *bootPIC) ackLocked(chip *bootPICChip, irq uint8, line uint8) uint8 {
+	mask := byte(1 << irq)
+	chip.isr |= mask
+	if p.elcr[line/8]&mask == 0 {
+		chip.irr &^= mask
+	}
+	return chip.vectorBase + irq
+}
+
+func (p *bootPIC) Resample() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for line, high := range p.lineHigh {
+		p.setLineLocked(uint8(line), high)
+	}
+}
+
+func (p *bootPIC) Clear(line uint8) {
+	if line >= 16 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lineHigh[line] = false
 	chip := &p.master
 	irq := line
 	if line >= 8 {
 		chip = &p.slave
 		irq = line - 8
 	}
-	if chip.mask&(1<<irq) != 0 {
-		return 0, false
+	chip.irr &^= 1 << irq
+}
+
+func (p *bootPIC) LevelTriggered(line uint8) bool {
+	if line >= 16 {
+		return false
 	}
-	chip.irr |= 1 << irq
-	chip.isr |= 1 << irq
-	return chip.vectorBase + irq, true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.elcr[line/8]&(1<<(line%8)) != 0
+}
+
+func (p *bootPIC) SetLevelTriggered(line uint8, level bool) {
+	if line >= 16 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	mask := byte(1 << (line % 8))
+	if level {
+		p.elcr[line/8] |= mask
+	} else {
+		p.elcr[line/8] &^= mask
+	}
+	p.setLineLocked(line, p.lineHigh[line])
+}
+
+func (p *bootPIC) summaryForLines(lines []uint8) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(lines) == 0 {
+		return "pic=[]"
+	}
+	var b strings.Builder
+	b.WriteString("pic=[")
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if line >= 16 {
+			fmt.Fprintf(&b, "%d:<out-of-range>", line)
+			continue
+		}
+		chip := p.master
+		irq := line
+		if line >= 8 {
+			chip = p.slave
+			irq = line - 8
+		}
+		mask := byte(1 << irq)
+		fmt.Fprintf(&b, "%d:mask=%t,irr=%t,isr=%t,level=%t,high=%t",
+			line,
+			chip.mask&mask != 0,
+			chip.irr&mask != 0,
+			chip.isr&mask != 0,
+			p.elcr[line/8]&mask != 0,
+			p.lineHigh[line],
+		)
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func (c *bootPICChip) pendingIRQ() int {
+	pending := c.irr &^ c.mask
+	if pending == 0 {
+		return -1
+	}
+	for irq := 0; irq < 8; irq++ {
+		if pending&(1<<irq) != 0 {
+			return irq
+		}
+	}
+	return -1
 }
 
 func (c *bootPICChip) writeCommand(value byte) {
@@ -111,6 +294,7 @@ func (c *bootPICChip) writeCommand(value byte) {
 		c.mask = 0xff
 		c.irr = 0
 		c.isr = 0
+		c.lastIRR = 0
 		return
 	}
 	if value&0x20 != 0 {
@@ -143,6 +327,7 @@ type bootPIT struct {
 	tickerStop chan struct{}
 	tickerWG   sync.WaitGroup
 	stop       chan struct{}
+	closed     bool
 	channels   [3]bootPITChannel
 	selected   uint8
 	port61     byte
@@ -168,6 +353,7 @@ type bootPITChannel struct {
 
 func (p *bootPIT) Close() {
 	p.mu.Lock()
+	p.closed = true
 	p.stopTickerLocked()
 	select {
 	case <-p.stop:
@@ -300,6 +486,9 @@ func (p *bootPIT) writePort61(value byte) {
 }
 
 func (p *bootPIT) armChannel0Locked() {
+	if p.closed {
+		return
+	}
 	p.stopTickerLocked()
 	reload := p.channels[0].reload
 	if reload == 0 {
@@ -449,11 +638,7 @@ func (a *bootIOAPIC) assert(line uint8, high bool) (bootIOAPICRoute, bool) {
 	if int(line) >= len(a.redir) {
 		return bootIOAPICRoute{}, false
 	}
-	asserted := high
-	if a.redir[line]&(1<<13) != 0 {
-		asserted = !high
-	}
-	if asserted {
+	if high {
 		edge := !a.lineHigh[line]
 		a.lineHigh[line] = true
 		return a.evaluateLocked(line, edge)
@@ -484,6 +669,19 @@ func (a *bootIOAPIC) deviceHighRoute(line uint8) (bootIOAPICRoute, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if int(line) >= len(a.redir) || !a.lineHigh[line] {
+		return bootIOAPICRoute{}, false
+	}
+	return a.routeForLineLocked(line)
+}
+
+func (a *bootIOAPIC) routeForLine(line uint8) (bootIOAPICRoute, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.routeForLineLocked(line)
+}
+
+func (a *bootIOAPIC) routeForLineLocked(line uint8) (bootIOAPICRoute, bool) {
+	if int(line) >= len(a.redir) {
 		return bootIOAPICRoute{}, false
 	}
 	entry := a.redir[line]

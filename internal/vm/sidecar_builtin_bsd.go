@@ -16,17 +16,27 @@ func (h *sidecarVMHost) startBuiltinGuestStream(ctx context.Context, req client.
 	if !ok {
 		return nil, false, nil
 	}
+	networkID := req.ID
 	req.Image = profile.Canonical
 	req.ID = DefaultInstanceID
-	sidecar, err := h.launch(ctx, nil)
+	netResources, err := prepareSidecarBuiltinGuestResources(h, networkID, req.Network)
 	if err != nil {
 		return nil, true, err
 	}
-	if _, err := sidecar.Worker().Start(ctx, req, onEvent); err != nil {
+	sidecar, err := h.launch(ctx, netResources.env)
+	if err != nil {
+		netResources.closeAll()
+		return nil, true, err
+	}
+	sidecar.AddCleanup(netResources.close)
+	state, err := sidecar.Worker().Start(ctx, req, onEvent)
+	if err != nil {
 		_ = sidecar.Close()
 		return nil, true, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, builtinSidecarResources(profile)), true, nil
+	resources := combineSidecarResources(builtinSidecarResources(profile), netResources)
+	resources.networkIPv4 = state.NetworkIPv4
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), true, nil
 }
 
 func (h *sidecarVMHost) startBuiltinGuestBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, bool, error) {
@@ -34,17 +44,27 @@ func (h *sidecarVMHost) startBuiltinGuestBlankStream(ctx context.Context, req cl
 	if !ok {
 		return nil, false, nil
 	}
+	networkID := req.ID
 	req.Image = profile.Canonical
 	req.ID = DefaultInstanceID
-	sidecar, err := h.launch(ctx, nil)
+	netResources, err := prepareSidecarBuiltinGuestResources(h, networkID, req.Network)
 	if err != nil {
 		return nil, true, err
 	}
-	if _, err := sidecar.Worker().StartBlank(ctx, req, onEvent); err != nil {
+	sidecar, err := h.launch(ctx, netResources.env)
+	if err != nil {
+		netResources.closeAll()
+		return nil, true, err
+	}
+	sidecar.AddCleanup(netResources.close)
+	state, err := sidecar.Worker().StartBlank(ctx, req, onEvent)
+	if err != nil {
 		_ = sidecar.Close()
 		return nil, true, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, builtinSidecarResources(profile)), true, nil
+	resources := combineSidecarResources(builtinSidecarResources(profile), netResources)
+	resources.networkIPv4 = state.NetworkIPv4
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), true, nil
 }
 
 func builtinSidecarResources(profile managedguest.Profile) sidecarStartResources {

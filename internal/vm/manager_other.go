@@ -5,6 +5,7 @@ package vm
 import (
 	"context"
 	"os"
+	"runtime"
 	"strings"
 
 	"j5.nz/cc/client"
@@ -15,7 +16,8 @@ import (
 
 func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool) *Manager {
 	backend := NewRuntimeBackend(kernel, images, guestInitCache)
-	if worker || strings.TrimSpace(os.Getenv(sidecarDisableEnv)) != "" || strings.TrimSpace(os.Getenv(sidecarEnableEnv)) == "" {
+	sidecarsEnabled := strings.TrimSpace(os.Getenv(sidecarEnableEnv)) != "" || defaultSidecarsEnabled()
+	if worker || strings.TrimSpace(os.Getenv(sidecarDisableEnv)) != "" || !sidecarsEnabled {
 		return NewManagerWithBackend(backend)
 	}
 	mgr := NewManagerWithHosts(
@@ -31,4 +33,8 @@ func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache
 		return caps
 	}
 	return mgr
+}
+
+func defaultSidecarsEnabled() bool {
+	return runtime.GOOS == "windows" && runtime.GOARCH == "amd64"
 }

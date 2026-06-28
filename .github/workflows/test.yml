@@ -96,8 +96,14 @@ jobs:
           CC_TEST_FREEBSD_ROOTFS: "1"
           CC_TEST_FREEBSD_KVM: "1"
           CC_TEST_NETBSD_ROOTFS: "1"
+          CC_TEST_NETBSD_KVM: "1"
         run: |
           set -euo pipefail
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          for goarch in arm64 amd64; do
+            for bsd in openbsd freebsd netbsd; do
+              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$goarch" go build -trimpath -o "internal/${bsd}/guestinit/guest-init-${bsd}-${goarch}" "./internal/cmd/${bsd}-init"
+            done
+          done
           go test -tags embed_guestinit -p 1 ./... -count=1 -timeout 75m

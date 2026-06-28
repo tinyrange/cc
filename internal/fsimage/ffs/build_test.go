@@ -81,7 +81,10 @@ func TestBuildFFSRawLayoutStartsAtBlockDeviceRoot(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         16 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,
@@ -111,7 +114,10 @@ func TestBuildFFSRawLayoutLargeCylinderGroupsAtFreeBSDOffsets(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         5 << 30,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,

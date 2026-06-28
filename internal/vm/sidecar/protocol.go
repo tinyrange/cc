@@ -30,6 +30,7 @@ const (
 	WorkerFrameExecInput    = "exec_input"
 	WorkerFrameCancel       = "cancel"
 	WorkerFrameFlush        = "flush"
+	WorkerFrameAddShare     = "add_share"
 	WorkerFrameConsole      = "console"
 	WorkerFrameDone         = "done"
 	WorkerFrameEvent        = "event"
@@ -86,6 +87,11 @@ type WorkerWaitRequest struct {
 
 type WorkerFlushRequest struct {
 	ID string `json:"id,omitempty"`
+}
+
+type WorkerAddShareRequest struct {
+	ID    string            `json:"id,omitempty"`
+	Share client.ShareMount `json:"share"`
 }
 
 type WorkerConsoleRequest struct {

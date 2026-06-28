@@ -55,7 +55,21 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 		return nil, nil
 	}
 	if cfg.IP == nil {
+		if ip := net.ParseIP(strings.TrimSpace(cfg.Config.GuestIPv4)).To4(); ip != nil {
+			cfg.IP = ip
+		}
+	}
+	if cfg.IP == nil {
 		cfg.IP = net.IPv4(10, 42, 0, 2)
+	}
+	if cfg.MAC == nil {
+		if macText := strings.TrimSpace(cfg.Config.GuestMAC); macText != "" {
+			mac, err := net.ParseMAC(macText)
+			if err != nil {
+				return nil, fmt.Errorf("parse guest network MAC %q: %w", macText, err)
+			}
+			cfg.MAC = mac
+		}
 	}
 	if cfg.MAC == nil {
 		cfg.MAC = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}

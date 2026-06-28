@@ -12,9 +12,12 @@ import (
 
 	"j5.nz/cc/client"
 	netbsdrootfs "j5.nz/cc/internal/netbsd/rootfs"
-	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/nvme"
 )
 
+// These KVM boot tests consume unstructured firmware/kernel serial logs.
+// Substring checks here synchronize with guest prompts and markers rather than
+// freezing user-facing copy.
 func TestNetBSDManagedSessionExec(t *testing.T) {
 	if os.Getenv("CC_TEST_NETBSD_ROOTFS") == "" {
 		t.Skip("set CC_TEST_NETBSD_ROOTFS=1 to build and boot the full NetBSD rootfs")
@@ -88,8 +91,8 @@ func TestNetBSDKernelRootSerial(t *testing.T) {
 	defer rt.Close()
 	netdev, stack := newNetBSDManagedNet(net.IPv4(10, 42, 0, 2), net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02})
 	defer stack.Close()
-	block := virtio.NewBlock(0, 0x1000, 10, rt.Root)
-	serial, err := BootNetBSDKernelWithPCIBlockNetToSerial(ctx, rt.Kernel, 1024, block, netdev)
+	block := nvme.NewController(rt.Root)
+	serial, err := BootNetBSDKernelWithNVMENetToSerial(ctx, rt.Kernel, 1024, block, netdev)
 	t.Logf("NetBSD root serial:\n%s", serial)
 	if err != nil && ctx.Err() == nil {
 		t.Fatalf("boot NetBSD with root devices to serial: %v", err)

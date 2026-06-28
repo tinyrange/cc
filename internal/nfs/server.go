@@ -930,12 +930,16 @@ func (s *Server) handleReaddir(proc uint32, r *xdrReader, w *xdrWriter) ([]byte,
 	}
 	for i := start; i < len(entries); i++ {
 		ent := entries[i]
+		childID, childAttr, childErr := lookupDirent(exp.Backend, node, ent)
+		fileID := ent.ino
+		if childErr == 0 {
+			fileID = childAttr.Ino
+		}
 		w.Bool(true)
-		w.Uint64(ent.ino)
+		w.Uint64(fileID)
 		w.String(ent.name)
 		w.Uint64(uint64(i + 1))
 		if proc == nfsProcReaddirPlus {
-			childID, childAttr, childErr := lookupDirent(exp.Backend, node, ent)
 			if childErr == 0 {
 				writePostOpAttr(w, childAttr)
 				w.Bool(true)
@@ -957,8 +961,7 @@ func lookupDirent(backend virtio.FSBackend, parent uint64, ent fuseDirent) (uint
 		attr, errno := backend.GetAttr(parent)
 		return parent, attr, errno
 	case "..":
-		attr, errno := backend.GetAttr(parent)
-		return parent, attr, errno
+		return backend.Lookup(parent, ent.name)
 	default:
 		return backend.Lookup(parent, ent.name)
 	}

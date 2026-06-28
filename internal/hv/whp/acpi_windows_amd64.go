@@ -89,7 +89,7 @@ func buildBootMADT() []byte {
 	body = binary.LittleEndian.AppendUint32(body, 0)
 
 	body = appendMADTInterruptOverride(body, 0, 2, 0)
-	for _, irq := range []byte{5, 6, 7, 8, 9} {
+	for _, irq := range []byte{5, 6, 7, 8, 9, 10} {
 		body = appendMADTInterruptOverride(body, irq, uint32(irq), 0x000d)
 	}
 	return body

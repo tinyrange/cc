@@ -75,7 +75,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}
 	mem, err := vm.MapAnonymousMemory(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
 	if err != nil {
-		vm.Close()
+		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
 		vsock.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
@@ -105,7 +105,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		ExtraNodes: nodes,
 	})
 	if err != nil {
-		vm.Close()
+		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -114,7 +114,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		return nil, fmt.Errorf("prepare boot: %w", err)
 	}
 	if err := setupBootRegisters(vm, plan); err != nil {
-		vm.Close()
+		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -126,8 +126,9 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		defer vm.Close()
-		done.finish(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut))
+		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
+		closeVMWithFS(vm, fsdevs)
+		done.finish(err)
 	}()
 
 	var control virtio.VsockConn
@@ -201,6 +202,9 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		listener:   listener,
 		vsock:      vsock,
 		bootWriter: bootWriter,
+		cleanup: func() {
+			_ = vm.CancelRun()
+		},
 		transcript: controlTranscript,
 		serialOut:  serialOut,
 		dmesg:      dmesg,
@@ -292,11 +296,14 @@ func (s *ManagedSession) Close() error {
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.cleanup != nil {
 		s.cleanup()
 	}
-	if s.cancel != nil {
-		s.cancel()
+	if s.done != nil {
+		_ = s.done.wait()
 	}
 	return nil
 }

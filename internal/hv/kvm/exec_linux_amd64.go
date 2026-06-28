@@ -61,6 +61,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 		return client.ExecResponse{}, "", err
 	}
 	defer vm.Close()
+	defer closeFSDevices(fsdevs)
 
 	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {

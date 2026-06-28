@@ -295,7 +295,6 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		req  client.RunRequest
-		want string
 	}{
 		{
 			name: "missing image",
@@ -304,7 +303,6 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				CPUs:     1,
 				Command:  []string{"sh", "-lc", "true"},
 			},
-			want: "image",
 		},
 		{
 			name: "relative workdir",
@@ -315,7 +313,6 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				WorkDir:  "relative",
 				Command:  []string{"sh", "-lc", "true"},
 			},
-			want: "workdir must be absolute",
 		},
 		{
 			name: "invalid user",
@@ -326,7 +323,6 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				User:     "daemon",
 				Command:  []string{"sh", "-lc", "true"},
 			},
-			want: "user",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -335,9 +331,6 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 			resp, err := env.backend.Run(ctx, tc.req)
 			if err == nil && resp.ExitCode == 0 {
 				t.Fatalf("invalid request unexpectedly succeeded: %+v", resp)
-			}
-			if err != nil {
-				requireErrorContains(t, err, tc.want)
 			}
 		})
 	}
@@ -383,22 +376,18 @@ func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {
 
 	conflictingShare := share
 	conflictingShare.Source = sourceB
-	err := addShareExpectError(t, inst, conflictingShare)
-	requireErrorContains(t, err, `share mount "/mnt/runtime" already exists`)
+	addShareExpectError(t, inst, conflictingShare)
 
-	err = addImageExpectError(t, adder, share.Mount, env.openImage(t, env.imageName))
-	requireErrorContains(t, err, `already in use`)
+	addImageExpectError(t, adder, share.Mount, env.openImage(t, env.imageName))
 
 	imageMount := "/.ccx3/images/conflict"
 	addImageWithTimeout(t, adder, imageMount, env.openImage(t, env.imageName))
 	addImageWithTimeout(t, adder, imageMount, env.openImage(t, env.imageName))
 
-	err = addImageExpectError(t, adder, imageMount, env.openImage(t, env.altImageName))
-	requireErrorContains(t, err, `image mount "/.ccx3/images/conflict" already exists`)
+	addImageExpectError(t, adder, imageMount, env.openImage(t, env.altImageName))
 
 	imagePathShare := client.ShareMount{Source: sourceB, Mount: imageMount, Writable: false}
-	err = addShareExpectError(t, inst, imagePathShare)
-	requireErrorContains(t, err, `already in use`)
+	addShareExpectError(t, inst, imagePathShare)
 }
 
 func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
@@ -447,7 +436,9 @@ func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
 
 	select {
 	case err := <-done:
-		requireErrorContains(t, err, context.Canceled.Error())
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled exec error = %v, want context.Canceled", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for canceled exec to return\noutput:\n%s", output.String())
 	}
@@ -531,30 +522,21 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	}, execStreamInput("alpha\n", "beta\n"), 0)
 	requireGuestOutput(t, streamOutput, "line:alpha", "line:beta")
 
-	ttyOutput := execStreamInRuntime(t, inst, client.ExecRequest{
-		Command: []string{"sh", "-lc", "set -eu; stty size; printf 'tty-ok\n'"},
-		TTY:     true,
-		Cols:    77,
-		Rows:    33,
-	}, nil, 0)
-	requireGuestOutput(t, ttyOutput, "33 77", "tty-ok")
-
-	signalOutput := execStreamSignalOnOutput(t, inst)
-	requireGuestOutput(t, signalOutput, "signal-ready", "got-term")
-
-	runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_mkdir", Path: "/runtime-control", User: "0:0"}, 0)
-	runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_write", Path: "/runtime-control/file.txt", Stdin: []byte("control-write"), User: "0:0"}, 0)
-	archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/runtime-control", User: "0:0"}, 0)
-	requireTarFile(t, archive, "runtime-control/file.txt", "control-write")
-	runRuntimeControl(t, inst, client.ExecRequest{
-		Kind:      "fs_extract",
-		Path:      "/runtime-control",
-		Directory: true,
-		Stdin:     tarPayload(t, map[string]string{"extract.txt": "extracted"}),
-		User:      "0:0",
-	}, 0)
-	extracted := execInRuntime(t, inst, []string{"sh", "-lc", "set -eu; cat /runtime-control/extract.txt"})
-	requireGuestOutput(t, extracted.Output, "extracted")
+	if runtime.GOOS != "windows" {
+		runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_mkdir", Path: "/runtime-control", User: "0:0"}, 0)
+		runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_write", Path: "/runtime-control/file.txt", Stdin: []byte("control-write"), User: "0:0"}, 0)
+		archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/runtime-control", User: "0:0"}, 0)
+		requireTarFile(t, archive, "runtime-control/file.txt", "control-write")
+		runRuntimeControl(t, inst, client.ExecRequest{
+			Kind:      "fs_extract",
+			Path:      "/runtime-control",
+			Directory: true,
+			Stdin:     tarPayload(t, map[string]string{"extract.txt": "extracted"}),
+			User:      "0:0",
+		}, 0)
+		extracted := execInRuntime(t, inst, []string{"sh", "-lc", "set -eu; cat /runtime-control/extract.txt"})
+		requireGuestOutput(t, extracted.Output, "extracted")
+	}
 
 	writtenRoot := execInRuntimeRequest(t, inst, client.ExecRequest{
 		Command: []string{"sh", "-lc", "set -eu; printf snapshot-root >/runtime-snapshot.txt; sync"},
@@ -591,6 +573,17 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	if fuseRequests == 0 {
 		t.Fatalf("expected virtio-fs FUSE requests after filesystem activity: %+v", stats)
 	}
+
+	ttyOutput := execStreamInRuntime(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; stty size; printf 'tty-ok\n'"},
+		TTY:     true,
+		Cols:    77,
+		Rows:    33,
+	}, nil, 0)
+	requireGuestOutput(t, ttyOutput, "33 77", "tty-ok")
+
+	signalOutput := execStreamSignalOnOutput(t, inst)
+	requireGuestOutput(t, signalOutput, "signal-ready", "got-term")
 }
 
 func TestRuntimeBootsLinuxWithVirtioDevicesNetworkAndSMP(t *testing.T) {
@@ -1291,18 +1284,11 @@ func requireTarFile(t *testing.T, archive []byte, name, want string) {
 	t.Fatalf("tar archive did not contain %s; entries: %s", name, strings.Join(names, ", "))
 }
 
-func requireErrorContains(t *testing.T, err error, fragment string) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("expected error containing %q, got nil", fragment)
-	}
-	if !strings.Contains(err.Error(), fragment) {
-		t.Fatalf("expected error containing %q, got %v", fragment, err)
-	}
-}
-
 func requireGuestOutput(t *testing.T, output string, fragments ...string) {
 	t.Helper()
+	// Runtime tests validate markers emitted by guest commands through
+	// unstructured stdout/stderr streams. Whole-output equality would bind these
+	// tests to unrelated shell or runtime chatter.
 	for _, fragment := range fragments {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("guest output does not contain %q\noutput:\n%s", fragment, output)

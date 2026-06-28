@@ -28,7 +28,23 @@ func hostStatFS(root string) (uint64, uint64, uint64, uint64, uint64, uint64, ui
 	return total / blockSize, free / blockSize, freeAvail / blockSize, 0, 0, blockSize, blockSize, 255, 0
 }
 
-func enrichHostFileAttr(_ os.FileInfo, _ *FuseAttr) {
+func enrichHostFileAttr(hostPath string, info os.FileInfo, attr *FuseAttr) {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	file, err := os.Open(hostPath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	var handleInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &handleInfo); err != nil {
+		return
+	}
+	attr.Ino = uint64(handleInfo.FileIndexHigh)<<32 | uint64(handleInfo.FileIndexLow)
+	if handleInfo.NumberOfLinks != 0 {
+		attr.NLink = handleInfo.NumberOfLinks
+	}
 }
 
 func mapHostError(err error) (int32, bool) {

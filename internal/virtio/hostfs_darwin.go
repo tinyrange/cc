@@ -18,7 +18,7 @@ func hostStatFS(root string) (uint64, uint64, uint64, uint64, uint64, uint64, ui
 	return st.Blocks, st.Bfree, st.Bavail, st.Files, st.Ffree, bsize, bsize, 255, 0
 }
 
-func enrichHostFileAttr(info os.FileInfo, attr *FuseAttr) {
+func enrichHostFileAttr(_ string, info os.FileInfo, attr *FuseAttr) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return

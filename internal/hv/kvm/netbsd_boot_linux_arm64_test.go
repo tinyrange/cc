@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+// This boot smoke test consumes an unstructured kernel serial transcript.
+// The substring check confirms the guest reached a NetBSD boot path.
 func TestBootNetBSD101Arm64KernelToSerial(t *testing.T) {
 	if os.Getenv("CC_TEST_NETBSD_KVM") == "" {
 		t.Skip("set CC_TEST_NETBSD_KVM=1 to run NetBSD KVM boot smoke test")

@@ -531,6 +531,7 @@ func (f *FS) Close() error {
 			irq := f.irq
 			f.irq = nil
 			f.mem = nil
+			f.clearQueueCachesLocked()
 			f.interruptStatus = 0
 			f.irqHigh = false
 			f.mu.Unlock()
@@ -655,6 +656,7 @@ func (f *FS) Attach(mem GuestMemory, irq IRQController) {
 	defer f.mu.Unlock()
 	f.mem = mem
 	f.irq = irq
+	f.clearQueueCachesLocked()
 }
 
 func (f *FS) Contains(addr uint64, size int) bool {
@@ -2788,6 +2790,14 @@ func (f *FS) resetLocked() {
 	f.resetQueueStateLocked()
 }
 
+func (f *FS) clearQueueCachesLocked() {
+	for i := range f.queues {
+		f.queues[i].descMem = nil
+		f.queues[i].availMem = nil
+		f.queues[i].usedMem = nil
+	}
+}
+
 func (f *FS) deviceFeaturesLocked() uint64 {
 	features := featureVersion1
 	if f.eventIdx && !f.kickPoll {
@@ -3083,7 +3093,7 @@ func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	if err != nil {
 		return FuseAttr{}, errnoFromError(err)
 	}
-	return p.fileAttr(nodeID, info), 0
+	return p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
@@ -3092,10 +3102,22 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	rel, ok := cleanChildName(name)
-	if !ok {
+	switch name {
+	case ".":
 		attr, errno := p.GetAttr(parent)
 		return parent, attr, errno
+	case "..":
+		guestPath := path.Dir(guestParent)
+		if guestPath == "." {
+			guestPath = "/"
+		}
+		nodeID := p.ensureNode(guestPath)
+		attr, errno := p.GetAttr(nodeID)
+		return nodeID, attr, errno
+	}
+	rel, ok := cleanChildName(name)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
 	}
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	info, err := os.Lstat(host)
@@ -3107,7 +3129,7 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 		p.logf("lookup name=%q guest=%q host=%q", name, guestPath, host)
 	}
 	nodeID := p.ensureNode(guestPath)
-	return nodeID, p.fileAttr(nodeID, info), 0
+	return nodeID, p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
@@ -3141,7 +3163,7 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32, uid uint3
 		p.mu.Unlock()
 	}
 	nodeID := p.ensureNode(guestPath)
-	return nodeID, p.fileAttr(nodeID, info), 0
+	return nodeID, p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
@@ -3174,7 +3196,7 @@ func (p *passthroughFS) Symlink(parent uint64, name string, target string, uid u
 		p.mu.Unlock()
 	}
 	nodeID := p.ensureNode(guestPath)
-	return nodeID, p.fileAttr(nodeID, info), 0
+	return nodeID, p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
@@ -3200,7 +3222,7 @@ func (p *passthroughFS) Link(nodeID uint64, newParent uint64, newName string) (u
 	}
 	guestPath := joinGuestChild(guestParent, rel)
 	newNodeID := p.ensureNode(guestPath)
-	return newNodeID, p.fileAttr(newNodeID, info), 0
+	return newNodeID, p.fileAttr(newNodeID, dst, info), 0
 }
 
 func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
@@ -3239,7 +3261,7 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 	p.nextHandle++
 	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file, append: flags&linuxOAPPEND != 0}
 	p.mu.Unlock()
-	return nodeID, handle, p.fileAttr(nodeID, info), 0
+	return nodeID, handle, p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
@@ -3371,9 +3393,13 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	if err != nil {
 		return 0, errnoFromError(err)
 	}
+	parentID := nodeID
+	if guest != "/" {
+		parentID = p.ensureNode(path.Dir(guest))
+	}
 	dirEntries := []dirEntry{
 		{name: ".", typ: dirTypeDir, ino: nodeID},
-		{name: "..", typ: dirTypeDir, ino: nodeID},
+		{name: "..", typ: dirTypeDir, ino: parentID},
 	}
 	for _, entry := range entries {
 		childPath := joinGuestChild(guest, entry.Name())
@@ -3575,7 +3601,7 @@ func (p *passthroughFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uin
 	if err != nil {
 		return FuseAttr{}, errnoFromError(err)
 	}
-	return p.fileAttr(nodeID, info), 0
+	return p.fileAttr(nodeID, host, info), 0
 }
 
 func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, int32) {
@@ -3692,7 +3718,7 @@ func (p *passthroughFS) renameNodeGuestPath(oldPath, newPath string) {
 	}
 }
 
-func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
+func (p *passthroughFS) fileAttr(nodeID uint64, hostPath string, info os.FileInfo) FuseAttr {
 	mode := goModeToLinux(info.Mode())
 	if mode&os.ModeType == 0 {
 		mode |= 0
@@ -3714,7 +3740,7 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 	attr.ATimeNsec = uint32(mod.Nanosecond())
 	attr.MTimeNsec = uint32(mod.Nanosecond())
 	attr.CTimeNsec = uint32(mod.Nanosecond())
-	enrichHostFileAttr(info, &attr)
+	enrichHostFileAttr(hostPath, info, &attr)
 	if p.mapOwner {
 		attr.UID = p.ownerUID
 		attr.GID = p.ownerGID
@@ -3871,16 +3897,26 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxENOENT
 	}
+	switch name {
+	case ".":
+		attr := p.attr(parentNode)
+		p.mu.Unlock()
+		return parentNode.id, attr, 0
+	case "..":
+		node := p.nodes[parentNode.parent]
+		if node == nil {
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		attr := p.attr(node)
+		p.mu.Unlock()
+		return node.id, attr, 0
+	}
 	var ok bool
 	name, ok = cleanChildName(name)
 	if !ok {
 		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxEINVAL
-	}
-	if name == "." {
-		attr := p.attr(parentNode)
-		p.mu.Unlock()
-		return parentNode.id, attr, 0
 	}
 	p.debugChildfLocked("lookup", parent, name, "")
 	childID, ok := parentNode.entries[name]

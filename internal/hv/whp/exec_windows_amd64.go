@@ -251,6 +251,10 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 			}
 		case runVPExitReasonX64ApicEoi:
 			platform.HandleEOI(raw.apicEoi().InterruptVector)
+		case runVPExitReasonX64MsrAccess:
+			if err := handleMSRAccess(vm, exit, &raw); err != nil {
+				return fmt.Errorf("handle msr at rip=%#x: %w", exit.RIP, err)
+			}
 		case runVPExitReasonX64InterruptWindow:
 		case runVPExitReasonCanceled:
 		default:

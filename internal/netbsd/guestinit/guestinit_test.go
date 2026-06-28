@@ -12,12 +12,6 @@ func TestBuildFindsModuleFromSourceLocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := os.Chdir(wd); err != nil {
-			t.Errorf("restore cwd: %v", err)
-		}
-	})
-
 	otherModule := t.TempDir()
 	if err := os.WriteFile(filepath.Join(otherModule, "go.mod"), []byte("module example.invalid/other\n"), 0o644); err != nil {
 		t.Fatal(err)

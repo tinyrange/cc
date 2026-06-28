@@ -12,11 +12,21 @@ import (
 )
 
 type Client struct {
-	conn   net.Conn
-	codec  *WorkerCodec
-	callMu sync.Mutex
-	idMu   sync.Mutex
-	next   uint64
+	conn  net.Conn
+	codec *WorkerCodec
+
+	idMu sync.Mutex
+	next uint64
+
+	pendingMu sync.Mutex
+	pending   map[uint64]chan workerFrameResult
+	closed    bool
+	recvErr   error
+}
+
+type workerFrameResult struct {
+	frame WorkerFrame
+	err   error
 }
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
@@ -38,8 +48,8 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	client := &Client{conn: conn, codec: NewWorkerCodec(conn)}
-	frame, err := client.codec.Receive()
+	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]chan workerFrameResult{}}
+	frame, err := worker.codec.Receive()
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read sidecar worker hello: %w", err)
@@ -48,7 +58,8 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
 	}
-	return client, nil
+	go worker.receiveLoop()
+	return worker, nil
 }
 
 func workerDialTarget(address string) (string, string) {
@@ -63,6 +74,63 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.conn.Close()
+}
+
+func (c *Client) receiveLoop() {
+	for {
+		frame, err := c.codec.Receive()
+		if err != nil {
+			c.closePending(err)
+			return
+		}
+		c.pendingMu.Lock()
+		ch := c.pending[frame.ID]
+		c.pendingMu.Unlock()
+		if ch == nil {
+			continue
+		}
+		ch <- workerFrameResult{frame: frame}
+	}
+}
+
+func (c *Client) registerCall(id uint64) (chan workerFrameResult, error) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.closed {
+		if c.recvErr != nil {
+			return nil, c.recvErr
+		}
+		return nil, fmt.Errorf("sidecar worker is closed")
+	}
+	ch := make(chan workerFrameResult, 256)
+	c.pending[id] = ch
+	return ch, nil
+}
+
+func (c *Client) unregisterCall(id uint64) {
+	c.pendingMu.Lock()
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+}
+
+func (c *Client) closePending(err error) {
+	if err == nil {
+		err = fmt.Errorf("sidecar worker is closed")
+	}
+	c.pendingMu.Lock()
+	if c.closed {
+		c.pendingMu.Unlock()
+		return
+	}
+	c.closed = true
+	c.recvErr = err
+	pending := c.pending
+	c.pending = map[uint64]chan workerFrameResult{}
+	c.pendingMu.Unlock()
+	for _, ch := range pending {
+		ch <- workerFrameResult{err: err}
+		close(ch)
+	}
 }
 
 func (c *Client) Start(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
@@ -130,6 +198,11 @@ func (c *Client) Flush(ctx context.Context, id string) error {
 	return c.call(ctx, WorkerFrameFlush, WorkerFlushRequest{ID: id}, nil, &resp)
 }
 
+func (c *Client) AddShare(ctx context.Context, id string, share client.ShareMount) error {
+	var resp map[string]string
+	return c.call(ctx, WorkerFrameAddShare, WorkerAddShareRequest{ID: id, Share: share}, nil, &resp)
+}
+
 func (c *Client) ConsoleHistory(ctx context.Context, id string) (string, error) {
 	var resp WorkerConsoleResponse
 	err := c.call(ctx, WorkerFrameConsole, WorkerConsoleRequest{ID: id}, nil, &resp)
@@ -149,10 +222,13 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
-
 	requestID := c.nextID()
+	frames, err := c.registerCall(requestID)
+	if err != nil {
+		return err
+	}
+	defer c.unregisterCall(requestID)
+
 	frame, err := NewWorkerFrame(requestID, WorkerServiceControl, WorkerFrameExec, WorkerExecRequest{
 		ID:          id,
 		Request:     req,
@@ -187,16 +263,11 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	}()
 
 	for {
-		got, err := c.codec.Receive()
+		result, err := c.nextFrame(ctx, frames)
 		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			return err
 		}
-		if got.ID != requestID {
-			continue
-		}
+		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -230,21 +301,24 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
+	id := c.nextID()
+	frames, err := c.registerCall(id)
+	if err != nil {
+		return err
+	}
+	defer c.unregisterCall(id)
+
 	cancelDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.conn.SetReadDeadline(time.Now())
+			_ = c.sendCancel(id)
 		case <-cancelDone:
 		}
 	}()
 	defer func() {
 		close(cancelDone)
-		_ = c.conn.SetReadDeadline(time.Time{})
 	}()
-	id := c.nextID()
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {
 		return err
@@ -253,18 +327,11 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 		return err
 	}
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		got, err := c.codec.Receive()
+		result, err := c.nextFrame(ctx, frames)
 		if err != nil {
 			return err
 		}
-		if got.ID != id {
-			continue
-		}
+		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -284,6 +351,27 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 				}
 			}
 		}
+	}
+}
+
+func (c *Client) nextFrame(ctx context.Context, frames <-chan workerFrameResult) (workerFrameResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return workerFrameResult{}, ctx.Err()
+	case result, ok := <-frames:
+		if !ok {
+			return workerFrameResult{}, fmt.Errorf("sidecar worker is closed")
+		}
+		if result.err != nil {
+			if ctx.Err() != nil {
+				return workerFrameResult{}, ctx.Err()
+			}
+			return workerFrameResult{}, result.err
+		}
+		return result, nil
 	}
 }
 

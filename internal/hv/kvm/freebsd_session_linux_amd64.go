@@ -39,15 +39,14 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 	}
 
 	netdev, stack, ownStack := freeBSDManagedNet(cfg)
-	devices := []machine.DeviceSpec{{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10}}
+	devices := []machine.DeviceSpec{{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10}}
 	for idx := range cfg.ExtraBlocks {
 		devices = append(devices, machine.DeviceSpec{
-			Kind:   "virtio-block",
-			Name:   fmt.Sprintf("extra%d", idx),
-			Bus:    "pci",
-			Slot:   uint8(2 + idx),
-			IOBase: uint16(0x1100 + idx*0x100),
-			IRQ:    uint8(11 + idx),
+			Kind: "nvme",
+			Name: fmt.Sprintf("extra%d", idx),
+			Bus:  "pci",
+			Slot: uint8(2 + idx),
+			IRQ:  uint8(11 + idx),
 		})
 	}
 	netIndex := len(devices) + 1
@@ -78,9 +77,6 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		NetDevice:   netdev,
 		NetStack:    stack,
 		OwnNetStack: ownStack,
-		BlockQuirks: bsdPCBlockQuirks{
-			DisableSizeMax: true,
-		},
 		Prepare: func(vm *VM, mem []byte) error {
 			plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
 				MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
@@ -162,7 +158,9 @@ func runFreeBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci
 				return err
 			}
 		case ExitMMIO:
-			return fmt.Errorf("unhandled FreeBSD mmio addr=%#x len=%d write=%v", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write)
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+				return fmt.Errorf("unhandled FreeBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
+			}
 		case ExitHLT:
 			return fmt.Errorf("FreeBSD guest halted\nserial:\n%s", serialOut.String())
 		case ExitShutdown:

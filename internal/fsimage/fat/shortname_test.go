@@ -1,7 +1,6 @@
 package fat
 
 import (
-	"strings"
 	"testing"
 
 	"j5.nz/cc/internal/fsimage/vm"
@@ -156,9 +155,8 @@ func TestShortNameCollisionResolution(t *testing.T) {
 		t.Logf("First: '%s', Second: '%s'", actualFirst, actualSecond)
 	}
 
-	// Check that second name has a numeric tail
-	if !strings.Contains(actualSecond, "~") {
-		t.Errorf("Second name should contain numeric tail '~', got '%s'", actualSecond)
+	if string(second.Name[:8]) != "VERYLO~1" {
+		t.Errorf("Second name should use numeric tail VERYLO~1, got '%s'", actualSecond[:8])
 	}
 }
 

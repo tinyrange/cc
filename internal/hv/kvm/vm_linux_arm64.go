@@ -409,6 +409,27 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	return nil
 }
 
+func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
+	if v == nil {
+		return nil, fmt.Errorf("vm is nil")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("invalid slice size %d", size)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	start := v.memRegion.GuestPhysAddr
+	end := start + v.memRegion.MemorySize
+	if addr < start || addr+uint64(size) > end {
+		return nil, fmt.Errorf("slice guest memory %#x size %d: unmapped", addr, size)
+	}
+	off := addr - start
+	return v.mem[off : off+uint64(size)], nil
+}
+
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	if v == nil {
 		return fmt.Errorf("vm is nil")

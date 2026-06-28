@@ -129,6 +129,7 @@ func TestVirtualMemoryRandomReadWriteConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create backing file: %v", err)
 	}
+	defer backing.Close()
 	if _, err := backing.WriteAt(oracle, 0); err != nil {
 		t.Fatalf("write backing file: %v", err)
 	}
@@ -172,6 +173,7 @@ func TestVirtualMemoryRandomReadWriteConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sparse output: %v", err)
 	}
+	defer out.Close()
 	if err := out.Truncate(size); err != nil {
 		t.Fatalf("truncate sparse output: %v", err)
 	}

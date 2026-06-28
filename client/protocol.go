@@ -8,10 +8,11 @@ import (
 )
 
 type ServerHello struct {
-	Addr   string `json:"addr,omitempty"`
-	Kind   string `json:"kind,omitempty"`
-	Error  string `json:"error,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	Addr      string `json:"addr,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	TokenPath string `json:"token_path,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type ErrorResponse struct {
@@ -300,6 +301,8 @@ type NetworkConfig struct {
 	Enabled                  bool          `json:"enabled,omitempty"`
 	AllowInternet            bool          `json:"allow_internet,omitempty"`
 	BlockHostAccess          bool          `json:"block_host_access,omitempty"`
+	GuestIPv4                string        `json:"guest_ipv4,omitempty"`
+	GuestMAC                 string        `json:"guest_mac,omitempty"`
 	HostDNSName              string        `json:"host_dns_name,omitempty"`
 	AllowedServiceProxyPorts []int         `json:"allowed_service_proxy_ports,omitempty"`
 	PortForwards             []PortForward `json:"port_forwards,omitempty"`
