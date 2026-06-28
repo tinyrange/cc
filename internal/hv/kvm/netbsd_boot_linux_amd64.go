@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/amd64vm"
 	netbsdamd64 "j5.nz/cc/internal/netbsd/boot/amd64"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
@@ -21,11 +22,11 @@ func BootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint6
 	return bootNetBSDKernelToSerial(ctx, kernel, memoryMB, nil, nil)
 }
 
-func BootNetBSDKernelWithPCIBlockNetToSerial(ctx context.Context, kernel []byte, memoryMB uint64, block *virtio.Block, netdev *virtio.Net) (string, error) {
+func BootNetBSDKernelWithNVMENetToSerial(ctx context.Context, kernel []byte, memoryMB uint64, block *nvme.Controller, netdev *virtio.Net) (string, error) {
 	return bootNetBSDKernelToSerial(ctx, kernel, memoryMB, block, netdev)
 }
 
-func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint64, block *virtio.Block, netdev *virtio.Net) (string, error) {
+func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint64, block *nvme.Controller, netdev *virtio.Net) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -44,7 +45,7 @@ func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint6
 	var pciDevices []*PCIDevice
 	if block != nil {
 		block.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+		pciDevices = append(pciDevices, NewNVMePCIDevice(1, 0xfeb00000, 10, block))
 	}
 	if netdev != nil {
 		netdev.Attach(vm, vm)
@@ -109,7 +110,7 @@ func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint6
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIOForVCPU(vm, 0, nil, nil, nil, nil, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
 				return serialOut.String(), fmt.Errorf("unhandled NetBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
 			}
 		case ExitHLT:

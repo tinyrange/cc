@@ -29,6 +29,61 @@ func TestBootPICLevelLineResamplesUntilDeasserted(t *testing.T) {
 	}
 }
 
+func TestBootPICSetLevelTriggeredResamplesAssertedLine(t *testing.T) {
+	var pic bootPIC
+	pic.master.vectorBase = 0x20
+	pic.slave.vectorBase = 0x28
+	pic.master.mask = 0xff
+	pic.slave.mask = 0xff
+	pic.master.mask &^= 1 << 2
+	pic.slave.mask &^= 1 << 2
+
+	pic.SetIRQ(10, true)
+	vector, line, ok := pic.AcknowledgePending()
+	if !ok || vector != 0x2a || line != 10 {
+		t.Fatalf("edge ack = vector %#x line %d ok %t, want vector 0x2a line 10", vector, line, ok)
+	}
+	if _, _, ok := pic.AcknowledgePending(); ok {
+		t.Fatalf("edge line delivered twice before level trigger was enabled")
+	}
+
+	pic.SetLevelTriggered(10, true)
+	vector, line, ok = pic.AcknowledgePending()
+	if !ok || vector != 0x2a || line != 10 {
+		t.Fatalf("level ack = vector %#x line %d ok %t, want vector 0x2a line 10", vector, line, ok)
+	}
+}
+
+func TestBootPICEndOfInterruptClearsSlaveISRAndResamples(t *testing.T) {
+	var pic bootPIC
+	pic.master.vectorBase = 0x30
+	pic.slave.vectorBase = 0x38
+	pic.master.mask = 0xff
+	pic.slave.mask = 0xff
+	pic.master.mask &^= 1 << 2
+	pic.slave.mask &^= 1 << 2
+	pic.SetLevelTriggered(10, true)
+
+	pic.SetIRQ(10, true)
+	vector, line, ok := pic.AcknowledgePending()
+	if !ok || vector != 0x3a || line != 10 {
+		t.Fatalf("ack = vector %#x line %d ok %t, want vector 0x3a line 10", vector, line, ok)
+	}
+	if !pic.EndOfInterrupt(vector) {
+		t.Fatalf("EndOfInterrupt(%#x) = false, want true", vector)
+	}
+	if pic.slave.isr&(1<<2) != 0 {
+		t.Fatalf("slave ISR still has IRQ 10 set after EOI")
+	}
+	if pic.master.isr&(1<<2) != 0 {
+		t.Fatalf("master cascade ISR still set after slave EOI")
+	}
+	vector, line, ok = pic.AcknowledgePending()
+	if !ok || vector != 0x3a || line != 10 {
+		t.Fatalf("resampled ack = vector %#x line %d ok %t, want vector 0x3a line 10", vector, line, ok)
+	}
+}
+
 func TestBootPICEdgeLineRequiresNewRisingEdge(t *testing.T) {
 	var pic bootPIC
 	pic.master.vectorBase = 0x20

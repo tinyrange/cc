@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -64,7 +65,7 @@ func BootInitramfsToMarkerWithFSAndSettle(ctx context.Context, kernel []byte, in
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, settle, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, nil, settle, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -73,13 +74,22 @@ func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initr
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, 0, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, nil, 0, func(serial string) bool {
+		return strings.Contains(serial, marker)
+	})
+}
+
+func BootInitramfsToMarkerWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *nvme.Controller) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, 0, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, 0, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, nil, 0, done)
 }
 
 func BootInitramfsToVsockMarker(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, port uint32, marker string) (string, string, error) {
@@ -110,7 +120,7 @@ func BootInitramfsToVsockMarker(ctx context.Context, kernel []byte, initrd []byt
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	defer vsock.Close()
 
-	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, vsock, nil, time.Second, func(string) bool {
+	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, vsock, nil, nil, time.Second, func(string) bool {
 		return strings.Contains(controlOut.String(), marker)
 	})
 	select {
@@ -152,7 +162,7 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, settleAfterDone time.Duration, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, nvmeBlock *nvme.Controller, settleAfterDone time.Duration, done func(string) bool) (string, error) {
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return "", err
@@ -172,6 +182,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
+	if nvmeBlock != nil {
+		extraCmdline = append(extraCmdline, "pci=conf1")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(vm.Memory(), kernel, initrd, amd64vm.BootConfig{
@@ -202,6 +215,10 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	if netdev != nil {
 		platform.AttachNet(netdev)
+	}
+	if nvmeBlock != nil {
+		nvmeBlock.Attach(vm, platform)
+		platform.AttachPCI(NewPCIBus(NewNVMePCIDevice(1, 0xfeb00000, 10, nvmeBlock)))
 	}
 	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {
@@ -485,6 +502,7 @@ func (p *bootPlatform) AttachPCI(pci *PCIBus) {
 	for _, dev := range pci.devices {
 		if dev != nil && dev.IRQLine < ioapicRedirEntries {
 			p.deviceIRQLine[dev.IRQLine] = true
+			p.pic.SetLevelTriggered(dev.IRQLine, true)
 		}
 	}
 }
@@ -498,6 +516,9 @@ func (p *bootPlatform) AttachPCDevices(i8042 *I8042, rtc *CMOSRTC, acpiPM *ACPIP
 func (p *bootPlatform) markDeviceIRQ(irq uint32) {
 	if irq < ioapicRedirEntries {
 		p.deviceIRQLine[irq] = true
+		if irq < 16 {
+			p.pic.SetLevelTriggered(uint8(irq), true)
+		}
 	}
 }
 
@@ -613,6 +634,9 @@ func (p *bootPlatform) ReadMMIO(addr uint64, data []byte) error {
 		putUint64(data, value)
 		return nil
 	}
+	if handled, err := p.pci.ReadMMIO(addr, data); handled || err != nil {
+		return err
+	}
 	if p.ioapic.Read(addr, data) {
 		return nil
 	}
@@ -640,6 +664,9 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	}
 	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
 		return p.netdev.Write(addr, len(data), readUint64(data))
+	}
+	if handled, err := p.pci.WriteMMIO(addr, data); handled || err != nil {
+		return err
 	}
 	if handled, route, pending := p.ioapic.Write(addr, data); handled {
 		if pending {
@@ -819,6 +846,9 @@ func (p *bootPlatform) deliverPICOutput() bool {
 }
 
 func (p *bootPlatform) HandleEOI(vector uint32) {
+	if p.pic.EndOfInterrupt(uint8(vector)) {
+		p.deliverPICOutput()
+	}
 	if route, pending := p.ioapic.handleEOI(vector); pending {
 		if p.isDeviceIRQ(route.line) {
 			return
@@ -1122,12 +1152,13 @@ func canAcceptInterrupt(ctx *runVPExitContext, vector uint8) bool {
 
 func (p *bootPlatform) Summary() string {
 	summary := fmt.Sprintf(
-		"whp platform irq_attempts=%d irq_delivered=%d irq_failed=%d irq_suppressed=%d irq_lines=%s %s",
+		"whp platform irq_attempts=%d irq_delivered=%d irq_failed=%d irq_suppressed=%d irq_lines=%s %s %s",
 		atomic.LoadUint64(&p.irqAttempts),
 		atomic.LoadUint64(&p.irqDelivered),
 		atomic.LoadUint64(&p.irqFailed),
 		atomic.LoadUint64(&p.irqSuppressed),
 		p.irqLineSummary(),
+		p.pic.summaryForLines(p.activeIRQLines()),
 		p.ioapic.summaryForLines(p.activeIRQLines()),
 	)
 	if pending := p.pendingIRQCount(); pending != 0 {

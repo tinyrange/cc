@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/nvme"
 	openbsdamd64 "j5.nz/cc/internal/openbsd/boot/amd64"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
@@ -26,25 +27,25 @@ func BootOpenBSDKernelToMarker(ctx context.Context, kernel []byte, memoryMB uint
 	})
 }
 
-func BootOpenBSDKernelToMarkerWithPCIBlock(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *virtio.Block) (string, error) {
+func BootOpenBSDKernelToMarkerWithNVMe(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *nvme.Controller) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, nil, nil, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*nvme.Controller{block}, nil, nil, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
-func BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *virtio.Block, input func(serial string) []byte) (string, error) {
+func BootOpenBSDKernelToMarkerWithNVMeConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *nvme.Controller, input func(serial string) []byte) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, nil, input, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*nvme.Controller{block}, nil, input, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
-func BootOpenBSDKernelToMarkerWithPCIBlocksConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, blocks []*virtio.Block, input func(serial string) []byte) (string, error) {
+func BootOpenBSDKernelToMarkerWithNVMesConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, blocks []*nvme.Controller, input func(serial string) []byte) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
@@ -53,11 +54,11 @@ func BootOpenBSDKernelToMarkerWithPCIBlocksConsole(ctx context.Context, kernel [
 	})
 }
 
-func BootOpenBSDKernelToMarkerWithPCIBlockNetConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *virtio.Block, netdev *virtio.Net, input func(serial string) []byte) (string, error) {
+func BootOpenBSDKernelToMarkerWithNVMENetConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *nvme.Controller, netdev *virtio.Net, input func(serial string) []byte) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, netdev, input, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*nvme.Controller{block}, netdev, input, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -68,7 +69,7 @@ func BootOpenBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint
 	})
 }
 
-func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, blocks []*virtio.Block, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
+func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, blocks []*nvme.Controller, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -90,7 +91,7 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 			continue
 		}
 		block.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(uint8(1+i), uint16(0x1000+i*0x100), uint8(10+i), block))
+		pciDevices = append(pciDevices, NewNVMePCIDevice(uint8(1+i), 0xfeb00000+uint64(i)*0x10000, uint8(10+i), block))
 	}
 	if netdev != nil {
 		netdev.Attach(vm, vm)
@@ -160,7 +161,9 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			return serialOut.String(), fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write)
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+				return serialOut.String(), fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
+			}
 		case ExitHLT:
 			return serialOut.String(), fmt.Errorf("OpenBSD guest halted before marker")
 		case ExitShutdown:

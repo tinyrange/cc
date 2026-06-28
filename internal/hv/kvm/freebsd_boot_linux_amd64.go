@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/amd64vm"
 	freebsdamd64 "j5.nz/cc/internal/freebsd/boot/amd64"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
@@ -26,11 +27,11 @@ func BootFreeBSDKernelToMarker(ctx context.Context, kernel []byte, memoryMB uint
 	})
 }
 
-func BootFreeBSDKernelToMarkerWithPCIBlockNetConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *virtio.Block, netdev *virtio.Net, input func(string) []byte) (string, error) {
+func BootFreeBSDKernelToMarkerWithNVMENetConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *nvme.Controller, netdev *virtio.Net, input func(string) []byte) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootFreeBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, netdev, input, func(serial string) bool {
+	return bootFreeBSDToCondition(ctx, kernel, memoryMB, []*nvme.Controller{block}, netdev, input, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -41,7 +42,7 @@ func BootFreeBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint
 	})
 }
 
-func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, blocks []*virtio.Block, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
+func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, blocks []*nvme.Controller, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -63,7 +64,7 @@ func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 			continue
 		}
 		block.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(uint8(1+i), uint16(0x1000+i*0x100), uint8(10+i), block))
+		pciDevices = append(pciDevices, NewNVMePCIDevice(uint8(1+i), 0xfeb00000+uint64(i)*0x10000, uint8(10+i), block))
 	}
 	if netdev != nil {
 		netdev.Attach(vm, vm)
@@ -129,7 +130,9 @@ func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			return serialOut.String(), fmt.Errorf("unhandled FreeBSD mmio addr=%#x len=%d write=%v", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write)
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+				return serialOut.String(), fmt.Errorf("unhandled FreeBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
+			}
 		case ExitHLT:
 			return serialOut.String(), fmt.Errorf("FreeBSD guest halted before marker")
 		case ExitShutdown:

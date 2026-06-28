@@ -13,6 +13,7 @@ import (
 	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -34,13 +35,8 @@ type bsdPCSessionConfig struct {
 	NetPCIDev   uint8
 	NetIOBase   uint16
 	NetIRQ      uint8
-	BlockQuirks bsdPCBlockQuirks
 	Prepare     func(vm *VM, mem []byte) error
 	Run         func(ctx context.Context, vm *VM, uart *serial.UART8250, pci *PCIBus, serialOut *vmruntime.SerialTranscript) error
-}
-
-type bsdPCBlockQuirks struct {
-	DisableSizeMax bool
 }
 
 func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -115,7 +111,7 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
 	uart.AttachIRQ(kvmVM, amd64vm.COM1IRQ)
 
-	pci := attachBSDPCDevices(kvmVM, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ, cfg.BlockQuirks)
+	pci := attachBSDPCDevices(kvmVM, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ)
 
 	if err := cfg.Prepare(kvmVM, mem); err != nil {
 		cleanupStartup()
@@ -214,23 +210,20 @@ func bsdSessionControlPort(cfg bsdPCSessionConfig) int {
 	return bsdControlPort
 }
 
-func attachBSDPCDevices(vm *VM, root virtio.BlockBackend, extraBlocks []virtio.BlockBackend, netdev *virtio.Net, netPCIDev uint8, netIOBase uint16, netIRQ uint8, blockQuirks bsdPCBlockQuirks) *PCIBus {
+func attachBSDPCDevices(vm *VM, root virtio.BlockBackend, extraBlocks []virtio.BlockBackend, netdev *virtio.Net, netPCIDev uint8, netIOBase uint16, netIRQ uint8) *PCIBus {
 	var pciDevices []*PCIDevice
-	block := virtio.NewBlock(0, 0x1000, 10, root)
-	block.DisableSizeMax = blockQuirks.DisableSizeMax
+	block := nvme.NewController(root)
 	block.Attach(vm, vm)
-	pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+	pciDevices = append(pciDevices, NewNVMePCIDevice(1, 0xfeb00000, 10, block))
 	for i, backend := range extraBlocks {
 		if backend == nil {
 			continue
 		}
 		dev := uint8(2 + i)
-		ioBase := uint16(0x1100 + i*0x100)
 		irq := uint8(11 + i)
-		extraBlock := virtio.NewBlock(0, 0x1000, uint32(irq), backend)
-		extraBlock.DisableSizeMax = blockQuirks.DisableSizeMax
+		extraBlock := nvme.NewController(backend)
 		extraBlock.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(dev, ioBase, irq, extraBlock))
+		pciDevices = append(pciDevices, NewNVMePCIDevice(dev, 0xfeb00000+uint64(i+1)*0x10000, irq, extraBlock))
 	}
 	netIndex := len(pciDevices) + 1
 	if netPCIDev == 0 {

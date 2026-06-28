@@ -14,15 +14,15 @@ import (
 
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/linux/initramfs"
-	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/nvme"
 )
 
-func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
-	if os.Getenv("CC_TEST_LINUX_KVM_PCI") == "" {
-		t.Skip("set CC_TEST_LINUX_KVM_PCI=1 to run Linux virtio-pci block KVM smoke test")
+func TestLinuxBootsWithNVMeBlock(t *testing.T) {
+	if os.Getenv("CC_TEST_LINUX_KVM_NVME") == "" {
+		t.Skip("set CC_TEST_LINUX_KVM_NVME=1 to run Linux NVMe block KVM smoke test")
 	}
 	if hostCPUHasFlag("hypervisor") {
-		t.Skip("legacy virtio-pci block smoke test requires bare-metal KVM")
+		t.Skip("NVMe block smoke test requires bare-metal KVM")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -40,17 +40,14 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 		t.Fatalf("read kernel: %v", err)
 	}
 	modules, err := kernelManager.PlanModuleLoad(
-		[]string{"CONFIG_VIRTIO_PCI", "CONFIG_VIRTIO_BLK"},
-		map[string]string{
-			"CONFIG_VIRTIO_PCI": "kernel/drivers/virtio/virtio_pci.ko.gz",
-			"CONFIG_VIRTIO_BLK": "kernel/drivers/block/virtio_blk.ko.gz",
-		},
+		[]string{"CONFIG_BLK_DEV_NVME"},
+		map[string]string{"CONFIG_BLK_DEV_NVME": "kernel/drivers/nvme/host/nvme.ko.gz"},
 	)
 	if err != nil {
-		t.Fatalf("plan virtio-pci block modules: %v", err)
+		t.Fatalf("plan NVMe block modules: %v", err)
 	}
 
-	initBin := buildVirtioPCIBlockInit(t)
+	initBin := buildNVMeBlockInit(t)
 	files := []initramfs.File{
 		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
 		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
@@ -61,6 +58,7 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
 		{Path: "/init", Mode: 0o755, Data: initBin, Type: initramfs.TypeRegular},
 	}
+	var loadOrder strings.Builder
 	for _, mod := range modules {
 		files = append(files, initramfs.File{
 			Path: "/modules/" + mod.Name + ".ko",
@@ -68,9 +66,6 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 			Data: mod.Data,
 			Type: initramfs.TypeRegular,
 		})
-	}
-	var loadOrder strings.Builder
-	for _, mod := range modules {
 		loadOrder.WriteString(mod.Name)
 		loadOrder.WriteString(".ko\n")
 	}
@@ -85,35 +80,33 @@ func TestLinuxBootsWithVirtioPCIBlock(t *testing.T) {
 		t.Fatalf("build initramfs: %v", err)
 	}
 
-	disk := newTestDisk(16 * 1024 * 1024)
-	block := virtio.NewBlock(0, 0x1000, 10, disk)
+	disk := newLinuxNVMeTestDisk(16 * 1024 * 1024)
+	ctrl := nvme.NewController(disk)
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer bootCancel()
-	success := "VIRTIO_PCI_BLOCK_OK\n"
-	serial, err := bootToConditionWithDevices(bootCtx, kernel, initrd, 512, true, nil, nil, nil, block, func(serial string) bool {
-		return disk.hasAt(1024, success)
-	})
+	success := "NVME_BLOCK_OK\n"
+	serial, err := BootInitramfsToMarkerWithNVMeBlock(bootCtx, kernel, initrd, 512, true, "NVME_BLOCK_OK", ctrl)
 	if err != nil {
-		t.Fatalf("boot Linux with virtio-pci block: %v\nserial:\n%s", err, serial)
+		t.Fatalf("boot Linux with NVMe block: %v\nserial:\n%s", err, serial)
 	}
 	if !disk.hasAt(1024, success) {
 		t.Fatalf("disk missing success marker; serial:\n%s", serial)
 	}
-	if got := disk.stringAt(512, 13); got != "cc-pci-block\n" {
+	if got := disk.stringAt(512, len("cc-nvme-block\n")); got != "cc-nvme-block\n" {
 		t.Fatalf("disk write = %q", got)
 	}
 }
 
-type testDisk struct {
+type linuxNVMeTestDisk struct {
 	mu   sync.Mutex
 	data []byte
 }
 
-func newTestDisk(size int) *testDisk {
-	return &testDisk{data: make([]byte, size)}
+func newLinuxNVMeTestDisk(size int) *linuxNVMeTestDisk {
+	return &linuxNVMeTestDisk{data: make([]byte, size)}
 }
 
-func (d *testDisk) ReadAt(p []byte, off int64) (int, error) {
+func (d *linuxNVMeTestDisk) ReadAt(p []byte, off int64) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if off < 0 || off >= int64(len(d.data)) {
@@ -122,7 +115,7 @@ func (d *testDisk) ReadAt(p []byte, off int64) (int, error) {
 	return copy(p, d.data[off:]), nil
 }
 
-func (d *testDisk) WriteAt(p []byte, off int64) (int, error) {
+func (d *linuxNVMeTestDisk) WriteAt(p []byte, off int64) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if off < 0 || off >= int64(len(d.data)) {
@@ -131,15 +124,15 @@ func (d *testDisk) WriteAt(p []byte, off int64) (int, error) {
 	return copy(d.data[off:], p), nil
 }
 
-func (d *testDisk) Size() int64 {
+func (d *linuxNVMeTestDisk) Size() int64 {
 	return int64(len(d.data))
 }
 
-func (d *testDisk) hasAt(off int64, value string) bool {
+func (d *linuxNVMeTestDisk) hasAt(off int64, value string) bool {
 	return d.stringAt(off, len(value)) == value
 }
 
-func (d *testDisk) stringAt(off int64, size int) string {
+func (d *linuxNVMeTestDisk) stringAt(off int64, size int) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if off < 0 || off+int64(size) > int64(len(d.data)) {
@@ -148,11 +141,11 @@ func (d *testDisk) stringAt(off int64, size int) string {
 	return string(d.data[off : off+int64(size)])
 }
 
-func buildVirtioPCIBlockInit(t *testing.T) []byte {
+func buildNVMeBlockInit(t *testing.T) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "init.c")
-	if err := os.WriteFile(src, []byte(virtioPCIBlockInitSource), 0o644); err != nil {
+	if err := os.WriteFile(src, []byte(nvmeBlockInitSource), 0o644); err != nil {
 		t.Fatalf("write init source: %v", err)
 	}
 	out := filepath.Join(dir, "init")
@@ -167,7 +160,7 @@ func buildVirtioPCIBlockInit(t *testing.T) []byte {
 	return data
 }
 
-const virtioPCIBlockInitSource = `#define _GNU_SOURCE
+const nvmeBlockInitSource = `#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -191,22 +184,6 @@ const virtioPCIBlockInitSource = `#define _GNU_SOURCE
 static void stay_alive(void) {
 	for (;;) {
 		pause();
-	}
-}
-
-static void setup_console(void) {
-	int fd = open("/dev/console", O_RDWR | O_NONBLOCK);
-	if (fd < 0) {
-		fd = open("/dev/console", O_WRONLY | O_NONBLOCK);
-	}
-	if (fd < 0) {
-		return;
-	}
-	for (int target = 0; target < 3; target++) {
-		dup2(fd, target);
-	}
-	if (fd > 2) {
-		close(fd);
 	}
 }
 
@@ -306,7 +283,7 @@ static int wait_block(char *name, size_t name_len) {
 		if (dir != NULL) {
 			struct dirent *entry;
 			while ((entry = readdir(dir)) != NULL) {
-				if (strncmp(entry->d_name, "vd", 2) == 0) {
+				if (strncmp(entry->d_name, "nvme", 4) == 0) {
 					snprintf(name, name_len, "%s", entry->d_name);
 					closedir(dir);
 					return 0;
@@ -344,7 +321,6 @@ static int make_node(const char *name) {
 }
 
 int main(void) {
-	setup_console();
 	logmsg("init starting");
 	mount("proc", "/proc", "proc", 0, "");
 	mount("sysfs", "/sys", "sysfs", 0, "");
@@ -352,7 +328,7 @@ int main(void) {
 
 	char dev[32];
 	if (wait_block(dev, sizeof(dev)) != 0) {
-		logmsg("virtio block device not found");
+		logmsg("NVMe block device not found");
 		stay_alive();
 	}
 	logmsg("found %s", dev);
@@ -368,7 +344,7 @@ int main(void) {
 		logmsg("open %s failed: errno=%d", path, errno);
 		stay_alive();
 	}
-	const char payload[] = "cc-pci-block\n";
+	const char payload[] = "cc-nvme-block\n";
 	if (pwrite(fd, payload, sizeof(payload) - 1, 512) != (ssize_t)(sizeof(payload) - 1)) {
 		logmsg("write block failed: errno=%d", errno);
 		stay_alive();
@@ -385,13 +361,13 @@ int main(void) {
 		logmsg("readback mismatch");
 		stay_alive();
 	}
-	const char success[] = "VIRTIO_PCI_BLOCK_OK\n";
+	const char success[] = "NVME_BLOCK_OK\n";
 	if (pwrite(fd, success, sizeof(success) - 1, 1024) != (ssize_t)(sizeof(success) - 1)) {
 		logmsg("write success marker failed: errno=%d", errno);
 		stay_alive();
 	}
 	fsync(fd);
-	logmsg("VIRTIO_PCI_BLOCK_OK");
+	logmsg("NVME_BLOCK_OK");
 	stay_alive();
 }
 `

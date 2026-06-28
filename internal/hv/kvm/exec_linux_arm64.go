@@ -60,6 +60,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		return client.ExecResponse{}, "", err
 	}
 	defer vm.Close()
+	defer closeFSDevices(fsdevs)
 
 	mem, err := vm.MapAnonymousMemory(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
 	if err != nil {
@@ -118,8 +119,15 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, serialOut.String(), controlTranscript.String())
 	}
 
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut))
+	}()
+	defer func() {
+		cancel()
+		_ = vm.CancelRun()
+		<-runDone
 	}()
 	go func() {
 		text, err := serialOut.WaitFor(runCtx, 0, vmruntime.HasFatalBootText)

@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/managed/machine"
 	netbsdamd64 "j5.nz/cc/internal/netbsd/boot/amd64"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/nvme"
 	openbsdamd64 "j5.nz/cc/internal/openbsd/boot/amd64"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
@@ -65,13 +66,8 @@ type bsdPCSessionConfig struct {
 	NetPCIDev   uint8
 	NetIOBase   uint16
 	NetIRQ      uint8
-	BlockQuirks bsdPCBlockQuirks
 	Prepare     func(vm *VM, mem []byte) error
 	Input       func(context.Context, *serial.UART8250, *vmruntime.SerialTranscript)
-}
-
-type bsdPCBlockQuirks struct {
-	DisableSizeMax bool
 }
 
 func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -94,7 +90,7 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 			Boot:     machine.BootSpec{Kind: "openbsd"},
 			Network:  &machine.NetworkSpec{GuestIPv4: cfg.GuestIPv4.String(), MAC: cfg.GuestMAC.String()},
 			Devices: []machine.DeviceSpec{
-				{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10},
+				{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10},
 				{Kind: "virtio-net", Name: "net0", Bus: "pci", Slot: 2, IOBase: 0x1100, IRQ: 11},
 			},
 		},
@@ -129,7 +125,7 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 1024
 	}
-	return startBSDPCManagedSession(ctx, freeNetBSDSessionConfig("FreeBSD", "freebsd", cfg, bsdPCBlockQuirks{DisableSizeMax: true}, func(vm *VM, mem []byte) error {
+	return startBSDPCManagedSession(ctx, freeNetBSDSessionConfig("FreeBSD", "freebsd", cfg, func(vm *VM, mem []byte) error {
 		plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
 			MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
 		})
@@ -150,7 +146,7 @@ func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onE
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 1024
 	}
-	return startBSDPCManagedSession(ctx, freeNetBSDSessionConfig("NetBSD", "netbsd", cfg, bsdPCBlockQuirks{}, func(vm *VM, mem []byte) error {
+	return startBSDPCManagedSession(ctx, freeNetBSDSessionConfig("NetBSD", "netbsd", cfg, func(vm *VM, mem []byte) error {
 		plan, err := netbsdamd64.PrepareBoot(mem, cfg.Kernel, netbsdamd64.BootOptions{
 			MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
 		})
@@ -161,16 +157,15 @@ func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onE
 	}), onEvent)
 }
 
-func freeNetBSDSessionConfig(name, boot string, cfg FreeBSDManagedConfig, quirks bsdPCBlockQuirks, prepare func(*VM, []byte) error) bsdPCSessionConfig {
-	devices := []machine.DeviceSpec{{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10}}
+func freeNetBSDSessionConfig(name, boot string, cfg FreeBSDManagedConfig, prepare func(*VM, []byte) error) bsdPCSessionConfig {
+	devices := []machine.DeviceSpec{{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10}}
 	for idx := range cfg.ExtraBlocks {
 		devices = append(devices, machine.DeviceSpec{
-			Kind:   "virtio-block",
-			Name:   fmt.Sprintf("extra%d", idx),
-			Bus:    "pci",
-			Slot:   uint8(2 + idx),
-			IOBase: uint16(0x1100 + idx*0x100),
-			IRQ:    uint8(11 + idx),
+			Kind: "nvme",
+			Name: fmt.Sprintf("extra%d", idx),
+			Bus:  "pci",
+			Slot: uint8(2 + idx),
+			IRQ:  uint8(11 + idx),
 		})
 	}
 	netIndex := len(devices) + 1
@@ -201,7 +196,6 @@ func freeNetBSDSessionConfig(name, boot string, cfg FreeBSDManagedConfig, quirks
 		Dmesg:       cfg.Dmesg,
 		NetDevice:   cfg.NetDevice,
 		NetStack:    cfg.NetStack,
-		BlockQuirks: quirks,
 		Prepare:     prepare,
 	}
 }
@@ -250,7 +244,7 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
 	platform := newBootPlatform(vm, uart)
 	platform.AttachPCDevices(NewI8042(), NewCMOSRTC(nil), NewACPIPM())
-	pci := attachBSDPCDevices(platform, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ, cfg.BlockQuirks)
+	pci := attachBSDPCDevices(platform, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ)
 	platform.AttachPCI(pci)
 	if err := cfg.Prepare(vm, vm.Memory()); err != nil {
 		platform.Close()
@@ -386,23 +380,20 @@ func bsdSessionControlPort(cfg bsdPCSessionConfig) int {
 	return bsdControlPort
 }
 
-func attachBSDPCDevices(platform *bootPlatform, root virtio.BlockBackend, extraBlocks []virtio.BlockBackend, netdev *virtio.Net, netPCIDev uint8, netIOBase uint16, netIRQ uint8, blockQuirks bsdPCBlockQuirks) *PCIBus {
+func attachBSDPCDevices(platform *bootPlatform, root virtio.BlockBackend, extraBlocks []virtio.BlockBackend, netdev *virtio.Net, netPCIDev uint8, netIOBase uint16, netIRQ uint8) *PCIBus {
 	var pciDevices []*PCIDevice
-	block := virtio.NewBlock(0, 0x1000, 10, root)
-	block.DisableSizeMax = blockQuirks.DisableSizeMax
+	block := nvme.NewController(root)
 	block.Attach(platform.vm, platform)
-	pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+	pciDevices = append(pciDevices, NewNVMePCIDevice(1, 0xfeb00000, 10, block))
 	for i, backend := range extraBlocks {
 		if backend == nil {
 			continue
 		}
 		dev := uint8(2 + i)
-		ioBase := uint16(0x1100 + i*0x100)
 		irq := uint8(11 + i)
-		extraBlock := virtio.NewBlock(0, 0x1000, uint32(irq), backend)
-		extraBlock.DisableSizeMax = blockQuirks.DisableSizeMax
+		extraBlock := nvme.NewController(backend)
 		extraBlock.Attach(platform.vm, platform)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(dev, ioBase, irq, extraBlock))
+		pciDevices = append(pciDevices, NewNVMePCIDevice(dev, 0xfeb00000+uint64(i+1)*0x10000, irq, extraBlock))
 	}
 	netIndex := len(pciDevices) + 1
 	if netPCIDev == 0 {

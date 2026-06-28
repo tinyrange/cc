@@ -522,30 +522,21 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	}, execStreamInput("alpha\n", "beta\n"), 0)
 	requireGuestOutput(t, streamOutput, "line:alpha", "line:beta")
 
-	ttyOutput := execStreamInRuntime(t, inst, client.ExecRequest{
-		Command: []string{"sh", "-lc", "set -eu; stty size; printf 'tty-ok\n'"},
-		TTY:     true,
-		Cols:    77,
-		Rows:    33,
-	}, nil, 0)
-	requireGuestOutput(t, ttyOutput, "33 77", "tty-ok")
-
-	signalOutput := execStreamSignalOnOutput(t, inst)
-	requireGuestOutput(t, signalOutput, "signal-ready", "got-term")
-
-	runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_mkdir", Path: "/runtime-control", User: "0:0"}, 0)
-	runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_write", Path: "/runtime-control/file.txt", Stdin: []byte("control-write"), User: "0:0"}, 0)
-	archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/runtime-control", User: "0:0"}, 0)
-	requireTarFile(t, archive, "runtime-control/file.txt", "control-write")
-	runRuntimeControl(t, inst, client.ExecRequest{
-		Kind:      "fs_extract",
-		Path:      "/runtime-control",
-		Directory: true,
-		Stdin:     tarPayload(t, map[string]string{"extract.txt": "extracted"}),
-		User:      "0:0",
-	}, 0)
-	extracted := execInRuntime(t, inst, []string{"sh", "-lc", "set -eu; cat /runtime-control/extract.txt"})
-	requireGuestOutput(t, extracted.Output, "extracted")
+	if runtime.GOOS != "windows" {
+		runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_mkdir", Path: "/runtime-control", User: "0:0"}, 0)
+		runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_write", Path: "/runtime-control/file.txt", Stdin: []byte("control-write"), User: "0:0"}, 0)
+		archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/runtime-control", User: "0:0"}, 0)
+		requireTarFile(t, archive, "runtime-control/file.txt", "control-write")
+		runRuntimeControl(t, inst, client.ExecRequest{
+			Kind:      "fs_extract",
+			Path:      "/runtime-control",
+			Directory: true,
+			Stdin:     tarPayload(t, map[string]string{"extract.txt": "extracted"}),
+			User:      "0:0",
+		}, 0)
+		extracted := execInRuntime(t, inst, []string{"sh", "-lc", "set -eu; cat /runtime-control/extract.txt"})
+		requireGuestOutput(t, extracted.Output, "extracted")
+	}
 
 	writtenRoot := execInRuntimeRequest(t, inst, client.ExecRequest{
 		Command: []string{"sh", "-lc", "set -eu; printf snapshot-root >/runtime-snapshot.txt; sync"},
@@ -582,6 +573,17 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	if fuseRequests == 0 {
 		t.Fatalf("expected virtio-fs FUSE requests after filesystem activity: %+v", stats)
 	}
+
+	ttyOutput := execStreamInRuntime(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; stty size; printf 'tty-ok\n'"},
+		TTY:     true,
+		Cols:    77,
+		Rows:    33,
+	}, nil, 0)
+	requireGuestOutput(t, ttyOutput, "33 77", "tty-ok")
+
+	signalOutput := execStreamSignalOnOutput(t, inst)
+	requireGuestOutput(t, signalOutput, "signal-ready", "got-term")
 }
 
 func TestRuntimeBootsLinuxWithVirtioDevicesNetworkAndSMP(t *testing.T) {

@@ -160,15 +160,35 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("invalid read size %d", size)
 	}
+	out := make([]byte, size)
+	if err := v.ReadIPAInto(addr, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	if v == nil || v.mem == nil {
+		return fmt.Errorf("guest memory is not mapped")
+	}
+	if addr > v.memSize || uint64(len(dst)) > v.memSize-addr {
+		return fmt.Errorf("read ipa %#x size %d out of range %#x", addr, len(dst), v.memSize)
+	}
+	copy(dst, v.mem.bytes()[addr:addr+uint64(len(dst))])
+	return nil
+}
+
+func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("invalid slice size %d", size)
+	}
 	if v == nil || v.mem == nil {
 		return nil, fmt.Errorf("guest memory is not mapped")
 	}
 	if addr > v.memSize || uint64(size) > v.memSize-addr {
-		return nil, fmt.Errorf("read ipa %#x size %d out of range %#x", addr, size, v.memSize)
+		return nil, fmt.Errorf("slice ipa %#x size %d out of range %#x", addr, size, v.memSize)
 	}
-	out := make([]byte, size)
-	copy(out, v.mem.bytes()[addr:addr+uint64(size)])
-	return out, nil
+	return v.mem.bytes()[addr : addr+uint64(size)], nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {

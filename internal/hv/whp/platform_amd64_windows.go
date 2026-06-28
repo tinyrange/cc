@@ -154,6 +154,34 @@ func (p *bootPIC) AcknowledgePending() (uint8, uint8, bool) {
 	return p.ackLocked(&p.master, line, line), line, true
 }
 
+func (p *bootPIC) EndOfInterrupt(vector uint8) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case vector >= p.slave.vectorBase && vector < p.slave.vectorBase+8:
+		irq := vector - p.slave.vectorBase
+		mask := byte(1 << irq)
+		if p.slave.isr&mask == 0 {
+			return false
+		}
+		p.slave.isr &^= mask
+		p.master.isr &^= 1 << 2
+		p.setLineLocked(8+irq, p.lineHigh[8+irq])
+		return true
+	case vector >= p.master.vectorBase && vector < p.master.vectorBase+8:
+		irq := vector - p.master.vectorBase
+		mask := byte(1 << irq)
+		if p.master.isr&mask == 0 {
+			return false
+		}
+		p.master.isr &^= mask
+		p.setLineLocked(irq, p.lineHigh[irq])
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *bootPIC) ackLocked(chip *bootPICChip, irq uint8, line uint8) uint8 {
 	mask := byte(1 << irq)
 	chip.isr |= mask
@@ -194,6 +222,57 @@ func (p *bootPIC) LevelTriggered(line uint8) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.elcr[line/8]&(1<<(line%8)) != 0
+}
+
+func (p *bootPIC) SetLevelTriggered(line uint8, level bool) {
+	if line >= 16 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	mask := byte(1 << (line % 8))
+	if level {
+		p.elcr[line/8] |= mask
+	} else {
+		p.elcr[line/8] &^= mask
+	}
+	p.setLineLocked(line, p.lineHigh[line])
+}
+
+func (p *bootPIC) summaryForLines(lines []uint8) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(lines) == 0 {
+		return "pic=[]"
+	}
+	var b strings.Builder
+	b.WriteString("pic=[")
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if line >= 16 {
+			fmt.Fprintf(&b, "%d:<out-of-range>", line)
+			continue
+		}
+		chip := p.master
+		irq := line
+		if line >= 8 {
+			chip = p.slave
+			irq = line - 8
+		}
+		mask := byte(1 << irq)
+		fmt.Fprintf(&b, "%d:mask=%t,irr=%t,isr=%t,level=%t,high=%t",
+			line,
+			chip.mask&mask != 0,
+			chip.irr&mask != 0,
+			chip.isr&mask != 0,
+			p.elcr[line/8]&mask != 0,
+			p.lineHigh[line],
+		)
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func (c *bootPICChip) pendingIRQ() int {
