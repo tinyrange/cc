@@ -150,6 +150,13 @@ const (
 	hvSysRegVBAR_EL1         SysReg = 0xc600
 	hvSysRegCNTHCTL_EL2      SysReg = 0xe708
 	hvSysRegCNTVOFF_EL2      SysReg = 0xe703
+	hvSysRegCNTFRQ_EL0       SysReg = 0xdf00
+	hvSysRegCNTP_TVAL_EL0    SysReg = 0xdf10
+	hvSysRegCNTP_CTL_EL0     SysReg = 0xdf11
+	hvSysRegCNTP_CVAL_EL0    SysReg = 0xdf12
+	hvSysRegCNTV_TVAL_EL0    SysReg = 0xdf18
+	hvSysRegCNTV_CTL_EL0     SysReg = 0xdf19
+	hvSysRegCNTV_CVAL_EL0    SysReg = 0xdf1a
 	hvSysRegCPTR_EL2         SysReg = 0xe08a
 	hvSysRegHCR_EL2          SysReg = 0xe088
 	hvSysRegSP_EL2           SysReg = 0xf208
