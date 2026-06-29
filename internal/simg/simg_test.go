@@ -51,6 +51,26 @@ func TestBuildImageFSFixture(t *testing.T) {
 	}
 }
 
+func TestBuildImageFSArm64Fixture(t *testing.T) {
+	root, meta, arch, err := BuildImageFS(alpineArm64Fixture(t))
+	if err != nil {
+		t.Fatalf("build image fs: %v", err)
+	}
+	if arch != "arm64" {
+		t.Fatalf("arch = %q, want arm64", arch)
+	}
+	if _, ok := meta["/bin/busybox"]; !ok {
+		t.Fatalf("metadata is missing busybox entry")
+	}
+	entry, err := imagefs.LookupPath(root, "/etc/alpine-release")
+	if err != nil {
+		t.Fatalf("lookup alpine release: %v", err)
+	}
+	if entry.File == nil {
+		t.Fatalf("alpine release entry is not a file")
+	}
+}
+
 func TestOpenRejectsInvalidImage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "not-a-simg")
 	if err := os.WriteFile(path, []byte(strings.Repeat("not-squashfs", 1024)), 0o644); err != nil {
@@ -68,4 +88,13 @@ func alpineFixture(t *testing.T) string {
 		t.Fatalf("resolve caller")
 	}
 	return filepath.Join(filepath.Dir(file), "..", "..", "fixtures", "alpine.simg")
+}
+
+func alpineArm64Fixture(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("resolve caller")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..", "fixtures", "alpine-arm64.simg")
 }

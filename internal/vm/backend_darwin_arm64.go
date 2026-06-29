@@ -544,11 +544,15 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	}
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
+	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)
 	timing.Since(ctx, "backend.build_start_request", start)
 	return runReq, nil
 }
 
 func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+	if strings.TrimSpace(req.RestoreSnapshot) != "" {
+		return b.buildBlankRestoreRequest(ctx, req, network)
+	}
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
 	} else if bundle != nil {
@@ -574,6 +578,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Persistent:        true,
 			Network:           network.guestInitConfig(),
 			NetDevice:         networkDeviceDarwin(network),
+			SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
+			RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 			UnixTime:          time.Now().Unix(),
 		}, ctx.Err()
 	}
@@ -637,8 +643,57 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Persistent:        true,
 		Network:           network.guestInitConfig(),
 		NetDevice:         networkDeviceDarwin(network),
+		SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
+		RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:          time.Now().Unix(),
 	}, ctx.Err()
+}
+
+func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req client.StartInstanceRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+	var image *oci.Image
+	imageName := strings.TrimSpace(req.Image)
+	if imageName != "" {
+		if b.images == nil {
+			return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
+		}
+		var err error
+		image, err = b.images.Open(imageName)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+		image = withRuntimeMountDirs(image)
+	}
+	rootFS, err := workerRemoteRootFS()
+	if err != nil {
+		return vmruntime.RunRequest{}, err
+	}
+	if rootFS == nil {
+		if image != nil {
+			rootFS = virtio.NewImageFS(image.RootFS, image.RootFSDir)
+		} else {
+			rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
+		}
+	}
+	return vmruntime.RunRequest{
+		Image:           image,
+		InitSystem:      req.InitSystem,
+		RootFS:          rootFS,
+		MemoryMB:        req.MemoryMB,
+		CPUs:            req.CPUs,
+		NestedVirt:      req.NestedVirt,
+		Dmesg:           req.Dmesg,
+		Persistent:      true,
+		Network:         network.guestInitConfig(),
+		NetDevice:       networkDeviceDarwin(network),
+		SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+		RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+		UnixTime:        time.Now().Unix(),
+	}, ctx.Err()
+}
+
+func applyStartupSnapshotOptions(req *vmruntime.RunRequest, snapshotDir, restoreSnapshot string) {
+	req.SnapshotDir = strings.TrimSpace(snapshotDir)
+	req.RestoreSnapshot = strings.TrimSpace(restoreSnapshot)
 }
 
 func workerRemoteRootFS() (virtio.FSBackend, error) {

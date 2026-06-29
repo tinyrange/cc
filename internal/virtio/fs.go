@@ -3798,6 +3798,73 @@ func (p *imageFS) DebugPath(nodeID uint64) string {
 	return p.pathForNode(nodeID)
 }
 
+func (p *imageFS) SnapshotNodePaths() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ids := make([]int, 0, len(p.nodes))
+	for id := range p.nodes {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	paths := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if path := p.pathForNode(uint64(id)); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func (p *imageFS) RestoreNodePaths(paths []string) error {
+	for _, nodePath := range paths {
+		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		if nodePath == "/" {
+			continue
+		}
+		if err := p.restoreNodePath(nodePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *imageFS) restoreNodePath(nodePath string) error {
+	parentPath, name := path.Split(nodePath)
+	parentPath = path.Clean(parentPath)
+	if parentPath == "." {
+		parentPath = "/"
+	}
+	parentID, ok := p.nodeIDForPath(parentPath)
+	if !ok {
+		if err := p.restoreNodePath(parentPath); err != nil {
+			return err
+		}
+		parentID, ok = p.nodeIDForPath(parentPath)
+		if !ok {
+			return fmt.Errorf("restore imagefs node %q: parent %q was not created", nodePath, parentPath)
+		}
+	}
+	childID, _, errno := p.Lookup(parentID, name)
+	if errno != 0 {
+		return fmt.Errorf("restore imagefs node %q: lookup errno %d", nodePath, errno)
+	}
+	if restoredPath := p.DebugPath(childID); restoredPath != nodePath {
+		return fmt.Errorf("restore imagefs node %q: got node %d path %q", nodePath, childID, restoredPath)
+	}
+	return nil
+}
+
+func (p *imageFS) nodeIDForPath(nodePath string) (uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id := range p.nodes {
+		if p.pathForNode(id) == nodePath {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
 func virtioFSDebugPathsFromEnv() []string {
 	raw := strings.TrimSpace(os.Getenv("CCX3_DEBUG_VIRTIOFS_PATHS"))
 	if raw == "" {

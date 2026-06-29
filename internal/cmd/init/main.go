@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -87,6 +88,7 @@ type config struct {
 	PrecopyAMD64Root   bool     `json:"precopy_amd64_root,omitempty"`
 	DisableCgroupMount bool     `json:"disable_cgroup_mount,omitempty"`
 	Network            *network `json:"network,omitempty"`
+	SnapshotMMIOBase   uint64   `json:"snapshot_mmio_base,omitempty"`
 	UnixTime           int64    `json:"unix_time,omitempty"`
 }
 
@@ -292,6 +294,11 @@ func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveE
 	}(req.ID, managed)
 }
 
+func runPreparedExecInline(cfg config, control io.Writer, req preparedExecRequest, waitReady func() error) {
+	managed := &managedExec{start: time.Now()}
+	runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {})
+}
+
 func newSystemdCommandGate(initSystem string) *systemdCommandGate {
 	return &systemdCommandGate{
 		enabled: strings.TrimSpace(initSystem) == initSystemSystemd,
@@ -437,6 +444,16 @@ func run() error {
 		if cfg.VsockPort != 0 {
 			if strings.TrimSpace(cfg.InitSystem) != "" {
 				return bootInitSystem(cfg, bootStart)
+			}
+			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
+				return fmt.Errorf("trigger snapshot: %w", err)
+			}
+			if cfg.SnapshotMMIOBase != 0 {
+				writeStage(bootStart, "seeding entropy")
+				if err := seedEntropyFromHostRNG(64); err != nil {
+					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
+				}
+				writeStage(bootStart, "entropy seeded")
 			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
@@ -1050,6 +1067,61 @@ func emptyRootFS(keep string) error {
 		if err := removeRootFSEntry(name); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func triggerSnapshotMMIO(base uint64) error {
+	if base == 0 {
+		return nil
+	}
+	file, err := os.OpenFile("/dev/mem", os.O_RDWR|syscall.O_SYNC, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/mem: %w", err)
+	}
+	defer file.Close()
+
+	pageSize := uint64(os.Getpagesize())
+	pageBase := base & ^(pageSize - 1)
+	pageOff := int(base - pageBase)
+	mapped, err := syscall.Mmap(int(file.Fd()), int64(pageBase), int(pageSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("mmap snapshot trigger %#x: %w", base, err)
+	}
+	defer syscall.Munmap(mapped)
+	if pageOff+8 > len(mapped) {
+		return fmt.Errorf("snapshot trigger offset %#x exceeds mapped page", pageOff)
+	}
+	binary.LittleEndian.PutUint64(mapped[pageOff:pageOff+8], 0x43535833534e4150)
+	return nil
+}
+
+func seedEntropyFromHostRNG(size int) error {
+	if size <= 0 {
+		return nil
+	}
+	seed := make([]byte, size)
+	rng, err := os.Open("/dev/hwrng")
+	if err != nil {
+		return fmt.Errorf("open /dev/hwrng: %w", err)
+	}
+	if _, err := io.ReadFull(rng, seed); err != nil {
+		_ = rng.Close()
+		return fmt.Errorf("read /dev/hwrng: %w", err)
+	}
+	if err := rng.Close(); err != nil {
+		return fmt.Errorf("close /dev/hwrng: %w", err)
+	}
+	urandom, err := os.OpenFile("/dev/urandom", os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/urandom: %w", err)
+	}
+	if _, err := urandom.Write(seed); err != nil {
+		_ = urandom.Close()
+		return fmt.Errorf("write /dev/urandom: %w", err)
+	}
+	if err := urandom.Close(); err != nil {
+		return fmt.Errorf("close /dev/urandom: %w", err)
 	}
 	return nil
 }
@@ -1996,6 +2068,10 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		if req.Kind == "" {
 			req.Kind = "exec"
 		}
+		inlineExec := req.Kind == "exec_inline"
+		if inlineExec {
+			req.Kind = "exec"
+		}
 		if handleInitControlRequest(cfg, control, active, req) {
 			continue
 		}
@@ -2008,6 +2084,10 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		}
 
 		execReq := prepareExecRequest(cfg, req)
+		if inlineExec {
+			runPreparedExecInline(cfg, control, execReq, systemdGate.WaitForCommand(execReq.Command))
+			continue
+		}
 		startPreparedExec(cfg, control, active, execReq, systemdGate.WaitForCommand(execReq.Command))
 	}
 }

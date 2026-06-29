@@ -45,6 +45,8 @@ type RunRequest struct {
 	Persistent        bool
 	Network           *GuestNetworkConfig
 	NetDevice         *virtio.Net
+	SnapshotDir       string
+	RestoreSnapshot   string
 	UnixTime          int64
 }
 

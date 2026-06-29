@@ -4,7 +4,10 @@ package vm
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -39,6 +42,35 @@ func TestSidecarResourcePrepRejectsBuiltinBSDBeforeImageStore(t *testing.T) {
 	_, err = prepareSidecarBlankResources(host, context.Background(), client.StartInstanceRequest{Image: "@openbsd"})
 	if err == nil {
 		t.Fatal("prepareSidecarBlankResources unexpectedly succeeded")
+	}
+}
+
+func TestSidecarBlankRestoreSkipsBootBundle(t *testing.T) {
+	cacheDir, err := os.MkdirTemp("/tmp", "ccsc-*")
+	if err != nil {
+		t.Fatalf("create short cache dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cacheDir) })
+	host := &sidecarVMHost{cacheDir: cacheDir}
+	resources, err := prepareSidecarBlankResources(host, context.Background(), client.StartInstanceRequest{
+		RestoreSnapshot: filepath.Join(t.TempDir(), "snapshot"),
+	})
+	if err != nil {
+		t.Fatalf("prepareSidecarBlankResources: %v", err)
+	}
+	defer resources.closeAll()
+
+	var hasFS bool
+	for _, env := range resources.env {
+		switch {
+		case strings.HasPrefix(env, sidecarFSSocketEnv+"="):
+			hasFS = true
+		case strings.HasPrefix(env, sidecarBootSocketEnv+"="):
+			t.Fatalf("restore resources included boot socket env %q", env)
+		}
+	}
+	if !hasFS {
+		t.Fatalf("restore resources env = %q, want fs socket", resources.env)
 	}
 }
 

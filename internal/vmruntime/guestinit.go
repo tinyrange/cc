@@ -34,6 +34,7 @@ type GuestInitConfig struct {
 	PrecopyAMD64Root   bool                `json:"precopy_amd64_root,omitempty"`
 	DisableCgroupMount bool                `json:"disable_cgroup_mount,omitempty"`
 	Network            *GuestNetworkConfig `json:"network,omitempty"`
+	SnapshotMMIOBase   uint64              `json:"snapshot_mmio_base,omitempty"`
 	UnixTime           int64               `json:"unix_time,omitempty"`
 }
 

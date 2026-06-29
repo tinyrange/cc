@@ -1097,6 +1097,8 @@
           "cpus": { "type": "integer" },
           "nested_virtualization": { "type": "boolean" },
           "dmesg": { "type": "boolean" },
+          "snapshot_dir": { "type": "string", "description": "Directory where the runtime may write a startup snapshot during this boot." },
+          "restore_snapshot": { "type": "string", "description": "Path to a startup snapshot directory to restore instead of cold booting." },
           "timeout_seconds": { "type": "number" }
         }
       },
