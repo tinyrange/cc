@@ -270,8 +270,9 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 		}()
 		runner := newVMRunManager(vm)
 		for {
+			active := activeExecs.Load() > 0
 			runStart := time.Now()
-			runRes, err, stalled := runner.Run(runCtx, persistentRunSlice(guestReady.Load(), activeExecs.Load() > 0))
+			runRes, err, stalled := runner.Run(runCtx, persistentRunSlice(guestReady.Load(), active))
 			timing.Since(ctx, "hvf.restore.run_loop.run_with_cancel", runStart)
 			if stalled {
 				if runCtx.Err() != nil {
@@ -376,7 +377,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			cancel: cancel, closeDone: closeDone, image: req.Image, baseEnv: baseEnv, workDir: workDir,
 			dmesg: req.Dmesg, uart: uart, control: res.conn, transcript: controlTranscript, serialOut: serialOut,
 			listener: listener, vsock: vsock, rootFS: rootFS, fsdevs: fsdevs, shares: shareState,
-			imageMounts: map[string]string{}, activeExecs: activeExecs, inlineExec: true,
+			imageMounts: map[string]string{}, activeExecs: activeExecs,
 		}
 		timing.Since(ctx, "hvf.restore.total_ready", startTotal)
 		timingLog("hvf.restore total ready=%s", time.Since(startTotal))
@@ -533,6 +534,13 @@ func snapshotVCPUSysRegisters(vm *VM, vcpuIndex int) map[string]uint64 {
 	regs := map[string]SysReg{
 		"amair_el1":      hvSysRegAMAIR_EL1,
 		"contextidr_el1": hvSysRegCONTEXTIDR_EL1,
+		"cntfrq_el0":     hvSysRegCNTFRQ_EL0,
+		"cntp_ctl_el0":   hvSysRegCNTP_CTL_EL0,
+		"cntp_cval_el0":  hvSysRegCNTP_CVAL_EL0,
+		"cntp_tval_el0":  hvSysRegCNTP_TVAL_EL0,
+		"cntv_ctl_el0":   hvSysRegCNTV_CTL_EL0,
+		"cntv_cval_el0":  hvSysRegCNTV_CVAL_EL0,
+		"cntv_tval_el0":  hvSysRegCNTV_TVAL_EL0,
 		"cntvoff_el2":    hvSysRegCNTVOFF_EL2,
 		"cpacr_el1":      hvSysRegCPACR_EL1,
 		"elr_el1":        hvSysRegELR_EL1,
@@ -890,31 +898,26 @@ func restoreSnapshotGIC(vm *VM, manifest snapshotManifest) error {
 			timingLog("restore gic redistributor %s failed: %v", name, err)
 		}
 	}
+	for name, value := range manifest.GICICC {
+		reg, ok := gicICCRegByName(name)
+		if !ok {
+			continue
+		}
+		if err := vm.SetGICICCRegForVCPU(manifest.CapturedVCPU, reg, value); err != nil {
+			timingLog("restore gic icc %s failed: %v", name, err)
+		}
+	}
 	return nil
 }
 
 func restoreSnapshotVTimer(vm *VM, manifest snapshotManifest) error {
-	offset := manifest.VTimerOffset + restoreVTimerElapsedOffset(manifest.CapturedAt)
-	if err := vm.SetVTimerOffset(offset); err != nil {
+	if err := vm.SetVTimerOffset(manifest.VTimerOffset); err != nil {
 		return fmt.Errorf("restore vtimer offset: %w", err)
 	}
 	if err := vm.SetVTimerMask(manifest.VTimerMasked); err != nil {
 		return fmt.Errorf("restore vtimer mask: %w", err)
 	}
 	return nil
-}
-
-func restoreVTimerElapsedOffset(capturedAt string) uint64 {
-	captured, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(capturedAt))
-	if err != nil {
-		return 0
-	}
-	elapsed := time.Since(captured)
-	if elapsed <= 0 {
-		return 0
-	}
-	const archTimerHz = 24_000_000
-	return uint64(elapsed.Nanoseconds()) * archTimerHz / uint64(time.Second)
 }
 
 func gicDistributorRuntimeReg(reg GICDistributorReg) bool {
@@ -943,6 +946,23 @@ func parseGICRedistributorReg(name string) (GICRedistributorReg, error) {
 	return GICRedistributorReg(value), nil
 }
 
+func gicICCRegByName(name string) (GICICCReg, bool) {
+	switch name {
+	case "ctlr_el1":
+		return hvGICICCRegCTLR_EL1, true
+	case "igrpen0_el1":
+		return hvGICICCRegIGRPEN0_EL1, true
+	case "igrpen1_el1":
+		return hvGICICCRegIGRPEN1_EL1, true
+	case "pmr_el1":
+		return hvGICICCRegPMR_EL1, true
+	case "sre_el1":
+		return hvGICICCRegSRE_EL1, true
+	default:
+		return 0, false
+	}
+}
+
 func snapshotRegByName(name string) (Reg, bool) {
 	switch name {
 	case "pc":
@@ -965,6 +985,20 @@ func snapshotSysRegByName(name string) (SysReg, bool) {
 		return hvSysRegAMAIR_EL1, true
 	case "contextidr_el1":
 		return hvSysRegCONTEXTIDR_EL1, true
+	case "cntfrq_el0":
+		return hvSysRegCNTFRQ_EL0, true
+	case "cntp_ctl_el0":
+		return hvSysRegCNTP_CTL_EL0, true
+	case "cntp_cval_el0":
+		return hvSysRegCNTP_CVAL_EL0, true
+	case "cntp_tval_el0":
+		return hvSysRegCNTP_TVAL_EL0, true
+	case "cntv_ctl_el0":
+		return hvSysRegCNTV_CTL_EL0, true
+	case "cntv_cval_el0":
+		return hvSysRegCNTV_CVAL_EL0, true
+	case "cntv_tval_el0":
+		return hvSysRegCNTV_TVAL_EL0, true
 	case "cntvoff_el2":
 		return hvSysRegCNTVOFF_EL2, true
 	case "cpacr_el1":

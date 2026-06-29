@@ -317,19 +317,24 @@ func (m *Manager) StartBlankInstanceStream(
 	m.mu.Unlock()
 
 	shares := append([]client.ShareMount(nil), req.Shares...)
-	req.Shares = nil
+	snapshotStartup := strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != ""
+	if !snapshotStartup {
+		req.Shares = nil
+	}
 	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
 		m.releaseNetworkLease(id)
 		return client.InstanceState{}, err
 	}
-	for _, share := range shares {
-		if err := inst.AddShare(ctx, share); err != nil {
-			_ = inst.Close()
-			m.clearStarting(id)
-			m.releaseNetworkLease(id)
-			return client.InstanceState{}, err
+	if !snapshotStartup {
+		for _, share := range shares {
+			if err := inst.AddShare(ctx, share); err != nil {
+				_ = inst.Close()
+				m.clearStarting(id)
+				m.releaseNetworkLease(id)
+				return client.InstanceState{}, err
+			}
 		}
 	}
 
