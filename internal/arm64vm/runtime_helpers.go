@@ -53,6 +53,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		ExitMarkerPrefix:  CommandExitMarkerPref,
 		PrecopyAMD64Root:  strings.TrimSpace(os.Getenv("CCX3_BENCH_PRECOPY_AMD64_ROOT")) != "",
 		Network:           req.Network,
+		SnapshotMMIOBase:  SnapshotBase,
 		UnixTime:          req.UnixTime,
 	})
 }
@@ -104,6 +105,17 @@ func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.Share
 		devs = append(devs, newFSDevice(ShareFSBase, ShareFSIRQ, EmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
 	}
 	return devs, rootFS, nil
+}
+
+func SnapshotDeviceNode() fdt.Node {
+	return fdt.Node{
+		Name: fmt.Sprintf("snapshot@%x", SnapshotBase),
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"ccx3,snapshot-trigger"}},
+			"reg":        {U64: []uint64{SnapshotBase, SnapshotSize}},
+			"status":     {Strings: []string{"okay"}},
+		},
+	}
 }
 
 func BuildShareMount(index int, share DirectoryShare) (virtio.ShareMount, error) {

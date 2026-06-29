@@ -114,25 +114,27 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	} else {
 		root = virtio.NewImageFS(blankRuntimeRootFS(), "")
 	}
-	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
-	if err != nil {
-		return sidecarStartResources{}, err
-	}
 	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, nil))
 	if err != nil {
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
 	if err != nil {
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	fsResources.resolver = resolver
 	netResources, err := prepareSidecarNetResources(h.cacheDir, req.ID, req.Network)
 	if err != nil {
 		fsResources.closeAll()
-		bootResources.closeAll()
+		return sidecarStartResources{}, err
+	}
+	if strings.TrimSpace(req.RestoreSnapshot) != "" {
+		return combineSidecarResources(fsResources, netResources), nil
+	}
+	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
+	if err != nil {
+		fsResources.closeAll()
+		netResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	return combineSidecarResources(fsResources, bootResources, netResources), nil

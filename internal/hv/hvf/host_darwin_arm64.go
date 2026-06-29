@@ -148,6 +148,9 @@ func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, 
 	if !req.Dmesg {
 		req.Dmesg = machine.Spec.Dmesg
 	}
+	if snapshotPath := strings.TrimSpace(req.RestoreSnapshot); snapshotPath != "" {
+		return StartContainerFromSnapshot(ctx, req, snapshotPath, onEvent)
+	}
 	return StartContainerStream(ctx, req, onEvent)
 }
 

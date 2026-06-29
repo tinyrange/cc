@@ -254,6 +254,81 @@ func (m *mountedFS) Init() (uint32, uint32) {
 	return m.root.Init()
 }
 
+func (m *mountedFS) SnapshotNodePaths() []string {
+	m.mu.RLock()
+	ids := make([]int, 0, len(m.nodes))
+	for id := range m.nodes {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	paths := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if node := m.nodes[uint64(id)]; node != nil && node.path != "" {
+			paths = append(paths, node.path)
+		}
+	}
+	m.mu.RUnlock()
+	return paths
+}
+
+func (m *mountedFS) RestoreNodePaths(paths []string) error {
+	for _, nodePath := range paths {
+		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		if nodePath == "/" {
+			continue
+		}
+		if err := m.restoreNodePath(nodePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *mountedFS) restoreNodePath(nodePath string) error {
+	parentPath, name := path.Split(nodePath)
+	parentPath = path.Clean(parentPath)
+	if parentPath == "." {
+		parentPath = "/"
+	}
+	parentID := m.nodeIDForPath(parentPath)
+	if parentID == 0 {
+		if err := m.restoreNodePath(parentPath); err != nil {
+			return err
+		}
+		parentID = m.nodeIDForPath(parentPath)
+		if parentID == 0 {
+			return fmt.Errorf("restore mountedfs node %q: parent %q was not created", nodePath, parentPath)
+		}
+	}
+	childID, _, errno := m.Lookup(parentID, name)
+	if errno != 0 {
+		childID, _, errno = m.Mkdir(parentID, name, 0o755, 0, 0)
+		if errno != 0 && errno != -linuxabi.EEXIST {
+			return fmt.Errorf("restore mountedfs node %q: lookup errno %d", nodePath, errno)
+		}
+		if errno == -linuxabi.EEXIST {
+			childID, _, errno = m.Lookup(parentID, name)
+			if errno != 0 {
+				return fmt.Errorf("restore mountedfs node %q: lookup after mkdir errno %d", nodePath, errno)
+			}
+		}
+	}
+	if node := m.node(childID); node == nil || node.path != nodePath {
+		got := ""
+		if node != nil {
+			got = node.path
+		}
+		return fmt.Errorf("restore mountedfs node %q: got node %d path %q", nodePath, childID, got)
+	}
+	return nil
+}
+
+func (m *mountedFS) nodeIDForPath(nodePath string) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pathToNode[nodePath]
+}
+
 func (m *mountedFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	node := m.node(nodeID)
 	if node == nil {

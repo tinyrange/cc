@@ -177,6 +177,7 @@ type ContainerSession struct {
 	imageMounts map[string]string
 	nextID      atomic.Uint64
 	activeExecs *atomic.Int32
+	inlineExec  bool
 }
 
 type ManagedMetadata struct {
@@ -466,6 +467,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 
 	execReq := req
 	execReq.Kind = "exec"
+	if s.inlineExec {
+		execReq.Kind = "exec_inline"
+	}
 	execReq.Command = command
 	execReq.Env = env
 	execReq.WorkDir = workDir
@@ -473,7 +477,12 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	err := managedagent.SendExec(s.controlWriter(), id, execReq)
+	var err error
+	if s.inlineExec {
+		err = managedagent.Send(s.controlWriter(), managedagent.ExecRequest(id, execReq))
+	} else {
+		err = managedagent.SendExec(s.controlWriter(), id, execReq)
+	}
 	s.sendMu.Unlock()
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -484,14 +493,14 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return hasManagedExecBegin(text, id)
 	})
 	if err != nil {
-		return client.ExecResponse{}, err
+		return client.ExecResponse{}, s.withControlDebug("wait for exec begin", err)
 	}
 	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
 	firstByteSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecFirstByte(text, id)
 	})
 	if err != nil {
-		return client.ExecResponse{}, err
+		return client.ExecResponse{}, s.withControlDebug("wait for exec first byte", err)
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
 	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
@@ -499,7 +508,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return ok
 	})
 	if err != nil {
-		return client.ExecResponse{}, err
+		return client.ExecResponse{}, s.withControlDebug("wait for exec result", err)
 	}
 	timingLog("session.Exec waitForResult took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(segment))
 	if phases := parseExecTimingMarkers(segment, id); len(phases) > 0 {
@@ -520,6 +529,23 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	timingLog("session.Exec total=%s argv=%q id=%s exit=%d output_bytes=%d", time.Since(startTime), req.Command, id, exitCode, len(output))
 	return client.ExecResponse{ExitCode: exitCode, Output: output}, nil
+}
+
+func (s *ContainerSession) withControlDebug(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if s == nil || s.vsock == nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	transcript := ""
+	if s.transcript != nil {
+		transcript = s.transcript.String()
+		if len(transcript) > 4096 {
+			transcript = transcript[len(transcript)-4096:]
+		}
+	}
+	return fmt.Errorf("%s: %w\n%s\ncontrol transcript tail:\n%s", op, err, s.vsock.Summary(), transcript)
 }
 
 func (s *ContainerSession) Flush(ctx context.Context) error {
@@ -950,6 +976,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	mmioRecorder := newSnapshotMMIORecorder()
+	snapshot := newSnapshotTrigger(req.SnapshotDir, mem, mmioRecorder)
 	timing.Since(ctx, "hvf.map_anonymous_memory", start)
 	timingLog("hvf.StartContainer MapAnonymousMemory took=%s", time.Since(start))
 	start = time.Now()
@@ -965,8 +993,11 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	var consoleOut bytes.Buffer
 	var fsTrace bytes.Buffer
 	var runTrace bytes.Buffer
-	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
-	uart.AttachIRQ(vm, arm64vm.UARTSPI)
+	var uart *serial.UART8250
+	if req.Dmesg {
+		uart = serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
+		uart.AttachIRQ(vm, arm64vm.UARTSPI)
+	}
 	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
@@ -991,18 +1022,31 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		return nil, err
 	}
 	attachFSDeviceTiming(ctx, fsdevs)
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		for _, fsdev := range fsdevs {
+			fsdev.Async = false
+		}
+	}
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
+	snapshot.setDevices(snapshotDevices{
+		console: console,
+		rng:     rng,
+		vsock:   vsock,
+		fsdevs:  fsdevs,
+		netdev:  netdev,
+	})
 	timing.Since(ctx, "hvf.device_setup", start)
 	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 	start = time.Now()
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
-		MemoryMB:   req.MemoryMB,
-		NumCPUs:    req.CPUs,
-		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
+		MemoryMB:    req.MemoryMB,
+		NumCPUs:     req.CPUs,
+		Dmesg:       req.Dmesg,
+		DisableUART: !req.Dmesg,
+		ExtraNodes:  arm64vm.AppendFSNodes(append(appendContainerDeviceNodes(console, rng, vsock, netdev), arm64vm.SnapshotDeviceNode()), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -1160,7 +1204,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, snapshot, mmioRecorder, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1511,7 +1555,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1614,7 +1658,7 @@ type runResultVM struct {
 	err   error
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshot *snapshotTrigger, mmioRecorder *snapshotMMIORecorder, exitInfo *VcpuExit) error {
 	recorder := timing.FromContext(ctx)
 	if recorder != nil {
 		totalStart := time.Now()
@@ -1627,19 +1671,26 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 	addr := uint64(exitInfo.Exception.PhysicalAddress)
 	fsdev := findFSDevice(fsdevs, addr, info.SizeBytes)
 	exitTimingEnabled := exitTiming.Enabled()
+	writeValue := uint64(0)
+	if info.Write {
+		var err error
+		writeValue, err = readAbortValue(vm, vcpuIndex, info)
+		if err != nil {
+			return err
+		}
+		mmioRecorder.record(addr, info.SizeBytes, writeValue)
+	}
 
 	switch {
+	case snapshot != nil && snapshot.contains(addr, info.SizeBytes):
+		return snapshot.handleDataAbort(vm, vcpuIndex, info, writeValue)
 	case uart != nil && uart.Contains(addr, info.SizeBytes):
 		if info.Write {
 			if exitTimingEnabled {
 				start := time.Now()
 				defer exitTiming.Record("data_abort.uart.write", start)
 			}
-			value, err := readAbortValue(vm, vcpuIndex, info)
-			if err != nil {
-				return err
-			}
-			if err := uart.WriteValue(addr, info.SizeBytes, value); err != nil {
+			if err := uart.WriteValue(addr, info.SizeBytes, writeValue); err != nil {
 				return err
 			}
 		} else {
@@ -1661,11 +1712,7 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				start := time.Now()
 				defer exitTiming.Record("data_abort.virtio_console.write", start)
 			}
-			value, err := readAbortValue(vm, vcpuIndex, info)
-			if err != nil {
-				return err
-			}
-			if err := console.Write(addr, info.SizeBytes, value); err != nil {
+			if err := console.Write(addr, info.SizeBytes, writeValue); err != nil {
 				return err
 			}
 		} else {
@@ -1687,11 +1734,7 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				start := time.Now()
 				defer exitTiming.Record("data_abort.virtio_rng.write", start)
 			}
-			value, err := readAbortValue(vm, vcpuIndex, info)
-			if err != nil {
-				return err
-			}
-			if err := rng.Write(addr, info.SizeBytes, value); err != nil {
+			if err := rng.Write(addr, info.SizeBytes, writeValue); err != nil {
 				return err
 			}
 		} else {
@@ -1732,11 +1775,7 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				start := time.Now()
 				defer exitTiming.Record("data_abort.virtio_vsock.write", start)
 			}
-			value, err := readAbortValue(vm, vcpuIndex, info)
-			if err != nil {
-				return err
-			}
-			if err := vsock.Write(addr, info.SizeBytes, value); err != nil {
+			if err := vsock.Write(addr, info.SizeBytes, writeValue); err != nil {
 				return err
 			}
 		} else {
@@ -1758,11 +1797,7 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				start := time.Now()
 				defer exitTiming.Record("data_abort.virtio_net.write", start)
 			}
-			value, err := readAbortValue(vm, vcpuIndex, info)
-			if err != nil {
-				return err
-			}
-			if err := netdev.Write(addr, info.SizeBytes, value); err != nil {
+			if err := netdev.Write(addr, info.SizeBytes, writeValue); err != nil {
 				return err
 			}
 		} else {

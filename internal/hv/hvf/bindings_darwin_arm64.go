@@ -123,7 +123,22 @@ const (
 	hvRegXZR                    Reg         = 0xffffffff
 
 	hvSysRegSP_EL1           SysReg = 0xe208
+	hvSysRegSPSR_EL1         SysReg = 0xc200
+	hvSysRegELR_EL1          SysReg = 0xc201
+	hvSysRegSP_EL0           SysReg = 0xc208
+	hvSysRegSCTLR_EL1        SysReg = 0xc080
+	hvSysRegCPACR_EL1        SysReg = 0xc082
+	hvSysRegTCR_EL1          SysReg = 0xc102
+	hvSysRegTTBR0EL1         SysReg = 0xc100
 	hvSysRegTTBR1EL1         SysReg = 0xc101
+	hvSysRegESR_EL1          SysReg = 0xc290
+	hvSysRegFAR_EL1          SysReg = 0xc300
+	hvSysRegMAIR_EL1         SysReg = 0xc510
+	hvSysRegAMAIR_EL1        SysReg = 0xc518
+	hvSysRegCONTEXTIDR_EL1   SysReg = 0xc681
+	hvSysRegTPIDR_EL1        SysReg = 0xc684
+	hvSysRegTPIDR_EL0        SysReg = 0xde82
+	hvSysRegTPIDRRO_EL0      SysReg = 0xde83
 	hvSysRegMPIDR_EL1        SysReg = 0xc005
 	hvSysRegID_AA64PFR0_EL1  SysReg = 0xc020
 	hvSysRegID_AA64PFR1_EL1  SysReg = 0xc021
@@ -828,6 +843,41 @@ func (v *VM) SetVTimerMask(masked bool) error {
 	v.threadCh <- func() {
 		if ret := hvVcpuSetVtimerMask(v.vcpu, masked); ret != hvSuccess {
 			errCh <- fmt.Errorf("set vtimer mask: %w", ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) GetVTimerOffset() (uint64, error) {
+	respCh := make(chan struct {
+		offset uint64
+		err    error
+	}, 1)
+	v.threadCh <- func() {
+		var offset uint64
+		if ret := hvVcpuGetVtimerOffset(v.vcpu, &offset); ret != hvSuccess {
+			respCh <- struct {
+				offset uint64
+				err    error
+			}{err: fmt.Errorf("get vtimer offset: %w", ret)}
+			return
+		}
+		respCh <- struct {
+			offset uint64
+			err    error
+		}{offset: offset}
+	}
+	res := <-respCh
+	return res.offset, res.err
+}
+
+func (v *VM) SetVTimerOffset(offset uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuSetVtimerOffset(v.vcpu, offset); ret != hvSuccess {
+			errCh <- fmt.Errorf("set vtimer offset: %w", ret)
 			return
 		}
 		errCh <- nil

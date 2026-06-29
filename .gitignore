@@ -31,3 +31,5 @@
 /pyneurodesk/src/pyneurodesk/bin/ccvm.exe
 
 *.simg
+!fixtures/alpine.simg
+!fixtures/alpine-arm64.simg
