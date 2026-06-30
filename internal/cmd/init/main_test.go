@@ -444,7 +444,7 @@ func TestWaitManagedExecProcess(t *testing.T) {
 		t.Fatalf("start exit 7: %v", err)
 	}
 	result = waitManagedExecProcess(failed, time.Now())
-	if result.WaitErr == nil || result.ExitErr != nil || result.ExitCode != 7 || result.ProcessState == nil || len(result.Usage) == 0 {
+	if result.WaitErr != nil || result.ExitErr != nil || result.ExitCode != 7 || result.ProcessState == nil || len(result.Usage) == 0 {
 		t.Fatalf("exit 7 result = %+v", result)
 	}
 }
@@ -579,6 +579,23 @@ func TestCopyManagedExecStdinToPTYWritesEOTOnEOF(t *testing.T) {
 	}
 }
 
+func TestCopyManagedExecStdinToPipeClosesBothEnds(t *testing.T) {
+	done := make(chan struct{}, 1)
+	stdin := &trackingReadCloser{Buffer: bytes.NewBufferString("input")}
+	childStdin := &trackingWriteCloser{}
+	copyManagedExecStdinToPipe(done, stdin, childStdin)
+	<-done
+	if got := childStdin.String(); got != "input" {
+		t.Fatalf("child stdin = %q, want input", got)
+	}
+	if !stdin.closed {
+		t.Fatalf("stdin was not closed")
+	}
+	if !childStdin.closed {
+		t.Fatalf("child stdin was not closed")
+	}
+}
+
 func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	if begin, done, ok := managedExecGuestReadyTimingPhases(nil); ok || begin != "" || done != "" {
 		t.Fatalf("nil wait ready phases = (%q, %q, %v), want disabled", begin, done, ok)
@@ -679,5 +696,15 @@ type trackingReadCloser struct {
 
 func (r *trackingReadCloser) Close() error {
 	r.closed = true
+	return nil
+}
+
+type trackingWriteCloser struct {
+	bytes.Buffer
+	closed bool
+}
+
+func (w *trackingWriteCloser) Close() error {
+	w.closed = true
 	return nil
 }

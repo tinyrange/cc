@@ -356,6 +356,17 @@ func TestRuntimeBootsPersistentLinuxAndExecsCommands(t *testing.T) {
 	requireGuestOutput(t, second.Output, "42", "persisted")
 }
 
+func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
+
+	output := execStreamInRuntime(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; while IFS= read -r line; do printf 'line:%s\n' \"$line\"; done"},
+	}, execStreamInput("alpha\n", "beta\n"), 0)
+	requireGuestOutput(t, output, "line:alpha", "line:beta")
+}
+
 func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	sourceA := t.TempDir()
