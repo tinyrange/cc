@@ -2,8 +2,10 @@ package netstack
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestAttachNetworkInterfaceGeneratesUnicastHostMAC(t *testing.T) {
@@ -50,4 +52,100 @@ func TestSetHostMACRejectsMulticast(t *testing.T) {
 	if err := ns.SetHostMAC(net.HardwareAddr{0x03, 0x42, 0x0a, 0x2a, 0x00, 0x01}); err == nil {
 		t.Fatal("SetHostMAC accepted multicast MAC")
 	}
+}
+
+func TestServiceProxyBridgesUDP(t *testing.T) {
+	host, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	hostPort := host.LocalAddr().(*net.UDPAddr).Port
+
+	hostPayloads := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		n, addr, err := host.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		hostPayloads <- append([]byte(nil), buf[:n]...)
+		_, _ = host.WriteTo([]byte("pong"), addr)
+	}()
+
+	h := newBenchmarkHarness(t)
+	guestFrames := make(chan []byte, 1)
+	h.nic.AttachVirtioBackend(func(frame []byte) error {
+		guestFrames <- append([]byte(nil), frame...)
+		return nil
+	})
+
+	guestPort := uint16(40200)
+	serviceIP := net.IP(h.stack.serviceIPv4[:])
+	frame := buildBenchmarkUDPFrameTo(guestPort, uint16(hostPort), serviceIP, []byte("ping"))
+	if err := h.nic.DeliverGuestPacket(frame, true); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-hostPayloads:
+		if !bytes.Equal(got, []byte("ping")) {
+			t.Fatalf("host udp payload = %q, want ping", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("host did not receive proxied UDP payload")
+	}
+
+	select {
+	case reply := <-guestFrames:
+		srcIP, dstIP, srcPort, dstPort, payload, ok := parseTestUDPFrame(reply)
+		if !ok {
+			t.Fatalf("reply frame is not UDP: %x", reply)
+		}
+		if !srcIP.Equal(serviceIP) {
+			t.Fatalf("reply src ip = %s, want %s", srcIP, serviceIP)
+		}
+		if !dstIP.Equal(benchmarkGuestIP) {
+			t.Fatalf("reply dst ip = %s, want %s", dstIP, benchmarkGuestIP)
+		}
+		if srcPort != uint16(hostPort) || dstPort != guestPort {
+			t.Fatalf("reply ports = %d -> %d, want %d -> %d", srcPort, dstPort, hostPort, guestPort)
+		}
+		udp := reply[ethernetHeaderLen+ipv4HeaderLen : ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+len(payload)]
+		if got := udpChecksum(srcIP, dstIP, udp); got != 0 {
+			t.Fatalf("reply udp checksum = 0x%04x, want 0", got)
+		}
+		if !bytes.Equal(payload, []byte("pong")) {
+			t.Fatalf("reply payload = %q, want pong", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guest did not receive UDP service proxy reply")
+	}
+}
+
+func parseTestUDPFrame(frame []byte) (srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte, ok bool) {
+	if len(frame) < ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen {
+		return nil, nil, 0, 0, nil, false
+	}
+	if etherType(binary.BigEndian.Uint16(frame[12:14])) != etherTypeIPv4 {
+		return nil, nil, 0, 0, nil, false
+	}
+	ip := frame[ethernetHeaderLen:]
+	if protocolNumber(ip[9]) != udpProtocolNumber {
+		return nil, nil, 0, 0, nil, false
+	}
+	ihl := int(ip[0]&0x0f) * 4
+	if len(ip) < ihl+udpHeaderLen {
+		return nil, nil, 0, 0, nil, false
+	}
+	udp := ip[ihl:]
+	length := int(binary.BigEndian.Uint16(udp[4:6]))
+	if length < udpHeaderLen || len(udp) < length {
+		return nil, nil, 0, 0, nil, false
+	}
+	return net.IP(ip[12:16]), net.IP(ip[16:20]),
+		binary.BigEndian.Uint16(udp[0:2]),
+		binary.BigEndian.Uint16(udp[2:4]),
+		udp[udpHeaderLen:length],
+		true
 }

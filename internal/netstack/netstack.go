@@ -265,6 +265,9 @@ type NetStack struct {
 	udpMu      sync.RWMutex
 	udpSockets map[uint16]udpEndpoint
 
+	udpProxyMu        sync.Mutex
+	udpServiceProxies map[udpProxyKey]*udpServiceProxyConn
+
 	// Embedded DNS server (optional).
 	dnsServer *dnsServer
 
@@ -297,6 +300,7 @@ func New(l *slog.Logger) *NetStack {
 		tcpListen:           make(map[uint16]*tcpListener),
 		tcpConns:            make(map[tcpFourTuple]*tcpConn),
 		udpSockets:          make(map[uint16]udpEndpoint),
+		udpServiceProxies:   make(map[udpProxyKey]*udpServiceProxyConn),
 		randSource:          rand.New(rand.NewSource(now)),
 	}
 	stack.tcpDial = stack.defaultOutboundTCPDial
@@ -415,6 +419,21 @@ func (ns *NetStack) Close() error {
 
 		for _, ep := range udpEndpoints {
 			_ = ep.Close()
+		}
+
+		var udpProxies []*udpServiceProxyConn
+		ns.udpProxyMu.Lock()
+		if ns.udpServiceProxies != nil {
+			udpProxies = make([]*udpServiceProxyConn, 0, len(ns.udpServiceProxies))
+			for _, proxy := range ns.udpServiceProxies {
+				udpProxies = append(udpProxies, proxy)
+			}
+			ns.udpServiceProxies = make(map[udpProxyKey]*udpServiceProxyConn)
+		}
+		ns.udpProxyMu.Unlock()
+		for _, proxy := range udpProxies {
+			_ = proxy.conn.Close()
+			<-proxy.done
 		}
 
 		// Stop packet capture.
@@ -1208,6 +1227,22 @@ type udpPacket struct {
 	addr    net.UDPAddr
 }
 
+type udpProxyKey struct {
+	srcIP   [4]byte
+	srcPort uint16
+	dstPort uint16
+}
+
+type udpServiceProxyConn struct {
+	stack    *NetStack
+	key      udpProxyKey
+	conn     *net.UDPConn
+	done     chan struct{}
+	lastUsed atomic.Int64
+}
+
+const udpServiceProxyIdleTimeout = 30 * time.Second
+
 // handleUDP parses the UDP header and enqueues payloads to bound endpoints.
 func (ns *NetStack) handleUDP(h ipv4Header, payload []byte) error {
 	return ns.handleUDPWithReuse(h, payload, false)
@@ -1244,6 +1279,15 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 		tracef("netstack.udpEndpointConn", "src=%s:%d dst=%s:%d dataLen=%d releaseUnsafe=%t", h.src.String(), srcPort, h.dst.String(), dstPort, len(data), releaseUnsafe)
 	}
 
+	dstIP := h.dst.To4()
+	if ns.shouldProxyService(dstIP) {
+		if !ns.serviceProxyEnabled || !ns.serviceProxyAllowed(dstIP, dstPort) {
+			tracef("netstack.handleUDP service proxy disabled", "src=%s:%d dst=%s:%d", h.src.String(), srcPort, h.dst.String(), dstPort)
+			return nil
+		}
+		return ns.proxyServiceUDP(h.src.To4(), srcPort, dstPort, data)
+	}
+
 	ns.udpMu.RLock()
 	ep, ok := ns.udpSockets[dstPort]
 	ns.udpMu.RUnlock()
@@ -1274,6 +1318,111 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	return nil
 }
 
+func (ns *NetStack) proxyServiceUDP(srcIP net.IP, srcPort, dstPort uint16, payload []byte) error {
+	if srcIP == nil {
+		return fmt.Errorf("udp service proxy source ip is not ipv4")
+	}
+	var key udpProxyKey
+	copy(key.srcIP[:], srcIP)
+	key.srcPort = srcPort
+	key.dstPort = dstPort
+
+	proxy, err := ns.getUDPServiceProxy(key)
+	if err != nil {
+		return err
+	}
+	proxy.lastUsed.Store(time.Now().UnixNano())
+	if _, err := proxy.conn.Write(payload); err != nil {
+		return err
+	}
+	ns.udpRxPackets.Add(1)
+	return nil
+}
+
+func (ns *NetStack) getUDPServiceProxy(key udpProxyKey) (*udpServiceProxyConn, error) {
+	ns.udpProxyMu.Lock()
+	if proxy, ok := ns.udpServiceProxies[key]; ok {
+		ns.udpProxyMu.Unlock()
+		return proxy, nil
+	}
+	ns.udpProxyMu.Unlock()
+
+	addr := &net.UDPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: int(key.dstPort),
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	proxy := &udpServiceProxyConn{
+		stack: ns,
+		key:   key,
+		conn:  conn,
+		done:  make(chan struct{}),
+	}
+	proxy.lastUsed.Store(time.Now().UnixNano())
+
+	ns.udpProxyMu.Lock()
+	if existing, ok := ns.udpServiceProxies[key]; ok {
+		ns.udpProxyMu.Unlock()
+		_ = conn.Close()
+		return existing, nil
+	}
+	ns.udpServiceProxies[key] = proxy
+	ns.udpProxyMu.Unlock()
+
+	go proxy.readLoop()
+	return proxy, nil
+}
+
+func (p *udpServiceProxyConn) readLoop() {
+	defer func() {
+		p.stack.udpProxyMu.Lock()
+		if p.stack.udpServiceProxies[p.key] == p {
+			delete(p.stack.udpServiceProxies, p.key)
+		}
+		p.stack.udpProxyMu.Unlock()
+		_ = p.conn.Close()
+		close(p.done)
+	}()
+
+	buf := make([]byte, maxEthernetFramePoolLen)
+	for {
+		if err := p.conn.SetReadDeadline(time.Now().Add(udpServiceProxyIdleTimeout)); err != nil {
+			return
+		}
+		n, err := p.conn.Read(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Since(time.Unix(0, p.lastUsed.Load())) < udpServiceProxyIdleTimeout {
+					continue
+				}
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			slog.Debug("raw: udp service proxy read failed", "port", p.key.dstPort, "err", err)
+			return
+		}
+
+		frameLen := ethernetHeaderLen + ipv4HeaderLen + udpHeaderLen + n
+		frame := getEthernetFrameBuffer(frameLen)
+		copy(frame[ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen:], buf[:n])
+		dstIP := net.IP(p.key.srcIP[:])
+		err = p.stack.sendUDP(frame, p.key.dstPort, p.key.srcPort, net.IP(p.stack.serviceIPv4[:]), dstIP, n)
+		putEthernetFrameBuffer(frame)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			slog.Debug("raw: udp service proxy send failed", "port", p.key.dstPort, "err", err)
+			return
+		}
+	}
+}
+
 // sendUDP crafts and transmits a UDP packet to the guest.
 func (ns *NetStack) sendUDP(
 	buf []byte,
@@ -1288,13 +1437,15 @@ func (ns *NetStack) sendUDP(
 	tracef("netstack.sendUDPPacket", "src=%s:%d dst=%s:%d payloadLen=%d", srcIP.String(), srcPort, dstIP.String(), dstPort, payloadLen)
 
 	totalLen := 8 + payloadLen
-	packet := buf[ethernetHeaderLen+ipv4HeaderLen:]
+	packet := buf[ethernetHeaderLen+ipv4HeaderLen : ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+payloadLen]
 	binary.BigEndian.PutUint16(packet[0:2], srcPort)
 	binary.BigEndian.PutUint16(packet[2:4], dstPort)
 	binary.BigEndian.PutUint16(packet[4:6], uint16(totalLen))
 	copy(packet[8:], buf[ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen:])
 
 	zeroOut := packet[6:8]
+	zeroOut[0] = 0
+	zeroOut[1] = 0
 	check := udpChecksum(srcIP, dstIP, packet)
 	binary.BigEndian.PutUint16(zeroOut, check)
 

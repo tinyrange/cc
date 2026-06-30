@@ -262,6 +262,10 @@ func establishBenchmarkTCPConn(
 }
 
 func buildBenchmarkUDPFrame(srcPort, dstPort uint16, payload []byte) []byte {
+	return buildBenchmarkUDPFrameTo(srcPort, dstPort, benchmarkHostIP, payload)
+}
+
+func buildBenchmarkUDPFrameTo(srcPort, dstPort uint16, dstIP net.IP, payload []byte) []byte {
 	frame := make([]byte, ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+len(payload))
 	buildEthernetHeaderInto(frame[:ethernetHeaderLen], mustBenchmarkMAC(benchmarkHostMAC), mustBenchmarkMAC(benchmarkGuestMAC), etherTypeIPv4)
 
@@ -271,9 +275,9 @@ func buildBenchmarkUDPFrame(srcPort, dstPort uint16, payload []byte) []byte {
 	binary.BigEndian.PutUint16(udp[4:6], uint16(udpHeaderLen+len(payload)))
 	copy(udp[udpHeaderLen:], payload)
 	binary.BigEndian.PutUint16(udp[6:8], 0)
-	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(benchmarkGuestIP, benchmarkHostIP, udp))
+	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(benchmarkGuestIP, dstIP, udp))
 
-	buildIPv4HeaderInto(frame[ethernetHeaderLen:ethernetHeaderLen+ipv4HeaderLen], benchmarkGuestIP, benchmarkHostIP, udpProtocolNumber, len(udp))
+	buildIPv4HeaderInto(frame[ethernetHeaderLen:ethernetHeaderLen+ipv4HeaderLen], benchmarkGuestIP, dstIP, udpProtocolNumber, len(udp))
 	return frame
 }
 
