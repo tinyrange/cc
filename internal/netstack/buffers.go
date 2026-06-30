@@ -3,12 +3,51 @@ package netstack
 import "sync"
 
 const maxRetainedPayloadPoolSize = 256 * 1024
+const byteSlicePoolDepth = 256
 
-var retainedPayloadPool = sync.Pool{
-	New: func() any {
-		return make([]byte, 0, 4096)
-	},
+type byteSlicePool struct {
+	ch         chan []byte
+	defaultCap int
+	maxCap     int
 }
+
+func newByteSlicePool(defaultCap, maxCap int) *byteSlicePool {
+	return &byteSlicePool{
+		ch:         make(chan []byte, byteSlicePoolDepth),
+		defaultCap: defaultCap,
+		maxCap:     maxCap,
+	}
+}
+
+func (p *byteSlicePool) get(size int) []byte {
+	if size > p.maxCap {
+		return make([]byte, size)
+	}
+	select {
+	case buf := <-p.ch:
+		if cap(buf) >= size {
+			return buf[:size]
+		}
+	default:
+	}
+	capacity := p.defaultCap
+	if capacity < size {
+		capacity = size
+	}
+	return make([]byte, size, capacity)
+}
+
+func (p *byteSlicePool) put(buf []byte) {
+	if buf == nil || cap(buf) > p.maxCap {
+		return
+	}
+	select {
+	case p.ch <- buf[:0]:
+	default:
+	}
+}
+
+var retainedPayloadPool = newByteSlicePool(4096, maxRetainedPayloadPoolSize)
 
 var proxyCopyBufferPool = sync.Pool{
 	New: func() any {
@@ -29,12 +68,7 @@ func retainPayload(src []byte) []byte {
 		copy(dst, src)
 		return dst
 	}
-	dst := retainedPayloadPool.Get().([]byte)
-	if cap(dst) < len(src) {
-		retainedPayloadPool.Put(dst[:0])
-		dst = make([]byte, len(src))
-	}
-	dst = dst[:len(src)]
+	dst := retainedPayloadPool.get(len(src))
 	copy(dst, src)
 	return dst
 }
@@ -43,7 +77,7 @@ func releasePayload(buf []byte) {
 	if buf == nil || cap(buf) > maxRetainedPayloadPoolSize {
 		return
 	}
-	retainedPayloadPool.Put(buf[:0])
+	retainedPayloadPool.put(buf)
 }
 
 func getProxyCopyBuffer(size int) []byte {
