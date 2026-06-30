@@ -296,9 +296,11 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 	mode := ""
 	if cfg != nil {
 		switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
-		case "", "remote":
+		case "":
+			mode = "bridge"
 		case "bridge":
 			mode = "bridge"
+		case "remote":
 		default:
 			return sidecarStartResources{}, fmt.Errorf("unsupported sidecar network mode %q", cfg.Mode)
 		}
