@@ -2367,12 +2367,25 @@ func managedExecExitCode(waitErr error, state *os.ProcessState) (int, error) {
 	if waitErr != nil && errors.Is(waitErr, exec.ErrWaitDelay) {
 		waitErr = nil
 	}
+	if state != nil {
+		status, ok := state.Sys().(syscall.WaitStatus)
+		if !ok {
+			return 126, fmt.Errorf("process state did not include wait status")
+		}
+		if status.Signaled() {
+			return 128 + int(status.Signal()), nil
+		}
+		if status.Exited() {
+			return status.ExitStatus(), nil
+		}
+		return 126, fmt.Errorf("process did not exit normally")
+	}
 	if waitErr == nil {
 		return 0, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
-		return guestagent.ProcessExitCode(state, exitErr.ExitCode()), nil
+		return exitErr.ExitCode(), nil
 	}
 	return 126, waitErr
 }
@@ -2395,16 +2408,17 @@ type managedExecWaitResult struct {
 }
 
 func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitResult {
-	waitErr := cmd.Wait()
-	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(execStart))
-	exitCode, exitErr := managedExecExitCode(waitErr, cmd.ProcessState)
+	state, waitErr := cmd.Process.Wait()
+	cmd.ProcessState = state
+	usage := guestagent.UsageFromProcessState(state, time.Since(execStart))
+	exitCode, exitErr := managedExecExitCode(waitErr, state)
 	var usagePayload string
 	if usage != nil {
 		usagePayload = guestagent.EncodeExecUsage(usage)
 	}
 	return managedExecWaitResult{
 		WaitErr:      waitErr,
-		ProcessState: cmd.ProcessState,
+		ProcessState: state,
 		Usage:        usagePayload,
 		ExitCode:     exitCode,
 		ExitErr:      exitErr,
@@ -2423,6 +2437,13 @@ func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
 		streams++
 	}
 	return streams
+}
+
+func managedExecDoneStreamCount(tty bool, hasStdin bool, hasControl bool) int {
+	if !tty {
+		hasStdin = false
+	}
+	return managedExecStreamCount(tty, hasStdin, hasControl)
 }
 
 func waitManagedExecStreams(done <-chan struct{}, count int) {
@@ -2487,6 +2508,25 @@ func copyManagedExecStdinToPTY(done chan<- struct{}, stdin io.ReadCloser, pty io
 	}
 }
 
+func copyManagedExecStdinToPipe(done chan<- struct{}, stdin io.ReadCloser, childStdin io.WriteCloser) {
+	defer func() { done <- struct{}{} }()
+	defer stdin.Close()
+	defer childStdin.Close()
+	_, _ = io.Copy(childStdin, stdin)
+}
+
+func closeManagedExecStdinPipe(stdin io.ReadCloser, childStdin io.WriteCloser, done <-chan struct{}) {
+	if childStdin != nil {
+		_ = childStdin.Close()
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
 func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, waitReady func() error, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
@@ -2544,8 +2584,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
-		stdoutW    *io.PipeWriter
-		stderrW    *io.PipeWriter
+		stdoutR    io.ReadCloser
+		stderrR    io.ReadCloser
+		stdinW     io.WriteCloser
+		stdinDone  chan struct{}
 		controlR   *os.File
 		controlW   *os.File
 		ptyMaster  *os.File
@@ -2598,7 +2640,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		done = make(chan struct{}, managedExecStreamCount(true, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		var ptyEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			ptyEmit = reporter.Stdout
@@ -2609,8 +2651,15 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 	} else {
 		if stdin != nil {
-			defer stdin.Close()
-			cmd.Stdin = stdin
+			var err error
+			stdinW, err = cmd.StdinPipe()
+			if err != nil {
+				closeManagedExecStdinPipe(stdin, nil, nil)
+				writeKernel("ccx3-init: open stdin pipe: " + err.Error())
+				writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
+				reporter.Exit(126)
+				return
+			}
 		} else {
 			devNull, err := os.Open("/dev/null")
 			if err == nil {
@@ -2619,14 +2668,26 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 		}
 
-		stdoutR, stdoutPipeW := io.Pipe()
-		stderrR, stderrPipeW := io.Pipe()
-		stdoutW = stdoutPipeW
-		stderrW = stderrPipeW
-		cmd.Stdout = stdoutW
-		cmd.Stderr = stderrW
+		var err error
+		stdoutR, err = cmd.StdoutPipe()
+		if err != nil {
+			closeManagedExecStdinPipe(stdin, stdinW, nil)
+			writeKernel("ccx3-init: open stdout pipe: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: open stdout pipe: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+		stderrR, err = cmd.StderrPipe()
+		if err != nil {
+			_ = stdoutR.Close()
+			closeManagedExecStdinPipe(stdin, stdinW, nil)
+			writeKernel("ccx3-init: open stderr pipe: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: open stderr pipe: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
 
-		done = make(chan struct{}, managedExecStreamCount(false, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		var stdoutEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			stdoutEmit = reporter.Stdout
@@ -2647,6 +2708,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	startErr := startManagedExecProcess(cmd, &controlW)
 	if startErr != nil {
 		_ = managed.closeStdin()
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 		if ptySlave != nil {
 			_ = ptySlave.Close()
 			ptySlave = nil
@@ -2655,11 +2717,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			_ = ptyMaster.Close()
 			ptyMaster = nil
 		}
-		if stdoutW != nil {
-			_ = stdoutW.Close()
+		if stdoutR != nil {
+			_ = stdoutR.Close()
 		}
-		if stderrW != nil {
-			_ = stderrW.Close()
+		if stderrR != nil {
+			_ = stderrR.Close()
 		}
 		waitManagedExecStreams(done, cap(done))
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
@@ -2668,6 +2730,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		return
 	}
 	reporter.Timing(managedExecTimingStarted)
+	if stdinW != nil {
+		stdinDone = make(chan struct{}, 1)
+		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
+	}
 	managed.setProcess(cmd.Process, signalGroup)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
@@ -2675,19 +2741,23 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	}
 
 	reporter.Timing(managedExecTimingWaitBegin)
-	waitResult := waitManagedExecProcess(cmd, execStart)
+	var waitResult managedExecWaitResult
+	if !tty {
+		waitManagedExecStreams(done, cap(done))
+		reporter.Timing(managedExecTimingStreamsDone)
+	}
+	waitResult = waitManagedExecProcess(cmd, execStart)
 	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()
 	}
-	if stdoutW != nil {
-		_ = stdoutW.Close()
+	if !tty {
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 	}
-	if stderrW != nil {
-		_ = stderrW.Close()
+	if tty {
+		waitManagedExecStreams(done, cap(done))
+		reporter.Timing(managedExecTimingStreamsDone)
 	}
-	waitManagedExecStreams(done, cap(done))
-	reporter.Timing(managedExecTimingStreamsDone)
 
 	if waitResult.ExitErr != nil {
 		writeKernel("ccx3-init: exec error: " + waitResult.ExitErr.Error())
