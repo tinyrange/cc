@@ -10,9 +10,18 @@ func (m testGuestMemory) ReadIPA(addr uint64, size int) ([]byte, error) {
 	return out, nil
 }
 
+func (m testGuestMemory) ReadIPAInto(addr uint64, dst []byte) error {
+	copy(dst, m[addr:addr+uint64(len(dst))])
+	return nil
+}
+
 func (m testGuestMemory) WriteIPA(addr uint64, data []byte) error {
 	copy(m[addr:addr+uint64(len(data))], data)
 	return nil
+}
+
+func (m testGuestMemory) SliceIPA(addr uint64, size int) ([]byte, error) {
+	return m[addr : addr+uint64(size)], nil
 }
 
 type testIRQ struct {
