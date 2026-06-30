@@ -2528,6 +2528,13 @@ func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
 	return streams
 }
 
+func managedExecDoneStreamCount(tty bool, hasStdin bool, hasControl bool) int {
+	if !tty {
+		hasStdin = false
+	}
+	return managedExecStreamCount(tty, hasStdin, hasControl)
+}
+
 func waitManagedExecStreams(done <-chan struct{}, count int) {
 	for i := 0; i < count; i++ {
 		<-done
@@ -2722,7 +2729,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		done = make(chan struct{}, managedExecStreamCount(true, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		var ptyEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			ptyEmit = reporter.Stdout
@@ -2769,7 +2776,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			return
 		}
 
-		done = make(chan struct{}, managedExecStreamCount(false, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		var stdoutEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			stdoutEmit = reporter.Stdout

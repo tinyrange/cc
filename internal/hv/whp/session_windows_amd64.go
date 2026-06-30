@@ -104,7 +104,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	go func() {
 		err := runManagedExecVM(runCtx, vm, platform, serialOut)
 		platform.Close()
-		vm.Close()
+		err = errors.Join(err, vm.Close())
 		doneCh <- err
 	}()
 
@@ -379,6 +379,10 @@ func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Dura
 }
 
 func (s *ManagedSession) Wait() error {
+	return s.waitDone()
+}
+
+func (s *ManagedSession) waitDone() error {
 	if s == nil || s.doneCh == nil {
 		return nil
 	}
@@ -388,10 +392,32 @@ func (s *ManagedSession) Wait() error {
 	return s.waitErr
 }
 
+func (s *ManagedSession) waitDoneTimeout(timeout time.Duration) error {
+	if s == nil || s.doneCh == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.waitDone()
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for managed session to stop")
+	}
+}
+
 func (s *ManagedSession) Close() error {
 	if s == nil {
 		return nil
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	waitErr := s.waitDoneTimeout(15 * time.Second)
 	if s.control != nil {
 		_ = s.control.Close()
 	}
@@ -404,11 +430,8 @@ func (s *ManagedSession) Close() error {
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
 	}
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if err := s.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		return waitErr
 	}
 	return nil
 }
