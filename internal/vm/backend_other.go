@@ -1,4 +1,4 @@
-//go:build (!darwin || !arm64) && (!linux || (!arm64 && !amd64)) && (!windows || !amd64)
+//go:build (!darwin || !arm64) && (!linux || (!arm64 && !amd64)) && (!windows || (!amd64 && !arm64))
 
 package vm
 
