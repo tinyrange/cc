@@ -2,6 +2,8 @@ package netstack
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -174,7 +176,7 @@ func BenchmarkHostPathUDPCallback(b *testing.B) {
 }
 
 func BenchmarkHostPathTCPListenerIngress(b *testing.B) {
-	for _, size := range []int{64, 512, 1400} {
+	for _, size := range []int{64, 512, 1400, 16 * 1024, 64 * 1024} {
 		b.Run(payloadBenchmarkName(size), func(b *testing.B) {
 			h := newBenchmarkHarness(b)
 			conn, guestSeq, hostAck := establishBenchmarkTCPConn(b, h, 40300, 10080)
@@ -209,6 +211,52 @@ func BenchmarkHostPathTCPListenerIngress(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkHostPathTCPWriteTo(b *testing.B) {
+	for _, size := range []int{512, 1400, 16 * 1024, 64 * 1024} {
+		b.Run(payloadBenchmarkName(size), func(b *testing.B) {
+			h := newBenchmarkHarness(b)
+			conn, _, _ := establishBenchmarkTCPConn(b, h, 40300, 10080)
+			tcpConn := conn.(*tcpConn)
+			writer := &benchmarkCountingWriter{}
+			done := make(chan error, 1)
+			go func() {
+				_, err := tcpConn.WriteTo(writer)
+				done <- err
+			}()
+
+			payload := benchmarkPayload(size)
+
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				tcpConn.recvBuf <- retainPayload(payload)
+			}
+			b.StopTimer()
+			tcpConn.recvBuf <- nil
+			if err := <-done; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+				b.Fatal(err)
+			}
+			_ = conn.Close()
+			if got := writer.bytes.Load(); got != uint64(b.N*size) {
+				b.Fatalf("writer bytes = %d, want %d", got, b.N*size)
+			}
+			b.ReportMetric(float64(writer.writes.Load())/float64(b.N), "writes/pkt")
+		})
+	}
+}
+
+type benchmarkCountingWriter struct {
+	bytes  atomic.Uint64
+	writes atomic.Uint64
+}
+
+func (w *benchmarkCountingWriter) Write(p []byte) (int, error) {
+	w.writes.Add(1)
+	w.bytes.Add(uint64(len(p)))
+	return len(p), nil
 }
 
 func establishBenchmarkTCPConn(

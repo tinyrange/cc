@@ -1059,6 +1059,7 @@
         "type": "object",
         "properties": {
           "enabled": { "type": "boolean" },
+          "mode": { "type": "string" },
           "allow_internet": { "type": "boolean" },
           "block_host_access": { "type": "boolean" },
           "host_dns_name": { "type": "string" },

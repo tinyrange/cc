@@ -126,6 +126,7 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 		txHook: cfg.TXHook,
 	}
 	dev := virtio.NewNet(cfg.Base, cfg.Size, cfg.IRQ, cfg.MAC, &netstackVirtioBackend{runtime: runtime})
+	dev.CompleteTXChecksum = false
 	runtime.dev = dev
 	rxHook := cfg.RXHook
 	if rxHook == nil {

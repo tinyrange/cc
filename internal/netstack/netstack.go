@@ -2464,6 +2464,9 @@ func (c *tcpConn) Read(b []byte) (int, error) {
 // buffer before the kernel write.
 func (c *tcpConn) WriteTo(w io.Writer) (int64, error) {
 	var written int64
+	batch := getProxyCopyBuffer(64 * 1024)
+	defer releaseProxyCopyBuffer(batch)
+
 	for {
 		data, owned, err := c.nextReadPayload()
 		if err != nil {
@@ -2472,23 +2475,76 @@ func (c *tcpConn) WriteTo(w io.Writer) (int64, error) {
 			}
 			return written, err
 		}
-		remaining := data
-		for len(remaining) > 0 {
-			n, writeErr := w.Write(remaining)
-			if n > 0 {
-				written += int64(n)
-				remaining = remaining[n:]
+		if len(data) >= cap(batch) {
+			n, err := writeFull(w, data)
+			written += n
+			releasePayload(owned)
+			if err != nil {
+				return written, err
 			}
-			if writeErr != nil {
-				releasePayload(owned)
-				return written, writeErr
+			continue
+		}
+
+		batch = batch[:0]
+		eofAfterBatch := false
+		for {
+			if len(data) > cap(batch)-len(batch) {
+				n, err := writeFull(w, batch)
+				written += n
+				if err != nil {
+					releasePayload(owned)
+					return written, err
+				}
+				batch = batch[:0]
 			}
-			if n == 0 {
+			batch = append(batch, data...)
+			releasePayload(owned)
+
+			var ok bool
+			data, owned, ok, err = c.tryNextReadPayload()
+			if err != nil {
+				if err == io.EOF {
+					eofAfterBatch = true
+					break
+				}
+				n, writeErr := writeFull(w, batch)
+				written += n
+				if writeErr != nil {
+					return written, writeErr
+				}
+				return written, err
+			}
+			if !ok {
+				break
+			}
+			if len(data) >= cap(batch) && len(batch) > 0 {
+				n, err := writeFull(w, batch)
+				written += n
+				if err != nil {
+					releasePayload(owned)
+					return written, err
+				}
+				batch = batch[:0]
+			}
+			if len(data) >= cap(batch) {
+				n, err := writeFull(w, data)
+				written += n
 				releasePayload(owned)
-				return written, io.ErrShortWrite
+				if err != nil {
+					return written, err
+				}
+				break
 			}
 		}
-		releasePayload(owned)
+
+		n, err := writeFull(w, batch)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if eofAfterBatch {
+			return written, nil
+		}
 	}
 }
 
@@ -2536,6 +2592,51 @@ func (c *tcpConn) nextReadPayload() ([]byte, []byte, error) {
 	case <-timeout:
 		return nil, nil, &net.OpError{Op: "read", Net: "tcp", Err: tcpTimeoutError{}}
 	}
+}
+
+func (c *tcpConn) tryNextReadPayload() ([]byte, []byte, bool, error) {
+	c.mu.Lock()
+	if len(c.readPending) > 0 {
+		data := c.readPending
+		owned := c.readPendingBuf
+		c.readPending = nil
+		c.readPendingBuf = nil
+		c.mu.Unlock()
+		return data, owned, true, nil
+	}
+	buf := c.recvBuf
+	c.mu.Unlock()
+
+	select {
+	case data, ok := <-buf:
+		if !ok {
+			return nil, nil, false, net.ErrClosed
+		}
+		if data == nil {
+			return nil, nil, false, io.EOF
+		}
+		return data, data, true, nil
+	default:
+		return nil, nil, false, nil
+	}
+}
+
+func writeFull(w io.Writer, data []byte) (int64, error) {
+	var written int64
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			written += int64(n)
+			data = data[n:]
+		}
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
 }
 
 // Write transmits payload to the guest.
@@ -3122,6 +3223,7 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 			_ = conn.Close()
 			return
 		}
+		tuneProxyTCPConn(outbound)
 		defer outbound.Close()
 		defer conn.Close()
 
@@ -3152,6 +3254,9 @@ func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
 			_ = conn.Close()
 			return
 		}
+		if tcpConn, ok := outbound.(*net.TCPConn); ok {
+			tuneProxyTCPConn(tcpConn)
+		}
 		defer outbound.Close()
 		defer conn.Close()
 
@@ -3161,6 +3266,15 @@ func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
 			slog.Error("raw: outbound proxy", "err", err)
 		}
 	}()
+}
+
+func tuneProxyTCPConn(conn *net.TCPConn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetNoDelay(true)
+	_ = conn.SetReadBuffer(4 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 }
 
 ////////////////////////////////////////////////////////////////////////////////

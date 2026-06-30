@@ -3,6 +3,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -14,6 +15,8 @@ import (
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
+
+var defaultGatewayMACBytes = []byte{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x01}
 
 type darwinNetworkRuntime struct {
 	*networkRuntime
@@ -93,6 +96,9 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 			Size:   arm64vm.NetSize,
 			IRQ:    arm64vm.NetIRQ,
 			TXHook: func(packet []byte) {
+				if frameTargetsDefaultGateway(packet) {
+					return
+				}
 				_ = codec.Send(virtio.NetPacket{
 					Kind:     virtio.NetPacketTX,
 					VMID:     DefaultInstanceID,
@@ -118,6 +124,7 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 		}, nil
 	}
 	dev := virtio.NewNet(arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ, mac, virtio.NewNetRemoteBackend(codec, DefaultInstanceID, "eth0"))
+	dev.CompleteTXChecksum = false
 	go func() {
 		_ = virtio.ReceiveNetRXPackets(context.Background(), codec, dev)
 	}()
@@ -126,6 +133,13 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 		mac: mac,
 		dev: dev,
 	}, closeFn: codec.Close}, nil
+}
+
+func frameTargetsDefaultGateway(frame []byte) bool {
+	if len(frame) < 6 {
+		return false
+	}
+	return bytes.Equal(frame[:6], defaultGatewayMACBytes)
 }
 
 func (n *darwinNetworkRuntime) Close() error {

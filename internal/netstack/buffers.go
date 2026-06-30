@@ -51,7 +51,7 @@ var retainedPayloadPool = newByteSlicePool(4096, maxRetainedPayloadPoolSize)
 
 var proxyCopyBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 64*1024)
+		return make([]byte, 256*1024)
 	},
 }
 
@@ -90,7 +90,7 @@ func getProxyCopyBuffer(size int) []byte {
 }
 
 func releaseProxyCopyBuffer(buf []byte) {
-	if cap(buf) != 64*1024 {
+	if cap(buf) != 256*1024 {
 		return
 	}
 	proxyCopyBufferPool.Put(buf[:cap(buf)])

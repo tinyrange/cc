@@ -17,7 +17,9 @@ const (
 
 	netQueueSize = 256
 
+	netFeatureCSUM          = uint64(1) << 0
 	netFeatureMAC           = uint64(1) << 5
+	netFeatureHostTSO4      = uint64(1) << 11
 	netFeatureStatus        = uint64(1) << 16
 	netFeatureMergeRX       = uint64(1) << 15
 	netHdrFlagNeedsChecksum = 1
@@ -90,27 +92,28 @@ type Net struct {
 	MAC        net.HardwareAddr
 	LegacyMMIO bool
 
-	DisableMergeRX   bool
-	HeaderLength     int
-	mu               sync.Mutex
-	mem              GuestMemory
-	irq              IRQController
-	backend          NetBackend
-	deviceFeatureSel uint32
-	driverFeatureSel uint32
-	driverFeatures   uint64
-	queueSel         uint32
-	status           uint32
-	interruptStatus  uint32
-	irqHigh          bool
-	configGeneration uint32
-	queues           [2]queue
-	pendingRx        [][]byte
-	legacy           bool
-	scratch2         [2]byte
-	scratch4         [4]byte
-	scratch8         [8]byte
-	scratch16        [16]byte
+	DisableMergeRX     bool
+	CompleteTXChecksum bool
+	HeaderLength       int
+	mu                 sync.Mutex
+	mem                GuestMemory
+	irq                IRQController
+	backend            NetBackend
+	deviceFeatureSel   uint32
+	driverFeatureSel   uint32
+	driverFeatures     uint64
+	queueSel           uint32
+	status             uint32
+	interruptStatus    uint32
+	irqHigh            bool
+	configGeneration   uint32
+	queues             [2]queue
+	pendingRx          [][]byte
+	legacy             bool
+	scratch2           [2]byte
+	scratch4           [4]byte
+	scratch8           [8]byte
+	scratch16          [16]byte
 }
 
 type netTXPacket struct {
@@ -120,11 +123,12 @@ type netTXPacket struct {
 
 func NewNet(base, size uint64, irq uint32, mac net.HardwareAddr, backend NetBackend) *Net {
 	n := &Net{
-		Base:    base,
-		Size:    size,
-		IRQ:     irq,
-		MAC:     append(net.HardwareAddr(nil), mac...),
-		backend: backend,
+		Base:               base,
+		Size:               size,
+		IRQ:                irq,
+		MAC:                append(net.HardwareAddr(nil), mac...),
+		backend:            backend,
+		CompleteTXChecksum: true,
 	}
 	if len(n.MAC) != 6 {
 		n.MAC = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
@@ -591,10 +595,12 @@ func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 		}
 		releaseData := data
 		if len(data) >= headerLen {
-			if err := fixTXChecksum(data, headerLen); err != nil {
-				releaseNetPacketBuffer(releaseData)
-				releaseNetTXPackets(packets)
-				return nil, err
+			if n.CompleteTXChecksum {
+				if err := fixTXChecksum(data, headerLen); err != nil {
+					releaseNetPacketBuffer(releaseData)
+					releaseNetTXPackets(packets)
+					return nil, err
+				}
 			}
 			packet := data[headerLen:]
 			if n.backend != nil {
@@ -947,7 +953,7 @@ func (n *Net) legacyFeaturesLocked() uint64 {
 }
 
 func (n *Net) deviceFeaturesLocked() uint64 {
-	features := featureVersion1 | netFeatureMAC | netFeatureStatus
+	features := featureVersion1 | netFeatureCSUM | netFeatureMAC | netFeatureHostTSO4 | netFeatureStatus
 	if !n.DisableMergeRX {
 		features |= netFeatureMergeRX
 	}
