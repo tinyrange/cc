@@ -4,6 +4,7 @@ package whp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -87,9 +88,10 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 	runCtx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan error, 1)
 	go func() {
-		defer vm.Close()
-		defer closeFSDevices(fsdevs)
-		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		closeFSDevices(fsdevs)
+		err = errors.Join(err, vm.Close())
+		doneCh <- err
 	}()
 
 	var control virtio.VsockConn
@@ -254,16 +256,47 @@ func (s *ManagedSession) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (s *ManagedSession) Wait() error {
+	return s.waitDone()
+}
+
+func (s *ManagedSession) waitDone() error {
 	if s == nil || s.doneCh == nil {
 		return nil
 	}
-	return <-s.doneCh
+	err := <-s.doneCh
+	select {
+	case s.doneCh <- err:
+	default:
+	}
+	return err
+}
+
+func (s *ManagedSession) waitDoneTimeout(timeout time.Duration) error {
+	if s == nil || s.doneCh == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-s.doneCh:
+		select {
+		case s.doneCh <- err:
+		default:
+		}
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for managed session to stop")
+	}
 }
 
 func (s *ManagedSession) Close() error {
 	if s == nil {
 		return nil
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	waitErr := s.waitDoneTimeout(15 * time.Second)
 	if s.control != nil {
 		_ = s.control.Close()
 	}
@@ -276,8 +309,8 @@ func (s *ManagedSession) Close() error {
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
 	}
-	if s.cancel != nil {
-		s.cancel()
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		return waitErr
 	}
 	return nil
 }

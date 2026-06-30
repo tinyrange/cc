@@ -612,6 +612,29 @@ func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	}
 }
 
+func TestManagedExecDoneStreamCount(t *testing.T) {
+	tests := []struct {
+		name       string
+		tty        bool
+		hasStdin   bool
+		hasControl bool
+		want       int
+	}{
+		{name: "non_tty", want: 2},
+		{name: "non_tty_stdin", hasStdin: true, want: 2},
+		{name: "non_tty_control_stdin", hasStdin: true, hasControl: true, want: 3},
+		{name: "tty_stdin", tty: true, hasStdin: true, want: 2},
+		{name: "tty_control_stdin", tty: true, hasStdin: true, hasControl: true, want: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedExecDoneStreamCount(tc.tty, tc.hasStdin, tc.hasControl); got != tc.want {
+				t.Fatalf("managedExecDoneStreamCount(%t, %t, %t) = %d, want %d", tc.tty, tc.hasStdin, tc.hasControl, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHandleInitControlRequest(t *testing.T) {
 	var control bytes.Buffer
 	active := guestagent.NewActiveExecSet()
