@@ -32,6 +32,12 @@ type ManagedSession struct {
 	sendMu     sync.Mutex
 	nextID     atomic.Uint64
 	dmesg      bool
+	inlineExec bool
+}
+
+type ManagedSessionOptions struct {
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -39,6 +45,18 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 }
 
 func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNetOptions(ctx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, netdev, ManagedSessionOptions{}, onEvent)
+}
+
+func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "" {
+		if cpus > 1 {
+			return nil, fmt.Errorf("KVM startup snapshots currently support only one vCPU")
+		}
+	}
+	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, netdev, onEvent)
+	}
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
 		return nil, err
 	}
@@ -84,6 +102,8 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
+	snapshot := newSnapshotTrigger(opts.SnapshotDir, mem)
+	serialWriter = snapshot.wrapSerialWriter(serialWriter)
 	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
@@ -131,7 +151,7 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, snapshot)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
@@ -222,11 +242,19 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
-	s.sendMu.Lock()
-	err := managedagent.SendExec(s.control, id, req)
-	s.sendMu.Unlock()
-	if err != nil {
-		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+	if s.inlineExec {
+		execReq := req
+		execReq.Kind = "exec_inline"
+		if err := s.sendExecMessage(managedagent.ExecRequest(id, execReq)); err != nil {
+			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
+	} else {
+		s.sendMu.Lock()
+		err := managedagent.SendExec(s.control, id, req)
+		s.sendMu.Unlock()
+		if err != nil {
+			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
 	}
 	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)

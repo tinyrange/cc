@@ -85,6 +85,126 @@ type kvmMSRs1 struct {
 	Entry kvmMSREntry
 }
 
+type kvmFPU struct {
+	FPR        [8][16]byte
+	FCW        uint16
+	FSW        uint16
+	FTWX       uint8
+	Pad1       uint8
+	LastOpcode uint16
+	LastIP     uint64
+	LastDP     uint64
+	XMM        [16][16]byte
+	MXCSR      uint32
+	Pad2       uint32
+}
+
+type kvmLAPICState struct {
+	Regs [1024]byte
+}
+
+type kvmMPState struct {
+	MPState uint32
+}
+
+type kvmVCPUEvents struct {
+	Exception struct {
+		Injected     uint8
+		Nr           uint8
+		HasErrorCode uint8
+		Pending      uint8
+		ErrorCode    uint32
+	}
+	Interrupt struct {
+		Injected uint8
+		Nr       uint8
+		Soft     uint8
+		Shadow   uint8
+	}
+	NMI struct {
+		Injected uint8
+		Pending  uint8
+		Masked   uint8
+		Pad      uint8
+	}
+	SIPIVector uint32
+	Flags      uint32
+	SMI        struct {
+		SMM          uint8
+		Pending      uint8
+		SMMInsideNMI uint8
+		LatchedInit  uint8
+	}
+	TripleFault struct {
+		Pending uint8
+	}
+	Reserved            [26]byte
+	ExceptionHasPayload uint8
+	ExceptionPayload    uint64
+}
+
+type kvmDebugRegs struct {
+	DB       [4]uint64
+	DR6      uint64
+	DR7      uint64
+	Flags    uint64
+	Reserved [9]uint64
+}
+
+type kvmXSAVE struct {
+	Region [1024]uint32
+}
+
+type kvmXCR struct {
+	XCR      uint32
+	Reserved uint32
+	Value    uint64
+}
+
+type kvmXCRS struct {
+	NrXCRs  uint32
+	Flags   uint32
+	XCRs    [16]kvmXCR
+	Padding [16]uint64
+}
+
+type kvmIRQChip struct {
+	ChipID uint32
+	Pad    uint32
+	Chip   [512]byte
+}
+
+type kvmPITChannelState struct {
+	Count         uint32
+	LatchedCount  uint16
+	CountLatched  uint8
+	StatusLatched uint8
+	Status        uint8
+	ReadState     uint8
+	WriteState    uint8
+	WriteLatch    uint8
+	RWMode        uint8
+	Mode          uint8
+	BCD           uint8
+	Gate          uint8
+	CountLoadTime int64
+}
+
+type kvmPITState2 struct {
+	Channels [3]kvmPITChannelState
+	Flags    uint32
+	Reserved [9]uint32
+}
+
+type kvmClockData struct {
+	Clock    uint64
+	Flags    uint32
+	Pad0     uint32
+	Realtime uint64
+	HostTSC  uint64
+	Pad      [4]uint32
+}
+
 type kvmRegs struct {
 	Rax    uint64
 	Rbx    uint64

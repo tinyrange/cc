@@ -1128,6 +1128,23 @@ func triggerSnapshotMMIO(base uint64) error {
 		return nil
 	}
 	writeConsole("__CCX3_SNAPSHOT__\n")
+	pageSize := unix.Getpagesize()
+	pageBase := base & ^uint64(pageSize-1)
+	pageOff := int(base - pageBase)
+	mem, err := os.OpenFile("/dev/mem", os.O_RDWR|unix.O_SYNC, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/mem: %w", err)
+	}
+	defer mem.Close()
+	mapped, err := unix.Mmap(int(mem.Fd()), int64(pageBase), pageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("mmap snapshot mmio: %w", err)
+	}
+	defer unix.Munmap(mapped)
+	if pageOff+8 > len(mapped) {
+		return fmt.Errorf("snapshot mmio offset %#x outside mapped page", pageOff)
+	}
+	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = 0x43535833534e4150
 	return nil
 }
 

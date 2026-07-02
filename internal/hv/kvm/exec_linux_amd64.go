@@ -197,15 +197,39 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
+	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, nil)
+}
+
+func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
 	if vm != nil && len(vm.vcpus) > 1 {
+		if snapshot != nil {
+			return fmt.Errorf("KVM startup snapshots currently support only one vCPU")
+		}
 		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	vm.SetVCPUTID(0, unix.Gettid())
+	defer vm.SetVCPUTID(0, 0)
+	cancelDone := make(chan struct{})
+	defer close(cancelDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			vm.RequestImmediateExit()
+		case <-cancelDone:
+		}
+	}()
+
 	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := vm.Run(&exit); err != nil {
+		if err := vm.RunVCPUInterruptible(0, &exit); err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
 			return fmt.Errorf("run step %d: %w", step, err)
 		}
 		switch exit.Reason {
@@ -214,6 +238,11 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 				return err
 			}
 		case ExitMMIO:
+			if handled, err := snapshot.handleMMIO(vm, exit.MMIO); err != nil {
+				return err
+			} else if handled {
+				break
+			}
 			if err := handleBootMMIO(vm, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
 				return err
 			}
@@ -224,6 +253,9 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 		default:
 			pc, _ := vm.GetPC()
 			return fmt.Errorf("unexpected exit reason %d at pc=%#x\nserial:\n%s", exit.Reason, pc, serialOut.String())
+		}
+		if err := snapshot.captureIfPending(vm, fsdevs, vsock, rng, netdev); err != nil {
+			return err
 		}
 	}
 }
@@ -248,15 +280,12 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 				if err := runCtx.Err(); err != nil {
 					return
 				}
-				err := error(nil)
-				if sampler.Enabled() {
-					err = vm.RunVCPUInterruptible(index, &exit)
-				} else {
-					err = vm.RunVCPU(index, &exit)
-				}
+				err := vm.RunVCPUInterruptible(index, &exit)
 				if err != nil {
-					if sampler.Enabled() && errors.Is(err, unix.EINTR) {
-						sampler.Record(vm.VCPURegisters(index))
+					if errors.Is(err, unix.EINTR) {
+						if sampler.Enabled() {
+							sampler.Record(vm.VCPURegisters(index))
+						}
 						continue
 					}
 					reportRunErr(errCh, cancel, fmt.Errorf("run vcpu %d: %w", index, err))
@@ -277,7 +306,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 	}
 	defer func() {
 		cancel()
-		_ = vm.CancelRun()
+		vm.RequestImmediateExit()
 		wg.Wait()
 	}()
 
