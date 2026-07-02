@@ -367,6 +367,35 @@ func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 	requireGuestOutput(t, output, "line:alpha", "line:beta")
 }
 
+func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("linux/amd64 startup snapshots are implemented by the KVM amd64 backend")
+	}
+	env := newRuntimeBootEnv(t)
+	snapshotRoot := t.TempDir()
+
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		SnapshotDir: snapshotRoot,
+		MemoryMB:    256,
+		CPUs:        1,
+	})
+	captureConsole := runtimeConsoleHistory(inst)
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close snapshot capture instance: %v", err)
+	}
+
+	snapshotPath := singleSnapshotPath(t, snapshotRoot, captureConsole)
+	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		RestoreSnapshot: snapshotPath,
+		MemoryMB:        256,
+		CPUs:            1,
+	})
+	defer restored.Close()
+
+	resp := execInRuntime(t, restored, []string{"sh", "-lc", "set -eu; printf 'restored-startup-snapshot\n'; cat /proc/sys/kernel/ostype"})
+	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
+}
+
 func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	sourceA := t.TempDir()
@@ -928,6 +957,30 @@ func startRuntimeInstance(t *testing.T, env *runtimeBootEnv, req client.CreateIn
 		t.Fatalf("boot persistent Linux guest: %v", err)
 	}
 	return inst
+}
+
+func singleSnapshotPath(t *testing.T, root, console string) string {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read snapshot root: %v", err)
+	}
+	var snapshots []string
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "snapshot-") {
+			snapshots = append(snapshots, filepath.Join(root, entry.Name()))
+		}
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot count = %d, want 1\nconsole:\n%s", len(snapshots), console)
+	}
+	if _, err := os.Stat(filepath.Join(snapshots[0], "manifest.json")); err != nil {
+		t.Fatalf("stat snapshot manifest: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(snapshots[0], "memory.bin")); err != nil {
+		t.Fatalf("stat snapshot memory: %v", err)
+	}
+	return snapshots[0]
 }
 
 func runInRuntimeInstance(t *testing.T, env *runtimeBootEnv, inst Instance, req client.RunRequest) client.ExecResponse {
