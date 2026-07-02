@@ -76,6 +76,7 @@ type queue struct {
 	sqTail     uint16
 	cqHead     uint16
 	cqTail     uint16
+	cqPending  uint16
 	cqPhase    bool
 	interrupts bool
 	sqMem      []byte
@@ -253,7 +254,7 @@ func (c *Controller) writeDoorbellLocked(offset uint64, value uint32) error {
 		q.sqTail = uint16(value)
 		return c.processSubmissionQueueLocked(q)
 	}
-	q.cqHead = uint16(value)
+	q.advanceCompletionHeadLocked(uint16(value))
 	return c.updateIRQLocked()
 }
 
@@ -622,6 +623,9 @@ func (c *Controller) writeCompletionLocked(q *queue, sqid uint16, sqHead uint16,
 		return fmt.Errorf("write cq%d entry tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
 	}
 	q.cqTail = (q.cqTail + 1) % q.size
+	if q.cqPending < q.size {
+		q.cqPending++
+	}
 	if q.cqTail == 0 {
 		q.cqPhase = !q.cqPhase
 	}
@@ -632,7 +636,7 @@ func (c *Controller) updateIRQLocked() error {
 	high := false
 	if c.intMask&1 == 0 {
 		for _, q := range c.queues {
-			if q.interrupts && q.cqHead != q.cqTail {
+			if q.interrupts && q.cqPending != 0 {
 				high = true
 				break
 			}
@@ -646,6 +650,29 @@ func (c *Controller) updateIRQLocked() error {
 		return nil
 	}
 	return c.irq.SetIRQ(c.IRQ, high)
+}
+
+func (q *queue) advanceCompletionHeadLocked(head uint16) {
+	if q.size == 0 {
+		q.cqHead = head
+		q.cqPending = 0
+		return
+	}
+	oldHead := q.cqHead
+	q.cqHead = head % q.size
+	consumed := q.cqHead - oldHead
+	if q.cqHead < oldHead {
+		consumed = q.size - oldHead + q.cqHead
+	}
+	if consumed == 0 && q.cqPending == q.size {
+		q.cqPending = 0
+		return
+	}
+	if consumed >= q.cqPending {
+		q.cqPending = 0
+		return
+	}
+	q.cqPending -= consumed
 }
 
 func (c *Controller) readPRP(prp1, prp2 uint64, dst []byte) error {
