@@ -114,7 +114,11 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	} else {
 		root = virtio.NewImageFS(blankRuntimeRootFS(), "")
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, nil))
+	shares, err := sidecarShareMounts(req.Shares)
+	if err != nil {
+		return sidecarStartResources{}, err
+	}
+	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
 	if err != nil {
 		return sidecarStartResources{}, err
 	}

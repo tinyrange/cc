@@ -560,8 +560,11 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		if err != nil {
 			return vmruntime.RunRequest{}, err
 		}
+		shares := mounts.ConvertShareMounts(req.Shares)
 		if rootFS == nil {
 			rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
+		} else {
+			shares = nil
 		}
 		return vmruntime.RunRequest{
 			Kernel:            append([]byte(nil), bundle.Kernel...),
@@ -571,6 +574,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Image:             sidecarBundleImage(bundle),
 			InitSystem:        req.InitSystem,
 			RootFS:            rootFS,
+			Shares:            shares,
 			MemoryMB:          req.MemoryMB,
 			CPUs:              req.CPUs,
 			NestedVirt:        req.NestedVirt,
@@ -625,8 +629,11 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	shares := mounts.ConvertShareMounts(req.Shares)
 	if rootFS == nil && image == nil {
 		rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
+	} else if rootFS != nil {
+		shares = nil
 	}
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
@@ -636,6 +643,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Image:             image,
 		InitSystem:        req.InitSystem,
 		RootFS:            rootFS,
+		Shares:            shares,
 		MemoryMB:          req.MemoryMB,
 		CPUs:              req.CPUs,
 		NestedVirt:        req.NestedVirt,
@@ -667,17 +675,21 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	shares := mounts.ConvertShareMounts(req.Shares)
 	if rootFS == nil {
 		if image != nil {
 			rootFS = virtio.NewImageFS(image.RootFS, image.RootFSDir)
 		} else {
 			rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
 		}
+	} else {
+		shares = nil
 	}
 	return vmruntime.RunRequest{
 		Image:           image,
 		InitSystem:      req.InitSystem,
 		RootFS:          rootFS,
+		Shares:          shares,
 		MemoryMB:        req.MemoryMB,
 		CPUs:            req.CPUs,
 		NestedVirt:      req.NestedVirt,

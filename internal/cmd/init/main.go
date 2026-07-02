@@ -392,8 +392,18 @@ func run() error {
 	}
 	configureMemoryOvercommit("/proc")
 
+	modules := cfg.Modules
+	var deferredModulePaths []string
+	var deferredModules []modulePayload
+	if cfg.SnapshotMMIOBase != 0 {
+		modules, deferredModulePaths = splitSnapshotDeferredModules(cfg.Modules)
+		deferredModules, err = readModulePayloads(deferredModulePaths)
+		if err != nil {
+			return err
+		}
+	}
 	writeStage(bootStart, "loading modules")
-	if err := loadModules(cfg.Modules); err != nil {
+	if err := loadModules(modules); err != nil {
 		return err
 	}
 	writeStage(bootStart, "modules loaded")
@@ -455,6 +465,13 @@ func run() error {
 				}
 				writeStage(bootStart, "entropy seeded")
 			}
+			if len(deferredModules) > 0 {
+				writeStage(bootStart, "loading deferred modules")
+				if err := loadModulePayloads(deferredModules); err != nil {
+					return err
+				}
+				writeStage(bootStart, "deferred modules loaded")
+			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
 			if err != nil {
@@ -466,7 +483,6 @@ func run() error {
 				writeStage(bootStart, "sending ready marker")
 				writeProtocolLineTo(control, cfg.ReadyMarker)
 			}
-			writeStage(bootStart, "entering command loop")
 			return commandLoop(cfg, control)
 		}
 		if cfg.ReadyMarker != "" {
@@ -1860,19 +1876,73 @@ func loadModules(modules []string) error {
 		if err != nil {
 			return fmt.Errorf("read module %s: %w", path, err)
 		}
-		if len(data) == 0 {
-			return fmt.Errorf("module %s is empty", path)
-		}
-		params, err := syscall.BytePtrFromString("")
-		if err != nil {
-			return fmt.Errorf("init module params: %w", err)
-		}
-		_, _, errno := syscall.RawSyscall(syscall.SYS_INIT_MODULE, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(params)))
-		if errno != 0 {
-			return fmt.Errorf("load module %s: errno=%d", path, errno)
+		if err := loadModuleData(path, data); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+type modulePayload struct {
+	path string
+	data []byte
+}
+
+func readModulePayloads(modules []string) ([]modulePayload, error) {
+	payloads := make([]modulePayload, 0, len(modules))
+	for _, path := range modules {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read module %s: %w", path, err)
+		}
+		payloads = append(payloads, modulePayload{path: path, data: data})
+	}
+	return payloads, nil
+}
+
+func loadModulePayloads(modules []modulePayload) error {
+	for _, module := range modules {
+		if err := loadModuleData(module.path, module.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadModuleData(path string, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("module %s is empty", path)
+	}
+	params, err := syscall.BytePtrFromString("")
+	if err != nil {
+		return fmt.Errorf("init module params: %w", err)
+	}
+	_, _, errno := syscall.RawSyscall(syscall.SYS_INIT_MODULE, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(params)))
+	if errno != 0 {
+		return fmt.Errorf("load module %s: errno=%d", path, errno)
+	}
+	return nil
+}
+
+func splitSnapshotDeferredModules(modules []string) ([]string, []string) {
+	var early []string
+	var deferred []string
+	for _, path := range modules {
+		if snapshotDeferredModule(path) {
+			deferred = append(deferred, path)
+			continue
+		}
+		early = append(early, path)
+	}
+	return early, deferred
+}
+
+func snapshotDeferredModule(path string) bool {
+	name := filepath.Base(path)
+	return name == "vsock.ko" ||
+		strings.HasPrefix(name, "vsock.ko.") ||
+		strings.HasPrefix(name, "vmw_vsock_") ||
+		strings.HasPrefix(name, "virtio_vsock")
 }
 
 func execCommand(cfg config) error {
