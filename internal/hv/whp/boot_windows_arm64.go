@@ -5,8 +5,10 @@ package whp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
+
+const linuxWHPCNTVOverflowInterrupt = 20
 
 func BootKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint64, dmesg bool) (string, error) {
 	return bootToCondition(ctx, kernel, nil, memoryMB, dmesg, nil, nil, nil, nil, func(serial string) bool {
@@ -42,7 +46,7 @@ func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initr
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, done func(string) bool) (string, error) {
-	vm, uart, serialOut, err := prepareArm64VM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, rng, netdev, nil)
+	vm, uart, serialOut, err := prepareArm64VM(kernel, initrd, memoryMB, dmesg, true, fsdevs, vsock, rng, netdev, nil)
 	if err != nil {
 		return "", err
 	}
@@ -51,6 +55,7 @@ func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB
 	if vsock != nil {
 		defer vsock.Close()
 	}
+	var stats arm64RunStats
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			if done(serialOut.String()) {
@@ -65,14 +70,16 @@ func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB
 		if done(serialOut.String()) {
 			return serialOut.String(), nil
 		}
-		if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit); err != nil {
+		if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit, &stats); err != nil {
 			return serialOut.String(), err
 		}
 	}
 }
 
-func prepareArm64VM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialWriter io.Writer) (*VM, *serial.UART8250, fmt.Stringer, error) {
-	vm, err := NewVM(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
+func prepareArm64VM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, serialConsole bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialWriter io.Writer) (*VM, *serial.UART8250, fmt.Stringer, error) {
+	vm, err := NewVMWithOptions(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase, VMOptions{
+		CNTVOverflowInterrupt: linuxWHPCNTVOverflowInterrupt,
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -104,10 +111,12 @@ func prepareArm64VM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, f
 		nodes = append(nodes, netdev.DeviceTreeNode())
 	}
 	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
-		MemoryMB:   memoryMB,
-		GICVersion: arm64vm.GICVersionV3,
-		Dmesg:      dmesg,
-		ExtraNodes: nodes,
+		MemoryMB:             memoryMB,
+		GICVersion:           arm64vm.GICVersionV3,
+		Dmesg:                dmesg,
+		DisableSerialConsole: !serialConsole,
+		HyperVTimer:          true,
+		ExtraNodes:           nodes,
 	})
 	if err != nil {
 		_ = vm.Close()
@@ -144,10 +153,19 @@ func setupBootRegisters(vm *VM, plan *bootarm64.BootPlan) error {
 	return nil
 }
 
-func handleArm64Exit(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, exit Exit) error {
+type arm64RunStats struct {
+	uart  uint64
+	fs    uint64
+	vsock uint64
+	rng   uint64
+	net   uint64
+	gic   uint64
+}
+
+func handleArm64Exit(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, exit Exit, stats *arm64RunStats) error {
 	switch exit.Reason {
 	case runVPExitReasonUnmappedGPA, runVPExitReasonGPAIntercept:
-		return handleBootMMIO(vm, uart, fsdevs, vsock, rng, netdev, exit.MMIO)
+		return handleBootMMIO(vm, uart, fsdevs, vsock, rng, netdev, exit.MMIO, stats)
 	case runVPExitReasonCanceled:
 		return nil
 	case runVPExitReasonArm64Reset:
@@ -158,8 +176,11 @@ func handleArm64Exit(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *
 	}
 }
 
-func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit, stats *arm64RunStats) error {
 	if uart.Contains(mmio.Addr, int(mmio.Len)) {
+		if stats != nil {
+			stats.uart++
+		}
 		if mmio.Write {
 			if err := uart.Write(mmio.Addr, mmio.Data[:mmio.Len]); err != nil {
 				return err
@@ -176,6 +197,9 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
 		}
+		if stats != nil {
+			stats.fs++
+		}
 		if mmio.Write {
 			if err := fsdev.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio)); err != nil {
 				return err
@@ -189,6 +213,9 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 		return vm.CompleteMMIORead(mmio, value)
 	}
 	if vsock != nil && vsock.Contains(mmio.Addr, int(mmio.Len)) {
+		if stats != nil {
+			stats.vsock++
+		}
 		if mmio.Write {
 			if err := vsock.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio)); err != nil {
 				return err
@@ -202,6 +229,9 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 		return vm.CompleteMMIORead(mmio, value)
 	}
 	if rng != nil && rng.Contains(mmio.Addr, int(mmio.Len)) {
+		if stats != nil {
+			stats.rng++
+		}
 		if mmio.Write {
 			if err := rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio)); err != nil {
 				return err
@@ -215,6 +245,9 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 		return vm.CompleteMMIORead(mmio, value)
 	}
 	if netdev != nil && netdev.Contains(mmio.Addr, int(mmio.Len)) {
+		if stats != nil {
+			stats.net++
+		}
 		if mmio.Write {
 			if err := netdev.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio)); err != nil {
 				return err
@@ -228,12 +261,18 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 		return vm.CompleteMMIORead(mmio, value)
 	}
 	if inRange(mmio.Addr, arm64vm.GICDistributorMin, arm64vm.GICDistributorMax) {
+		if stats != nil {
+			stats.gic++
+		}
 		if mmio.Write {
 			return vm.CompleteMMIOWrite(mmio)
 		}
 		return vm.CompleteMMIORead(mmio, readBootGICDistributor(mmio.Addr-arm64vm.GICDistributorMin))
 	}
 	if inRange(mmio.Addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax) {
+		if stats != nil {
+			stats.gic++
+		}
 		if mmio.Write {
 			return vm.CompleteMMIOWrite(mmio)
 		}
@@ -242,13 +281,69 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 	return fmt.Errorf("unhandled mmio addr=%#x len=%d write=%v", mmio.Addr, mmio.Len, mmio.Write)
 }
 
-func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut fmt.Stringer) error {
+func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut fmt.Stringer, sampler *whpPCSampler) error {
+	if sampler != nil {
+		defer sampler.dump("final")
+	}
+	trace := os.Getenv("CC_WHP_ARM64_TIMING") != "" || os.Getenv("CC_WHP_BSD_TIMING") != ""
+	traceStart := time.Now()
+	nextTrace := traceStart.Add(5 * time.Second)
+	var nextSample time.Time
+	if sampler != nil {
+		nextSample = traceStart.Add(sampler.interval)
+	}
+	var exits, mmioExits, canceledExits uint64
+	var stats arm64RunStats
 	for step := 0; ; step++ {
 		var exit Exit
-		if err := vm.RunInterruptible(ctx, &exit); err != nil {
+		runCtx := ctx
+		var cancel context.CancelFunc
+		if sampler != nil {
+			timeout := time.Until(nextSample)
+			if timeout <= 0 {
+				timeout = time.Nanosecond
+			}
+			runCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		err := vm.RunInterruptible(runCtx, &exit)
+		now := time.Now()
+		if cancel != nil {
+			cancel()
+		}
+		if err != nil {
+			if sampler != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				sampler.recordCurrentPC(vm, now)
+				nextSample = sampler.nextAfter(nextSample, now)
+				continue
+			}
 			return fmt.Errorf("run step %d: %w", step, err)
 		}
-		if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit); err != nil {
+		if sampler != nil && !now.Before(nextSample) {
+			lr, _ := vm.getRegister(registerX(30))
+			if exit.PC != 0 {
+				sampler.record(exit.PC, lr, now)
+			} else {
+				sampler.recordCurrentPC(vm, now)
+			}
+			nextSample = sampler.nextAfter(nextSample, now)
+		}
+		exits++
+		switch exit.Reason {
+		case runVPExitReasonUnmappedGPA, runVPExitReasonGPAIntercept:
+			mmioExits++
+		case runVPExitReasonCanceled:
+			canceledExits++
+		}
+		if trace {
+			if !now.Before(nextTrace) {
+				_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux run +%s: exits=%d mmio=%d canceled=%d serial=%d uart=%d fs=%d vsock=%d rng=%d net=%d gic=%d\n",
+					now.Sub(traceStart).Round(time.Millisecond), exits, mmioExits, canceledExits, len(serialOut.String()), stats.uart, stats.fs, stats.vsock, stats.rng, stats.net, stats.gic)
+				for !nextTrace.After(now) {
+					nextTrace = nextTrace.Add(5 * time.Second)
+				}
+			}
+		}
+		if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit, &stats); err != nil {
 			return err
 		}
 	}

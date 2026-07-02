@@ -20,6 +20,16 @@ type VM struct {
 	vcpuCreated bool
 }
 
+const (
+	defaultCNTVOverflowInterrupt = 27
+	defaultPMUInterrupt          = 23
+)
+
+type VMOptions struct {
+	CNTVOverflowInterrupt uint32
+	GICLPIIntIDBits       uint32
+}
+
 type Exit struct {
 	Reason runVPExitReason
 	PC     uint64
@@ -73,6 +83,10 @@ func probePartitionSupport() error {
 }
 
 func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
+	return NewVMWithOptions(memorySize, memoryBase, VMOptions{})
+}
+
+func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
@@ -85,18 +99,19 @@ func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
 	}
-	lpiBits, err := getCapability[uint32](capabilityCodeGicLpiIntIDBits)
-	if err != nil || lpiBits == 0 {
-		lpiBits = 16
+	opts, err = normalizeVMOptions(opts)
+	if err != nil {
+		_ = vm.Close()
+		return nil, err
 	}
 	ic := arm64ICParameters{
 		EmulationMode: arm64ICEmulationModeGICV3,
 		GICV3Parameters: arm64ICGICV3Parameters{
 			GICDBaseAddress:           0x08000000,
 			GITSTranslaterBaseAddress: 0x08080000,
-			GICLPIIntIDBits:           lpiBits,
-			GICPPIOverflowFromCNTV:    27,
-			GICPPIPerformanceMonitors: 23,
+			GICLPIIntIDBits:           opts.GICLPIIntIDBits,
+			GICPPIOverflowFromCNTV:    opts.CNTVOverflowInterrupt,
+			GICPPIPerformanceMonitors: defaultPMUInterrupt,
 		},
 	}
 	if err := setPartitionProperty(part, partitionPropertyCodeArm64ICParameters, ic); err != nil {
@@ -114,10 +129,12 @@ func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
 	}
 	vm.mem = mem
 	vm.memSize = memorySize
+	vm.preTouchGuestMemory()
 	if err := mapGPARange(part, unsafe.Pointer(mem.addr), memoryBase, memorySize, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
 		_ = vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	vm.populateGuestMemory()
 	if err := createVirtualProcessor(part, 0); err != nil {
 		_ = vm.Close()
 		return nil, fmt.Errorf("create virtual processor: %w", err)
@@ -128,6 +145,43 @@ func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
 		return nil, fmt.Errorf("set gic redistributor base: %w", err)
 	}
 	return vm, nil
+}
+
+func (v *VM) preTouchGuestMemory() {
+	if v.mem == nil {
+		return
+	}
+	// WHP/arm64 can otherwise populate backing pages lazily on the guest's
+	// first writes, making early kernel page clearing pathologically slow.
+	mem := v.mem.bytes()
+	const pageSize = 4096
+	for off := 0; off < len(mem); off += pageSize {
+		mem[off] = 0
+	}
+	if len(mem) > 0 {
+		mem[len(mem)-1] = 0
+	}
+}
+
+func (v *VM) populateGuestMemory() {
+	flags := adviseGPARangePopulateFlagPrefetch | adviseGPARangePopulateFlagAvoidHardFaults
+	_ = adviseGPARangePopulate(v.part, v.memGPA, v.memSize, memoryAccessRead, flags)
+	_ = adviseGPARangePopulate(v.part, v.memGPA, v.memSize, memoryAccessWrite, flags)
+	_ = adviseGPARangePopulate(v.part, v.memGPA, v.memSize, memoryAccessExecute, flags)
+}
+
+func normalizeVMOptions(opts VMOptions) (VMOptions, error) {
+	if opts.CNTVOverflowInterrupt == 0 {
+		opts.CNTVOverflowInterrupt = defaultCNTVOverflowInterrupt
+	}
+	if opts.GICLPIIntIDBits == 0 {
+		lpiBits, err := getCapability[uint32](capabilityCodeGicLpiIntIDBits)
+		if err != nil || lpiBits == 0 {
+			lpiBits = 16
+		}
+		opts.GICLPIIntIDBits = lpiBits
+	}
+	return opts, nil
 }
 
 func (v *VM) Close() error {
@@ -191,6 +245,20 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	off := addr - v.memGPA
 	copy(dst, v.mem.bytes()[off:off+uint64(len(dst))])
 	return nil
+}
+
+func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("invalid slice size %d", size)
+	}
+	if v == nil || v.mem == nil {
+		return nil, fmt.Errorf("guest memory is not mapped")
+	}
+	if addr < v.memGPA || addr-v.memGPA > v.memSize || uint64(size) > v.memSize-(addr-v.memGPA) {
+		return nil, fmt.Errorf("slice ipa %#x size %d out of range [%#x,%#x)", addr, size, v.memGPA, v.memGPA+v.memSize)
+	}
+	off := addr - v.memGPA
+	return v.mem.bytes()[off : off+uint64(size)], nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
@@ -261,16 +329,14 @@ func (v *VM) Run(exit *Exit) error {
 }
 
 func (v *VM) RunInterruptible(ctx context.Context, exit *Exit) error {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = cancelRunVirtualProcessor(v.part, 0)
-		case <-done:
-		}
-	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = cancelRunVirtualProcessor(v.part, 0)
+	})
 	err := v.Run(exit)
-	close(done)
+	stopCancel()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -300,6 +366,18 @@ func (v *VM) SetIRQ(line uint32, level bool) error {
 	if level {
 		_ = cancelRunVirtualProcessor(v.part, 0)
 	}
+	return nil
+}
+
+func (v *VM) SetMSI(addr uint64, data uint32) error {
+	if v == nil || v.part == 0 {
+		return fmt.Errorf("vm is nil")
+	}
+	const lpiBase = 8192
+	if err := requestInterrupt(v.part, lpiBase+data, true); err != nil {
+		return err
+	}
+	_ = cancelRunVirtualProcessor(v.part, 0)
 	return nil
 }
 

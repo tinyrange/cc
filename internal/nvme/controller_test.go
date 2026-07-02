@@ -27,13 +27,23 @@ func (m *testMemory) WriteIPA(addr uint64, data []byte) error {
 }
 
 type testIRQ struct {
-	line  uint32
-	level bool
+	line    uint32
+	level   bool
+	msiAddr uint64
+	msiData uint32
+	msis    int
 }
 
 func (i *testIRQ) SetIRQ(line uint32, level bool) error {
 	i.line = line
 	i.level = level
+	return nil
+}
+
+func (i *testIRQ) SetMSI(addr uint64, data uint32) error {
+	i.msiAddr = addr
+	i.msiData = data
+	i.msis++
 	return nil
 }
 
@@ -113,6 +123,94 @@ func TestControllerIdentifyAndReadWrite(t *testing.T) {
 	}
 	if !irq.level {
 		t.Fatalf("completion interrupt was not asserted")
+	}
+}
+
+func TestControllerInterruptRemainsAssertedForFullCompletionQueue(t *testing.T) {
+	mem := newTestMemory(0x20000)
+	disk := newTestDisk(1024 * 1024)
+	irq := &testIRQ{}
+	ctrl := NewController(disk)
+	ctrl.IRQ = 10
+	ctrl.Attach(mem, irq)
+
+	adminSQ := uint64(0x1000)
+	adminCQ := uint64(0x2000)
+	ioSQ := uint64(0x3000)
+	ioCQ := uint64(0x4000)
+	data := uint64(0x5000)
+
+	mustWriteMMIO(t, ctrl, regAQA, 4-1|uint64(4-1)<<16)
+	mustWriteMMIO(t, ctrl, regASQ, adminSQ)
+	mustWriteMMIO(t, ctrl, regACQ, adminCQ)
+	mustWriteMMIO(t, ctrl, regCC, 1)
+
+	writeAdminCommand(mem, adminSQ, 0, command{opcode: adminCreateCQ, cid: 1, prp1: ioCQ, cdw10: 1 | uint32(2-1)<<16, cdw11: 2})
+	mustWriteMMIO(t, ctrl, doorbellBase, 1)
+	writeAdminCommand(mem, adminSQ, 1, command{opcode: adminCreateSQ, cid: 2, prp1: ioSQ, cdw10: 1 | uint32(4-1)<<16, cdw11: 1 << 16})
+	mustWriteMMIO(t, ctrl, doorbellBase, 2)
+	mustWriteMMIO(t, ctrl, doorbellBase+4, 2)
+
+	writeIOCommand(mem, ioSQ, 0, command{opcode: ioRead, cid: 3, nsid: 1, prp1: data, cdw12: 0})
+	writeIOCommand(mem, ioSQ, 1, command{opcode: ioRead, cid: 4, nsid: 1, prp1: data + 512, cdw12: 0})
+	mustWriteMMIO(t, ctrl, doorbellBase+8, 2)
+	if !irq.level {
+		t.Fatalf("interrupt level = false after completion queue wrapped full")
+	}
+	if got := binary.LittleEndian.Uint16(mem.data[ioCQ+12 : ioCQ+14]); got != 3 {
+		t.Fatalf("first completion cid = %d", got)
+	}
+	if got := binary.LittleEndian.Uint16(mem.data[ioCQ+16+12 : ioCQ+16+14]); got != 4 {
+		t.Fatalf("second completion cid = %d", got)
+	}
+
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 1)
+	if !irq.level {
+		t.Fatalf("interrupt level = false after only one full-queue completion was acknowledged")
+	}
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 0)
+	if irq.level {
+		t.Fatalf("interrupt level = true after all full-queue completions were acknowledged")
+	}
+}
+
+func TestControllerUsesMSIWhenConfigured(t *testing.T) {
+	mem := newTestMemory(0x20000)
+	disk := newTestDisk(1024 * 1024)
+	irq := &testIRQ{}
+	ctrl := NewController(disk)
+	ctrl.IRQ = 10
+	ctrl.Attach(mem, irq)
+	ctrl.ConfigureMSI(true, 0x8080000, 3)
+
+	adminSQ := uint64(0x1000)
+	adminCQ := uint64(0x2000)
+	ioSQ := uint64(0x3000)
+	ioCQ := uint64(0x4000)
+	data := uint64(0x5000)
+
+	mustWriteMMIO(t, ctrl, regAQA, 4-1|uint64(4-1)<<16)
+	mustWriteMMIO(t, ctrl, regASQ, adminSQ)
+	mustWriteMMIO(t, ctrl, regACQ, adminCQ)
+	mustWriteMMIO(t, ctrl, regCC, 1)
+
+	writeAdminCommand(mem, adminSQ, 0, command{opcode: adminCreateCQ, cid: 1, prp1: ioCQ, cdw10: 1 | uint32(4-1)<<16, cdw11: 2})
+	mustWriteMMIO(t, ctrl, doorbellBase, 1)
+	writeAdminCommand(mem, adminSQ, 1, command{opcode: adminCreateSQ, cid: 2, prp1: ioSQ, cdw10: 1 | uint32(4-1)<<16, cdw11: 1 << 16})
+	mustWriteMMIO(t, ctrl, doorbellBase, 2)
+	mustWriteMMIO(t, ctrl, doorbellBase+4, 2)
+	irq.msis = 0
+
+	writeIOCommand(mem, ioSQ, 0, command{opcode: ioRead, cid: 3, nsid: 1, prp1: data, cdw12: 0})
+	mustWriteMMIO(t, ctrl, doorbellBase+8, 1)
+	if irq.level {
+		t.Fatalf("INTx level asserted while MSI enabled")
+	}
+	if irq.msis != 1 {
+		t.Fatalf("MSI count = %d, want 1", irq.msis)
+	}
+	if irq.msiAddr != 0x8080000 || irq.msiData != 3 {
+		t.Fatalf("MSI addr/data = %#x/%#x, want %#x/%#x", irq.msiAddr, irq.msiData, uint64(0x8080000), uint32(3))
 	}
 }
 

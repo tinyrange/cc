@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -53,6 +54,14 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
+	trace := os.Getenv("CC_WHP_ARM64_TIMING") != "" || os.Getenv("CC_WHP_BSD_TIMING") != ""
+	startTime := time.Now()
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +0s: StartStream image=%q\n", req.Image)
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -63,9 +72,15 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: kernel read bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(kernel))
+	}
 	image, err := b.images.Open(req.Image)
 	if err != nil {
 		return nil, err
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: image opened\n", time.Since(startTime).Round(time.Millisecond))
 	}
 	if err := ensureWindowsARM64Image(image); err != nil {
 		return nil, err
@@ -75,9 +90,15 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: planned modules=%d\n", time.Since(startTime).Round(time.Millisecond), len(modules))
+	}
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return nil, err
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: amd64 emulator prepared=%v\n", time.Since(startTime).Round(time.Millisecond), qemuX8664 != "")
 	}
 	network, err := newWindowsARM64NetworkRuntime(req.Network)
 	if err != nil {
@@ -98,9 +119,15 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: fs devices built=%d\n", time.Since(startTime).Round(time.Millisecond), len(fsdevs))
+	}
 	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "arm64")
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: guest init bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(initBin))
 	}
 	workDir := image.Config.WorkingDir
 	if workDir == "" {
@@ -118,6 +145,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: initramfs bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(initrd))
+	}
 	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
 		Profile: managedguest.LinuxProfile,
 		Host:    whp.Host{},
@@ -133,6 +163,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}, onEvent)
 	if err != nil {
 		return nil, err
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: managed service ready\n", time.Since(startTime).Round(time.Millisecond))
 	}
 	return &windowsInstance{
 		managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
@@ -219,6 +252,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
+	}
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
 		Image:         req.Image,
 		InitSystem:    req.InitSystem,

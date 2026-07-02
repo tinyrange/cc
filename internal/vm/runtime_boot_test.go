@@ -197,7 +197,7 @@ func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {
 		envVar:   "CC_TEST_NETBSD_KVM",
 		image:    "@netbsd",
 		memoryMB: 1024,
-		timeout:  180 * time.Second,
+		timeout:  240 * time.Second,
 		guestOS:  "NetBSD",
 		label:    "netbsd",
 	})

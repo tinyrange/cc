@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ type ManagedSession struct {
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
+	cleanup    func()
 	sendMu     sync.Mutex
 	nextID     atomic.Uint64
 	dmesg      bool
@@ -45,6 +47,11 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 }
 
 func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	trace := os.Getenv("CC_WHP_ARM64_TIMING") != "" || os.Getenv("CC_WHP_BSD_TIMING") != ""
+	startTime := time.Now()
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +0s: starting managed session\n")
+	}
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
 		return nil, err
 	}
@@ -75,7 +82,8 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
-	vm, uart, _, err := prepareArm64VM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, rng, netdev, serialWriter)
+	prepareStart := time.Now()
+	vm, uart, _, err := prepareArm64VM(kernel, initrd, memoryMB, dmesg, dmesg, fsdevs, vsock, rng, netdev, serialWriter)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
@@ -84,15 +92,21 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		}
 		return nil, err
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: vm prepared took=%s\n", time.Since(startTime).Round(time.Millisecond), time.Since(prepareStart).Round(time.Millisecond))
+	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan error, 1)
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, newWHPPCSampler("linux", kernel))
 		closeFSDevices(fsdevs)
 		err = errors.Join(err, vm.Close())
 		doneCh <- err
 	}()
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: vm run loop started\n", time.Since(startTime).Round(time.Millisecond))
+	}
 
 	var control virtio.VsockConn
 	select {
@@ -106,6 +120,9 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	case conn := <-connCh:
 		control = conn
+		if trace {
+			_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: control connected\n", time.Since(startTime).Round(time.Millisecond))
+		}
 	case err := <-doneCh:
 		cancel()
 		_ = listener.Close()
@@ -156,6 +173,9 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		}
 		return nil, err
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: ready marker received\n", time.Since(startTime).Round(time.Millisecond))
+	}
 
 	return &ManagedSession{cancel: cancel, doneCh: doneCh, control: control, listener: listener, vsock: vsock, bootWriter: bootWriter, transcript: controlTranscript, serialOut: serialOut, dmesg: dmesg}, nil
 }
@@ -164,10 +184,23 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	if len(req.Command) == 0 {
 		return client.ExecResponse{}, fmt.Errorf("exec command is required")
 	}
+	trace := os.Getenv("CC_WHP_BSD_TIMING") != ""
+	startTime := time.Now()
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed exec %s start command=%q\n", id, strings.Join(req.Command, " "))
+	}
 	start := s.transcript.Len()
-	if err := s.sendExecMessage(managedagent.ExecRequest(id, req)); err != nil {
+	s.sendMu.Lock()
+	err := managedagent.SendExec(s.control, id, req)
+	s.sendMu.Unlock()
+	if err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+	}
+	if len(req.Stdin) == 0 {
+		if err := s.sendExecMessage(managedagent.StdinCloseRequest(id)); err != nil {
+			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
 	}
 	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
@@ -180,6 +213,9 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	if !ok {
 		return client.ExecResponse{}, transcriptError(fmt.Errorf("exec did not produce a complete result"), s.serialOut.String(), s.transcript.String())
 	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed exec %s done duration=%s code=%d output=%d\n", id, time.Since(startTime).Round(time.Millisecond), code, len(output))
+	}
 	if s.dmesg {
 		output = s.serialOut.String() + "\n[control]\n" + output
 	}
@@ -190,7 +226,12 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	if (req.Kind == "" || req.Kind == "exec") && len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
+	trace := os.Getenv("CC_WHP_BSD_TIMING") != ""
+	startTime := time.Now()
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed stream %s start command=%q\n", id, strings.Join(req.Command, " "))
+	}
 	start := s.transcript.Len()
 	if err := s.sendExecMessage(managedagent.ExecRequest(id, req)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
@@ -200,7 +241,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	} else if len(req.Stdin) == 0 && !req.TTY {
 		_ = s.sendExecMessage(managedagent.StdinCloseRequest(id))
 	}
-	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
+	err := managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
 		Start:      start,
 		ID:         id,
@@ -223,10 +264,19 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 			}
 		},
 	})
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed stream %s done duration=%s err=%v\n", id, time.Since(startTime).Round(time.Millisecond), err)
+	}
+	return err
 }
 
 func (s *ManagedSession) Flush(ctx context.Context) error {
+	trace := os.Getenv("CC_WHP_BSD_TIMING") != ""
+	startTime := time.Now()
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed flush %s start\n", id)
+	}
 	start := s.transcript.Len()
 	if err := s.sendExecMessage(managedagent.SyncRequest(id)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
@@ -244,6 +294,9 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	}
 	if code != 0 {
 		return transcriptError(fmt.Errorf("sync exited with status %d: %s", code, output), s.serialOut.String(), s.transcript.String())
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-managed flush %s done duration=%s\n", id, time.Since(startTime).Round(time.Millisecond))
 	}
 	return nil
 }
@@ -308,6 +361,9 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
+	}
+	if s.cleanup != nil {
+		s.cleanup()
 	}
 	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 		return waitErr

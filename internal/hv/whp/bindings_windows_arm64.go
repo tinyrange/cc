@@ -27,6 +27,7 @@ var (
 	procWHvSetVirtualProcessorRegisters = winhvplatform.NewProc("WHvSetVirtualProcessorRegisters")
 	procWHvCancelRunVirtualProcessor    = winhvplatform.NewProc("WHvCancelRunVirtualProcessor")
 	procWHvRequestInterrupt             = winhvplatform.NewProc("WHvRequestInterrupt")
+	procWHvAdviseGpaRange               = winhvplatform.NewProc("WHvAdviseGpaRange")
 	procVirtualAlloc                    = kernel32.NewProc("VirtualAlloc")
 	procVirtualFree                     = kernel32.NewProc("VirtualFree")
 )
@@ -101,6 +102,37 @@ const (
 	mapGPARangeFlagWrite   mapGPARangeFlags = 0x2
 	mapGPARangeFlagExecute mapGPARangeFlags = 0x4
 )
+
+type memoryRangeEntry struct {
+	GuestAddress guestPhysicalAddress
+	SizeInBytes  uint64
+}
+
+type adviseGPARangeCode uint32
+
+const (
+	adviseGPARangeCodePopulate adviseGPARangeCode = 0
+)
+
+type memoryAccessType uint32
+
+const (
+	memoryAccessRead    memoryAccessType = 0
+	memoryAccessWrite   memoryAccessType = 1
+	memoryAccessExecute memoryAccessType = 2
+)
+
+type adviseGPARangePopulateFlags uint32
+
+const (
+	adviseGPARangePopulateFlagPrefetch        adviseGPARangePopulateFlags = 0x1
+	adviseGPARangePopulateFlagAvoidHardFaults adviseGPARangePopulateFlags = 0x2
+)
+
+type adviseGPARangePopulateOptions struct {
+	Flags      adviseGPARangePopulateFlags
+	AccessType memoryAccessType
+}
 
 type registerName uint32
 
@@ -332,6 +364,26 @@ func mapGPARange(part partitionHandle, source unsafe.Pointer, guestAddress uint6
 
 func unmapGPARange(part partitionHandle, guestAddress uint64, size uint64) error {
 	return callHRESULT(procWHvUnmapGpaRange, uintptr(part), uintptr(guestPhysicalAddress(guestAddress)), uintptr(size))
+}
+
+func adviseGPARangePopulate(part partitionHandle, guestAddress uint64, size uint64, access memoryAccessType, flags adviseGPARangePopulateFlags) error {
+	ranges := []memoryRangeEntry{{
+		GuestAddress: guestPhysicalAddress(guestAddress),
+		SizeInBytes:  size,
+	}}
+	populate := adviseGPARangePopulateOptions{
+		Flags:      flags,
+		AccessType: access,
+	}
+	return callHRESULT(
+		procWHvAdviseGpaRange,
+		uintptr(part),
+		uintptr(unsafe.Pointer(&ranges[0])),
+		uintptr(len(ranges)),
+		uintptr(adviseGPARangeCodePopulate),
+		uintptr(unsafe.Pointer(&populate)),
+		unsafe.Sizeof(populate),
+	)
 }
 
 func createVirtualProcessor(part partitionHandle, vpIndex uint32) error {

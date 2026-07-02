@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
+	"time"
 
 	"j5.nz/cc/internal/virtio"
 )
@@ -64,6 +66,14 @@ type Controller struct {
 	queues  map[uint16]*queue
 	scratch []byte
 	prps    []byte
+
+	msi msiConfig
+
+	readOps    uint64
+	readBytes  uint64
+	writeOps   uint64
+	writeBytes uint64
+	lastTrace  time.Time
 }
 
 type queue struct {
@@ -76,6 +86,7 @@ type queue struct {
 	sqTail     uint16
 	cqHead     uint16
 	cqTail     uint16
+	cqPending  uint16
 	cqPhase    bool
 	interrupts bool
 	sqMem      []byte
@@ -104,6 +115,16 @@ type guestMemorySlicer interface {
 	SliceIPA(addr uint64, size int) ([]byte, error)
 }
 
+type msiIRQController interface {
+	SetMSI(addr uint64, data uint32) error
+}
+
+type msiConfig struct {
+	enabled bool
+	addr    uint64
+	data    uint32
+}
+
 func NewController(backend virtio.BlockBackend) *Controller {
 	c := &Controller{
 		Size:    MMIOSize,
@@ -120,6 +141,12 @@ func (c *Controller) Attach(mem virtio.GuestMemory, irq virtio.IRQController) {
 	defer c.mu.Unlock()
 	c.mem = mem
 	c.irq = irq
+}
+
+func (c *Controller) ConfigureMSI(enabled bool, addr uint64, data uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msi = msiConfig{enabled: enabled, addr: addr, data: data}
 }
 
 func (c *Controller) ReadMMIO(offset uint64, size int) (uint64, error) {
@@ -253,7 +280,7 @@ func (c *Controller) writeDoorbellLocked(offset uint64, value uint32) error {
 		q.sqTail = uint16(value)
 		return c.processSubmissionQueueLocked(q)
 	}
-	q.cqHead = uint16(value)
+	q.advanceCompletionHeadLocked(uint16(value))
 	return c.updateIRQLocked()
 }
 
@@ -413,6 +440,7 @@ func (c *Controller) executeIOLocked(cmd command) (uint32, uint16, error) {
 			if err != nil {
 				return 0, 1, err
 			}
+			c.recordIOLocked("read", count)
 			return 0, 0, nil
 		}
 		n, err := c.backend.ReadAt(buf, offset)
@@ -420,12 +448,14 @@ func (c *Controller) executeIOLocked(cmd command) (uint32, uint16, error) {
 			return 0, 1, nil
 		}
 		clear(buf[n:])
+		c.recordIOLocked("read", count)
 		return 0, 0, c.writePRP(cmd.prp1, cmd.prp2, buf)
 	case ioWrite:
 		if ok, err := c.writeBackendFromPRP(offset, count, cmd.prp1, cmd.prp2); ok {
 			if err != nil {
 				return 0, 1, err
 			}
+			c.recordIOLocked("write", count)
 			return 0, 0, nil
 		}
 		if err := c.readPRP(cmd.prp1, cmd.prp2, buf); err != nil {
@@ -434,9 +464,32 @@ func (c *Controller) executeIOLocked(cmd command) (uint32, uint16, error) {
 		if _, err := c.backend.WriteAt(buf, offset); err != nil {
 			return 0, 1, nil
 		}
+		c.recordIOLocked("write", count)
 		return 0, 0, nil
 	default:
 		return 0, 1, nil
+	}
+}
+
+func (c *Controller) recordIOLocked(kind string, size int) {
+	if size < 0 {
+		size = 0
+	}
+	switch kind {
+	case "read":
+		c.readOps++
+		c.readBytes += uint64(size)
+	case "write":
+		c.writeOps++
+		c.writeBytes += uint64(size)
+	}
+	if os.Getenv("CC_NVME_TRACE") == "" {
+		return
+	}
+	now := time.Now()
+	if c.lastTrace.IsZero() || now.Sub(c.lastTrace) >= 5*time.Second {
+		_, _ = fmt.Fprintf(os.Stderr, "nvme io read_ops=%d read_bytes=%d write_ops=%d write_bytes=%d\n", c.readOps, c.readBytes, c.writeOps, c.writeBytes)
+		c.lastTrace = now
 	}
 }
 
@@ -622,6 +675,9 @@ func (c *Controller) writeCompletionLocked(q *queue, sqid uint16, sqHead uint16,
 		return fmt.Errorf("write cq%d entry tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
 	}
 	q.cqTail = (q.cqTail + 1) % q.size
+	if q.cqPending < q.size {
+		q.cqPending++
+	}
 	if q.cqTail == 0 {
 		q.cqPhase = !q.cqPhase
 	}
@@ -632,7 +688,7 @@ func (c *Controller) updateIRQLocked() error {
 	high := false
 	if c.intMask&1 == 0 {
 		for _, q := range c.queues {
-			if q.interrupts && q.cqHead != q.cqTail {
+			if q.interrupts && q.cqPending != 0 {
 				high = true
 				break
 			}
@@ -645,7 +701,40 @@ func (c *Controller) updateIRQLocked() error {
 	if c.irq == nil {
 		return nil
 	}
+	if c.msi.enabled {
+		if !high {
+			return nil
+		}
+		irq, ok := c.irq.(msiIRQController)
+		if !ok {
+			return nil
+		}
+		return irq.SetMSI(c.msi.addr, c.msi.data)
+	}
 	return c.irq.SetIRQ(c.IRQ, high)
+}
+
+func (q *queue) advanceCompletionHeadLocked(head uint16) {
+	if q.size == 0 {
+		q.cqHead = head
+		q.cqPending = 0
+		return
+	}
+	oldHead := q.cqHead
+	q.cqHead = head % q.size
+	consumed := q.cqHead - oldHead
+	if q.cqHead < oldHead {
+		consumed = q.size - oldHead + q.cqHead
+	}
+	if consumed == 0 && q.cqPending == q.size {
+		q.cqPending = 0
+		return
+	}
+	if consumed >= q.cqPending {
+		q.cqPending = 0
+		return
+	}
+	q.cqPending -= consumed
 }
 
 func (c *Controller) readPRP(prp1, prp2 uint64, dst []byte) error {
