@@ -42,6 +42,11 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	if err := s.sendExecStart(id, req); err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
+	if len(req.Stdin) == 0 {
+		if err := s.sendStdinClose(id); err != nil {
+			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
+	}
 	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok

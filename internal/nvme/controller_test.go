@@ -116,6 +116,54 @@ func TestControllerIdentifyAndReadWrite(t *testing.T) {
 	}
 }
 
+func TestControllerInterruptRemainsAssertedForFullCompletionQueue(t *testing.T) {
+	mem := newTestMemory(0x20000)
+	disk := newTestDisk(1024 * 1024)
+	irq := &testIRQ{}
+	ctrl := NewController(disk)
+	ctrl.IRQ = 10
+	ctrl.Attach(mem, irq)
+
+	adminSQ := uint64(0x1000)
+	adminCQ := uint64(0x2000)
+	ioSQ := uint64(0x3000)
+	ioCQ := uint64(0x4000)
+	data := uint64(0x5000)
+
+	mustWriteMMIO(t, ctrl, regAQA, 4-1|uint64(4-1)<<16)
+	mustWriteMMIO(t, ctrl, regASQ, adminSQ)
+	mustWriteMMIO(t, ctrl, regACQ, adminCQ)
+	mustWriteMMIO(t, ctrl, regCC, 1)
+
+	writeAdminCommand(mem, adminSQ, 0, command{opcode: adminCreateCQ, cid: 1, prp1: ioCQ, cdw10: 1 | uint32(2-1)<<16, cdw11: 2})
+	mustWriteMMIO(t, ctrl, doorbellBase, 1)
+	writeAdminCommand(mem, adminSQ, 1, command{opcode: adminCreateSQ, cid: 2, prp1: ioSQ, cdw10: 1 | uint32(4-1)<<16, cdw11: 1 << 16})
+	mustWriteMMIO(t, ctrl, doorbellBase, 2)
+	mustWriteMMIO(t, ctrl, doorbellBase+4, 2)
+
+	writeIOCommand(mem, ioSQ, 0, command{opcode: ioRead, cid: 3, nsid: 1, prp1: data, cdw12: 0})
+	writeIOCommand(mem, ioSQ, 1, command{opcode: ioRead, cid: 4, nsid: 1, prp1: data + 512, cdw12: 0})
+	mustWriteMMIO(t, ctrl, doorbellBase+8, 2)
+	if !irq.level {
+		t.Fatalf("interrupt level = false after completion queue wrapped full")
+	}
+	if got := binary.LittleEndian.Uint16(mem.data[ioCQ+12 : ioCQ+14]); got != 3 {
+		t.Fatalf("first completion cid = %d", got)
+	}
+	if got := binary.LittleEndian.Uint16(mem.data[ioCQ+16+12 : ioCQ+16+14]); got != 4 {
+		t.Fatalf("second completion cid = %d", got)
+	}
+
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 1)
+	if !irq.level {
+		t.Fatalf("interrupt level = false after only one full-queue completion was acknowledged")
+	}
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 0)
+	if irq.level {
+		t.Fatalf("interrupt level = true after all full-queue completions were acknowledged")
+	}
+}
+
 func TestControllerPreservesAdminQueuesAcrossDisabledCCConfiguration(t *testing.T) {
 	mem := newTestMemory(0x20000)
 	disk := newTestDisk(1024 * 1024)
