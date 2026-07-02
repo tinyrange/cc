@@ -293,7 +293,19 @@ func serveSidecarFS(cacheDir string, backend sidecarRootFS) (sidecarStartResourc
 }
 
 func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) (sidecarStartResources, error) {
-	return prepareSidecarNetResourcesWithMode(cacheDir, id, cfg, "")
+	mode := ""
+	if cfg != nil {
+		switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+		case "":
+			mode = "bridge"
+		case "bridge":
+			mode = "bridge"
+		case "remote":
+		default:
+			return sidecarStartResources{}, fmt.Errorf("unsupported sidecar network mode %q", cfg.Mode)
+		}
+	}
+	return prepareSidecarNetResourcesWithMode(cacheDir, id, cfg, mode)
 }
 
 func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.NetworkConfig, mode string) (sidecarStartResources, error) {

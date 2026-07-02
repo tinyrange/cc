@@ -299,6 +299,7 @@ type ShareMount struct {
 
 type NetworkConfig struct {
 	Enabled                  bool          `json:"enabled,omitempty"`
+	Mode                     string        `json:"mode,omitempty"`
 	AllowInternet            bool          `json:"allow_internet,omitempty"`
 	BlockHostAccess          bool          `json:"block_host_access,omitempty"`
 	GuestIPv4                string        `json:"guest_ipv4,omitempty"`
