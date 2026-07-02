@@ -25,13 +25,14 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 		ID:         "alpha",
 		Image:      "alpine",
 		MemoryMB:   256,
+		BalloonMB:  64,
 		CPUs:       2,
 		NestedVirt: true,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if state.ID != "alpha" || state.Status != "running" || state.Image != "alpine" || state.MemoryMB != 256 || state.CPUs != 2 || !state.NestedVirt || state.NetworkIPv4 != "10.0.2.15" {
+	if state.ID != "alpha" || state.Status != "running" || state.Image != "alpine" || state.MemoryMB != 256 || state.BalloonMB != 64 || state.CPUs != 2 || !state.NestedVirt || state.NetworkIPv4 != "10.0.2.15" {
 		t.Fatalf("state = %+v", state)
 	}
 
@@ -100,11 +101,12 @@ func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
 		Image:      "ubuntu",
 		InitSystem: "systemd",
 		MemoryMB:   512,
+		BalloonMB:  128,
 	}, nil)
 	if err != nil {
 		t.Fatalf("start blank: %v", err)
 	}
-	if state.Image != "ubuntu" || state.InitSystem != "systemd" {
+	if state.Image != "ubuntu" || state.InitSystem != "systemd" || state.BalloonMB != 128 {
 		t.Fatalf("state = %+v, want image ubuntu and init systemd", state)
 	}
 	if _, err := manager.RunIn(ctx, "alpha", client.RunRequest{Image: "ubuntu", Command: []string{"systemctl"}}); err != nil {

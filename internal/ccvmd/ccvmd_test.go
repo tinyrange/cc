@@ -3,6 +3,7 @@ package ccvmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -18,7 +19,7 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	defer watchdog.Stop()
 	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {
 		shutdownCalled <- struct{}{}
-	})
+	}, ServerOptions{})
 
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -79,7 +80,7 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 func TestMuxBadRequests(t *testing.T) {
 	watchdog := newWatchdogController(func() {})
 	defer watchdog.Stop()
-	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {})
+	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{})
 
 	for _, tc := range []struct {
 		name   string
@@ -106,6 +107,29 @@ func TestMuxBadRequests(t *testing.T) {
 				t.Fatalf("empty error response: %s", rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestMuxNormalizesRunRequestsAfterDecode(t *testing.T) {
+	watchdog := newWatchdogController(func() {})
+	defer watchdog.Stop()
+	var normalized client.RunRequest
+	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{
+		NormalizeRunRequest: func(req *client.RunRequest, _ RuntimeView) error {
+			req.MemoryMB = 4096
+			req.BalloonMB = 512
+			normalized = *req
+			return fmt.Errorf("stop after normalize")
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vm/run", jsonBody(t, client.RunRequest{Command: []string{"true"}})))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want bad request", rr.Code)
+	}
+	if len(normalized.Command) != 1 || normalized.Command[0] != "true" || normalized.MemoryMB != 4096 || normalized.BalloonMB != 512 {
+		t.Fatalf("normalized request = %+v", normalized)
 	}
 }
 

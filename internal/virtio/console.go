@@ -51,7 +51,8 @@ const (
 	featureVersion1 = uint64(1) << 32
 	featureSize     = uint64(1) << 0
 
-	intVring = 0x1
+	intVring  = 0x1
+	intConfig = 0x2
 
 	queueRx = 0
 	queueTx = 1

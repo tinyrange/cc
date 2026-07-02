@@ -351,6 +351,7 @@ type CreateInstanceRequest struct {
 	Network         *NetworkConfig `json:"network,omitempty"`
 	KernelModules   []string       `json:"kernel_modules,omitempty"`
 	MemoryMB        uint64         `json:"memory_mb,omitempty"`
+	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
 	CPUs            int            `json:"cpus,omitempty"`
 	NestedVirt      bool           `json:"nested_virtualization,omitempty"`
 	Dmesg           bool           `json:"dmesg,omitempty"`
@@ -368,6 +369,7 @@ type StartInstanceRequest struct {
 	Network         *NetworkConfig `json:"network,omitempty"`
 	KernelModules   []string       `json:"kernel_modules,omitempty"`
 	MemoryMB        uint64         `json:"memory_mb,omitempty"`
+	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
 	CPUs            int            `json:"cpus,omitempty"`
 	NestedVirt      bool           `json:"nested_virtualization,omitempty"`
 	Dmesg           bool           `json:"dmesg,omitempty"`
@@ -383,6 +385,7 @@ type InstanceState struct {
 	InitSystem  string `json:"init,omitempty"`
 	Kernel      string `json:"kernel,omitempty"`
 	MemoryMB    uint64 `json:"memory_mb,omitempty"`
+	BalloonMB   uint64 `json:"balloon_mb,omitempty"`
 	CPUs        int    `json:"cpus,omitempty"`
 	NestedVirt  bool   `json:"nested_virtualization,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
@@ -414,6 +417,7 @@ type RunRequest struct {
 	Cols           int            `json:"cols,omitempty"`
 	Rows           int            `json:"rows,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
+	BalloonMB      uint64         `json:"balloon_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
 	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`

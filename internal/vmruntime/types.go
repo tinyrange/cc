@@ -39,6 +39,7 @@ type RunRequest struct {
 	WorkDir           string
 	User              string
 	MemoryMB          uint64
+	BalloonMB         uint64
 	CPUs              int
 	NestedVirt        bool
 	Dmesg             bool

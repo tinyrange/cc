@@ -82,13 +82,14 @@ func runtimeKernelRequirements(flavor string, image *oci.Image, network bool, ex
 }
 
 func alpineRuntimeKernelRequirements(network bool, extra []string) ([]string, map[string]string) {
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_VIRTIO_BALLOON", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	if network {
 		configVars = append(configVars, "CONFIG_VIRTIO_NET")
 	}
 	configVars = append(configVars, extra...)
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_VIRTIO_BALLOON":   "kernel/drivers/virtio/virtio_balloon.ko.gz",
 		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
 		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
 		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
@@ -104,6 +105,7 @@ func alpineRuntimeKernelRequirements(network bool, extra []string) ([]string, ma
 func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]string) {
 	configVars := []string{
 		"CONFIG_VIRTIO_MMIO",
+		"CONFIG_VIRTIO_BALLOON",
 		"CONFIG_FUSE_FS",
 		"CONFIG_VIRTIO_FS",
 		"CONFIG_VSOCKETS",
@@ -120,6 +122,7 @@ func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]strin
 	configVars = append(configVars, extra...)
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.zst",
+		"CONFIG_VIRTIO_BALLOON":   "kernel/drivers/virtio/virtio_balloon.ko.zst",
 		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.zst",
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.zst",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.zst",
@@ -257,6 +260,7 @@ func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, i
 		Network:        req.Network,
 		KernelModules:  append([]string(nil), req.KernelModules...),
 		MemoryMB:       req.MemoryMB,
+		BalloonMB:      req.BalloonMB,
 		CPUs:           req.CPUs,
 		NestedVirt:     req.NestedVirt,
 		Dmesg:          req.Dmesg,
@@ -402,7 +406,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, balloonMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
@@ -415,6 +419,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 			Image:             sidecarBundleImage(bundle),
 			InitSystem:        initSystem,
 			MemoryMB:          memoryMB,
+			BalloonMB:         balloonMB,
 			CPUs:              cpus,
 			NestedVirt:        nestedVirt,
 			Dmesg:             dmesg,
@@ -478,6 +483,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		Image:             image,
 		InitSystem:        initSystem,
 		MemoryMB:          memoryMB,
+		BalloonMB:         balloonMB,
 		CPUs:              cpus,
 		NestedVirt:        nestedVirt,
 		Dmesg:             dmesg,
@@ -528,7 +534,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -576,6 +582,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			RootFS:            rootFS,
 			Shares:            shares,
 			MemoryMB:          req.MemoryMB,
+			BalloonMB:         req.BalloonMB,
 			CPUs:              req.CPUs,
 			NestedVirt:        req.NestedVirt,
 			Dmesg:             req.Dmesg,
@@ -645,6 +652,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		RootFS:            rootFS,
 		Shares:            shares,
 		MemoryMB:          req.MemoryMB,
+		BalloonMB:         req.BalloonMB,
 		CPUs:              req.CPUs,
 		NestedVirt:        req.NestedVirt,
 		Dmesg:             req.Dmesg,
@@ -691,6 +699,7 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 		RootFS:          rootFS,
 		Shares:          shares,
 		MemoryMB:        req.MemoryMB,
+		BalloonMB:       req.BalloonMB,
 		CPUs:            req.CPUs,
 		NestedVirt:      req.NestedVirt,
 		Dmesg:           req.Dmesg,
@@ -814,7 +823,7 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

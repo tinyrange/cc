@@ -75,6 +75,7 @@ type Machine struct {
 	initSystem   string
 	kernel       string
 	memoryMB     uint64
+	balloonMB    uint64
 	cpus         int
 	nestedVirt   bool
 	startedAt    time.Time
@@ -246,6 +247,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		initSystem: req.InitSystem,
 		kernel:     req.Kernel,
 		memoryMB:   req.MemoryMB,
+		balloonMB:  req.BalloonMB,
 		cpus:       req.CPUs,
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
@@ -344,6 +346,7 @@ func (m *Manager) StartBlankInstanceStream(
 		initSystem: req.InitSystem,
 		kernel:     req.Kernel,
 		memoryMB:   req.MemoryMB,
+		balloonMB:  req.BalloonMB,
 		cpus:       req.CPUs,
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
@@ -713,6 +716,7 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		InitSystem: machine.initSystem,
 		Kernel:     machine.kernel,
 		MemoryMB:   machine.memoryMB,
+		BalloonMB:  machine.balloonMB,
 		CPUs:       machine.cpus,
 		NestedVirt: machine.nestedVirt,
 		StartedAt:  machine.startedAt.Format(time.RFC3339),

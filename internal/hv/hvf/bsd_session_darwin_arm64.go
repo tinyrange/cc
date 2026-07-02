@@ -518,7 +518,7 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 		}
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, netdev, nil, nil, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, nil, netdev, nil, nil, exitInfo); err != nil {
 				addr := uint64(exitInfo.Exception.PhysicalAddress)
 				if pci != nil && pci.Contains(addr, 1) {
 					if err := handleBSDPCIDataAbort(vm, vcpuIndex, pci, exitInfo); err != nil {
