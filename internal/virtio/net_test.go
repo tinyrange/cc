@@ -78,6 +78,41 @@ func TestNetLegacyTXStripsTenByteHeader(t *testing.T) {
 	}
 }
 
+func TestNetLegacyTXHonorsAvailNoInterrupt(t *testing.T) {
+	mem := make(testGuestMemory, 0x20000)
+	backend := &testNetBackend{}
+	irq := &testIRQ{}
+	dev := NewNet(0, 0x1000, 11, nil, backend)
+	dev.DisableMergeRX = true
+	dev.Attach(mem, irq)
+
+	if err := dev.WriteLegacy(14, 2, netQueueTX); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.WriteLegacy(8, 4, 0x10); err != nil {
+		t.Fatal(err)
+	}
+	packet := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02, 0x08, 0x06}
+	copy(mem[0x2000+netHeaderLen:], packet)
+	writeDesc(mem, 0x10000, 0x2000, uint32(netHeaderLen+len(packet)), 0, 0)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize:], vringAvailNoInterrupt)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+2:], 1)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+4:], 0)
+
+	if err := dev.WriteLegacy(16, 2, netQueueTX); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.packets) != 1 {
+		t.Fatalf("packets = %d", len(backend.packets))
+	}
+	if irq.level || dev.IRQAsserted() {
+		t.Fatalf("TX queue asserted IRQ despite avail no-interrupt flag")
+	}
+	if isr, err := dev.ReadLegacy(19, 1); err != nil || isr != 0 {
+		t.Fatalf("legacy ISR = %#x, %v; want 0, nil", isr, err)
+	}
+}
+
 func TestNetTXCanForceTwelveByteHeader(t *testing.T) {
 	mem := make(testGuestMemory, 0x20000)
 	backend := &testNetBackend{}
@@ -140,6 +175,40 @@ func TestNetLegacyRXWritesTenByteHeader(t *testing.T) {
 	}
 	if !bytes.Equal(mem[0x3000+netHeaderLen:0x3000+netHeaderLen+uint64(len(packet))], packet) {
 		t.Fatalf("packet payload was not written after ten-byte header")
+	}
+}
+
+func TestNetLegacyRXHonorsAvailNoInterrupt(t *testing.T) {
+	mem := make(testGuestMemory, 0x20000)
+	irq := &testIRQ{}
+	dev := NewNet(0, 0x1000, 11, nil, nil)
+	dev.DisableMergeRX = true
+	dev.Attach(mem, irq)
+
+	if err := dev.WriteLegacy(14, 2, netQueueRX); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.WriteLegacy(8, 4, 0x10); err != nil {
+		t.Fatal(err)
+	}
+	writeDesc(mem, 0x10000, 0x3000, 2048, descFWrite, 0)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize:], vringAvailNoInterrupt)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+2:], 1)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+4:], 0)
+
+	packet := []byte{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x08, 0x00}
+	if err := dev.EnqueueRxPacket(packet); err != nil {
+		t.Fatal(err)
+	}
+	if irq.level || dev.IRQAsserted() {
+		t.Fatalf("RX queue asserted IRQ despite avail no-interrupt flag")
+	}
+	usedLen := binary.LittleEndian.Uint32(mem[0x10000+16*netQueueSize+4096+8:])
+	if usedLen != uint32(netHeaderLen+len(packet)) {
+		t.Fatalf("used len = %d, want %d", usedLen, netHeaderLen+len(packet))
+	}
+	if isr, err := dev.ReadLegacy(19, 1); err != nil || isr != 0 {
+		t.Fatalf("legacy ISR = %#x, %v; want 0, nil", isr, err)
 	}
 }
 

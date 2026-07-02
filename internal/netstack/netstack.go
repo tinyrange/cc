@@ -28,6 +28,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -2157,6 +2158,12 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		return nil
 	case tcpStateSynRcvd:
 		if hdr.flags&tcpFlagACK != 0 {
+			if hdr.ack != c.hostSeq {
+				tracef("netstack.tcpConn synrcvd drop badAck", "ack=%d want=%d", hdr.ack, c.hostSeq)
+				c.mu.Unlock()
+				return nil
+			}
+			tracef("netstack.tcpConn established", "seq=%d ack=%d payloadLen=%d", hdr.seq, hdr.ack, len(hdr.payload))
 			c.state = tcpStateEstablished
 			cb := c.onEstablished
 			listener := c.listener
@@ -3974,9 +3981,14 @@ func itoa(v int) string {
 	return strconv.Itoa(v)
 }
 
-const netstackTraceEnabled = false
+var netstackTraceEnabled = os.Getenv("CC_NETSTACK_TRACE") != ""
 
-func tracef(_ string, _ string, _ ...any) {}
+func tracef(event string, format string, args ...any) {
+	if !netstackTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, event+": "+format+"\n", args...)
+}
 
 // proxyConns bridges bytes between a and b until one side closes.
 func proxyConns(a, b net.Conn, bufSize int) error {

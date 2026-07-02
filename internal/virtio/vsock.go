@@ -726,6 +726,9 @@ func (v *Vsock) updateIRQLocked() error {
 	}
 	level := v.interruptStatus != 0
 	if v.irqHigh == level {
+		if level {
+			return v.irq.SetIRQ(v.IRQ, true)
+		}
 		return nil
 	}
 	v.irqHigh = level

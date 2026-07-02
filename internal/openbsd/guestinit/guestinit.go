@@ -39,7 +39,7 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 		return nil, fmt.Errorf("locate OpenBSD guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
-	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, "./internal/cmd/openbsd-init")
+	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/openbsd-init")
 	cmd.Env = append(os.Environ(), "GOOS=openbsd", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot
 	data, err := cmd.CombinedOutput()

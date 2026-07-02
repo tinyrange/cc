@@ -2586,6 +2586,9 @@ func (f *FS) updateIRQLocked() error {
 	}
 	level := f.interruptStatus != 0
 	if f.irqHigh == level {
+		if level {
+			return f.irq.SetIRQ(f.IRQ, true)
+		}
 		return nil
 	}
 	f.irqHigh = level

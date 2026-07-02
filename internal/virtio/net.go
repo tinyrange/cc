@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"j5.nz/cc/internal/fdt"
 )
@@ -18,6 +19,7 @@ const (
 	netQueueSize = 256
 
 	netFeatureCSUM          = uint64(1) << 0
+	vringAvailNoInterrupt   = 1
 	netFeatureMAC           = uint64(1) << 5
 	netFeatureHostTSO4      = uint64(1) << 11
 	netFeatureStatus        = uint64(1) << 16
@@ -86,11 +88,15 @@ type NetBackend interface {
 }
 
 type Net struct {
-	Base       uint64
-	Size       uint64
-	IRQ        uint32
-	MAC        net.HardwareAddr
-	LegacyMMIO bool
+	Base         uint64
+	Size         uint64
+	IRQ          uint32
+	MAC          net.HardwareAddr
+	LegacyMMIO   bool
+	AsyncTX      bool
+	AsyncTXDelay time.Duration
+	NoTXIRQ      bool
+	NoTXUsed     bool
 
 	DisableMergeRX     bool
 	CompleteTXChecksum bool
@@ -114,6 +120,9 @@ type Net struct {
 	scratch4           [4]byte
 	scratch8           [8]byte
 	scratch16          [16]byte
+	asyncTXRunning     bool
+	asyncTXAgain       bool
+	asyncTXErr         error
 }
 
 type netTXPacket struct {
@@ -229,6 +238,12 @@ func (n *Net) Read(addr uint64, size int) (uint64, error) {
 
 func (n *Net) Write(addr uint64, size int, value uint64) error {
 	n.mu.Lock()
+	if n.asyncTXErr != nil {
+		err := n.asyncTXErr
+		n.asyncTXErr = nil
+		n.mu.Unlock()
+		return err
+	}
 
 	offset := addr - n.Base
 	switch offset {
@@ -335,6 +350,11 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 	case regQueueNotify:
 		switch value {
 		case netQueueTX:
+			if n.AsyncTX {
+				n.scheduleAsyncTXLocked()
+				n.mu.Unlock()
+				return nil
+			}
 			packetBatch := getNetTXPacketBatch()
 			packets, err := n.processTXLocked(packetBatch[:0])
 			n.mu.Unlock()
@@ -397,6 +417,12 @@ func (n *Net) ReadLegacy(offset uint16, size int) (uint64, error) {
 func (n *Net) WriteLegacy(offset uint16, size int, value uint64) error {
 	n.mu.Lock()
 	n.legacy = true
+	if n.asyncTXErr != nil {
+		err := n.asyncTXErr
+		n.asyncTXErr = nil
+		n.mu.Unlock()
+		return err
+	}
 
 	switch offset {
 	case 4:
@@ -425,6 +451,11 @@ func (n *Net) WriteLegacy(offset uint16, size int, value uint64) error {
 	case 16:
 		switch value {
 		case netQueueTX:
+			if n.AsyncTX {
+				n.scheduleAsyncTXLocked()
+				n.mu.Unlock()
+				return nil
+			}
 			packetBatch := getNetTXPacketBatch()
 			packets, err := n.processTXLocked(packetBatch[:0])
 			n.mu.Unlock()
@@ -450,6 +481,45 @@ func (n *Net) WriteLegacy(offset uint16, size int, value uint64) error {
 	}
 	n.mu.Unlock()
 	return nil
+}
+
+func (n *Net) scheduleAsyncTXLocked() {
+	if n.asyncTXRunning {
+		n.asyncTXAgain = true
+		return
+	}
+	n.asyncTXRunning = true
+	if n.AsyncTXDelay > 0 {
+		time.AfterFunc(n.AsyncTXDelay, n.runAsyncTX)
+		return
+	}
+	go n.runAsyncTX()
+}
+
+func (n *Net) runAsyncTX() {
+	for {
+		packetBatch := getNetTXPacketBatch()
+		n.mu.Lock()
+		packets, err := n.processTXLocked(packetBatch[:0])
+		n.mu.Unlock()
+		if err == nil {
+			err = n.deliverTXPackets(packets)
+		}
+		releaseNetTXPacketBatch(packetBatch, len(packets))
+
+		n.mu.Lock()
+		if err != nil {
+			n.asyncTXErr = err
+		}
+		if !n.asyncTXAgain || err != nil {
+			n.asyncTXRunning = false
+			n.asyncTXAgain = false
+			n.mu.Unlock()
+			return
+		}
+		n.asyncTXAgain = false
+		n.mu.Unlock()
+	}
 }
 
 func (n *Net) EnqueueRxPacket(packet []byte) error {
@@ -617,22 +687,26 @@ func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 			}
 		}
 		releaseNetPacketBuffer(releaseData)
-		if err := n.writeUsedLocked(q, head, 0); err != nil {
-			releaseNetTXPackets(packets)
-			return nil, err
+		if !n.NoTXUsed {
+			if err := n.writeUsedLocked(q, head, 0); err != nil {
+				releaseNetTXPackets(packets)
+				return nil, err
+			}
 		}
 		q.lastAvailIdx++
 	}
-	n.interruptStatus |= intVring
-	if err := n.updateIRQLocked(); err != nil {
-		releaseNetTXPackets(packets)
-		return nil, err
+	if !n.NoTXUsed && !n.NoTXIRQ && !n.queueInterruptSuppressedLocked(q) {
+		n.interruptStatus |= intVring
+		if err := n.updateIRQLocked(); err != nil {
+			releaseNetTXPackets(packets)
+			return nil, err
+		}
 	}
 	return packets, nil
 }
 
 func (n *Net) deliverTXPackets(packets []netTXPacket) error {
-	for _, packet := range packets {
+	for i, packet := range packets {
 		if n.backend == nil {
 			releaseNetPacketBuffer(packet.buffer)
 			continue
@@ -640,6 +714,7 @@ func (n *Net) deliverTXPackets(packets []netTXPacket) error {
 		err := n.backend.HandleTxPacket(packet.packet)
 		releaseNetPacketBuffer(packet.buffer)
 		if err != nil {
+			releaseNetTXPackets(packets[i+1:])
 			return err
 		}
 	}
@@ -681,8 +756,10 @@ func (n *Net) processRXLocked() error {
 		processed = true
 	}
 	if processed {
-		n.interruptStatus |= intVring
-		return n.updateIRQLocked()
+		if !n.queueInterruptSuppressedLocked(q) {
+			n.interruptStatus |= intVring
+			return n.updateIRQLocked()
+		}
 	}
 	return nil
 }
@@ -712,8 +789,11 @@ func (n *Net) processOneRXPacketLocked(packet []byte) (bool, error) {
 		return false, err
 	}
 	q.lastAvailIdx++
-	n.interruptStatus |= intVring
-	return true, n.updateIRQLocked()
+	if !n.queueInterruptSuppressedLocked(q) {
+		n.interruptStatus |= intVring
+		return true, n.updateIRQLocked()
+	}
+	return true, nil
 }
 
 func (n *Net) readChainLocked(q *queue, head uint16, writable bool) ([]byte, error) {
@@ -867,6 +947,18 @@ func (n *Net) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	}
 	binary.LittleEndian.PutUint16(n.scratch2[:], q.usedIdx)
 	return n.mem.WriteIPA(q.usedAddr+2, n.scratch2[:])
+}
+
+func (n *Net) queueInterruptSuppressedLocked(q *queue) bool {
+	if q == nil || n.mem == nil || q.availAddr == 0 {
+		return false
+	}
+	header, err := n.mem.ReadIPA(q.availAddr, 2)
+	if err != nil || len(header) < 2 {
+		return false
+	}
+	flags := binary.LittleEndian.Uint16(header)
+	return flags&vringAvailNoInterrupt != 0
 }
 
 func (n *Net) selectedQueueLocked() *queue {

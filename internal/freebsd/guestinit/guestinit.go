@@ -36,7 +36,7 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 	out := filepath.Join(cacheDir, "guest-init-freebsd-"+arch)
-	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, "./internal/cmd/freebsd-init")
+	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/freebsd-init")
 	cmd.Env = append(os.Environ(), "GOOS=freebsd", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot
 	data, err := cmd.CombinedOutput()

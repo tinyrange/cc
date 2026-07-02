@@ -135,7 +135,7 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
 	}
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" {
+	if runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
 		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "Windows WHP currently supports one vCPU per instance")
 	}
@@ -169,7 +169,7 @@ func networkModesForHost(goos, goarch string) []string {
 		return []string{"user"}
 	case goos == "darwin" && goarch == "arm64":
 		return []string{"user"}
-	case goos == "windows" && goarch == "amd64":
+	case goos == "windows" && (goarch == "amd64" || goarch == "arm64"):
 		return []string{"user"}
 	default:
 		return []string{}
@@ -182,7 +182,7 @@ func backendName() string {
 		return "kvm"
 	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
 		return "hvf"
-	case runtime.GOOS == "windows" && runtime.GOARCH == "amd64":
+	case runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"):
 		return "whp"
 	default:
 		return "unsupported"
