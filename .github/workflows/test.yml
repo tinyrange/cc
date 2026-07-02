@@ -54,9 +54,28 @@ jobs:
         run: go test -short ./... -count=1 -timeout 30m
 
   kvm-test:
-    name: KVM and rootfs tests
+    name: KVM and rootfs tests (${{ matrix.name }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: freebsd-oci-runtime
+            packages: ./internal/vm
+            test_run: ^TestRuntimeBootsFreeBSDBuiltinImage$
+          - name: kvm-openbsd
+            packages: ./internal/hv/kvm
+            test_run: ^(TestBootOpenBSD|TestOpenBSD)
+          - name: kvm-netbsd
+            packages: ./internal/hv/kvm
+            test_run: ^(TestBootNetBSD|TestNetBSD)
+          - name: vm-runtime
+            packages: ./internal/vm
+            test_run: ^TestRuntime(BootsLinux|OneShot|RejectsInvalidRequests|BootsPersistentLinux|Persistent|Isolated)
+          - name: rootfs-support
+            packages: ./internal/fsimage/ffs ./internal/netbsd/rootfs ./internal/openbsd/rootfs
+            test_run: .
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -87,18 +106,10 @@ jobs:
           restore-keys: |
             cc-runtime-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Run all tests with KVM suites enabled
-        env:
-          CC_TEST_LINUX_KVM_PCI: "1"
-          CC_TEST_OPENBSD_KVM: "1"
-          CC_TEST_OPENBSD_STARTUP_MAX_MS: "3000"
-          CC_TEST_OPENBSD_FULL_BASE_FFS: "1"
-          CC_TEST_FREEBSD_ROOTFS: "1"
-          CC_TEST_FREEBSD_KVM: "1"
-          CC_TEST_NETBSD_ROOTFS: "1"
-          CC_TEST_NETBSD_KVM: "1"
+      - name: Build guest init payloads
         run: |
           set -euo pipefail
+          start=$SECONDS
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
           for goarch in arm64 amd64; do
@@ -106,4 +117,28 @@ jobs:
               CGO_ENABLED=0 GOOS="$bsd" GOARCH="$goarch" go build -trimpath -o "internal/${bsd}/guestinit/guest-init-${bsd}-${goarch}" "./internal/cmd/${bsd}-init"
             done
           done
-          go test -tags embed_guestinit -p 1 ./... -count=1 -timeout 75m
+          echo "guest init payload build took $((SECONDS - start))s"
+
+      - name: Run KVM/rootfs test shard
+        env:
+          CC_TEST_LINUX_KVM_PCI: "1"
+          CC_TEST_OPENBSD_KVM: "1"
+          CC_TEST_OPENBSD_STARTUP_MAX_MS: "3000"
+          CC_TEST_OPENBSD_FULL_BASE_FFS: "1"
+          CC_TEST_FREEBSD_KVM: "1"
+          CC_TEST_NETBSD_ROOTFS: "1"
+          CC_TEST_NETBSD_KVM: "1"
+          TEST_PACKAGES: ${{ matrix.packages }}
+          TEST_RUN: ${{ matrix.test_run }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          # The regular matrix already runs `go test -short ./...` across all
+          # platforms. This job only enables the expensive KVM/rootfs tests and
+          # runs the packages that contain those gated checks.
+          run_args=()
+          if [ "$TEST_RUN" != "." ]; then
+            run_args=(-run "$TEST_RUN")
+          fi
+          go test -tags embed_guestinit -p 1 "${run_args[@]}" ${TEST_PACKAGES} -count=1 -timeout 40m
+          echo "KVM/rootfs shard '${{ matrix.name }}' took $((SECONDS - start))s"
