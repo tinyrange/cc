@@ -28,6 +28,71 @@ type bootPICChip struct {
 	lastIRR    byte
 }
 
+type bootPICState struct {
+	Master   bootPICChipState `json:"master"`
+	Slave    bootPICChipState `json:"slave"`
+	ELCR     [2]byte          `json:"elcr"`
+	LineHigh [16]bool         `json:"line_high"`
+}
+
+type bootPICChipState struct {
+	VectorBase uint8 `json:"vector_base"`
+	Mask       uint8 `json:"mask"`
+	ICWStep    uint8 `json:"icw_step"`
+	OCW3       byte  `json:"ocw3"`
+	IRR        byte  `json:"irr"`
+	ISR        byte  `json:"isr"`
+	LastIRR    byte  `json:"last_irr"`
+}
+
+func (p *bootPIC) SnapshotState() bootPICState {
+	if p == nil {
+		return bootPICState{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return bootPICState{
+		Master:   p.master.snapshotState(),
+		Slave:    p.slave.snapshotState(),
+		ELCR:     p.elcr,
+		LineHigh: p.lineHigh,
+	}
+}
+
+func (p *bootPIC) RestoreState(state bootPICState) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.master.restoreState(state.Master)
+	p.slave.restoreState(state.Slave)
+	p.elcr = state.ELCR
+	p.lineHigh = state.LineHigh
+}
+
+func (c bootPICChip) snapshotState() bootPICChipState {
+	return bootPICChipState{
+		VectorBase: c.vectorBase,
+		Mask:       c.mask,
+		ICWStep:    c.icwStep,
+		OCW3:       c.ocw3,
+		IRR:        c.irr,
+		ISR:        c.isr,
+		LastIRR:    c.lastIRR,
+	}
+}
+
+func (c *bootPICChip) restoreState(state bootPICChipState) {
+	c.vectorBase = state.VectorBase
+	c.mask = state.Mask
+	c.icwStep = state.ICWStep
+	c.ocw3 = state.OCW3
+	c.irr = state.IRR
+	c.isr = state.ISR
+	c.lastIRR = state.LastIRR
+}
+
 func (p *bootPIC) Read(port uint16, data []byte) bool {
 	if len(data) != 1 {
 		return false
@@ -351,6 +416,70 @@ type bootPITChannel struct {
 	gate     bool
 }
 
+type bootPITState struct {
+	Channels [3]bootPITChannelState `json:"channels"`
+	Selected uint8                  `json:"selected"`
+	Port61   byte                   `json:"port61"`
+}
+
+type bootPITChannelState struct {
+	Reload       uint16 `json:"reload"`
+	LowByte      byte   `json:"low_byte"`
+	HaveLow      bool   `json:"have_low"`
+	ReadHigh     bool   `json:"read_high"`
+	ElapsedNanos int64  `json:"elapsed_nanos"`
+	Gate         bool   `json:"gate"`
+}
+
+func (p *bootPIT) SnapshotState() bootPITState {
+	if p == nil {
+		return bootPITState{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var state bootPITState
+	state.Selected = p.selected
+	state.Port61 = p.port61
+	for i, ch := range p.channels {
+		state.Channels[i] = bootPITChannelState{
+			Reload:       ch.reload,
+			LowByte:      ch.lowByte,
+			HaveLow:      ch.haveLow,
+			ReadHigh:     ch.readHigh,
+			ElapsedNanos: now.Sub(ch.start).Nanoseconds(),
+			Gate:         ch.gate,
+		}
+	}
+	return state
+}
+
+func (p *bootPIT) RestoreState(state bootPITState) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopTickerLocked()
+	p.selected = state.Selected
+	p.port61 = state.Port61
+	now := time.Now()
+	for i, ch := range state.Channels {
+		p.channels[i] = bootPITChannel{
+			reload:   ch.Reload,
+			lowByte:  ch.LowByte,
+			haveLow:  ch.HaveLow,
+			readHigh: ch.ReadHigh,
+			start:    now.Add(-time.Duration(ch.ElapsedNanos)),
+			gate:     ch.Gate,
+		}
+		if p.channels[i].reload == 0 {
+			p.channels[i].reload = 0xffff
+		}
+	}
+	p.armChannel0Locked()
+}
+
 func (p *bootPIT) Close() {
 	p.mu.Lock()
 	p.closed = true
@@ -536,6 +665,45 @@ type bootIOAPIC struct {
 	version  uint32
 	inFlight [256]bool
 	lineHigh [ioapicRedirEntries]bool
+}
+
+type bootIOAPICState struct {
+	Index    uint32                     `json:"index"`
+	Redir    [ioapicRedirEntries]uint64 `json:"redir"`
+	Version  uint32                     `json:"version"`
+	InFlight [256]bool                  `json:"in_flight"`
+	LineHigh [ioapicRedirEntries]bool   `json:"line_high"`
+}
+
+func (a *bootIOAPIC) SnapshotState() bootIOAPICState {
+	if a == nil {
+		return bootIOAPICState{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return bootIOAPICState{
+		Index:    a.index,
+		Redir:    a.redir,
+		Version:  a.version,
+		InFlight: a.inFlight,
+		LineHigh: a.lineHigh,
+	}
+}
+
+func (a *bootIOAPIC) RestoreState(state bootIOAPICState) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.index = state.Index
+	a.redir = state.Redir
+	a.version = state.Version
+	if a.version == 0 {
+		a.version = 0x11 | ((ioapicRedirEntries - 1) << 16)
+	}
+	a.inFlight = state.InFlight
+	a.lineHigh = state.LineHigh
 }
 
 type bootIOAPICRoute struct {

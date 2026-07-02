@@ -2596,6 +2596,15 @@ func (f *FS) updateIRQLocked() error {
 	return f.irq.SetIRQ(f.IRQ, level)
 }
 
+func (f *FS) IRQAsserted() bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.interruptStatus != 0 || f.irqHigh
+}
+
 func (f *FS) Summary() string {
 	if f == nil {
 		return "virtio-fs=<nil>"
