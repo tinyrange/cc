@@ -338,6 +338,7 @@ type bootPlatform struct {
 	i8042         *I8042
 	rtc           *CMOSRTC
 	acpiPM        *ACPIPM
+	snapshot      *snapshotTrigger
 	start         time.Time
 	irqAttempts   uint64
 	irqDelivered  uint64
@@ -430,13 +431,21 @@ func (p *bootPlatform) vpRegisterSummary() string {
 }
 
 func newBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
+	return newBootPlatformWithOptions(vm, uart, true)
+}
+
+func newRestoredBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
+	return newBootPlatformWithOptions(vm, uart, false)
+}
+
+func newBootPlatformWithOptions(vm *VM, uart *serial.UART8250, attachUARTIRQ bool) *bootPlatform {
 	p := &bootPlatform{vm: vm, uart: uart, start: time.Now()}
 	p.pic.master.vectorBase = 0x20
 	p.pic.slave.vectorBase = 0x28
 	p.pic.master.mask = 0xff
 	p.pic.slave.mask = 0xff
 	p.ioapic.init()
-	if uart != nil {
+	if uart != nil && attachUARTIRQ {
 		uart.AttachIRQ(p, amd64vm.COM1IRQ)
 	}
 	p.pit = newBootPIT(func() {
@@ -809,7 +818,7 @@ func (p *bootPlatform) armPendingIRQWindow() error {
 	if !p.hasPendingIRQ() {
 		return nil
 	}
-	if delivered, err := p.flushHaltedPICIRQ(); err != nil {
+	if delivered, err := p.flushHaltedPendingIRQ(); err != nil {
 		return err
 	} else if delivered {
 		return nil
@@ -818,6 +827,26 @@ func (p *bootPlatform) armPendingIRQWindow() error {
 }
 
 func (p *bootPlatform) resampleDeviceIRQs() {
+	if p.vsock != nil && p.vsock.IRQAsserted() {
+		line := uint8(p.vsock.IRQ)
+		if route, pending := p.ioapic.assert(line, true); pending {
+			p.injectIOAPIC(route, true)
+		}
+	}
+	if p.rng != nil && p.rng.IRQAsserted() {
+		line := uint8(p.rng.IRQ)
+		if route, pending := p.ioapic.assert(line, true); pending {
+			p.injectIOAPIC(route, true)
+		}
+	}
+	for _, fsdev := range p.fsdevs {
+		if fsdev != nil && fsdev.IRQAsserted() {
+			line := uint8(fsdev.IRQ)
+			if route, pending := p.ioapic.assert(line, true); pending {
+				p.injectIOAPIC(route, true)
+			}
+		}
+	}
 	if p.netdev != nil && p.netdev.IRQAsserted() {
 		line := uint8(p.netdev.IRQ)
 		if route, pending := p.ioapic.assert(line, true); pending {
@@ -887,14 +916,28 @@ func (p *bootPlatform) queuePendingPICIRQ(route bootIOAPICRoute, trigger interru
 	})
 }
 
-func (p *bootPlatform) flushHaltedPICIRQ() (bool, error) {
+func (p *bootPlatform) injectPendingInterruption(vector uint8) (bool, error) {
+	ready, err := p.vm.canSetPendingInterruption(vector)
+	if err != nil || !ready {
+		return false, err
+	}
+	if err := p.vm.SetPendingInterruption(vector); err != nil {
+		return false, err
+	}
+	_ = p.vm.kickOutOfHLT()
+	p.vm.kickIfRunning()
+	atomic.AddUint64(&p.irqDelivered, 1)
+	return true, nil
+}
+
+func (p *bootPlatform) flushHaltedPendingIRQ() (bool, error) {
 	p.pendingMu.Lock()
 	if len(p.pendingIRQs) == 0 {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
 	pending := p.pendingIRQs[0]
-	if !pending.pic {
+	if !pending.pic && !p.usePendingInterruptionFallback(pending.route.line) {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
@@ -907,7 +950,12 @@ func (p *bootPlatform) flushHaltedPICIRQ() (bool, error) {
 	}
 
 	p.pendingMu.Lock()
-	if len(p.pendingIRQs) == 0 || !p.pendingIRQs[0].pic || p.pendingIRQs[0].route.vector != route.vector {
+	if len(p.pendingIRQs) == 0 || p.pendingIRQs[0].route.vector != route.vector {
+		p.pendingMu.Unlock()
+		return false, nil
+	}
+	pending = p.pendingIRQs[0]
+	if !pending.pic && !p.usePendingInterruptionFallback(pending.route.line) {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
@@ -916,13 +964,7 @@ func (p *bootPlatform) flushHaltedPICIRQ() (bool, error) {
 	p.pendingIRQ[route.vector] = false
 	p.pendingMu.Unlock()
 
-	if err := p.vm.SetPendingInterruption(route.vector); err != nil {
-		atomic.AddUint64(&p.irqFailed, 1)
-		return false, err
-	}
-	_ = p.vm.kickOutOfHLT()
-	atomic.AddUint64(&p.irqDelivered, 1)
-	return true, nil
+	return p.injectPendingInterruption(route.vector)
 }
 
 func (p *bootPlatform) markDeferredDeviceIRQ(line uint8) {
@@ -1000,12 +1042,13 @@ func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
 		return false, nil
 	}
 	pending := p.pendingIRQs[0]
+	fallback := pending.pic || p.usePendingInterruptionFallback(pending.route.line)
 	if ctx == nil {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
 	windowExit := ctx.ExitReason == runVPExitReasonX64InterruptWindow
-	if !windowExit && !canAcceptInterrupt(ctx, pending.route.vector) {
+	if !windowExit && !canAcceptInterrupt(ctx, pending.route.vector) && !(fallback && canSetPendingInterruption(ctx, pending.route.vector)) {
 		p.pendingMu.Unlock()
 		return false, nil
 	}
@@ -1034,7 +1077,7 @@ func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
 		p.pendingIRQ[route.vector] = false
 		p.pendingMu.Unlock()
 		var err error
-		if pending.pic || p.usePendingInterruptionFallback(route.line) {
+		if fallback {
 			err = p.vm.SetPendingInterruption(route.vector)
 		} else {
 			if route.level && !p.ioapic.beginInterrupt(route.vector) {
@@ -1057,7 +1100,7 @@ func (p *bootPlatform) flushPendingIRQ(ctx *runVPExitContext) (bool, error) {
 	p.pendingMu.Unlock()
 
 	_ = p.vm.kickOutOfHLT()
-	if pending.pic {
+	if fallback {
 		if err := p.vm.SetPendingInterruption(route.vector); err != nil {
 			atomic.AddUint64(&p.irqFailed, 1)
 			return false, err
@@ -1144,6 +1187,17 @@ func canAcceptInterrupt(ctx *runVPExitContext, vector uint8) bool {
 	}
 	const rflagsInterruptEnable = uint64(1 << 9)
 	if ctx.VpContext.Rflags&rflagsInterruptEnable == 0 {
+		return false
+	}
+	priority := vector >> 4
+	return priority == 0 || priority > ctx.VpContext.cr8()
+}
+
+func canSetPendingInterruption(ctx *runVPExitContext, vector uint8) bool {
+	if ctx == nil {
+		return true
+	}
+	if ctx.VpContext.ExecutionState.interruptionPending() || ctx.VpContext.ExecutionState.interruptShadow() {
 		return false
 	}
 	priority := vector >> 4
@@ -1238,6 +1292,42 @@ type bootHPET struct {
 	config     uint64
 	counter    uint64
 	lastUpdate time.Time
+}
+
+type bootHPETState struct {
+	Config       uint64 `json:"config"`
+	Counter      uint64 `json:"counter"`
+	ElapsedNanos int64  `json:"elapsed_nanos,omitempty"`
+}
+
+func (h *bootHPET) SnapshotState() bootHPETState {
+	if h == nil {
+		return bootHPETState{}
+	}
+	h.update()
+	state := bootHPETState{
+		Config:  h.config,
+		Counter: h.counter,
+	}
+	if !h.lastUpdate.IsZero() {
+		state.ElapsedNanos = time.Since(h.lastUpdate).Nanoseconds()
+	}
+	return state
+}
+
+func (h *bootHPET) RestoreState(state bootHPETState) {
+	if h == nil {
+		return
+	}
+	h.config = state.Config
+	h.counter = state.Counter
+	if state.ElapsedNanos != 0 {
+		h.lastUpdate = time.Now().Add(-time.Duration(state.ElapsedNanos))
+	} else if h.config&1 != 0 {
+		h.lastUpdate = time.Now()
+	} else {
+		h.lastUpdate = time.Time{}
+	}
 }
 
 func (h *bootHPET) read(offset uint64) uint64 {

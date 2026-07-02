@@ -50,7 +50,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, nil)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, "", nil)
 	if err != nil {
 		return client.ExecResponse{}, "", err
 	}
@@ -151,7 +151,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, serialOut.String(), nil
 }
 
-func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
+func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshotDir string, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return nil, nil, nil, err
@@ -196,7 +196,10 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	} else {
 		serialWriter = io.MultiWriter(serialOut, serialWriter)
 	}
+	snapshot := newSnapshotTrigger(snapshotDir, vm.Memory())
+	serialWriter = snapshot.wrapSerialWriter(serialWriter)
 	platform := newBootPlatform(vm, serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter))
+	platform.snapshot = snapshot
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			platform.AttachFS(fsdev)
@@ -239,6 +242,9 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 			if err := vm.emulateIO(&raw); err != nil {
 				io := raw.ioPortAccess()
 				return fmt.Errorf("emulate io at rip=%#x port=%#x: %w", exit.RIP, io.Port, err)
+			}
+			if err := platform.captureSnapshotIfPending(vm); err != nil {
+				return err
 			}
 		case runVPExitReasonMemoryAccess:
 			if err := vm.emulateMMIO(&raw); err != nil {

@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -296,7 +295,38 @@ func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveE
 
 func runPreparedExecInline(cfg config, control io.Writer, req preparedExecRequest, waitReady func() error) {
 	managed := &managedExec{start: time.Now()}
-	runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {})
+	stdin, cleanup, err := inlineExecStdin(req.Stdin)
+	if err != nil {
+		writeKernel("ccx3-init: prepare inline stdin: " + err.Error())
+		writeExecStderr(cfg, control, req.ID, "ccx3-init: prepare inline stdin: "+err.Error()+"\n")
+		reporterForConfig(cfg, control, req.ID, time.Now()).Exit(126)
+		return
+	}
+	runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdin, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, cleanup)
+}
+
+func inlineExecStdin(data []byte) (io.ReadCloser, func(), error) {
+	if len(data) == 0 {
+		return nil, func() {}, nil
+	}
+	file, err := os.CreateTemp("", "ccx3-stdin-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = os.Remove(file.Name())
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, nil, err
+	}
+	return file, cleanup, nil
 }
 
 func newSystemdCommandGate(initSystem string) *systemdCommandGate {
@@ -413,15 +443,21 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		writeStage(bootStart, "configuring hostname")
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)
 		}
+		writeStage(bootStart, "hostname configured")
+		writeStage(bootStart, "configuring runtime filesystem")
 		if err := configureRuntimeFilesystem(); err != nil {
 			return fmt.Errorf("configure runtime filesystem: %w", err)
 		}
+		writeStage(bootStart, "runtime filesystem configured")
+		writeStage(bootStart, "configuring package managers")
 		if err := configurePackageManagers(""); err != nil {
 			return fmt.Errorf("configure package managers: %w", err)
 		}
+		writeStage(bootStart, "package managers configured")
 		if cfg.PrecopyAMD64Root {
 			writeStage(bootStart, "precopying amd64 root")
 			if err := precopyAMD64Root(); err != nil {
@@ -1091,24 +1127,7 @@ func triggerSnapshotMMIO(base uint64) error {
 	if base == 0 {
 		return nil
 	}
-	file, err := os.OpenFile("/dev/mem", os.O_RDWR|syscall.O_SYNC, 0)
-	if err != nil {
-		return fmt.Errorf("open /dev/mem: %w", err)
-	}
-	defer file.Close()
-
-	pageSize := uint64(os.Getpagesize())
-	pageBase := base & ^(pageSize - 1)
-	pageOff := int(base - pageBase)
-	mapped, err := syscall.Mmap(int(file.Fd()), int64(pageBase), int(pageSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-	if err != nil {
-		return fmt.Errorf("mmap snapshot trigger %#x: %w", base, err)
-	}
-	defer syscall.Munmap(mapped)
-	if pageOff+8 > len(mapped) {
-		return fmt.Errorf("snapshot trigger offset %#x exceeds mapped page", pageOff)
-	}
-	binary.LittleEndian.PutUint64(mapped[pageOff:pageOff+8], 0x43535833534e4150)
+	writeConsole("__CCX3_SNAPSHOT__\n")
 	return nil
 }
 

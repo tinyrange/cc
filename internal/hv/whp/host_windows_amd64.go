@@ -19,16 +19,20 @@ import (
 type Host struct{}
 
 type LinuxManagedMachine struct {
-	Spec      machine.Spec
-	Kernel    []byte
-	Initrd    []byte
-	FSDevices []*virtio.FS
-	NetDevice *virtio.Net
+	Spec            machine.Spec
+	Kernel          []byte
+	Initrd          []byte
+	FSDevices       []*virtio.FS
+	NetDevice       *virtio.Net
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 type LinuxManagedAttachments struct {
-	FSDevices []*virtio.FS
-	NetDevice *virtio.Net
+	FSDevices       []*virtio.FS
+	NetDevice       *virtio.Net
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 type BSDManagedAttachments struct {
@@ -108,26 +112,23 @@ func (Host) startLinux(ctx context.Context, req managedhost.StartRequest, onEven
 		return nil, fmt.Errorf("whp linux managed attachments have type %T", req.Attachments)
 	}
 	return Host{}.StartLinuxManaged(ctx, LinuxManagedMachine{
-		Spec:      req.Spec,
-		Kernel:    req.Artifact.Kernel,
-		Initrd:    req.Artifact.Initrd,
-		FSDevices: attachments.FSDevices,
-		NetDevice: attachments.NetDevice,
+		Spec:            req.Spec,
+		Kernel:          req.Artifact.Kernel,
+		Initrd:          req.Artifact.Initrd,
+		FSDevices:       attachments.FSDevices,
+		NetDevice:       attachments.NetDevice,
+		SnapshotDir:     attachments.SnapshotDir,
+		RestoreSnapshot: attachments.RestoreSnapshot,
 	}, onEvent)
 }
 
 func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	machine = normalizeLinuxManagedMachine(machine)
-	return StartManagedSessionWithNet(
-		ctx,
-		machine.Kernel,
-		machine.Initrd,
-		machine.Spec.MemoryMB,
-		machine.Spec.Dmesg,
-		machine.FSDevices,
-		machine.NetDevice,
-		onEvent,
-	)
+	opts := ManagedSessionOptions{
+		SnapshotDir:     strings.TrimSpace(machine.SnapshotDir),
+		RestoreSnapshot: strings.TrimSpace(machine.RestoreSnapshot),
+	}
+	return StartManagedSessionWithNetOptions(ctx, machine.Kernel, machine.Initrd, machine.Spec.MemoryMB, machine.Spec.Dmesg, machine.FSDevices, machine.NetDevice, opts, onEvent)
 }
 
 func normalizeLinuxManagedMachine(machine LinuxManagedMachine) LinuxManagedMachine {

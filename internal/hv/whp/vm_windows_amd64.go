@@ -65,36 +65,58 @@ func newBootVM(memorySize uint64) (*VM, error) {
 }
 
 func newVM(memorySize uint64, localAPIC bool) (*VM, error) {
+	return newVMWithAllocation(memorySize, localAPIC, nil)
+}
+
+func newVMWithAllocation(memorySize uint64, localAPIC bool, mem *allocation) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
+	cleanupMem := func() {
+		if mem != nil {
+			_ = mem.free()
+			mem = nil
+		}
+	}
 	part, err := createPartition()
 	if err != nil {
+		cleanupMem()
 		return nil, fmt.Errorf("create partition: %w", err)
 	}
 	vm := &VM{part: part}
 	if err := setPartitionProperty(part, partitionPropertyCodeProcessorCount, uint32(1)); err != nil {
+		cleanupMem()
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
 	}
 	if err := setPartitionProperty(part, partitionPropertyCodeExtendedVMExits, uint64(1<<1)); err != nil {
+		cleanupMem()
 		_ = vm.Close()
 		return nil, fmt.Errorf("set extended VM exits: %w", err)
 	}
 	if localAPIC {
 		if err := setPartitionProperty(part, partitionPropertyCodeLocalAPICEmulationMode, localAPICEmulationModeXAPIC); err != nil {
+			cleanupMem()
 			_ = vm.Close()
 			return nil, fmt.Errorf("set local APIC emulation mode: %w", err)
 		}
 	}
 	if err := setupPartition(part); err != nil {
+		cleanupMem()
 		_ = vm.Close()
 		return nil, fmt.Errorf("setup partition: %w", err)
 	}
-	mem, err := virtualAlloc(uintptr(memorySize))
-	if err != nil {
+	if mem == nil {
+		var err error
+		mem, err = virtualAlloc(uintptr(memorySize))
+		if err != nil {
+			_ = vm.Close()
+			return nil, fmt.Errorf("allocate guest memory: %w", err)
+		}
+	} else if uint64(mem.size) < memorySize {
+		_ = mem.free()
 		_ = vm.Close()
-		return nil, fmt.Errorf("allocate guest memory: %w", err)
+		return nil, fmt.Errorf("guest memory allocation size %d is smaller than VM memory %d", mem.size, memorySize)
 	}
 	vm.mem = mem
 	vm.memSize = memorySize
@@ -553,6 +575,25 @@ func (v *VM) SetPendingInterruption(vector uint8) error {
 	names := []registerName{registerPendingInterruption}
 	values := []registerValue{uint64RegisterValue(value)}
 	return setVirtualProcessorRegisters(v.part, 0, names, values)
+}
+
+func (v *VM) canSetPendingInterruption(vector uint8) (bool, error) {
+	if v == nil || v.part == 0 {
+		return false, nil
+	}
+	names := []registerName{
+		registerPendingInterruption,
+		registerCr8,
+	}
+	values := make([]registerValue, len(names))
+	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return false, err
+	}
+	if values[0].uint64() != 0 {
+		return false, nil
+	}
+	priority := vector >> 4
+	return priority == 0 || priority > uint8(values[1].uint64()), nil
 }
 
 func (v *VM) haltedAndInterruptible(vector uint8) (bool, error) {
