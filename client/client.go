@@ -664,10 +664,11 @@ func (c *Client) VMStatus() (VMState, error)                  { return c.Instanc
 func (c *Client) ShutdownVM() error                           { return c.ShutdownInstance() }
 func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
 	return c.Run(RunRequest{
-		Image:    req.Image,
-		MemoryMB: req.MemoryMB,
-		CPUs:     req.CPUs,
-		Dmesg:    req.Dmesg,
+		Image:     req.Image,
+		MemoryMB:  req.MemoryMB,
+		BalloonMB: req.BalloonMB,
+		CPUs:      req.CPUs,
+		Dmesg:     req.Dmesg,
 	})
 }
 

@@ -53,6 +53,10 @@ const (
 	SnapshotBase = 0x0a106000
 	SnapshotSize = 0x1000
 
+	BalloonBase = 0x0a107000
+	BalloonSize = 0x1000
+	BalloonIRQ  = 47
+
 	PCIConfigBase = 0x20000000
 	PCIConfigSize = 0x01000000
 	PCIMMIOBase   = 0x21000000

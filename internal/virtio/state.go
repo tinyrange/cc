@@ -24,6 +24,9 @@ type MMIOState struct {
 	Legacy           bool         `json:"legacy,omitempty"`
 	Queues           []QueueState `json:"queues,omitempty"`
 	BackendPaths     []string     `json:"backend_paths,omitempty"`
+	NumPages         uint32       `json:"num_pages,omitempty"`
+	ActualPages      uint32       `json:"actual_pages,omitempty"`
+	InflatedPages    []uint64     `json:"inflated_pages,omitempty"`
 }
 
 func snapshotQueues(queues []queue) []QueueState {
@@ -137,6 +140,43 @@ func (r *RNG) RestoreState(state MMIOState) error {
 	}
 	r.queue = queues[0]
 	return nil
+}
+
+func (b *Balloon) SnapshotState() MMIOState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return MMIOState{
+		DeviceFeatureSel: b.deviceFeatureSel,
+		DriverFeatureSel: b.driverFeatureSel,
+		DriverFeatures:   b.driverFeatures,
+		QueueSel:         b.queueSel,
+		Status:           b.status,
+		ConfigGeneration: b.configGeneration,
+		Queues:           snapshotQueues(b.queues[:]),
+		NumPages:         b.numPages,
+		ActualPages:      b.actualPages,
+		InflatedPages:    b.inflatedPagesLocked(),
+	}
+}
+
+func (b *Balloon) RestoreState(state MMIOState) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deviceFeatureSel = state.DeviceFeatureSel
+	b.driverFeatureSel = state.DriverFeatureSel
+	b.driverFeatures = state.DriverFeatures
+	b.queueSel = state.QueueSel
+	b.status = state.Status
+	b.interruptStatus = 0
+	b.irqHigh = false
+	b.configGeneration = state.ConfigGeneration
+	b.numPages = state.NumPages
+	b.actualPages = state.ActualPages
+	b.inflated = make(map[uint64]struct{}, len(state.InflatedPages))
+	for _, pfn := range state.InflatedPages {
+		b.inflated[pfn] = struct{}{}
+	}
+	return restoreQueues(b.queues[:], state.Queues, b.mem)
 }
 
 func (v *Vsock) SnapshotState() MMIOState {

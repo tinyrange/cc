@@ -78,10 +78,13 @@ type server struct {
 }
 
 type ServerOptions struct {
-	Kind             string
-	TokenPath        string
-	RegisterHandlers func(*http.ServeMux, RuntimeView)
-	WrapHandler      func(http.Handler) http.Handler
+	Kind                   string
+	TokenPath              string
+	RegisterHandlers       func(*http.ServeMux, RuntimeView)
+	WrapHandler            func(http.Handler) http.Handler
+	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
+	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
+	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
 }
 
 type RuntimeView interface {
@@ -397,7 +400,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	watchdog := newWatchdogController(shutdown)
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
-	mux := newMux(srvState, watchdog, shutdown)
+	mux := newMux(srvState, watchdog, shutdown, opts)
 	if opts.RegisterHandlers != nil {
 		opts.RegisterHandlers(mux, srvState)
 	}
@@ -752,7 +755,7 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 	}
 }
 
-func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *http.ServeMux {
+func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
 	mux := http.NewServeMux()
 	if debugPprof {
 		runtime.SetBlockProfileRate(1)
@@ -1241,6 +1244,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts.NormalizeStartRequest != nil {
+			if err := opts.NormalizeStartRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -1395,6 +1404,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts.NormalizeCreateRequest != nil {
+			if err := opts.NormalizeCreateRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -1547,6 +1562,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts.NormalizeRunRequest != nil {
+			if err := opts.NormalizeRunRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if req.Image != "" && !builtInBSDImage {
 			if _, err := srvState.images.Open(req.Image); err != nil {
@@ -1590,7 +1611,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux.Handle("/vm/run/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
-			serveRunRequestWebSocket(ws, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
 				if err := srvState.vms.RunStream(runCtx, req, inputs, onEvent); err != nil {
@@ -1719,13 +1740,19 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}
 }
 
-func serveRunRequestWebSocket(ws *websocket.Conn, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
 	defer ws.Close()
 
 	var req client.RunRequest
 	if err := websocket.JSON.Receive(ws, &req); err != nil {
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: fmt.Sprintf("decode run request: %v", err)})
 		return
+	}
+	if normalize != nil {
+		if err := normalize(&req, runtime); err != nil {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
+			return
+		}
 	}
 
 	inputs := make(chan client.ExecInput, 16)
