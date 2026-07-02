@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync/atomic"
-	"time"
 	"unsafe"
 )
 
@@ -166,7 +165,6 @@ func (v *VM) Close() error {
 			first = err
 		}
 		v.part = 0
-		time.Sleep(3 * time.Second)
 	}
 	return first
 }

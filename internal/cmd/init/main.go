@@ -1127,25 +1127,41 @@ func triggerSnapshotMMIO(base uint64) error {
 	if base == 0 {
 		return nil
 	}
-	writeConsole("__CCX3_SNAPSHOT__\n")
+	const snapshotMagic = 0x43535833534e4150
 	pageSize := unix.Getpagesize()
 	pageBase := base & ^uint64(pageSize-1)
 	pageOff := int(base - pageBase)
+	if err := ensureDeviceNode("/dev/mem", unix.S_IFCHR|0o600, int(unix.Mkdev(1, 1))); err != nil {
+		writeConsole("__CCX3_SNAPSHOT__\n")
+		return fmt.Errorf("create /dev/mem: %w", err)
+	}
 	mem, err := os.OpenFile("/dev/mem", os.O_RDWR|unix.O_SYNC, 0)
 	if err != nil {
+		writeConsole("__CCX3_SNAPSHOT__\n")
 		return fmt.Errorf("open /dev/mem: %w", err)
 	}
 	defer mem.Close()
 	mapped, err := unix.Mmap(int(mem.Fd()), int64(pageBase), pageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return fmt.Errorf("mmap snapshot mmio: %w", err)
+		writeConsole("__CCX3_SNAPSHOT__\n")
+		return fmt.Errorf("map snapshot MMIO: %w", err)
 	}
 	defer unix.Munmap(mapped)
 	if pageOff+8 > len(mapped) {
 		return fmt.Errorf("snapshot mmio offset %#x outside mapped page", pageOff)
 	}
-	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = 0x43535833534e4150
+	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = snapshotMagic
+	writeConsole("__CCX3_SNAPSHOT__\n")
 	return nil
+}
+
+func ensureDeviceNode(path string, mode uint32, dev int) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return unix.Mknod(path, mode, dev)
 }
 
 func seedEntropyFromHostRNG(size int) error {
