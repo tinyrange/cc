@@ -171,7 +171,7 @@ func runOpenBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci
 				return err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, nil, exit.MMIO); err != nil {
 				return fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
 			}
 		case ExitHLT:

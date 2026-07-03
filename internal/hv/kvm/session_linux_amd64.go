@@ -38,6 +38,7 @@ type ManagedSession struct {
 type ManagedSessionOptions struct {
 	SnapshotDir     string
 	RestoreSnapshot string
+	BalloonMB       uint64
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -55,7 +56,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		}
 	}
 	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
-		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, netdev, onEvent)
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, opts.BalloonMB, dmesg, fsdevs, netdev, onEvent)
 	}
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
 		return nil, err
@@ -68,6 +69,14 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
+	balloon := virtio.NewBalloon(amd64vm.BalloonBase, amd64vm.BalloonSize, amd64vm.BalloonIRQ)
+	if targetPages := balloonTargetPages(opts.BalloonMB); targetPages != 0 {
+		if err := balloon.SetTargetPages(targetPages); err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("set balloon target: %w", err)
+		}
+	}
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -112,6 +121,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 	vsock.Attach(vm, vm)
 	rng.Attach(vm, vm)
+	balloon.Attach(vm, vm)
 	if netdev != nil {
 		netdev.Attach(vm, vm)
 	}
@@ -119,6 +129,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(balloon.Base, balloon.IRQ))
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
@@ -151,7 +162,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, snapshot)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut, snapshot)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()

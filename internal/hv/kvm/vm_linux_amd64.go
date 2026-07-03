@@ -566,6 +566,31 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	return nil
 }
 
+func (v *VM) ReclaimGuestPage(ipa uint64) error {
+	return v.madviseGuestPage(ipa, unix.MADV_DONTNEED)
+}
+
+func (v *VM) ReuseGuestPage(ipa uint64) error {
+	return nil
+}
+
+func (v *VM) madviseGuestPage(ipa uint64, advice int) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	const pageSize = 4096
+	if ipa%pageSize != 0 {
+		return fmt.Errorf("guest page %#x is not page aligned", ipa)
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	region, off, ok := v.findMemoryRegion(ipa)
+	if !ok || off+pageSize > uint64(len(region)) {
+		return fmt.Errorf("guest page %#x: unmapped", ipa)
+	}
+	return unix.Madvise(region[off:off+pageSize], advice)
+}
+
 func (v *VM) copyFromGuest(addr uint64, out []byte) error {
 	for len(out) > 0 {
 		region, off, ok := v.findMemoryRegion(addr)

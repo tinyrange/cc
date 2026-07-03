@@ -185,7 +185,7 @@ func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []b
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIOWithPCI(vm, 0, pci, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, fsdevs, vsock, rng, nil, netdev, exit.MMIO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitHLT, ExitShutdown:
@@ -253,11 +253,11 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 	return nil
 }
 
-func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
-	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, netdev, mmio)
+func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
+	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, balloon, netdev, mmio)
 }
 
-func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
@@ -288,6 +288,17 @@ func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *vi
 			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := rng.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
+		return nil
+	}
+	if balloon != nil && balloon.Contains(mmio.Addr, int(mmio.Len)) {
+		if mmio.Write {
+			return balloon.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := balloon.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

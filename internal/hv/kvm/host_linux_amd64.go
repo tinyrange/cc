@@ -24,6 +24,7 @@ type LinuxManagedMachine struct {
 	Initrd          []byte
 	FSDevices       []*virtio.FS
 	NetDevice       *virtio.Net
+	BalloonMB       uint64
 	SnapshotDir     string
 	RestoreSnapshot string
 }
@@ -31,6 +32,7 @@ type LinuxManagedMachine struct {
 type LinuxManagedAttachments struct {
 	FSDevices       []*virtio.FS
 	NetDevice       *virtio.Net
+	BalloonMB       uint64
 	SnapshotDir     string
 	RestoreSnapshot string
 }
@@ -76,6 +78,7 @@ func (Host) startLinux(ctx context.Context, req managedhost.StartRequest, onEven
 		Initrd:          req.Artifact.Initrd,
 		FSDevices:       attachments.FSDevices,
 		NetDevice:       attachments.NetDevice,
+		BalloonMB:       attachments.BalloonMB,
 		SnapshotDir:     strings.TrimSpace(attachments.SnapshotDir),
 		RestoreSnapshot: strings.TrimSpace(attachments.RestoreSnapshot),
 	}, onEvent)
@@ -164,6 +167,7 @@ func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, 
 		ManagedSessionOptions{
 			SnapshotDir:     strings.TrimSpace(machine.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(machine.RestoreSnapshot),
+			BalloonMB:       machine.BalloonMB,
 		},
 		onEvent,
 	)

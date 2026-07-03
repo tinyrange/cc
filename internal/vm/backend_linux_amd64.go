@@ -113,6 +113,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		Attachments: kvm.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
+			BalloonMB:       req.BalloonMB,
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -230,6 +231,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		Attachments: kvm.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
+			BalloonMB:       req.BalloonMB,
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -414,7 +416,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:      req.Cols,
 			Rows:      req.Rows,
 		}
-		resp, serial, err := kvm.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
+		resp, serial, err := kvm.RunManagedExecWithFSNetAndBalloon(ctx, kernel, initrd, req.MemoryMB, req.BalloonMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}
