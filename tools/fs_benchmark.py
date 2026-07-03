@@ -443,7 +443,7 @@ def ensure_ccvm(args: argparse.Namespace) -> Path | None:
     build_guestinit_payloads()
     env = os.environ.copy()
     env["CGO_ENABLED"] = "0"
-    subprocess.run(["go", "build", "-tags", "embed_guestinit", "-o", str(out), "./cmd/ccvm"], cwd=REPO_ROOT, env=env, check=True)
+    subprocess.run(["go", "build", "-o", str(out), "./cmd/ccvm"], cwd=REPO_ROOT, env=env, check=True)
     os.environ["PYNEURODESK_CCVM"] = str(out)
     return out
 

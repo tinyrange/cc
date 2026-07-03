@@ -17,9 +17,6 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 	if arch == "" {
 		arch = "amd64"
 	}
-	if payload := embeddedPayload(arch); len(payload) != 0 {
-		return append([]byte(nil), payload...), nil
-	}
 	if cacheDir == "" {
 		var err error
 		cacheDir, err = os.MkdirTemp("", "cc-netbsd-guestinit-*")
@@ -50,18 +47,4 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 		return nil, fmt.Errorf("read NetBSD guest init: %w", err)
 	}
 	return data, nil
-}
-
-func RequireEmbeddedForArch(arch string) error {
-	return validateEmbeddedPayload("NetBSD", arch, embeddedPayload(arch))
-}
-
-func validateEmbeddedPayload(name, arch string, payload []byte) error {
-	if len(payload) == 0 {
-		return fmt.Errorf("%s guest init payload for %q is not embedded; build ccvm with -tags embed_guestinit", name, arch)
-	}
-	if len(payload) < 4 || string(payload[:4]) != "\x7fELF" {
-		return fmt.Errorf("%s guest init payload for %q is not an ELF binary", name, arch)
-	}
-	return nil
 }

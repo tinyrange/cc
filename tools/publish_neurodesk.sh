@@ -169,7 +169,7 @@ build_ccvm_for_target() {
   build_guestinit_payloads "${goarch}"
 
   CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-    go build -tags embed_guestinit -o "${output}" ./cmd/ccvm
+    go build -o "${output}" ./cmd/ccvm
 
   rm -rf "${PACKAGE_BIN_DIR}"
   mkdir -p "${PACKAGE_BIN_DIR}"
