@@ -281,7 +281,7 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 	return fmt.Errorf("unhandled mmio addr=%#x len=%d write=%v", mmio.Addr, mmio.Len, mmio.Write)
 }
 
-func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut fmt.Stringer, sampler *whpPCSampler) error {
+func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut fmt.Stringer, snapshot *snapshotTrigger, sampler *whpPCSampler) error {
 	if sampler != nil {
 		defer sampler.dump("final")
 	}
@@ -334,6 +334,9 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 		case runVPExitReasonCanceled:
 			canceledExits++
 		}
+		if err := snapshot.captureIfPending(vm, fsdevs, vsock, rng, netdev); err != nil {
+			return err
+		}
 		if trace {
 			if !now.Before(nextTrace) {
 				_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux run +%s: exits=%d mmio=%d canceled=%d serial=%d uart=%d fs=%d vsock=%d rng=%d net=%d gic=%d\n",
@@ -343,8 +346,24 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 				}
 			}
 		}
-		if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit, &stats); err != nil {
-			return err
+		handled := false
+		if exit.Reason == runVPExitReasonUnmappedGPA || exit.Reason == runVPExitReasonGPAIntercept {
+			snapshotWrite := snapshot != nil && snapshot.contains(exit.MMIO.Addr, int(exit.MMIO.Len)) && exit.MMIO.Write && mmioValue(exit.MMIO) == snapshotTriggerMagic
+			var err error
+			handled, err = snapshot.handleMMIO(vm, exit.MMIO)
+			if err != nil {
+				return err
+			}
+			if handled && snapshotWrite {
+				if err := snapshot.requestHostCapture(vm); err != nil {
+					return err
+				}
+			}
+		}
+		if !handled {
+			if err := handleArm64Exit(vm, uart, fsdevs, vsock, rng, netdev, exit, &stats); err != nil {
+				return err
+			}
 		}
 	}
 }

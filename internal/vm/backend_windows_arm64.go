@@ -68,13 +68,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("windows arm64 runtime currently supports only 1 CPU")
 	}
-	kernel, err := b.kernel.ReadKernel()
-	if err != nil {
-		return nil, err
-	}
-	if trace {
-		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: kernel read bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(kernel))
-	}
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
 	image, err := b.images.Open(req.Image)
 	if err != nil {
 		return nil, err
@@ -86,13 +80,6 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withWindowsRuntimeMountDirs(image)
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(image), windowsRuntimeModuleMap())
-	if err != nil {
-		return nil, err
-	}
-	if trace {
-		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: planned modules=%d\n", time.Since(startTime).Round(time.Millisecond), len(modules))
-	}
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return nil, err
@@ -122,6 +109,41 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if trace {
 		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: fs devices built=%d\n", time.Since(startTime).Round(time.Millisecond), len(fsdevs))
 	}
+	workDir := image.Config.WorkingDir
+	if workDir == "" {
+		workDir = "/"
+	}
+	if restoreSnapshot != "" {
+		started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+			Profile: managedguest.LinuxProfile,
+			Host:    whp.Host{},
+			Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+			Attachments: whp.LinuxManagedAttachments{
+				FSDevices:       fsdevs,
+				NetDevice:       windowsNetworkDevice(network),
+				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+				RestoreSnapshot: restoreSnapshot,
+			},
+		}, onEvent)
+		if err != nil {
+			return nil, err
+		}
+		return &windowsInstance{
+			managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
+			image:               image,
+			rootFS:              rootFS,
+			fsdevs:              fsdevs,
+			network:             network,
+			dmesg:               req.Dmesg,
+		}, nil
+	}
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(image), windowsRuntimeModuleMap())
+	if err != nil {
+		return nil, err
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: planned modules=%d\n", time.Since(startTime).Round(time.Millisecond), len(modules))
+	}
 	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "arm64")
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
@@ -129,9 +151,12 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if trace {
 		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: guest init bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(initBin))
 	}
-	workDir := image.Config.WorkingDir
-	if workDir == "" {
-		workDir = "/"
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return nil, err
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 backend +%s: kernel read bytes=%d\n", time.Since(startTime).Round(time.Millisecond), len(kernel))
 	}
 	initCfg := windowsGuestInitConfig(modules, true)
 	initCfg.RootFSTag = vmruntime.RootFSTag
@@ -141,6 +166,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
@@ -157,8 +185,10 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			Initrd: initrd,
 		},
 		Attachments: whp.LinuxManagedAttachments{
-			FSDevices: fsdevs,
-			NetDevice: windowsNetworkDevice(network),
+			FSDevices:       fsdevs,
+			NetDevice:       windowsNetworkDevice(network),
+			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
 	}, onEvent)
 	if err != nil {
@@ -180,29 +210,23 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          req.Image,
-			InitSystem:     req.InitSystem,
-			Kernel:         req.Kernel,
-			Network:        req.Network,
-			KernelModules:  append([]string(nil), req.KernelModules...),
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			NestedVirt:     req.NestedVirt,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
+			ID:              req.ID,
+			Image:           req.Image,
+			InitSystem:      req.InitSystem,
+			Kernel:          req.Kernel,
+			Network:         req.Network,
+			KernelModules:   append([]string(nil), req.KernelModules...),
+			MemoryMB:        req.MemoryMB,
+			CPUs:            req.CPUs,
+			NestedVirt:      req.NestedVirt,
+			Dmesg:           req.Dmesg,
+			SnapshotDir:     req.SnapshotDir,
+			RestoreSnapshot: req.RestoreSnapshot,
+			TimeoutSeconds:  req.TimeoutSeconds,
 		}, onEvent)
 	}
 	if b == nil || b.kernel == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
-	}
-	kernel, err := b.kernel.ReadKernel()
-	if err != nil {
-		return nil, err
-	}
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(nil), windowsRuntimeModuleMap())
-	if err != nil {
-		return nil, err
 	}
 	network, err := newWindowsARM64NetworkRuntime(req.Network)
 	if err != nil {
@@ -210,6 +234,38 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	rootFSBackend := virtio.NewImageFS(blankWindowsRuntimeRootFS(), "")
 	fsdevs, rootFS, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{RootFS: rootFSBackend}, nil)
+	if err != nil {
+		return nil, err
+	}
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
+	if restoreSnapshot != "" {
+		started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+			Profile: managedguest.LinuxProfile,
+			Host:    whp.Host{},
+			Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+			Attachments: whp.LinuxManagedAttachments{
+				FSDevices:       fsdevs,
+				NetDevice:       windowsNetworkDevice(network),
+				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+				RestoreSnapshot: restoreSnapshot,
+			},
+		}, onEvent)
+		if err != nil {
+			return nil, err
+		}
+		return &windowsInstance{
+			managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(nil), "/"),
+			rootFS:              rootFS,
+			fsdevs:              fsdevs,
+			network:             network,
+			dmesg:               req.Dmesg,
+		}, nil
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return nil, err
+	}
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(nil), windowsRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +278,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
@@ -235,8 +294,10 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Initrd: initrd,
 		},
 		Attachments: whp.LinuxManagedAttachments{
-			FSDevices: fsdevs,
-			NetDevice: windowsNetworkDevice(network),
+			FSDevices:       fsdevs,
+			NetDevice:       windowsNetworkDevice(network),
+			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
 	}, onEvent)
 	if err != nil {

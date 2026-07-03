@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"time"
 	"unsafe"
 
@@ -87,19 +88,37 @@ func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
 }
 
 func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM, error) {
+	return newVMWithAllocation(memorySize, memoryBase, opts, nil)
+}
+
+func newVMWithAllocation(memorySize uint64, memoryBase uint64, opts VMOptions, mem *allocation) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
+	trace := os.Getenv("CC_WHP_ARM64_TIMING") != ""
+	createStart := time.Now()
+	traceStep := func(name string, start time.Time, err error) {
+		if trace {
+			_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 vm create +%s: %s took=%s err=%v\n", time.Since(createStart).Round(time.Millisecond), name, time.Since(start).Round(time.Millisecond), err)
+		}
+	}
+	stepStart := time.Now()
 	part, err := createPartition()
+	traceStep("create partition", stepStart, err)
 	if err != nil {
 		return nil, fmt.Errorf("create partition: %w", err)
 	}
 	vm := &VM{part: part, memGPA: memoryBase}
+	stepStart = time.Now()
 	if err := setPartitionProperty(part, partitionPropertyCodeProcessorCount, uint32(1)); err != nil {
+		traceStep("set processor count", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
 	}
+	traceStep("set processor count", stepStart, nil)
+	stepStart = time.Now()
 	opts, err = normalizeVMOptions(opts)
+	traceStep("normalize options", stepStart, err)
 	if err != nil {
 		_ = vm.Close()
 		return nil, err
@@ -114,35 +133,65 @@ func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM
 			GICPPIPerformanceMonitors: defaultPMUInterrupt,
 		},
 	}
+	stepStart = time.Now()
 	if err := setPartitionProperty(part, partitionPropertyCodeArm64ICParameters, ic); err != nil {
+		traceStep("set interrupt controller parameters", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("set arm64 interrupt controller parameters: %w", err)
 	}
+	traceStep("set interrupt controller parameters", stepStart, nil)
+	stepStart = time.Now()
 	if err := setupPartition(part); err != nil {
+		traceStep("setup partition", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("setup partition: %w", err)
 	}
-	mem, err := virtualAlloc(uintptr(memorySize))
-	if err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("allocate guest memory: %w", err)
+	traceStep("setup partition", stepStart, nil)
+	blankMemory := mem == nil
+	if mem == nil {
+		var err error
+		stepStart = time.Now()
+		mem, err = virtualAlloc(uintptr(memorySize))
+		traceStep("allocate guest memory", stepStart, err)
+		if err != nil {
+			_ = vm.Close()
+			return nil, fmt.Errorf("allocate guest memory: %w", err)
+		}
 	}
 	vm.mem = mem
 	vm.memSize = memorySize
-	vm.preTouchGuestMemory()
+	if blankMemory {
+		stepStart = time.Now()
+		vm.preTouchGuestMemory()
+		traceStep("pre-touch guest memory", stepStart, nil)
+	}
+	stepStart = time.Now()
 	if err := mapGPARange(part, unsafe.Pointer(mem.addr), memoryBase, memorySize, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
+		traceStep("map guest memory", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	traceStep("map guest memory", stepStart, nil)
+	stepStart = time.Now()
 	vm.populateGuestMemory()
+	traceStep("populate guest memory", stepStart, nil)
+	stepStart = time.Now()
 	if err := createVirtualProcessor(part, 0); err != nil {
+		traceStep("create virtual processor", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("create virtual processor: %w", err)
 	}
+	traceStep("create virtual processor", stepStart, nil)
 	vm.vcpuCreated = true
+	stepStart = time.Now()
 	if err := vm.setRegister(registerGICR, arm64vm.GICRedistributorMin); err != nil {
+		traceStep("set gic redistributor base", stepStart, err)
 		_ = vm.Close()
 		return nil, fmt.Errorf("set gic redistributor base: %w", err)
+	}
+	traceStep("set gic redistributor base", stepStart, nil)
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 vm create +%s: total\n", time.Since(createStart).Round(time.Millisecond))
 	}
 	return vm, nil
 }
@@ -188,31 +237,52 @@ func (v *VM) Close() error {
 	if v == nil {
 		return nil
 	}
+	trace := os.Getenv("CC_WHP_ARM64_TIMING") != ""
+	closeStart := time.Now()
+	traceStep := func(name string, start time.Time, err error) {
+		if trace {
+			_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 vm close +%s: %s took=%s err=%v\n", time.Since(closeStart).Round(time.Millisecond), name, time.Since(start).Round(time.Millisecond), err)
+		}
+	}
 	var first error
 	if v.part != 0 && v.vcpuCreated {
+		stepStart := time.Now()
 		_ = cancelRunVirtualProcessor(v.part, 0)
-		if err := deleteVirtualProcessor(v.part, 0); err != nil && first == nil {
+		err := deleteVirtualProcessor(v.part, 0)
+		traceStep("delete virtual processor", stepStart, err)
+		if err != nil && first == nil {
 			first = err
 		}
 		v.vcpuCreated = false
 	}
 	if v.part != 0 && v.mem != nil {
-		if err := unmapGPARange(v.part, v.memGPA, v.memSize); err != nil && first == nil {
+		stepStart := time.Now()
+		err := unmapGPARange(v.part, v.memGPA, v.memSize)
+		traceStep("unmap guest memory", stepStart, err)
+		if err != nil && first == nil {
 			first = err
 		}
 	}
 	if v.mem != nil {
-		if err := v.mem.free(); err != nil && first == nil {
+		stepStart := time.Now()
+		err := v.mem.free()
+		traceStep("free guest memory", stepStart, err)
+		if err != nil && first == nil {
 			first = err
 		}
 		v.mem = nil
 	}
 	if v.part != 0 {
-		if err := deletePartition(v.part); err != nil && first == nil {
+		stepStart := time.Now()
+		err := deletePartition(v.part)
+		traceStep("delete partition", stepStart, err)
+		if err != nil && first == nil {
 			first = err
 		}
 		v.part = 0
-		time.Sleep(3 * time.Second)
+	}
+	if trace {
+		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 vm close +%s: total err=%v\n", time.Since(closeStart).Round(time.Millisecond), first)
 	}
 	return first
 }

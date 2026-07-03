@@ -37,9 +37,16 @@ type ManagedSession struct {
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
 	cleanup    func()
+	waitOnce   sync.Once
+	waitErr    error
 	sendMu     sync.Mutex
 	nextID     atomic.Uint64
 	dmesg      bool
+}
+
+type ManagedSessionOptions struct {
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -47,6 +54,13 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 }
 
 func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNetOptions(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, netdev, ManagedSessionOptions{}, onEvent)
+}
+
+func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, netdev, onEvent)
+	}
 	trace := os.Getenv("CC_WHP_ARM64_TIMING") != "" || os.Getenv("CC_WHP_BSD_TIMING") != ""
 	startTime := time.Now()
 	if trace {
@@ -82,6 +96,7 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
+	snapshot := newSnapshotTrigger(opts.SnapshotDir, nil)
 	prepareStart := time.Now()
 	vm, uart, _, err := prepareArm64VM(kernel, initrd, memoryMB, dmesg, dmesg, fsdevs, vsock, rng, netdev, serialWriter)
 	if err != nil {
@@ -92,6 +107,14 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		}
 		return nil, err
 	}
+	if snapshot != nil {
+		snapshot.mem = vm.Memory()
+		for _, fsdev := range fsdevs {
+			if fsdev != nil {
+				fsdev.Async = false
+			}
+		}
+	}
 	if trace {
 		_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: vm prepared took=%s\n", time.Since(startTime).Round(time.Millisecond), time.Since(prepareStart).Round(time.Millisecond))
 	}
@@ -99,9 +122,17 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 	runCtx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan error, 1)
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, newWHPPCSampler("linux", kernel))
+		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut, snapshot, newWHPPCSampler("linux", kernel))
+		if trace {
+			_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: run loop stopped err=%v\n", time.Since(startTime).Round(time.Millisecond), err)
+		}
 		closeFSDevices(fsdevs)
-		err = errors.Join(err, vm.Close())
+		closeStart := time.Now()
+		closeErr := vm.Close()
+		if trace {
+			_, _ = fmt.Fprintf(os.Stderr, "whp-arm64 linux +%s: vm close took=%s err=%v\n", time.Since(startTime).Round(time.Millisecond), time.Since(closeStart).Round(time.Millisecond), closeErr)
+		}
+		err = errors.Join(err, closeErr)
 		doneCh <- err
 	}()
 	if trace {
@@ -162,6 +193,18 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 			_ = bootWriter.Close()
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if snapshot != nil {
+		if err := snapshot.wait(ctx); err != nil {
+			cancel()
+			_ = control.Close()
+			_ = listener.Close()
+			vsock.Close()
+			if bootWriter != nil {
+				_ = bootWriter.Close()
+			}
+			return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
+		}
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()
@@ -316,12 +359,10 @@ func (s *ManagedSession) waitDone() error {
 	if s == nil || s.doneCh == nil {
 		return nil
 	}
-	err := <-s.doneCh
-	select {
-	case s.doneCh <- err:
-	default:
-	}
-	return err
+	s.waitOnce.Do(func() {
+		s.waitErr = <-s.doneCh
+	})
+	return s.waitErr
 }
 
 func (s *ManagedSession) waitDoneTimeout(timeout time.Duration) error {
@@ -330,12 +371,12 @@ func (s *ManagedSession) waitDoneTimeout(timeout time.Duration) error {
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.waitDone()
+	}()
 	select {
-	case err := <-s.doneCh:
-		select {
-		case s.doneCh <- err:
-		default:
-		}
+	case err := <-errCh:
 		return err
 	case <-timer.C:
 		return fmt.Errorf("timed out waiting for managed session to stop")

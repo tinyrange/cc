@@ -356,6 +356,48 @@ func TestRuntimeBootsPersistentLinuxAndExecsCommands(t *testing.T) {
 	requireGuestOutput(t, second.Output, "42", "persisted")
 }
 
+func TestRuntimeRestoresLinuxFromStartupSnapshotOnWindowsARM64(t *testing.T) {
+	if runtime.GOOS != "windows" || runtime.GOARCH != "arm64" {
+		t.Skip("Windows arm64 WHP startup snapshots are host-specific")
+	}
+	env := newRuntimeBootEnv(t)
+	snapshotRoot := t.TempDir()
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		SnapshotDir: snapshotRoot,
+	})
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close snapshot capture instance: %v", err)
+	}
+	snapshotPath := requireSingleStartupSnapshot(t, snapshotRoot)
+	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		RestoreSnapshot: snapshotPath,
+	})
+	t.Cleanup(func() { _ = restored.Close() })
+	resp := execInRuntime(t, restored, []string{"sh", "-lc", "printf 'snapshot-restored:'; uname -m"})
+	requireGuestOutput(t, resp.Output, "snapshot-restored:")
+}
+
+func requireSingleStartupSnapshot(t *testing.T, root string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(root, "snapshot-*"))
+	if err != nil {
+		t.Fatalf("glob startup snapshots: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("snapshot count = %d, want 1 under %s", len(matches), root)
+	}
+	for _, name := range []string{"manifest.json", "memory.bin"} {
+		info, err := os.Stat(filepath.Join(matches[0], name))
+		if err != nil {
+			t.Fatalf("stat snapshot %s: %v", name, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("snapshot %s is empty", name)
+		}
+	}
+	return matches[0]
+}
+
 func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
