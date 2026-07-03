@@ -15,6 +15,7 @@ import (
 type VM struct {
 	part        partitionHandle
 	mem         *allocation
+	externalMem []byte
 	memGPA      uint64
 	memSize     uint64
 	vcpuCreated bool
@@ -87,6 +88,50 @@ func NewVM(memorySize uint64, memoryBase uint64) (*VM, error) {
 }
 
 func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM, error) {
+	vm, err := newVMPartition(memorySize, memoryBase, opts)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := virtualAlloc(uintptr(memorySize))
+	if err != nil {
+		_ = vm.Close()
+		return nil, fmt.Errorf("allocate guest memory: %w", err)
+	}
+	vm.mem = mem
+	vm.preTouchGuestMemory()
+	if err := mapGPARange(vm.part, unsafe.Pointer(mem.addr), memoryBase, memorySize, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
+		_ = vm.Close()
+		return nil, fmt.Errorf("map guest memory: %w", err)
+	}
+	vm.populateGuestMemory()
+	if err := vm.finishSetup(); err != nil {
+		_ = vm.Close()
+		return nil, err
+	}
+	return vm, nil
+}
+
+func NewVMWithMemory(mem []byte, memoryBase uint64) (*VM, error) {
+	if len(mem) == 0 {
+		return nil, fmt.Errorf("guest memory must be non-empty")
+	}
+	vm, err := newVMPartition(uint64(len(mem)), memoryBase, VMOptions{})
+	if err != nil {
+		return nil, err
+	}
+	vm.externalMem = mem
+	if err := mapGPARange(vm.part, unsafe.Pointer(&mem[0]), memoryBase, uint64(len(mem)), mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
+		_ = vm.Close()
+		return nil, fmt.Errorf("map guest memory: %w", err)
+	}
+	if err := vm.finishSetup(); err != nil {
+		_ = vm.Close()
+		return nil, err
+	}
+	return vm, nil
+}
+
+func newVMPartition(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
@@ -94,7 +139,7 @@ func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM
 	if err != nil {
 		return nil, fmt.Errorf("create partition: %w", err)
 	}
-	vm := &VM{part: part, memGPA: memoryBase}
+	vm := &VM{part: part, memGPA: memoryBase, memSize: memorySize}
 	if err := setPartitionProperty(part, partitionPropertyCodeProcessorCount, uint32(1)); err != nil {
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
@@ -122,29 +167,18 @@ func NewVMWithOptions(memorySize uint64, memoryBase uint64, opts VMOptions) (*VM
 		_ = vm.Close()
 		return nil, fmt.Errorf("setup partition: %w", err)
 	}
-	mem, err := virtualAlloc(uintptr(memorySize))
-	if err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("allocate guest memory: %w", err)
-	}
-	vm.mem = mem
-	vm.memSize = memorySize
-	vm.preTouchGuestMemory()
-	if err := mapGPARange(part, unsafe.Pointer(mem.addr), memoryBase, memorySize, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("map guest memory: %w", err)
-	}
-	vm.populateGuestMemory()
-	if err := createVirtualProcessor(part, 0); err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("create virtual processor: %w", err)
-	}
-	vm.vcpuCreated = true
-	if err := vm.setRegister(registerGICR, arm64vm.GICRedistributorMin); err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("set gic redistributor base: %w", err)
-	}
 	return vm, nil
+}
+
+func (v *VM) finishSetup() error {
+	if err := createVirtualProcessor(v.part, 0); err != nil {
+		return fmt.Errorf("create virtual processor: %w", err)
+	}
+	v.vcpuCreated = true
+	if err := v.setRegister(registerGICR, arm64vm.GICRedistributorMin); err != nil {
+		return fmt.Errorf("set gic redistributor base: %w", err)
+	}
+	return nil
 }
 
 func (v *VM) preTouchGuestMemory() {
@@ -196,7 +230,7 @@ func (v *VM) Close() error {
 		}
 		v.vcpuCreated = false
 	}
-	if v.part != 0 && v.mem != nil {
+	if v.part != 0 && (v.mem != nil || v.externalMem != nil) {
 		if err := unmapGPARange(v.part, v.memGPA, v.memSize); err != nil && first == nil {
 			first = err
 		}
@@ -218,8 +252,11 @@ func (v *VM) Close() error {
 }
 
 func (v *VM) Memory() []byte {
-	if v == nil || v.mem == nil {
+	if v == nil {
 		return nil
+	}
+	if v.mem == nil {
+		return v.externalMem
 	}
 	return v.mem.bytes()
 }
