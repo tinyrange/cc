@@ -161,7 +161,7 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, nil, exit.MMIO); err != nil {
 				return serialOut.String(), fmt.Errorf("unhandled OpenBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
 			}
 		case ExitHLT:

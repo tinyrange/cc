@@ -113,6 +113,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		Attachments: kvm.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
+			BalloonMB:       req.BalloonMB,
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -230,6 +231,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		Attachments: kvm.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
+			BalloonMB:       req.BalloonMB,
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -414,7 +416,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:      req.Cols,
 			Rows:      req.Rows,
 		}
-		resp, serial, err := kvm.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
+		resp, serial, err := kvm.RunManagedExecWithFSNetAndBalloon(ctx, kernel, initrd, req.MemoryMB, req.BalloonMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}
@@ -713,7 +715,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 }
 
 func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
-	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_VIRTIO_BALLOON", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
 	if kvmhost.RootFSImageEnabled() {
 		vars = append(vars, "CONFIG_BLK_DEV_LOOP")
 		rootImageType, err := kvmhost.RootFSImageType()
@@ -776,6 +778,7 @@ func linuxRuntimeExtraConfigVars(names []string) []string {
 func linuxRuntimeModuleMap() map[string]string {
 	return map[string]string{
 		"CONFIG_VIRTIO_MMIO":                    "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_VIRTIO_BALLOON":                 "kernel/drivers/virtio/virtio_balloon.ko.gz",
 		"CONFIG_FUSE_FS":                        "kernel/fs/fuse/fuse.ko.gz",
 		"CONFIG_VIRTIO_FS":                      "kernel/fs/fuse/virtiofs.ko.gz",
 		"CONFIG_VSOCKETS":                       "kernel/net/vmw_vsock/vsock.ko.gz",

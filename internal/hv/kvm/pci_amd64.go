@@ -342,7 +342,7 @@ func handleBootIOWithPCI(uartIO func(IOExit) error, pci *PCIBus, ioExit IOExit) 
 	return uartIO(ioExit)
 }
 
-func handleBootMMIOWithPCI(vm *VM, vcpuIndex int, pci *PCIBus, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+func handleBootMMIOWithPCI(vm *VM, vcpuIndex int, pci *PCIBus, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
 	if handled, value, err := pci.HandleMMIO(mmio); handled || err != nil {
 		if err != nil {
 			return err
@@ -352,7 +352,7 @@ func handleBootMMIOWithPCI(vm *VM, vcpuIndex int, pci *PCIBus, fsdevs []*virtio.
 		}
 		return nil
 	}
-	return handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, netdev, mmio)
+	return handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, balloon, netdev, mmio)
 }
 
 func readLittleValue(data []byte) uint64 {

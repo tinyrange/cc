@@ -61,9 +61,9 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
 }
 
-func TestRuntimeBootsLinuxWithHVFBalloon(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("HVF balloon support is implemented by the Darwin backend")
+func TestRuntimeBootsLinuxWithVirtioBalloon(t *testing.T) {
+	if runtime.GOOS != "darwin" && !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("virtio balloon support is implemented by the Darwin arm64 and Linux amd64 backends")
 	}
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())

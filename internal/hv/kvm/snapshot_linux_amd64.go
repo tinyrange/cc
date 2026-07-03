@@ -173,7 +173,7 @@ func (w *snapshotSerialWriter) Write(data []byte) (int, error) {
 	return w.dst.Write(data)
 }
 
-func (s *snapshotTrigger) captureIfPending(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net) error {
+func (s *snapshotTrigger) captureIfPending(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net) error {
 	if s == nil {
 		return nil
 	}
@@ -182,7 +182,7 @@ func (s *snapshotTrigger) captureIfPending(vm *VM, fsdevs []*virtio.FS, vsock *v
 		return nil
 	}
 	s.once.Do(func() {
-		s.err = s.capture(vm, fsdevs, vsock, rng, netdev, value)
+		s.err = s.capture(vm, fsdevs, vsock, rng, balloon, netdev, value)
 	})
 	if s.err != nil {
 		return fmt.Errorf("capture KVM snapshot: %w", s.err)
@@ -190,7 +190,7 @@ func (s *snapshotTrigger) captureIfPending(vm *VM, fsdevs []*virtio.FS, vsock *v
 	return nil
 }
 
-func (s *snapshotTrigger) capture(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, value uint64) error {
+func (s *snapshotTrigger) capture(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, value uint64) error {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return nil
 	}
@@ -235,7 +235,7 @@ func (s *snapshotTrigger) capture(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vso
 		IRQChips:     irqChips,
 		PIT:          pit,
 		Clock:        clock,
-		Devices:      snapshotKVMDeviceStates(fsdevs, vsock, rng, netdev),
+		Devices:      snapshotKVMDeviceStates(fsdevs, vsock, rng, balloon, netdev),
 		Note:         "KVM Linux checkpoint captured after guest init configured non-unique state and before vsock ready.",
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
@@ -283,7 +283,7 @@ func allZero(data []byte) bool {
 	return true
 }
 
-func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, memoryMB uint64, balloonMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	if err := emitManagedBootStatus(onEvent, "restoring VM snapshot"); err != nil {
 		return nil, err
 	}
@@ -303,6 +303,14 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		return nil, fmt.Errorf("listen vsock control: %w", err)
 	}
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
+	balloon := virtio.NewBalloon(amd64vm.BalloonBase, amd64vm.BalloonSize, amd64vm.BalloonIRQ)
+	if targetPages := balloonTargetPages(balloonMB); targetPages != 0 {
+		if err := balloon.SetTargetPages(targetPages); err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("set balloon target: %w", err)
+		}
+	}
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -322,7 +330,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = bootWriter
 	}
-	vm, uart, rng, serialOut, err := restoreManagedVMFromSnapshot(manifest, memPath, memoryMB, dmesg, fsdevs, vsock, netdev, serialWriter)
+	vm, uart, rng, serialOut, err := restoreManagedVMFromSnapshot(manifest, memPath, memoryMB, dmesg, fsdevs, vsock, balloon, netdev, serialWriter)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
@@ -335,7 +343,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
+		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
@@ -421,7 +429,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	}, nil
 }
 
-func restoreManagedVMFromSnapshot(manifest kvmSnapshotManifest, memPath string, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, serialWriter io.Writer) (*VM, *serial.UART8250, *virtio.RNG, *vmruntime.SerialTranscript, error) {
+func restoreManagedVMFromSnapshot(manifest kvmSnapshotManifest, memPath string, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, balloon *virtio.Balloon, netdev *virtio.Net, serialWriter io.Writer) (*VM, *serial.UART8250, *virtio.RNG, *vmruntime.SerialTranscript, error) {
 	memorySize := amd64vm.MemorySizeBytes(memoryMB)
 	if manifest.MemorySize != 0 && manifest.MemorySize != memorySize {
 		return nil, nil, nil, nil, fmt.Errorf("snapshot memory size %d does not match requested VM memory %d", manifest.MemorySize, memorySize)
@@ -457,10 +465,13 @@ func restoreManagedVMFromSnapshot(manifest kvmSnapshotManifest, memPath string, 
 		vsock.Attach(vm, vm)
 	}
 	rng.Attach(vm, vm)
+	if balloon != nil {
+		balloon.Attach(vm, vm)
+	}
 	if netdev != nil {
 		netdev.Attach(vm, vm)
 	}
-	if err := restoreKVMDeviceStates(manifest.Devices, fsdevs, vsock, rng, netdev); err != nil {
+	if err := restoreKVMDeviceStates(manifest.Devices, fsdevs, vsock, rng, balloon, netdev); err != nil {
 		closeVMWithFS(vm, fsdevs)
 		return nil, nil, nil, serialOut, err
 	}
@@ -682,13 +693,16 @@ func restoreKVMIRQChips(vmFd int, chips []kvmIRQChip) error {
 	return nil
 }
 
-func snapshotKVMDeviceStates(fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net) map[string]virtio.MMIOState {
+func snapshotKVMDeviceStates(fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net) map[string]virtio.MMIOState {
 	out := map[string]virtio.MMIOState{}
 	if rng != nil {
 		out["rng"] = rng.SnapshotState()
 	}
 	if vsock != nil {
 		out["vsock"] = vsock.SnapshotState()
+	}
+	if balloon != nil {
+		out["balloon"] = balloon.SnapshotState()
 	}
 	if netdev != nil {
 		out["net"] = netdev.SnapshotState()
@@ -702,7 +716,7 @@ func snapshotKVMDeviceStates(fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virt
 	return out
 }
 
-func restoreKVMDeviceStates(states map[string]virtio.MMIOState, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net) error {
+func restoreKVMDeviceStates(states map[string]virtio.MMIOState, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net) error {
 	if state, ok := states["rng"]; ok && rng != nil {
 		if err := rng.RestoreState(state); err != nil {
 			return fmt.Errorf("restore rng state: %w", err)
@@ -711,6 +725,11 @@ func restoreKVMDeviceStates(states map[string]virtio.MMIOState, fsdevs []*virtio
 	if state, ok := states["vsock"]; ok && vsock != nil {
 		if err := vsock.RestoreState(state); err != nil {
 			return fmt.Errorf("restore vsock state: %w", err)
+		}
+	}
+	if state, ok := states["balloon"]; ok && balloon != nil {
+		if err := balloon.RestoreState(state); err != nil {
+			return fmt.Errorf("restore balloon state: %w", err)
 		}
 	}
 	if state, ok := states["net"]; ok && netdev != nil {
