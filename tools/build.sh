@@ -32,7 +32,7 @@ for bsd in openbsd freebsd netbsd; do
   install -m 644 "${BUILD_DIR}/guest-init-${bsd}-${TARGET_GOARCH}" "${ROOT_DIR}/internal/${bsd}/guestinit/guest-init-${bsd}-${TARGET_GOARCH}"
 done
 
-GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -tags embed_guestinit -o "${CCVM_OUTPUT}" ./cmd/ccvm
+GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${CCVM_OUTPUT}" ./cmd/ccvm
 GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/cc-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}" ./cmd/cc
 
 install -m 755 "${CCVM_OUTPUT}" "${PYNEURODESK_CCVM_OUTPUT}"
