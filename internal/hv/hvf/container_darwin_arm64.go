@@ -1512,6 +1512,23 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	var lastSampleCPSR uint64
 	var pendingResult *ContainerRunResult
 	includeTraceOnExit := os.Getenv("CCX3_DEBUG_VIRTIOFS") != ""
+	captureResult := func() string {
+		transcript := commandTranscript(req.Dmesg, &serialOut, &consoleOut)
+		if pendingResult == nil {
+			if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
+				resultTranscript := transcript
+				if includeTraceOnExit {
+					resultTranscript = resultTranscript + "\n[virtio-fs trace]\n" + fsTrace.String()
+				}
+				pendingResult = &ContainerRunResult{
+					ExitCode:   exitCode,
+					Output:     output,
+					Transcript: resultTranscript,
+				}
+			}
+		}
+		return transcript
+	}
 	runner := newVMRunManager(vm)
 	for {
 		runRes, err, stalled := runner.Run(ctx, 5*time.Second)
@@ -1533,26 +1550,13 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			return ContainerRunResult{}, fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 
-		transcript := commandTranscript(req.Dmesg, &serialOut, &consoleOut)
+		transcript := captureResult()
 		if !readySent && strings.Contains(transcript, commandBeginMarker) {
 			readySent = true
 			if readyCh != nil {
 				readyCh <- nil
 				close(readyCh)
 				readyCh = nil
-			}
-		}
-		if pendingResult == nil {
-			if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
-				resultTranscript := transcript
-				if includeTraceOnExit {
-					resultTranscript = resultTranscript + "\n[virtio-fs trace]\n" + fsTrace.String()
-				}
-				pendingResult = &ContainerRunResult{
-					ExitCode:   exitCode,
-					Output:     output,
-					Transcript: resultTranscript,
-				}
 			}
 		}
 		if pendingResult != nil && ctx.Err() != nil {
@@ -1609,6 +1613,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				return ContainerRunResult{}, err
 			}
 			if halt {
+				captureResult()
 				if pendingResult != nil {
 					return *pendingResult, nil
 				}
@@ -2131,7 +2136,7 @@ func commandTranscript(dmesg bool, serialOut, consoleOut fmt.Stringer) string {
 func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 	begin := strings.Index(serial, strings.TrimSuffix(commandBeginMarker, ":"))
 	exit := strings.Index(serial, commandExitMarkerPref)
-	if begin == -1 || exit == -1 || exit < begin {
+	if exit == -1 || (begin != -1 && exit < begin) {
 		return 0, "", false
 	}
 
@@ -2147,7 +2152,13 @@ func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 
 	output := serial
 	if !dmesg {
-		beginOutput := serial[begin+len(commandBeginMarker):]
+		outputStart := 0
+		if begin >= 0 {
+			outputStart = begin + len(commandBeginMarker)
+		} else {
+			outputStart = oneShotOutputStart(serial[:exit])
+		}
+		beginOutput := serial[outputStart:]
 		if strings.HasPrefix(beginOutput, "\r\n") {
 			beginOutput = beginOutput[2:]
 		} else if strings.HasPrefix(beginOutput, "\n") {
@@ -2162,6 +2173,28 @@ func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 		output = cleanCommandOutput(output)
 	}
 	return code, output, true
+}
+
+func oneShotOutputStart(serialBeforeExit string) int {
+	lineStart := 0
+	outputStart := 0
+	for lineStart < len(serialBeforeExit) {
+		lineEnd := strings.IndexByte(serialBeforeExit[lineStart:], '\n')
+		if lineEnd == -1 {
+			lineEnd = len(serialBeforeExit)
+		} else {
+			lineEnd += lineStart
+		}
+		line := strings.TrimSpace(serialBeforeExit[lineStart:lineEnd])
+		if strings.HasPrefix(line, "ccx3-init:") || strings.Contains(line, "] ccx3-init:") {
+			outputStart = lineEnd
+			if outputStart < len(serialBeforeExit) && serialBeforeExit[outputStart] == '\n' {
+				outputStart++
+			}
+		}
+		lineStart = lineEnd + 1
+	}
+	return outputStart
 }
 
 func extractManagedExecResult(serial, id string, dmesg bool) (int, string, bool) {
