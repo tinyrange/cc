@@ -61,6 +61,39 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
 }
 
+func TestRuntimeBootsLinuxWithHVFBalloon(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("HVF balloon support is implemented by the Darwin backend")
+	}
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:     env.imageName,
+		MemoryMB:  env.memoryMB,
+		BalloonMB: 64,
+		CPUs:      1,
+		Command: []string{
+			"sh",
+			"-lc",
+			`set -eu
+found=0
+for dev in /sys/bus/virtio/devices/virtio*; do
+	test -e "$dev/device" || continue
+	if test "$(cat "$dev/device")" = "0x0005"; then
+		found=1
+		test "$(basename "$(readlink "$dev/driver")")" = "virtio_balloon"
+		break
+	fi
+done
+test "$found" = 1
+printf 'virtio-balloon-ok\n'`,
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
+}
+
 func TestRuntimeOneShotReportsNonZeroExitAndStderr(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())

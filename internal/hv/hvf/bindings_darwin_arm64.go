@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/timing"
 
 	"github.com/ebitengine/purego"
+	"golang.org/x/sys/unix"
 )
 
 type Return int32
@@ -1729,6 +1730,24 @@ func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
 		return m.mem[off : off+uint64(size)], nil
 	}
 	return nil, fmt.Errorf("slice guest memory %#x size %d: unmapped", addr, size)
+}
+
+func (v *VM) ReclaimGuestPage(ipa uint64) error {
+	page, err := v.SliceIPA(ipa, 4096)
+	if err != nil {
+		return err
+	}
+	if uintptr(unsafe.Pointer(&page[0]))%4096 != 0 {
+		return fmt.Errorf("reclaim guest page %#x: host mapping is not page-aligned", ipa)
+	}
+	if err := unix.Madvise(page, unix.MADV_FREE); err != nil {
+		return fmt.Errorf("reclaim guest page %#x: %w", ipa, err)
+	}
+	return nil
+}
+
+func (v *VM) ReuseGuestPage(ipa uint64) error {
+	return nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {

@@ -42,6 +42,7 @@ type snapshotTrigger struct {
 type snapshotDevices struct {
 	console *virtio.Console
 	rng     *virtio.RNG
+	balloon *virtio.Balloon
 	vsock   *virtio.Vsock
 	fsdevs  []*virtio.FS
 	netdev  *virtio.Net
@@ -85,6 +86,10 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 	start := time.Now()
 	manifest, mem, err := loadSnapshot(snapshotPath)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSnapshotRequest(manifest, req); err != nil {
+		_ = syscall.Munmap(mem)
 		return nil, err
 	}
 	timing.Since(ctx, "hvf.restore.load_snapshot", start)
@@ -150,6 +155,8 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(vm, vm)
+	balloon := virtio.NewBalloon(arm64vm.BalloonBase, arm64vm.BalloonSize, arm64vm.BalloonIRQ)
+	balloon.Attach(vm, vm)
 	var netdev *virtio.Net
 	if req.NetDevice != nil {
 		netdev = req.NetDevice
@@ -180,13 +187,13 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 	timingLog("hvf.restore device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 	start = time.Now()
 	if len(manifest.Devices) > 0 {
-		if err := restoreDeviceStates(manifest.Devices, console, rng, fsdevs, vsock, netdev); err != nil {
+		if err := restoreDeviceStates(manifest.Devices, console, rng, balloon, fsdevs, vsock, netdev); err != nil {
 			_ = listener.Close()
 			vm.Close()
 			return nil, err
 		}
 	} else {
-		if err := replaySnapshotMMIO(vm, manifest.MMIOWrites, uart, console, rng, fsdevs, vsock, netdev); err != nil {
+		if err := replaySnapshotMMIO(vm, manifest.MMIOWrites, uart, console, rng, balloon, fsdevs, vsock, netdev); err != nil {
 			_ = listener.Close()
 			vm.Close()
 			return nil, err
@@ -307,7 +314,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -673,6 +680,9 @@ func snapshotDeviceStates(devices snapshotDevices) map[string]virtio.MMIOState {
 	if devices.rng != nil {
 		out["rng"] = devices.rng.SnapshotState()
 	}
+	if devices.balloon != nil {
+		out["balloon"] = devices.balloon.SnapshotState()
+	}
 	if devices.vsock != nil {
 		out["vsock"] = devices.vsock.SnapshotState()
 	}
@@ -688,7 +698,7 @@ func snapshotDeviceStates(devices snapshotDevices) map[string]virtio.MMIOState {
 	return out
 }
 
-func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
+func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
 	if state, ok := states["console"]; ok && console != nil {
 		if err := console.RestoreState(state); err != nil {
 			return fmt.Errorf("restore console state: %w", err)
@@ -697,6 +707,11 @@ func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Con
 	if state, ok := states["rng"]; ok && rng != nil {
 		if err := rng.RestoreState(state); err != nil {
 			return fmt.Errorf("restore rng state: %w", err)
+		}
+	}
+	if state, ok := states["balloon"]; ok && balloon != nil {
+		if err := balloon.RestoreState(state); err != nil {
+			return fmt.Errorf("restore balloon state: %w", err)
 		}
 	}
 	if state, ok := states["vsock"]; ok && vsock != nil {
@@ -772,6 +787,22 @@ func loadSnapshot(path string) (snapshotManifest, []byte, error) {
 	return manifest, mem, nil
 }
 
+func validateSnapshotRequest(manifest snapshotManifest, req ContainerRunRequest) error {
+	if req.MemoryMB != 0 {
+		want := arm64vm.MemorySizeBytes(req.MemoryMB)
+		if manifest.MemorySize != 0 && manifest.MemorySize != want {
+			return fmt.Errorf("snapshot memory size = %d, want %d for %d MB VM", manifest.MemorySize, want, req.MemoryMB)
+		}
+	}
+	if state, ok := manifest.Devices["balloon"]; ok {
+		want := balloonTargetPages(req.BalloonMB)
+		if state.NumPages != want {
+			return fmt.Errorf("snapshot balloon target pages = %d, want %d", state.NumPages, want)
+		}
+	}
+	return nil
+}
+
 func (v *VM) markLastMappingOwned() {
 	v.mappingsMu.Lock()
 	defer v.mappingsMu.Unlock()
@@ -781,7 +812,7 @@ func (v *VM) markLastMappingOwned() {
 	v.mappings[len(v.mappings)-1].anonymous = true
 }
 
-func replaySnapshotMMIO(vm *VM, writes []snapshotMMIOWrite, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
+func replaySnapshotMMIO(vm *VM, writes []snapshotMMIOWrite, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
 	const virtioRegQueueNotify = 0x50
 	const virtioRegInterruptAck = 0x64
 	for _, write := range writes {
@@ -805,6 +836,10 @@ func replaySnapshotMMIO(vm *VM, writes []snapshotMMIOWrite, uart *serial.UART825
 		case rng != nil && rng.Contains(addr, size):
 			if err := rng.Write(addr, size, value); err != nil {
 				return fmt.Errorf("replay rng write %#x: %w", addr, err)
+			}
+		case balloon != nil && balloon.Contains(addr, size):
+			if err := balloon.Write(addr, size, value); err != nil {
+				return fmt.Errorf("replay balloon write %#x: %w", addr, err)
 			}
 		case vsock != nil && vsock.Contains(addr, size):
 			if err := vsock.Write(addr, size, value); err != nil {

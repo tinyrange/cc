@@ -1002,6 +1002,14 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(vm, vm)
+	balloon := virtio.NewBalloon(arm64vm.BalloonBase, arm64vm.BalloonSize, arm64vm.BalloonIRQ)
+	balloon.Attach(vm, vm)
+	if targetPages := balloonTargetPages(req.BalloonMB); targetPages != 0 {
+		if err := balloon.SetTargetPages(targetPages); err != nil {
+			vm.Close()
+			return nil, fmt.Errorf("set balloon target: %w", err)
+		}
+	}
 	var netdev *virtio.Net
 	if req.NetDevice != nil {
 		netdev = req.NetDevice
@@ -1033,6 +1041,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	snapshot.setDevices(snapshotDevices{
 		console: console,
 		rng:     rng,
+		balloon: balloon,
 		vsock:   vsock,
 		fsdevs:  fsdevs,
 		netdev:  netdev,
@@ -1046,7 +1055,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		NumCPUs:     req.CPUs,
 		Dmesg:       req.Dmesg,
 		DisableUART: !req.Dmesg,
-		ExtraNodes:  arm64vm.AppendFSNodes(append(appendContainerDeviceNodes(console, rng, vsock, netdev), arm64vm.SnapshotDeviceNode()), fsdevs),
+		ExtraNodes:  arm64vm.AppendFSNodes(append(appendContainerDeviceNodes(console, rng, balloon, vsock, netdev), arm64vm.SnapshotDeviceNode()), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -1204,7 +1213,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, snapshot, mmioRecorder, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, snapshot, mmioRecorder, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1339,8 +1348,11 @@ func persistentRunSlice(ready bool, active bool) time.Duration {
 	}
 }
 
-func appendContainerDeviceNodes(console *virtio.Console, rng *virtio.RNG, vsock *virtio.Vsock, netdev *virtio.Net) []fdt.Node {
+func appendContainerDeviceNodes(console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, vsock *virtio.Vsock, netdev *virtio.Net) []fdt.Node {
 	nodes := []fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}
+	if balloon != nil {
+		nodes = append(nodes, balloon.DeviceTreeNode())
+	}
 	if vsock != nil {
 		nodes = append(nodes, vsock.DeviceTreeNode())
 	}
@@ -1348,6 +1360,17 @@ func appendContainerDeviceNodes(console *virtio.Console, rng *virtio.RNG, vsock 
 		nodes = append(nodes, netdev.DeviceTreeNode())
 	}
 	return nodes
+}
+
+func balloonTargetPages(mb uint64) uint32 {
+	if mb == 0 {
+		return 0
+	}
+	pages := mb * 1024 * 1024 / 4096
+	if pages > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(pages)
 }
 
 func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunResult, error) {
@@ -1444,6 +1467,13 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(vm, vm)
+	balloon := virtio.NewBalloon(arm64vm.BalloonBase, arm64vm.BalloonSize, arm64vm.BalloonIRQ)
+	balloon.Attach(vm, vm)
+	if targetPages := balloonTargetPages(req.BalloonMB); targetPages != 0 {
+		if err := balloon.SetTargetPages(targetPages); err != nil {
+			return ContainerRunResult{}, fmt.Errorf("set balloon target: %w", err)
+		}
+	}
 	var netdev *virtio.Net
 	if req.NetDevice != nil {
 		netdev = req.NetDevice
@@ -1463,7 +1493,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		MemoryMB:   req.MemoryMB,
 		NumCPUs:    req.CPUs,
 		Dmesg:      true,
-		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, balloon, vsock, netdev), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -1482,6 +1512,23 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	var lastSampleCPSR uint64
 	var pendingResult *ContainerRunResult
 	includeTraceOnExit := os.Getenv("CCX3_DEBUG_VIRTIOFS") != ""
+	captureResult := func() string {
+		transcript := commandTranscript(req.Dmesg, &serialOut, &consoleOut)
+		if pendingResult == nil {
+			if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
+				resultTranscript := transcript
+				if includeTraceOnExit {
+					resultTranscript = resultTranscript + "\n[virtio-fs trace]\n" + fsTrace.String()
+				}
+				pendingResult = &ContainerRunResult{
+					ExitCode:   exitCode,
+					Output:     output,
+					Transcript: resultTranscript,
+				}
+			}
+		}
+		return transcript
+	}
 	runner := newVMRunManager(vm)
 	for {
 		runRes, err, stalled := runner.Run(ctx, 5*time.Second)
@@ -1503,26 +1550,13 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			return ContainerRunResult{}, fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 
-		transcript := commandTranscript(req.Dmesg, &serialOut, &consoleOut)
+		transcript := captureResult()
 		if !readySent && strings.Contains(transcript, commandBeginMarker) {
 			readySent = true
 			if readyCh != nil {
 				readyCh <- nil
 				close(readyCh)
 				readyCh = nil
-			}
-		}
-		if pendingResult == nil {
-			if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
-				resultTranscript := transcript
-				if includeTraceOnExit {
-					resultTranscript = resultTranscript + "\n[virtio-fs trace]\n" + fsTrace.String()
-				}
-				pendingResult = &ContainerRunResult{
-					ExitCode:   exitCode,
-					Output:     output,
-					Transcript: resultTranscript,
-				}
 			}
 		}
 		if pendingResult != nil && ctx.Err() != nil {
@@ -1555,7 +1589,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1579,6 +1613,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				return ContainerRunResult{}, err
 			}
 			if halt {
+				captureResult()
 				if pendingResult != nil {
 					return *pendingResult, nil
 				}
@@ -1658,7 +1693,7 @@ type runResultVM struct {
 	err   error
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshot *snapshotTrigger, mmioRecorder *snapshotMMIORecorder, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshot *snapshotTrigger, mmioRecorder *snapshotMMIORecorder, exitInfo *VcpuExit) error {
 	recorder := timing.FromContext(ctx)
 	if recorder != nil {
 		totalStart := time.Now()
@@ -1743,6 +1778,28 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				defer exitTiming.Record("data_abort.virtio_rng.read", start)
 			}
 			value, err := rng.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
+				return err
+			}
+		}
+	case balloon != nil && balloon.Contains(addr, info.SizeBytes):
+		if info.Write {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_balloon.write", start)
+			}
+			if err := balloon.Write(addr, info.SizeBytes, writeValue); err != nil {
+				return err
+			}
+		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_balloon.read", start)
+			}
+			value, err := balloon.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
@@ -2079,7 +2136,7 @@ func commandTranscript(dmesg bool, serialOut, consoleOut fmt.Stringer) string {
 func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 	begin := strings.Index(serial, strings.TrimSuffix(commandBeginMarker, ":"))
 	exit := strings.Index(serial, commandExitMarkerPref)
-	if begin == -1 || exit == -1 || exit < begin {
+	if exit == -1 || (begin != -1 && exit < begin) {
 		return 0, "", false
 	}
 
@@ -2095,7 +2152,13 @@ func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 
 	output := serial
 	if !dmesg {
-		beginOutput := serial[begin+len(commandBeginMarker):]
+		outputStart := 0
+		if begin >= 0 {
+			outputStart = begin + len(commandBeginMarker)
+		} else {
+			outputStart = oneShotOutputStart(serial[:exit])
+		}
+		beginOutput := serial[outputStart:]
 		if strings.HasPrefix(beginOutput, "\r\n") {
 			beginOutput = beginOutput[2:]
 		} else if strings.HasPrefix(beginOutput, "\n") {
@@ -2110,6 +2173,28 @@ func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 		output = cleanCommandOutput(output)
 	}
 	return code, output, true
+}
+
+func oneShotOutputStart(serialBeforeExit string) int {
+	lineStart := 0
+	outputStart := 0
+	for lineStart < len(serialBeforeExit) {
+		lineEnd := strings.IndexByte(serialBeforeExit[lineStart:], '\n')
+		if lineEnd == -1 {
+			lineEnd = len(serialBeforeExit)
+		} else {
+			lineEnd += lineStart
+		}
+		line := strings.TrimSpace(serialBeforeExit[lineStart:lineEnd])
+		if strings.HasPrefix(line, "ccx3-init:") || strings.Contains(line, "] ccx3-init:") {
+			outputStart = lineEnd
+			if outputStart < len(serialBeforeExit) && serialBeforeExit[outputStart] == '\n' {
+				outputStart++
+			}
+		}
+		lineStart = lineEnd + 1
+	}
+	return outputStart
 }
 
 func extractManagedExecResult(serial, id string, dmesg bool) (int, string, bool) {
