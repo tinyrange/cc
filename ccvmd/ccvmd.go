@@ -11,6 +11,8 @@ import (
 type ServerOptions struct {
 	Kind                   string
 	TokenPath              string
+	Persistent             bool
+	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
@@ -30,8 +32,10 @@ func Main(args []string) {
 
 func RunServer(args []string, opts ServerOptions) (bool, error) {
 	return internal.RunServer(args, internal.ServerOptions{
-		Kind:      opts.Kind,
-		TokenPath: opts.TokenPath,
+		Kind:       opts.Kind,
+		TokenPath:  opts.TokenPath,
+		Persistent: opts.Persistent,
+		OnStartup:  opts.OnStartup,
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime internal.RuntimeView) error {
 			if opts.NormalizeCreateRequest == nil {
 				return nil

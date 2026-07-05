@@ -15,10 +15,10 @@ import (
 )
 
 type Client struct {
-	url       string
-	dialer    func() (net.Conn, error)
-	authToken string
-	client    http.Client
+	url     string
+	dialer  func() (net.Conn, error)
+	headers http.Header
+	client  http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
@@ -34,7 +34,10 @@ func NewClient(url string, dialer func() (net.Conn, error)) *Client {
 				},
 			},
 			token: func() string {
-				return c.authToken
+				return c.headers.Get("Authorization")
+			},
+			headers: func() http.Header {
+				return c.headers.Clone()
 			},
 		},
 	}
@@ -42,22 +45,51 @@ func NewClient(url string, dialer func() (net.Conn, error)) *Client {
 }
 
 type authTransport struct {
-	base  http.RoundTripper
-	token func() string
+	base    http.RoundTripper
+	token   func() string
+	headers func() http.Header
 }
 
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	if t.headers != nil {
+		for key, values := range t.headers() {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
 	if t.token != nil {
 		if token := strings.TrimSpace(t.token()); token != "" {
-			req = req.Clone(req.Context())
-			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Authorization", token)
 		}
 	}
 	return t.base.RoundTrip(req)
 }
 
 func (c *Client) SetBearerToken(token string) {
-	c.authToken = strings.TrimSpace(token)
+	token = strings.TrimSpace(token)
+	if token == "" {
+		c.SetHeader("Authorization", "")
+		return
+	}
+	c.SetHeader("Authorization", "Bearer "+token)
+}
+
+func (c *Client) SetHeader(key, value string) {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" {
+		return
+	}
+	if c.headers == nil {
+		c.headers = http.Header{}
+	}
+	if value == "" {
+		c.headers.Del(key)
+		return
+	}
+	c.headers.Set(key, value)
 }
 
 func (c *Client) HealthCheck() error {
@@ -615,11 +647,15 @@ func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
 	if cfg == nil {
 		return
 	}
-	if token := strings.TrimSpace(c.authToken); token != "" {
+	if c.headers != nil {
 		if cfg.Header == nil {
 			cfg.Header = http.Header{}
 		}
-		cfg.Header.Set("Authorization", "Bearer "+token)
+		for key, values := range c.headers {
+			for _, value := range values {
+				cfg.Header.Add(key, value)
+			}
+		}
 	}
 }
 
