@@ -77,6 +77,38 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	}
 }
 
+func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
+	shutdownCalled := make(chan struct{}, 1)
+	watchdog := newPersistentWatchdogController(func() {
+		shutdownCalled <- struct{}{}
+	})
+	defer watchdog.Stop()
+
+	leaseID, err := watchdog.CreateLease(10 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("create lease: %v", err)
+	}
+	if !watchdog.ReleaseLease(leaseID) {
+		t.Fatalf("release lease failed")
+	}
+	assertNoShutdown(t, shutdownCalled)
+
+	if _, err := watchdog.CreateLease(10 * time.Millisecond); err != nil {
+		t.Fatalf("create expiring lease: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	assertNoShutdown(t, shutdownCalled)
+}
+
+func assertNoShutdown(t *testing.T, shutdownCalled <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-shutdownCalled:
+		t.Fatalf("persistent watchdog called shutdown")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestMuxBadRequests(t *testing.T) {
 	watchdog := newWatchdogController(func() {})
 	defer watchdog.Stop()

@@ -80,6 +80,8 @@ type server struct {
 type ServerOptions struct {
 	Kind                   string
 	TokenPath              string
+	Persistent             bool
+	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
@@ -124,6 +126,7 @@ type watchdogController struct {
 	active      bool
 	leases      map[string]time.Time
 	onExpired   func()
+	persistent  bool
 	cvmfsEvents uint64
 	cvmfsBytes  int64
 	cvmfsLast   time.Time
@@ -135,6 +138,12 @@ type watchdogRequest struct {
 
 func newWatchdogController(onExpired func()) *watchdogController {
 	return &watchdogController{onExpired: onExpired}
+}
+
+func newPersistentWatchdogController(onExpired func()) *watchdogController {
+	w := newWatchdogController(onExpired)
+	w.persistent = true
+	return w
 }
 
 func (w *watchdogController) Create(timeout time.Duration) {
@@ -231,7 +240,9 @@ func (w *watchdogController) ReleaseLease(id string) bool {
 		if w.timer != nil {
 			w.timer.Stop()
 		}
-		onExpired = w.onExpired
+		if !w.persistent {
+			onExpired = w.onExpired
+		}
 	} else {
 		w.resetTimerLocked(time.Now())
 	}
@@ -281,7 +292,9 @@ func (w *watchdogController) expire() {
 	}
 	if w.active || w.leases != nil {
 		w.active = false
-		onExpired = w.onExpired
+		if !w.persistent {
+			onExpired = w.onExpired
+		}
 	}
 	w.mu.Unlock()
 
@@ -394,10 +407,19 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}
+	if opts.OnStartup != nil {
+		if err := opts.OnStartup(hello); err != nil {
+			_ = l.Close()
+			return false, fmt.Errorf("startup callback: %w", err)
+		}
+	}
 
 	var httpServer http.Server
 	shutdown := newServerShutdown(srvState, &httpServer)
 	watchdog := newWatchdogController(shutdown)
+	if opts.Persistent {
+		watchdog = newPersistentWatchdogController(shutdown)
+	}
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown, opts)
