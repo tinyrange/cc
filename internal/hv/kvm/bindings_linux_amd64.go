@@ -17,6 +17,7 @@ const kvmCPUIDFlagSignificantIndex = 1
 
 const (
 	kvmCreateVM            = 0xae01
+	kvmCheckExtension      = 0xae03
 	kvmGetVcpuMmapSize     = 0xae04
 	kvmGetSupportedCpuid   = 0xc008ae05
 	kvmSetUserMemoryRegion = 0x4020ae46
@@ -54,7 +55,10 @@ const (
 	kvmGetXCRS             = 0x8188aea6
 	kvmSetXCRS             = 0x4188aea7
 	kvmGetTSCKHz           = 0xaea3
+	kvmGetXSAVE2           = 0x9000aecf
 )
+
+const kvmCapXSAVE2 = 208
 
 const (
 	ia32TSCMSR        = 0x00000010
@@ -81,6 +85,14 @@ func ioctlWithRetry(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 		}
 		return v1, err
 	}
+}
+
+func checkExtension(fd int, cap int) (uint64, error) {
+	v1, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(kvmCheckExtension), uintptr(cap))
+	if err != 0 {
+		return 0, err
+	}
+	return uint64(v1), nil
 }
 
 func ioctlRunVCPU(fd uintptr) (uintptr, error) {
@@ -322,6 +334,50 @@ func setXSAVE(vcpuFd int, xsave *kvmXSAVE) error {
 	return err
 }
 
+func getXSAVEBytes(vmFd int, vcpuFd int) ([]byte, error) {
+	size := kvmXSAVEBufferSize(vmFd)
+	buf := make([]byte, size)
+	request := uint64(kvmGetXSAVE)
+	if size > int(unsafe.Sizeof(kvmXSAVE{})) {
+		request = uint64(kvmGetXSAVE2)
+	}
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), request, uintptr(unsafe.Pointer(&buf[0]))); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func setXSAVEBytes(vmFd int, vcpuFd int, data []byte) error {
+	size := kvmXSAVEBufferSize(vmFd)
+	if len(data) > size {
+		return unix.EINVAL
+	}
+	buf := make([]byte, size)
+	copy(buf, data)
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetXSAVE), uintptr(unsafe.Pointer(&buf[0])))
+	return err
+}
+
+func legacyXSAVEBytes(xsave *kvmXSAVE) []byte {
+	if xsave == nil {
+		return nil
+	}
+	size := int(unsafe.Sizeof(*xsave))
+	out := make([]byte, size)
+	src := unsafe.Slice((*byte)(unsafe.Pointer(xsave)), size)
+	copy(out, src)
+	return out
+}
+
+func kvmXSAVEBufferSize(vmFd int) int {
+	const legacySize = int(unsafe.Sizeof(kvmXSAVE{}))
+	size, err := checkExtension(vmFd, kvmCapXSAVE2)
+	if err != nil || size < uint64(legacySize) {
+		return legacySize
+	}
+	return int(size)
+}
+
 func getXCRS(vcpuFd int) (kvmXCRS, error) {
 	var xcrs kvmXCRS
 	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetXCRS), uintptr(unsafe.Pointer(&xcrs))); err != nil {
@@ -381,7 +437,16 @@ func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 					e.Eax = 1
 				}
 				e.Ebx &^= (uint32(1) << 6) | (uint32(1) << 13)
+				e.Ecx &^= uint32(1) << 7
+				e.Edx &^= uint32(1) << 20
 			case 2:
+				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, 0, 0
+			}
+		case 0xd:
+			switch e.Index {
+			case 0:
+				e.Eax &^= (uint32(1) << 11) | (uint32(1) << 12)
+			case 11, 12:
 				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, 0, 0
 			}
 		case 1:
