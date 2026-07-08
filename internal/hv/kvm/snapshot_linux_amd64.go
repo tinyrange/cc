@@ -87,7 +87,8 @@ type kvmSnapshotVCPU struct {
 	MPState   kvmMPState    `json:"mp_state"`
 	Events    kvmVCPUEvents `json:"events"`
 	DebugRegs kvmDebugRegs  `json:"debug_regs"`
-	XSAVE     kvmXSAVE      `json:"xsave"`
+	XSAVE     *kvmXSAVE     `json:"xsave,omitempty"`
+	XSAVEData []byte        `json:"xsave_data,omitempty"`
 	XCRS      kvmXCRS       `json:"xcrs"`
 }
 
@@ -578,7 +579,7 @@ func snapshotKVMVCPU(vm *VM, index int) (kvmSnapshotVCPU, error) {
 	if err != nil {
 		return kvmSnapshotVCPU{}, fmt.Errorf("capture KVM debug regs: %w", err)
 	}
-	xsave, err := getXSAVE(vcpu.fd)
+	xsave, err := getXSAVEBytes(vm.vmfd, vcpu.fd)
 	if err != nil {
 		return kvmSnapshotVCPU{}, fmt.Errorf("capture KVM xsave: %w", err)
 	}
@@ -595,7 +596,7 @@ func snapshotKVMVCPU(vm *VM, index int) (kvmSnapshotVCPU, error) {
 		MPState:   mpState,
 		Events:    events,
 		DebugRegs: debugRegs,
-		XSAVE:     xsave,
+		XSAVEData: xsave,
 		XCRS:      xcrs,
 	}, nil
 }
@@ -617,7 +618,11 @@ func restoreKVMVCPU(vm *VM, index int, state kvmSnapshotVCPU) error {
 	if err := setXCRS(vcpu.fd, &state.XCRS); err != nil {
 		return fmt.Errorf("restore KVM xcrs: %w", err)
 	}
-	if err := setXSAVE(vcpu.fd, &state.XSAVE); err != nil {
+	xsave := state.XSAVEData
+	if len(xsave) == 0 {
+		xsave = legacyXSAVEBytes(state.XSAVE)
+	}
+	if err := setXSAVEBytes(vm.vmfd, vcpu.fd, xsave); err != nil {
 		return fmt.Errorf("restore KVM xsave: %w", err)
 	}
 	if err := setLAPIC(vcpu.fd, &state.LAPIC); err != nil {
