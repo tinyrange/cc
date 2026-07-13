@@ -173,17 +173,17 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	}
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))},
-		{"/sbin/cc-netbsd-init", 0o755, initBin},
-		{"/etc/fstab", 0o644, []byte(fmt.Sprintf("/dev/%s / ffs rw 1 1\n", rootDevice))},
-		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("rc_configured=YES\nhostname=\"%s\"\ndefaultroute=\"%s\"\n", network.Hostname, network.GatewayIPv4))},
-		{"/etc/ifconfig." + network.Interface, 0o644, []byte(fmt.Sprintf("inet %s netmask 255.255.255.0\n", network.GuestIPv4))},
-		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
-		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
-		{"/etc/services", 0o644, []byte(bsdNetworkServices)},
-		{"/etc/protocols", 0o644, []byte(bsdNetworkProtocols)},
-		{"/etc/netconfig", 0o644, []byte(netBSDNetconfig)},
-		{"/root/.profile", 0o644, []byte(`export PKG_PATH=${PKG_PATH:-https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/x86_64/10.1/All}
+		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))},
+		{Path: "/sbin/cc-netbsd-init", Mode: 0o755, Data: initBin},
+		{Path: "/etc/fstab", Mode: 0o644, Data: []byte(fmt.Sprintf("/dev/%s / ffs rw 1 1\n", rootDevice))},
+		{Path: "/etc/rc.conf", Mode: 0o644, Data: []byte(fmt.Sprintf("rc_configured=YES\nhostname=\"%s\"\ndefaultroute=\"%s\"\n", network.Hostname, network.GatewayIPv4))},
+		{Path: "/etc/ifconfig." + network.Interface, Mode: 0o644, Data: []byte(fmt.Sprintf("inet %s netmask 255.255.255.0\n", network.GuestIPv4))},
+		{Path: "/etc/resolv.conf", Mode: 0o644, Data: []byte("nameserver " + network.DNSIPv4 + "\n")},
+		{Path: "/etc/hosts", Mode: 0o644, Data: []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{Path: "/etc/services", Mode: 0o644, Data: []byte(bsdNetworkServices)},
+		{Path: "/etc/protocols", Mode: 0o644, Data: []byte(bsdNetworkProtocols)},
+		{Path: "/etc/netconfig", Mode: 0o644, Data: []byte(netBSDNetconfig)},
+		{Path: "/root/.profile", Mode: 0o644, Data: []byte(`export PKG_PATH=${PKG_PATH:-https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/x86_64/10.1/All}
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/pkg/bin:/usr/pkg/sbin
 `)},
 	}); err != nil {
@@ -230,25 +230,25 @@ func netBSDDeviceMajorsForArch(arch string) netBSDDeviceMajors {
 func netBSDManagedDevices(arch string) []rootplan.Device {
 	maj := netBSDDeviceMajorsForArch(arch)
 	return []rootplan.Device{
-		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(maj.consChar, 0)},
-		{"/dev/constty", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(maj.consChar, 1)},
-		{"/dev/tty", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.cttyChar, 0)},
-		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.memChar, 2)},
-		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.memChar, 12)},
-		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o444, rdev(maj.rndChar, 0)},
-		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, rdev(maj.rndChar, 1)},
-		{"/dev/ld0", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 3)},
-		{"/dev/ld0a", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 0)},
-		{"/dev/ld0d", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 3)},
-		{"/dev/rld0", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 3)},
-		{"/dev/rld0a", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 0)},
-		{"/dev/rld0d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 3)},
-		{"/dev/ld4", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 35)},
-		{"/dev/ld4a", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 32)},
-		{"/dev/ld4d", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 35)},
-		{"/dev/rld4", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 35)},
-		{"/dev/rld4a", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 32)},
-		{"/dev/rld4d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 35)},
+		{Path: "/dev/console", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600, RDev: rdev(maj.consChar, 0)},
+		{Path: "/dev/constty", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600, RDev: rdev(maj.consChar, 1)},
+		{Path: "/dev/tty", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.cttyChar, 0)},
+		{Path: "/dev/null", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.memChar, 2)},
+		{Path: "/dev/zero", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.memChar, 12)},
+		{Path: "/dev/random", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o444, RDev: rdev(maj.rndChar, 0)},
+		{Path: "/dev/urandom", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: rdev(maj.rndChar, 1)},
+		{Path: "/dev/ld0", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 3)},
+		{Path: "/dev/ld0a", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 0)},
+		{Path: "/dev/ld0d", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 3)},
+		{Path: "/dev/rld0", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 3)},
+		{Path: "/dev/rld0a", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 0)},
+		{Path: "/dev/rld0d", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 3)},
+		{Path: "/dev/ld4", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 35)},
+		{Path: "/dev/ld4a", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 32)},
+		{Path: "/dev/ld4d", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 35)},
+		{Path: "/dev/rld4", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 35)},
+		{Path: "/dev/rld4a", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 32)},
+		{Path: "/dev/rld4d", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o640, RDev: rdev(maj.ldChar, 35)},
 	}
 }
 

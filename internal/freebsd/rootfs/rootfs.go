@@ -159,21 +159,21 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	network = normalizeFreeBSDNetwork(network)
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
-		{"/sbin/cc-freebsd-init", 0o755, initBin},
-		{"/etc/fstab", 0o644, []byte("/dev/nda0 / ufs rw 1 1\n")},
-		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("hostname=\"%s\"\nifconfig_%s=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"%s\"\n", network.Hostname, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
-		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
-		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
-		{"/etc/services", 0o644, []byte(bsdNetworkServices)},
+		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
+		{Path: "/sbin/cc-freebsd-init", Mode: 0o755, Data: initBin},
+		{Path: "/etc/fstab", Mode: 0o644, Data: []byte("/dev/nda0 / ufs rw 1 1\n")},
+		{Path: "/etc/rc.conf", Mode: 0o644, Data: []byte(fmt.Sprintf("hostname=\"%s\"\nifconfig_%s=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"%s\"\n", network.Hostname, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
+		{Path: "/etc/resolv.conf", Mode: 0o644, Data: []byte("nameserver " + network.DNSIPv4 + "\n")},
+		{Path: "/etc/hosts", Mode: 0o644, Data: []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{Path: "/etc/services", Mode: 0o644, Data: []byte(bsdNetworkServices)},
 	}); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
 	}
 	if err := rootplan.AddDevices(overlay, []rootplan.Device{
-		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
-		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 2},
-		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 12},
+		{Path: "/dev/console", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600, RDev: 0},
+		{Path: "/dev/null", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 2},
+		{Path: "/dev/zero", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 12},
 	}); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
