@@ -208,6 +208,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
+	maxVMs := m.host.HostCapabilities(ctx).MaxVMs
 
 	m.mu.Lock()
 	if m.running == nil {
@@ -217,16 +218,16 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.starting = make(map[string]struct{})
 	}
 	if m.running[id] != nil {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already running", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already running", id)
 	}
 	if _, ok := m.starting[id]; ok {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already starting", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(maxVMs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
@@ -292,6 +293,7 @@ func (m *Manager) StartBlankInstanceStream(
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
+	maxVMs := m.host.HostCapabilities(ctx).MaxVMs
 
 	m.mu.Lock()
 	if m.running == nil {
@@ -301,16 +303,16 @@ func (m *Manager) StartBlankInstanceStream(
 		m.starting = make(map[string]struct{})
 	}
 	if m.running[id] != nil {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already running", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already running", id)
 	}
 	if _, ok := m.starting[id]; ok {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already starting", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(maxVMs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
@@ -655,18 +657,20 @@ func (m *Manager) Status() client.InstanceState {
 func (m *Manager) StatusOf(id string) client.InstanceState {
 	id = instanceID(id)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.statusLocked(id)
+	snapshot := m.statusSnapshotLocked(id)
+	m.mu.Unlock()
+	return m.resolveStatusSnapshot(snapshot)
 }
 
 func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
 	id = instanceID(id)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.running == nil || m.running[id] == nil || m.running[id].instance == nil {
+		m.mu.Unlock()
 		return nil
 	}
 	provider, ok := m.running[id].instance.(virtioFSStatsProvider)
+	m.mu.Unlock()
 	if !ok {
 		return nil
 	}
@@ -675,8 +679,8 @@ func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
 
 func (m *Manager) Statuses() []client.InstanceState {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if len(m.running) == 0 {
+		m.mu.Unlock()
 		return nil
 	}
 	ids := make([]string, 0, len(m.running))
@@ -684,9 +688,17 @@ func (m *Manager) Statuses() []client.InstanceState {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	out := make([]client.InstanceState, 0, len(ids))
+	snapshots := make([]managerStatusSnapshot, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, m.statusLocked(id))
+		snapshots = append(snapshots, m.statusSnapshotLocked(id))
+	}
+	m.mu.Unlock()
+	out := make([]client.InstanceState, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		state := m.resolveStatusSnapshot(snapshot)
+		if state.Status != "stopped" {
+			out = append(out, state)
+		}
 	}
 	return out
 }
@@ -698,15 +710,22 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 	return m.capabilities()
 }
 
-func (m *Manager) statusLocked(id string) client.InstanceState {
+type managerStatusSnapshot struct {
+	id       string
+	machine  *Machine
+	state    client.InstanceState
+	provider networkIPv4Provider
+}
+
+func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	id = instanceID(id)
 	if m.running == nil || m.running[id] == nil {
 		if m.starting != nil {
 			if _, ok := m.starting[id]; ok {
-				return client.InstanceState{ID: id, Status: "starting"}
+				return managerStatusSnapshot{id: id, state: client.InstanceState{ID: id, Status: "starting"}}
 			}
 		}
-		return client.InstanceState{ID: id, Status: "stopped"}
+		return managerStatusSnapshot{id: id, state: client.InstanceState{ID: id, Status: "stopped"}}
 	}
 	machine := m.running[id]
 	state := client.InstanceState{
@@ -721,10 +740,25 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		NestedVirt: machine.nestedVirt,
 		StartedAt:  machine.startedAt.Format(time.RFC3339),
 	}
+	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
-		state.NetworkIPv4 = provider.NetworkIPv4()
+		snapshot.provider = provider
 	}
-	return state
+	return snapshot
+}
+
+func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
+	if snapshot.provider == nil {
+		return snapshot.state
+	}
+	ipv4 := snapshot.provider.NetworkIPv4()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running == nil || m.running[snapshot.id] != snapshot.machine {
+		return m.statusSnapshotLocked(snapshot.id).state
+	}
+	snapshot.state.NetworkIPv4 = ipv4
+	return snapshot.state
 }
 
 func (m *Manager) watch(machine *Machine) {
@@ -741,10 +775,9 @@ func (m *Manager) watch(machine *Machine) {
 	machine.exitedAt = time.Now().UTC()
 }
 
-func (m *Manager) checkCapacityLocked() error {
-	caps := m.host.HostCapabilities(context.Background())
-	if caps.MaxVMs > 0 && len(m.running)+len(m.starting) >= caps.MaxVMs {
-		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxVMs)
+func (m *Manager) checkCapacityLocked(maxVMs int) error {
+	if maxVMs > 0 && len(m.running)+len(m.starting) >= maxVMs {
+		return fmt.Errorf("maximum running VM instances reached: %d", maxVMs)
 	}
 	return nil
 }
