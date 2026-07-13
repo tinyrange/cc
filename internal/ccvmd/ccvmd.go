@@ -42,7 +42,19 @@ var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
 var bootEventWriteMu sync.Mutex
 
-const defaultVMBootTimeout = 5 * time.Second
+const (
+	defaultVMBootTimeout = 5 * time.Second
+
+	// ccvmd has JSON control requests, not bulk upload request bodies. The
+	// largest legitimate body is inline run stdin, so 64 MiB leaves ample room
+	// while bounding allocations. Streaming stdin is framed into smaller
+	// WebSocket messages.
+	maxHTTPRequestBytes      int64 = 64 << 20
+	maxWebSocketMessageBytes       = 8 << 20
+	serverReadHeaderTimeout        = 10 * time.Second
+	serverRequestReadTimeout       = 30 * time.Second
+	serverIdleTimeout              = 2 * time.Minute
+)
 
 func bootTimeoutFromRequest(seconds float64) time.Duration {
 	if seconds <= 0 {
@@ -431,7 +443,13 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if opts.WrapHandler != nil {
 		handler = opts.WrapHandler(handler)
 	}
-	httpServer = http.Server{Handler: handler}
+	handler = http.MaxBytesHandler(handler, maxHTTPRequestBytes)
+	httpServer = http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverRequestReadTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return true, fmt.Errorf("serve daemon API: %w", err)
 	}
@@ -1637,6 +1655,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 	mux.Handle("/vm/run", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			serveRunWebSocket(ws, func(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				return srvState.vms.Stream(ctx, req, inputs, onEvent)
 			})
@@ -1645,6 +1665,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 	mux.Handle("/vm/run/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
@@ -1702,21 +1724,34 @@ func sharedRuntimeRoot() string {
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
-	if r.Body == nil {
-		return fmt.Errorf("request body is required")
-	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		return fmt.Errorf("decode request body: %w", err)
-	}
-	return nil
+	return decodeJSON(r, dst, true)
 }
 
 func decodeOptionalJSON(r *http.Request, dst any) error {
+	return decodeJSON(r, dst, false)
+}
+
+func decodeJSON(r *http.Request, dst any, required bool) error {
 	if r.Body == nil || r.ContentLength == 0 {
+		if required {
+			return fmt.Errorf("request body is required")
+		}
 		return nil
 	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		if !required && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("decode request body: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("decode request body: multiple JSON values")
+		}
+		return fmt.Errorf("decode request body: trailing data: %w", err)
 	}
 	return nil
 }
@@ -1970,6 +2005,10 @@ func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		status = http.StatusRequestEntityTooLarge
+	}
 	writeJSON(w, status, client.ErrorResponse{Error: err.Error()})
 }
 
