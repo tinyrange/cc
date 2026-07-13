@@ -21,6 +21,8 @@ import (
 
 const DefaultInstanceID = "default"
 
+var ErrManagerClosing = errors.New("VM manager is shutting down")
+
 type Backend = vmhost.Backend
 
 type VMHost = vmhost.VMHost
@@ -65,8 +67,15 @@ type Manager struct {
 	supports      func() error
 	capabilities  func() client.CapabilitiesResponse
 	running       map[string]*Machine
-	starting      map[string]struct{}
+	starting      map[string]*managerStart
 	networkLeases map[string]managerNetworkLease
+	closing       bool
+}
+
+type managerStart struct {
+	cancel     context.CancelFunc
+	done       chan struct{}
+	cleanupErr error
 }
 
 type Machine struct {
@@ -210,11 +219,15 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return client.InstanceState{}, ErrManagerClosing
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	if m.starting == nil {
-		m.starting = make(map[string]struct{})
+		m.starting = make(map[string]*managerStart)
 	}
 	if m.running[id] != nil {
 		state := m.statusLocked(id)
@@ -230,14 +243,15 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
-	m.starting[id] = struct{}{}
+	startCtx, cancelStart := context.WithCancel(ctx)
+	start := &managerStart{cancel: cancelStart, done: make(chan struct{})}
+	m.starting[id] = start
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
-	inst, err := m.host.StartStream(ctx, req, onEvent)
+	inst, err := m.host.StartStream(startCtx, req, onEvent)
 	if err != nil {
-		m.clearStarting(id)
-		m.releaseNetworkLease(id)
+		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
 
@@ -256,12 +270,25 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	}
 
 	m.mu.Lock()
+	if m.closing || m.starting[id] != start {
+		if m.starting[id] == start {
+			delete(m.starting, id)
+		}
+		delete(m.networkLeases, id)
+		m.mu.Unlock()
+		cancelStart()
+		start.cleanupErr = inst.Close()
+		close(start.done)
+		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
 	m.running[id] = machine
 	m.mu.Unlock()
+	cancelStart()
+	close(start.done)
 
 	go m.watch(machine)
 
@@ -294,11 +321,15 @@ func (m *Manager) StartBlankInstanceStream(
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return client.InstanceState{}, ErrManagerClosing
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	if m.starting == nil {
-		m.starting = make(map[string]struct{})
+		m.starting = make(map[string]*managerStart)
 	}
 	if m.running[id] != nil {
 		state := m.statusLocked(id)
@@ -314,7 +345,9 @@ func (m *Manager) StartBlankInstanceStream(
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
-	m.starting[id] = struct{}{}
+	startCtx, cancelStart := context.WithCancel(ctx)
+	start := &managerStart{cancel: cancelStart, done: make(chan struct{})}
+	m.starting[id] = start
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
@@ -323,19 +356,17 @@ func (m *Manager) StartBlankInstanceStream(
 	if !snapshotStartup {
 		req.Shares = nil
 	}
-	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
+	inst, err := m.host.StartBlankStream(startCtx, req, onEvent)
 	if err != nil {
-		m.clearStarting(id)
-		m.releaseNetworkLease(id)
+		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
 	if !snapshotStartup {
 		for _, share := range shares {
-			if err := inst.AddShare(ctx, share); err != nil {
-				_ = inst.Close()
-				m.clearStarting(id)
-				m.releaseNetworkLease(id)
-				return client.InstanceState{}, err
+			if err := inst.AddShare(startCtx, share); err != nil {
+				start.cleanupErr = inst.Close()
+				m.finishStart(id, start)
+				return client.InstanceState{}, errors.Join(err, start.cleanupErr)
 			}
 		}
 	}
@@ -355,12 +386,25 @@ func (m *Manager) StartBlankInstanceStream(
 	}
 
 	m.mu.Lock()
+	if m.closing || m.starting[id] != start {
+		if m.starting[id] == start {
+			delete(m.starting, id)
+		}
+		delete(m.networkLeases, id)
+		m.mu.Unlock()
+		cancelStart()
+		start.cleanupErr = inst.Close()
+		close(start.done)
+		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
 	m.running[id] = machine
 	m.mu.Unlock()
+	cancelStart()
+	close(start.done)
 
 	go m.watch(machine)
 
@@ -374,10 +418,17 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) ShutdownAll(ctx context.Context) error {
 	_ = ctx
 	m.mu.Lock()
+	m.closing = true
 	running := m.running
 	m.running = nil
-	m.starting = nil
+	starts := make([]*managerStart, 0, len(m.starting))
+	for _, start := range m.starting {
+		starts = append(starts, start)
+	}
 	m.mu.Unlock()
+	for _, start := range starts {
+		start.cancel()
+	}
 
 	var errs []error
 	for id, machine := range running {
@@ -388,6 +439,16 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, err))
 		}
 	}
+	for _, start := range starts {
+		<-start.done
+		if start.cleanupErr != nil {
+			errs = append(errs, fmt.Errorf("clean up canceled VM start: %w", start.cleanupErr))
+		}
+	}
+	m.mu.Lock()
+	m.starting = nil
+	m.networkLeases = nil
+	m.mu.Unlock()
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -701,6 +762,9 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 func (m *Manager) statusLocked(id string) client.InstanceState {
 	id = instanceID(id)
 	if m.running == nil || m.running[id] == nil {
+		if m.closing {
+			return client.InstanceState{ID: id, Status: "stopped"}
+		}
 		if m.starting != nil {
 			if _, ok := m.starting[id]; ok {
 				return client.InstanceState{ID: id, Status: "starting"}
@@ -749,10 +813,15 @@ func (m *Manager) checkCapacityLocked() error {
 	return nil
 }
 
-func (m *Manager) clearStarting(id string) {
+func (m *Manager) finishStart(id string, start *managerStart) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.starting, id)
+	if m.starting[id] == start {
+		delete(m.starting, id)
+	}
+	delete(m.networkLeases, id)
+	m.mu.Unlock()
+	start.cancel()
+	close(start.done)
 }
 
 func (m *Manager) ensureNetworkLeaseLocked(id, image string, cfg *client.NetworkConfig) *client.NetworkConfig {
