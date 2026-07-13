@@ -2,9 +2,13 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,17 +95,85 @@ func TestClientBearerTokenIsSent(t *testing.T) {
 		client: http.Client{
 			Transport: &authTransport{
 				base: srv.Client().Transport,
-				token: func() string {
-					return "Bearer secret"
-				},
 				headers: func() http.Header {
-					return http.Header{"X-Test-Protocol": []string{"1"}}
+					return http.Header{
+						"Authorization":   []string{"Bearer secret"},
+						"X-Test-Protocol": []string{"1"},
+					}
 				},
 			},
 		},
 	}
 	if err := c.HealthCheck(); err != nil {
 		t.Fatalf("health check: %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestClientConcurrentHeaderUpdatesAndRequests(t *testing.T) {
+	const iterations = 1_000
+	requestErrs := make(chan error, 2*iterations)
+	c := &Client{url: "http://client.test"}
+	c.client.Transport = &authTransport{
+		headers: c.headerSnapshot,
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			values := req.Header.Values("Authorization")
+			if len(values) > 1 {
+				return nil, fmt.Errorf("Authorization values = %q", values)
+			}
+			if len(values) == 1 {
+				generation, err := strconv.Atoi(strings.TrimPrefix(values[0], "Bearer generation-"))
+				if err != nil || generation < 0 || generation >= iterations {
+					return nil, fmt.Errorf("Authorization = %q", values[0])
+				}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := range iterations {
+			c.SetBearerToken(fmt.Sprintf("generation-%d", i))
+			if i%7 == 0 {
+				c.SetBearerToken("")
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range iterations {
+			if err := c.HealthCheck(); err != nil {
+				requestErrs <- err
+			}
+			cfg := &websocket.Config{}
+			c.applyWebSocketAuth(cfg)
+			if values := cfg.Header.Values("Authorization"); len(values) > 1 {
+				requestErrs <- fmt.Errorf("WebSocket Authorization values = %q", values)
+			}
+		}
+	}()
+	wg.Wait()
+	close(requestErrs)
+	for err := range requestErrs {
+		t.Error(err)
+	}
+
+	c.SetBearerToken("")
+	if authorization := c.headerSnapshot().Get("Authorization"); authorization != "" {
+		t.Fatalf("cleared Authorization = %q", authorization)
 	}
 }
 

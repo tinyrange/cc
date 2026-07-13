@@ -10,15 +10,17 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/websocket"
 )
 
 type Client struct {
-	url     string
-	dialer  func() (net.Conn, error)
-	headers http.Header
-	client  http.Client
+	url       string
+	dialer    func() (net.Conn, error)
+	headersMu sync.RWMutex
+	headers   http.Header
+	client    http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
@@ -33,12 +35,7 @@ func NewClient(url string, dialer func() (net.Conn, error)) *Client {
 					return c.dialer()
 				},
 			},
-			token: func() string {
-				return c.headers.Get("Authorization")
-			},
-			headers: func() http.Header {
-				return c.headers.Clone()
-			},
+			headers: c.headerSnapshot,
 		},
 	}
 	return c
@@ -46,7 +43,6 @@ func NewClient(url string, dialer func() (net.Conn, error)) *Client {
 
 type authTransport struct {
 	base    http.RoundTripper
-	token   func() string
 	headers func() http.Header
 }
 
@@ -54,14 +50,12 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	if t.headers != nil {
 		for key, values := range t.headers() {
+			if strings.EqualFold(key, "Authorization") {
+				req.Header.Del(key)
+			}
 			for _, value := range values {
 				req.Header.Add(key, value)
 			}
-		}
-	}
-	if t.token != nil {
-		if token := strings.TrimSpace(t.token()); token != "" {
-			req.Header.Set("Authorization", token)
 		}
 	}
 	return t.base.RoundTrip(req)
@@ -82,6 +76,8 @@ func (c *Client) SetHeader(key, value string) {
 	if key == "" {
 		return
 	}
+	c.headersMu.Lock()
+	defer c.headersMu.Unlock()
 	if c.headers == nil {
 		c.headers = http.Header{}
 	}
@@ -90,6 +86,12 @@ func (c *Client) SetHeader(key, value string) {
 		return
 	}
 	c.headers.Set(key, value)
+}
+
+func (c *Client) headerSnapshot() http.Header {
+	c.headersMu.RLock()
+	defer c.headersMu.RUnlock()
+	return c.headers.Clone()
 }
 
 func (c *Client) HealthCheck() error {
@@ -647,11 +649,12 @@ func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
 	if cfg == nil {
 		return
 	}
-	if c.headers != nil {
+	headers := c.headerSnapshot()
+	if len(headers) != 0 {
 		if cfg.Header == nil {
 			cfg.Header = http.Header{}
 		}
-		for key, values := range c.headers {
+		for key, values := range headers {
 			for _, value := range values {
 				cfg.Header.Add(key, value)
 			}
