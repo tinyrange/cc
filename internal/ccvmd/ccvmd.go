@@ -416,13 +416,13 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	var httpServer http.Server
 	shutdown := newServerShutdown(srvState, &httpServer)
-	watchdog := newWatchdogController(shutdown)
+	watchdog := newWatchdogController(shutdown.Shutdown)
 	if opts.Persistent {
-		watchdog = newPersistentWatchdogController(shutdown)
+		watchdog = newPersistentWatchdogController(shutdown.Shutdown)
 	}
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
-	mux := newMux(srvState, watchdog, shutdown, opts)
+	mux := newMux(srvState, watchdog, shutdown.Shutdown, opts)
 	if opts.RegisterHandlers != nil {
 		opts.RegisterHandlers(mux, srvState)
 	}
@@ -432,10 +432,9 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		handler = opts.WrapHandler(handler)
 	}
 	httpServer = http.Server{Handler: handler}
-	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return true, fmt.Errorf("serve daemon API: %w", err)
-	}
-	return true, nil
+	serveErr := daemonServeError(httpServer.Serve(l))
+	shutdownErr := shutdown.Err()
+	return true, errors.Join(serveErr, shutdownErr)
 }
 
 func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) error {
@@ -773,20 +772,63 @@ func sendWorkerError(codec *vm.WorkerCodec, id uint64, err error) error {
 	return sendWorkerPayload(codec, id, vm.WorkerFrameError, vm.WorkerError{Error: err.Error()})
 }
 
-func newServerShutdown(srvState *server, httpServer *http.Server) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if srvState != nil && srvState.vms != nil {
-				_ = srvState.vms.ShutdownAll(ctx)
-			}
-			if httpServer != nil {
-				_ = httpServer.Shutdown(ctx)
-			}
-		})
+type serverShutdown struct {
+	once         sync.Once
+	shutdownVMs  func(context.Context) error
+	shutdownHTTP func(context.Context) error
+	err          error
+}
+
+func newServerShutdown(srvState *server, httpServer *http.Server) *serverShutdown {
+	shutdown := &serverShutdown{}
+	if srvState != nil && srvState.vms != nil {
+		shutdown.shutdownVMs = srvState.vms.ShutdownAll
 	}
+	if httpServer != nil {
+		shutdown.shutdownHTTP = httpServer.Shutdown
+	}
+	return shutdown
+}
+
+func (s *serverShutdown) Shutdown() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		var errs []error
+		if s.shutdownVMs != nil {
+			if err := runShutdownStep(s.shutdownVMs); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VMs: %w", err))
+			}
+		}
+		if s.shutdownHTTP != nil {
+			if err := runShutdownStep(s.shutdownHTTP); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown HTTP server: %w", err))
+			}
+		}
+		s.err = errors.Join(errs...)
+	})
+}
+
+func (s *serverShutdown) Err() error {
+	if s == nil {
+		return nil
+	}
+	s.Shutdown()
+	return s.err
+}
+
+func runShutdownStep(step func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return step(ctx)
+}
+
+func daemonServeError(err error) error {
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve daemon API: %w", err)
 }
 
 func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
