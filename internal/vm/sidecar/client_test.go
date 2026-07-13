@@ -2,7 +2,9 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -147,6 +149,150 @@ func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWorkerCallOverflowDoesNotBlockUnrelatedCall(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	eventsSent := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		codec := NewWorkerCodec(conn)
+		defer codec.Close()
+		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+			serverErr <- err
+			return
+		}
+		execFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if execFrame.Type != WorkerFrameExec {
+			serverErr <- fmt.Errorf("first frame type = %q", execFrame.Type)
+			return
+		}
+		event := mustWorkerFrame(execFrame.ID, WorkerFrameEvent, client.ExecEvent{Kind: "stdout", Output: "x"})
+		if err := codec.Send(event); err != nil {
+			serverErr <- err
+			return
+		}
+		<-callbackStarted
+		for range 257 {
+			if err := codec.Send(event); err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		close(eventsSent)
+
+		gotCancel := false
+		gotControl := false
+		for !gotCancel || !gotControl {
+			frame, err := codec.Receive()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			switch frame.Type {
+			case WorkerFrameCancel:
+				if frame.ID != execFrame.ID {
+					serverErr <- fmt.Errorf("cancel request id = %d, want %d", frame.ID, execFrame.ID)
+					return
+				}
+				gotCancel = true
+			case WorkerFrameAddShare:
+				gotControl = true
+				if err := codec.Send(mustWorkerFrame(frame.ID, WorkerFrameDone, map[string]string{"status": "mounted"})); err != nil {
+					serverErr <- err
+					return
+				}
+			default:
+				serverErr <- fmt.Errorf("unexpected frame type = %q", frame.Type)
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialWorker: %v", err)
+	}
+	defer worker.Close()
+
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- worker.ExecStream(t.Context(), "vm", client.ExecRequest{Command: []string{"yes"}}, nil, func(client.ExecEvent) error {
+			close(callbackStarted)
+			<-releaseCallback
+			return nil
+		})
+	}()
+	select {
+	case <-eventsSent:
+	case err := <-serverErr:
+		t.Fatalf("server: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive overflowing event stream")
+	}
+
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- worker.AddShare(t.Context(), "vm", client.ShareMount{Source: "/host", Mount: "/host"})
+	}()
+	select {
+	case err := <-controlDone:
+		if err != nil {
+			t.Fatalf("unrelated AddShare: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated AddShare blocked behind overflowing call")
+	}
+	close(releaseCallback)
+	select {
+	case err := <-execDone:
+		if !errors.Is(err, ErrWorkerCallOverflow) {
+			t.Fatalf("ExecStream error = %v, want call overflow", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overflowing ExecStream did not return")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestClosePendingDoesNotBlockFullCall(t *testing.T) {
+	call := newWorkerCall()
+	for i := 0; i < cap(call.frames); i++ {
+		call.frames <- WorkerFrame{ID: 1, Type: WorkerFrameEvent}
+	}
+	c := &Client{pending: map[uint64]*workerCall{1: call}}
+	closed := make(chan struct{})
+	go func() {
+		c.closePending(io.EOF)
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("connection close blocked on a full call buffer")
+	}
+	if _, err := c.nextFrame(t.Context(), call); !errors.Is(err, io.EOF) {
+		t.Fatalf("call error = %v, want connection EOF", err)
 	}
 }
 
