@@ -461,6 +461,12 @@ type ExecRequest struct {
 	ControlFD   bool     `json:"control_fd,omitempty"`
 	Cols        int      `json:"cols,omitempty"`
 	Rows        int      `json:"rows,omitempty"`
+	// Archive extraction budgets apply when Kind is fs_extract. Zero selects
+	// the guest's documented safety default; callers may raise or lower them.
+	ArchiveMaxEntries       int     `json:"archive_max_entries,omitempty"`
+	ArchiveMaxFileBytes     int64   `json:"archive_max_file_bytes,omitempty"`
+	ArchiveMaxExpandedBytes int64   `json:"archive_max_expanded_bytes,omitempty"`
+	ArchiveTimeoutSeconds   float64 `json:"archive_timeout_seconds,omitempty"`
 }
 
 type ExecInput struct {

@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,7 +33,41 @@ const (
 	UsageMarkerPrefix   = protocol.UsageMarkerPrefix
 	ExitMarkerPrefix    = protocol.ExitMarkerPrefix
 	TimingMarkerPrefix  = protocol.TimingMarkerPrefix
+
+	defaultArchiveMaxEntries       = 100_000
+	defaultArchiveMaxFileBytes     = int64(16 << 30)
+	defaultArchiveMaxExpandedBytes = int64(32 << 30)
 )
+
+type ArchiveExtractionOptions struct {
+	Context          context.Context
+	MaxEntries       int
+	MaxFileBytes     int64
+	MaxExpandedBytes int64
+}
+
+type ArchiveBudgetError struct {
+	Budget string
+	Limit  int64
+}
+
+func (e *ArchiveBudgetError) Error() string {
+	return fmt.Sprintf("archive %s budget exceeded (limit %d)", e.Budget, e.Limit)
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	default:
+		return r.r.Read(p)
+	}
+}
 
 type Options struct {
 	Name         string
@@ -597,7 +632,27 @@ func runExtract(opts Options, control io.Writer, req request, r io.ReadCloser, c
 	proto := DefaultProtocol()
 	proto.WriteBegin(control, req.ID)
 	code := 0
-	if err := extractTarToPath(r, req.RootDir, req.Path, req.Directory); err != nil {
+	ctx := context.Background()
+	cancel := func() {}
+	if req.ArchiveTimeoutSeconds > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.ArchiveTimeoutSeconds*float64(time.Second)))
+	}
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.Close()
+		case <-done:
+		}
+	}()
+	if err := ExtractTarToPathWithOptions(r, req.RootDir, req.Path, req.Directory, ArchiveExtractionOptions{
+		Context:          ctx,
+		MaxEntries:       req.ArchiveMaxEntries,
+		MaxFileBytes:     req.ArchiveMaxFileBytes,
+		MaxExpandedBytes: req.ArchiveMaxExpandedBytes,
+	}); err != nil {
 		writeErr(opts, control, req.ID, err)
 		code = 1
 	}
@@ -699,6 +754,22 @@ func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 }
 
 func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
+	return ExtractTarToPathWithOptions(r, rootDir, dst, dstDir, ArchiveExtractionOptions{})
+}
+
+func ExtractTarToPathWithOptions(r io.Reader, rootDir, dst string, dstDir bool, opts ArchiveExtractionOptions) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+	if opts.MaxEntries <= 0 {
+		opts.MaxEntries = defaultArchiveMaxEntries
+	}
+	if opts.MaxFileBytes <= 0 {
+		opts.MaxFileBytes = defaultArchiveMaxFileBytes
+	}
+	if opts.MaxExpandedBytes <= 0 {
+		opts.MaxExpandedBytes = defaultArchiveMaxExpandedBytes
+	}
 	if strings.TrimSpace(dst) == "" {
 		return fmt.Errorf("destination path is required")
 	}
@@ -706,8 +777,10 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 	if info, err := os.Stat(dst); err == nil && info.IsDir() {
 		dstDir = true
 	}
-	tr := tar.NewReader(r)
+	tr := tar.NewReader(contextReader{ctx: opts.Context, r: r})
 	sawEntry := false
+	entries := 0
+	var expanded int64
 	var dirs []tarDirMtime
 	for {
 		header, err := tr.Next()
@@ -719,6 +792,19 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if entries > opts.MaxEntries {
+			return &ArchiveBudgetError{Budget: "entry count", Limit: int64(opts.MaxEntries)}
+		}
+		if header.Size < 0 || header.Size > opts.MaxFileBytes {
+			return &ArchiveBudgetError{Budget: "file size", Limit: opts.MaxFileBytes}
+		}
+		if header.Size > 0 {
+			if expanded > opts.MaxExpandedBytes-header.Size {
+				return &ArchiveBudgetError{Budget: "expanded bytes", Limit: opts.MaxExpandedBytes}
+			}
+			expanded += header.Size
 		}
 		sawEntry = true
 		target, err := tarTarget(dst, dstDir, header.Name)
@@ -762,6 +848,7 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 			_, copyErr := io.Copy(file, tr)
 			closeErr := file.Close()
 			if copyErr != nil {
+				_ = os.Remove(target)
 				return copyErr
 			}
 			if closeErr != nil {

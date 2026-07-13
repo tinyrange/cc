@@ -5,6 +5,8 @@ package guestagent
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -175,6 +177,39 @@ func TestExtractTarToPathConflictSemantics(t *testing.T) {
 			t.Fatalf("dst dir stat = %v info=%v", err, info)
 		}
 	})
+}
+
+func TestExtractTarToPathEnforcesCallerBudgets(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "large.txt", "12345"); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	dst := filepath.Join(t.TempDir(), "out")
+	err := ExtractTarToPathWithOptions(bytes.NewReader(archive.Bytes()), "/", dst, false, ArchiveExtractionOptions{
+		MaxEntries:       1,
+		MaxFileBytes:     4,
+		MaxExpandedBytes: 8,
+	})
+	var budgetErr *ArchiveBudgetError
+	if !errors.As(err, &budgetErr) || budgetErr.Budget != "file size" {
+		t.Fatalf("extract error = %v, want file-size budget error", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("over-budget destination was created: %v", statErr)
+	}
+}
+
+func TestExtractTarToPathHonorsCancellation(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "file.txt", "payload"); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ExtractTarToPathWithOptions(bytes.NewReader(archive.Bytes()), "/", filepath.Join(t.TempDir(), "out"), false, ArchiveExtractionOptions{Context: ctx})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("extract error = %v, want cancellation", err)
+	}
 }
 
 func TestParseSignal(t *testing.T) {
