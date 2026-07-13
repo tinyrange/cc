@@ -1,4 +1,4 @@
-package vmregion
+package vm
 
 import (
 	"bytes"
