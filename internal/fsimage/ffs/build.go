@@ -23,6 +23,15 @@ type Options struct {
 	Layout            Layout
 }
 
+type CapacityError struct {
+	RequiredBytes  uint64
+	AvailableBytes uint64
+}
+
+func (e *CapacityError) Error() string {
+	return fmt.Sprintf("FFS image is too small: requires at least %d bytes, has %d bytes", e.RequiredBytes, e.AvailableBytes)
+}
+
 const (
 	defaultFFSSize = 64 << 20
 	ffsPageSize    = 16 << 10
@@ -623,12 +632,24 @@ func (b *ffsBuilder) assignData(node *ffsNode) error {
 	case ifdir:
 		data := encodeFFSDir(node)
 		node.size = uint64(len(data))
-		node.blocks, node.blockFrags = b.allocBlocksForSize(uint64(len(data)))
+		blocks, frags, err := b.allocBlocksForSize(uint64(len(data)))
+		if err != nil {
+			return fmt.Errorf("allocate directory %q: %w", node.name, err)
+		}
+		node.blocks, node.blockFrags = blocks, frags
 	case ifreg:
-		node.blocks, node.blockFrags = b.allocBlocksForSize(node.size)
+		blocks, frags, err := b.allocBlocksForSize(node.size)
+		if err != nil {
+			return fmt.Errorf("allocate file %q: %w", node.name, err)
+		}
+		node.blocks, node.blockFrags = blocks, frags
 	case iflnk:
 		if len(node.target) > 60 {
-			node.blocks, node.blockFrags = b.allocBlocksForSize(uint64(len(node.target)))
+			blocks, frags, err := b.allocBlocksForSize(uint64(len(node.target)))
+			if err != nil {
+				return fmt.Errorf("allocate symlink %q: %w", node.name, err)
+			}
+			node.blocks, node.blockFrags = blocks, frags
 		}
 	}
 	if err := b.allocIndirectBlocks(node); err != nil {
@@ -648,36 +669,59 @@ func (b *ffsBuilder) allocIndirectBlocks(node *ffsNode) error {
 		return nil
 	}
 	remaining := blocks - ffsNDaddr
-	node.indir[0] = b.allocBlock()
+	block, err := b.allocBlock()
+	if err != nil {
+		return fmt.Errorf("allocate single-indirect block for %q: %w", node.name, err)
+	}
+	node.indir[0] = block
 	if remaining <= ffsNindir {
 		return nil
 	}
 	remaining -= ffsNindir
-	node.indir[1] = b.allocBlock()
+	block, err = b.allocBlock()
+	if err != nil {
+		return fmt.Errorf("allocate double-indirect root for %q: %w", node.name, err)
+	}
+	node.indir[1] = block
 	count := (remaining + ffsNindir - 1) / ffsNindir
 	if count > ffsNindir {
 		return fmt.Errorf("%s is too large for FFS double-indirect writer: %d blocks", node.name, blocks)
 	}
 	node.indir2 = make([]uint32, count)
 	for i := range node.indir2 {
-		node.indir2[i] = b.allocBlock()
+		block, err := b.allocBlock()
+		if err != nil {
+			return fmt.Errorf("allocate double-indirect block %d for %q: %w", i, node.name, err)
+		}
+		node.indir2[i] = block
 	}
 	return nil
 }
 
-func (b *ffsBuilder) allocBlocksForSize(size uint64) ([]uint32, []uint32) {
+func (b *ffsBuilder) allocBlocksForSize(size uint64) ([]uint32, []uint32, error) {
 	if size == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	if int(roundUp(int64(size), ffsBSize)/ffsBSize) > ffsNDaddr {
-		count := int(roundUp(int64(size), ffsBSize) / ffsBSize)
+	if size > uint64(b.fsSize) {
+		return nil, nil, &CapacityError{RequiredBytes: size, AvailableBytes: uint64(b.fsSize)}
+	}
+	blockCount := (size-1)/ffsBSize + 1
+	if blockCount > uint64(math.MaxInt) {
+		return nil, nil, fmt.Errorf("FFS block count is too large: %d", blockCount)
+	}
+	if blockCount > ffsNDaddr {
+		count := int(blockCount)
 		blocks := make([]uint32, 0, count)
 		frags := make([]uint32, 0, count)
 		for i := 0; i < count; i++ {
-			blocks = append(blocks, b.allocBlock())
+			block, err := b.allocBlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			blocks = append(blocks, block)
 			frags = append(frags, ffsFrag)
 		}
-		return blocks, frags
+		return blocks, frags, nil
 	}
 	fullBlocks := int(size / ffsBSize)
 	remainder := size % ffsBSize
@@ -688,47 +732,59 @@ func (b *ffsBuilder) allocBlocksForSize(size uint64) ([]uint32, []uint32) {
 	blocks := make([]uint32, 0, count)
 	frags := make([]uint32, 0, count)
 	for i := 0; i < fullBlocks; i++ {
-		blocks = append(blocks, b.allocBlock())
+		block, err := b.allocBlock()
+		if err != nil {
+			return nil, nil, err
+		}
+		blocks = append(blocks, block)
 		frags = append(frags, ffsFrag)
 	}
 	if remainder != 0 {
 		needed := uint32(roundUp(int64(remainder), ffsFSize) / ffsFSize)
-		blocks = append(blocks, b.allocFragRun(needed))
+		frag, err := b.allocFragRun(needed)
+		if err != nil {
+			return nil, nil, err
+		}
+		blocks = append(blocks, frag)
 		frags = append(frags, needed)
 	}
-	return blocks, frags
+	return blocks, frags, nil
 }
 
-func (b *ffsBuilder) allocBlock() uint32 {
+func (b *ffsBuilder) allocBlock() (uint32, error) {
 	return b.allocFragRun(ffsFrag)
 }
 
-func (b *ffsBuilder) allocFragRun(count uint32) uint32 {
+func (b *ffsBuilder) allocFragRun(count uint32) (uint32, error) {
 	if count == 0 || count > ffsFrag {
-		panic("invalid FFS fragment allocation")
+		return 0, fmt.Errorf("invalid FFS fragment allocation: %d fragments", count)
 	}
-	frag := roundUpFrag(b.nextFrag, ffsFrag)
+	frag := (uint64(b.nextFrag) + ffsFrag - 1) / ffsFrag * ffsFrag
+	available := uint64(len(b.usedFrags))
 	for {
-		if frag%ffsFrag+count > ffsFrag {
-			frag = roundUpFrag(frag, ffsFrag)
+		if frag%ffsFrag+uint64(count) > ffsFrag {
+			frag = (frag + ffsFrag - 1) / ffsFrag * ffsFrag
 		}
-		end := frag + count
-		if end > uint32(len(b.usedFrags)) {
-			panic("FFS image is too small")
+		end := frag + uint64(count)
+		if end > available {
+			return 0, &CapacityError{
+				RequiredBytes:  end * ffsFSize,
+				AvailableBytes: available * ffsFSize,
+			}
 		}
 		ok := true
 		for i := frag; i < end; i++ {
-			if b.usedFrags[i] {
+			if b.usedFrags[int(i)] {
 				ok = false
 				break
 			}
 		}
 		if ok {
 			for i := frag; i < end; i++ {
-				b.usedFrags[i] = true
+				b.usedFrags[int(i)] = true
 			}
-			b.nextFrag = end
-			return frag
+			b.nextFrag = uint32(end)
+			return uint32(frag), nil
 		}
 		frag++
 	}
