@@ -2,10 +2,14 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
@@ -207,6 +211,84 @@ func TestManagerAssignsDistinctNetworkLeasesBeforeStart(t *testing.T) {
 	}
 }
 
+func TestManagerRetriesFailedCloseAndSharesConcurrentResult(t *testing.T) {
+	ctx := context.Background()
+	transientErr := errors.New("transient close failure")
+	inst := &flakyCloseInstance{
+		fakeInstance: newFakeInstance(),
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		firstErr:     transientErr,
+	}
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+		ID:      "alpha",
+		Image:   "alpine",
+		Network: &client.NetworkConfig{Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- manager.ShutdownInstance(ctx, "alpha") }()
+	<-inst.firstStarted
+	go func() { secondDone <- manager.ShutdownInstance(ctx, "alpha") }()
+	waitForStopObservers(t, manager, "alpha", 2)
+	close(inst.releaseFirst)
+	for i, result := range []<-chan error{firstDone, secondDone} {
+		if err := <-result; !errors.Is(err, transientErr) {
+			t.Fatalf("concurrent shutdown %d error = %v, want transient failure", i+1, err)
+		}
+	}
+	if got := inst.closeCalls.Load(); got != 1 {
+		t.Fatalf("Close calls after shared failure = %d, want 1", got)
+	}
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "running" {
+		t.Fatalf("state after failed close = %+v", state)
+	}
+	if _, err := manager.RunIn(ctx, "alpha", client.RunRequest{Command: []string{"true"}}); err != nil {
+		t.Fatalf("instance remained unusable after failed close: %v", err)
+	}
+
+	if err := manager.ShutdownInstance(ctx, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if got := inst.closeCalls.Load(); got != 2 {
+		t.Fatalf("Close calls after retry = %d, want 2", got)
+	}
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "stopped" {
+		t.Fatalf("state after successful retry = %+v", state)
+	}
+	manager.mu.Lock()
+	_, leaseExists := manager.networkLeases["alpha"]
+	manager.mu.Unlock()
+	if leaseExists {
+		t.Fatal("network lease remained after successful close retry")
+	}
+}
+
+func waitForStopObservers(t *testing.T, manager *Manager, id string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		machine := manager.running[id]
+		got := 0
+		if machine != nil && machine.stop != nil {
+			got = machine.stop.observers
+		}
+		manager.mu.Unlock()
+		if got >= want {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("shutdown observers did not reach %d", want)
+}
+
 func TestManagerAssignsNetworkLeasesForBuiltinDefaultNetwork(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -365,7 +447,7 @@ func TestManagerSnapshotConsoleForwardAndStats(t *testing.T) {
 type fakeHost struct {
 	mu                sync.Mutex
 	caps              VMHostCapabilities
-	next              []*fakeInstance
+	next              []Instance
 	starts            []client.CreateInstanceRequest
 	blankStarts       []client.StartInstanceRequest
 	runs              []client.RunRequest
@@ -396,7 +478,7 @@ func newFakeHost(caps VMHostCapabilities) *fakeHost {
 	return &fakeHost{caps: caps}
 }
 
-func (h *fakeHost) queueInstance(inst *fakeInstance) {
+func (h *fakeHost) queueInstance(inst Instance) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.next = append(h.next, inst)
@@ -485,7 +567,7 @@ func (h *fakeHost) ExecInInstanceStream(_ context.Context, inst Instance, runnin
 	return emitFakeExecEvents(onEvent, "host exec in stream")
 }
 
-func (h *fakeHost) popInstanceLocked() *fakeInstance {
+func (h *fakeHost) popInstanceLocked() Instance {
 	if len(h.next) == 0 {
 		return newFakeInstance()
 	}
@@ -539,6 +621,23 @@ type fakeInstance struct {
 	stats          []virtio.FSStats
 	ipv4           string
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
+}
+
+type flakyCloseInstance struct {
+	*fakeInstance
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	firstErr     error
+	closeCalls   atomic.Int32
+}
+
+func (i *flakyCloseInstance) Close() error {
+	if i.closeCalls.Add(1) == 1 {
+		close(i.firstStarted)
+		<-i.releaseFirst
+		return i.firstErr
+	}
+	return i.fakeInstance.Close()
 }
 
 func newFakeInstance() *fakeInstance {
