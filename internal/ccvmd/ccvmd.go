@@ -80,6 +80,7 @@ type server struct {
 type ServerOptions struct {
 	Kind                   string
 	TokenPath              string
+	Authentication         *ServerAuthentication
 	Persistent             bool
 	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
@@ -363,10 +364,15 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
+	tlsConfigPath := fs.String("tls-config", "", "Path to mutual TLS listener configuration")
 	worker := fs.Bool("worker", false, "Run as a single-process VM worker")
 
 	if err := fs.Parse(args); err != nil {
 		return false, fmt.Errorf("parse ccvm flags: %w", err)
+	}
+	authentication, err := resolveServerAuthentication(*addr, *tlsConfigPath, opts.Authentication)
+	if err != nil {
+		return false, err
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
@@ -397,9 +403,22 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
+	if listenerAddrRequiresAuthentication(l.Addr()) && authentication == nil {
+		_ = l.Close()
+		return false, &ListenerSecurityError{
+			Address: *addr,
+			Reason:  ListenerSecurityRemoteAuthenticationRequired,
+		}
+	}
+	scheme := "http"
+	if authentication != nil {
+		l = authentication.listener(l)
+		scheme = "https"
+	}
 
 	hello := client.ServerHello{
 		Addr:      l.Addr().String(),
+		Scheme:    scheme,
 		Kind:      opts.Kind,
 		TokenPath: opts.TokenPath,
 	}

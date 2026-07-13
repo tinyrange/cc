@@ -9,6 +9,7 @@ import (
 
 type ServerHello struct {
 	Addr      string `json:"addr,omitempty"`
+	Scheme    string `json:"scheme,omitempty"`
 	Kind      string `json:"kind,omitempty"`
 	TokenPath string `json:"token_path,omitempty"`
 	Error     string `json:"error,omitempty"`

@@ -48,6 +48,47 @@ Quick KVM check:
 test -r /dev/kvm -a -w /dev/kvm && echo "KVM is accessible"
 ```
 
+## Remote daemon TLS
+
+The default `ccvm` listener is local-only. Any wildcard, non-loopback IP, or
+hostname other than `localhost` requires mutual TLS and fails before startup
+without it. This applies to health, control, debug, streaming, and WebSocket
+routes; a bearer-token wrapper or firewall rule is not treated as remote
+authentication.
+
+Put the listener configuration in an owner-only JSON file:
+
+```json
+{
+  "certificate_file": "server.crt",
+  "private_key_file": "server.key",
+  "client_ca_file": "clients.pem"
+}
+```
+
+Relative paths are resolved beside the configuration file. On Unix, both the
+configuration and private key must be inaccessible to group and other users.
+Start a remote listener with:
+
+```sh
+ccvm --addr 100.64.0.10:8080 --tls-config /secure/ccvm-tls.json
+```
+
+`ccvm` requires TLS 1.3 and a verified client certificate. Any certificate
+chaining to `client_ca_file` has full daemon API authority, so use a dedicated
+client CA, issue short-lived certificates, and keep its signing key outside the
+daemon host. Tailscale can provide reachability but does not replace this
+application-layer authentication.
+
+The server certificate, private key, and client CA bundle are reloaded for each
+new TLS connection, and TLS session resumption is disabled so new connections
+always reauthenticate. Rotate files with atomic replacement. For CA rotation,
+publish an overlap bundle containing old and new client CAs, rotate clients,
+then remove the old CA. Existing TLS connections keep their authenticated
+state; new connections fail closed if the rotated files are missing or invalid.
+Changing the configured file paths requires a daemon restart. TLS termination
+at a reverse proxy is not accepted by this listener mode.
+
 ## Build
 
 ```sh
