@@ -2,10 +2,14 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
@@ -207,6 +211,136 @@ func TestManagerAssignsDistinctNetworkLeasesBeforeStart(t *testing.T) {
 	}
 }
 
+func TestManagerShutdownAllDeadlinePreservesFailedAndPendingInstances(t *testing.T) {
+	ctx := context.Background()
+	alphaRelease := make(chan struct{})
+	alphaStarted := make(chan struct{})
+	alpha := &shutdownTestInstance{
+		fakeInstance: newFakeInstance(),
+		closeFunc: func(call int) error {
+			if call == 1 {
+				close(alphaStarted)
+				<-alphaRelease
+			}
+			return nil
+		},
+	}
+	betaErr := errors.New("beta cleanup failed")
+	beta := &shutdownTestInstance{
+		fakeInstance: newFakeInstance(),
+		closeFunc: func(call int) error {
+			if call == 1 {
+				return betaErr
+			}
+			return nil
+		},
+	}
+	gamma := &shutdownTestInstance{fakeInstance: newFakeInstance()}
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 3})
+	for _, inst := range []Instance{alpha, beta, gamma} {
+		host.queueInstance(inst)
+	}
+	manager := testManager(host)
+	for _, id := range []string{"alpha", "beta", "gamma"} {
+		if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+			ID:      id,
+			Image:   "alpine",
+			Network: &client.NetworkConfig{Enabled: true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := newTestDeadlineContext()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownAll(deadline) }()
+	<-alphaStarted
+	waitForInstanceState(t, manager, "beta", "running", func(machine *Machine) bool { return !machine.stopping })
+	waitForInstanceState(t, manager, "gamma", "stopped", nil)
+	deadline.expire()
+	if err := <-shutdownDone; !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, betaErr) {
+		t.Fatalf("ShutdownAll error = %v, want deadline and beta cleanup errors", err)
+	}
+
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "running" {
+		t.Fatalf("pending instance state = %+v", state)
+	}
+	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
+		t.Fatalf("failed instance state = %+v", state)
+	}
+	if state := manager.StatusOf("gamma"); state.ID != "gamma" || state.Status != "stopped" {
+		t.Fatalf("closed instance state = %+v", state)
+	}
+	assertManagerLease(t, manager, "alpha", true)
+	assertManagerLease(t, manager, "beta", true)
+	assertManagerLease(t, manager, "gamma", false)
+
+	if err := manager.ShutdownInstance(ctx, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	assertManagerLease(t, manager, "beta", false)
+	close(alphaRelease)
+	waitForInstanceState(t, manager, "alpha", "stopped", nil)
+	assertManagerLease(t, manager, "alpha", false)
+	if got := alpha.closeCalls.Load(); got != 1 {
+		t.Fatalf("alpha Close calls = %d, want 1", got)
+	}
+	if got := beta.closeCalls.Load(); got != 2 {
+		t.Fatalf("beta Close calls = %d, want 2", got)
+	}
+}
+
+func waitForInstanceState(t *testing.T, manager *Manager, id, status string, machineReady func(*Machine) bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		machine := manager.running[id]
+		ready := status == "stopped" && machine == nil
+		if status == "running" && machine != nil {
+			ready = machineReady == nil || machineReady(machine)
+		}
+		manager.mu.Unlock()
+		if ready {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("instance %q did not reach %s state", id, status)
+}
+
+func assertManagerLease(t *testing.T, manager *Manager, id string, want bool) {
+	t.Helper()
+	manager.mu.Lock()
+	_, got := manager.networkLeases[id]
+	manager.mu.Unlock()
+	if got != want {
+		t.Fatalf("lease %q exists = %v, want %v", id, got, want)
+	}
+}
+
+type testDeadlineContext struct {
+	context.Context
+	done chan struct{}
+}
+
+func newTestDeadlineContext() *testDeadlineContext {
+	return &testDeadlineContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *testDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *testDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *testDeadlineContext) expire() { close(c.done) }
+
 func TestManagerAssignsNetworkLeasesForBuiltinDefaultNetwork(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -365,7 +499,7 @@ func TestManagerSnapshotConsoleForwardAndStats(t *testing.T) {
 type fakeHost struct {
 	mu                sync.Mutex
 	caps              VMHostCapabilities
-	next              []*fakeInstance
+	next              []Instance
 	starts            []client.CreateInstanceRequest
 	blankStarts       []client.StartInstanceRequest
 	runs              []client.RunRequest
@@ -396,7 +530,7 @@ func newFakeHost(caps VMHostCapabilities) *fakeHost {
 	return &fakeHost{caps: caps}
 }
 
-func (h *fakeHost) queueInstance(inst *fakeInstance) {
+func (h *fakeHost) queueInstance(inst Instance) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.next = append(h.next, inst)
@@ -485,7 +619,7 @@ func (h *fakeHost) ExecInInstanceStream(_ context.Context, inst Instance, runnin
 	return emitFakeExecEvents(onEvent, "host exec in stream")
 }
 
-func (h *fakeHost) popInstanceLocked() *fakeInstance {
+func (h *fakeHost) popInstanceLocked() Instance {
 	if len(h.next) == 0 {
 		return newFakeInstance()
 	}
@@ -539,6 +673,22 @@ type fakeInstance struct {
 	stats          []virtio.FSStats
 	ipv4           string
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
+}
+
+type shutdownTestInstance struct {
+	*fakeInstance
+	closeFunc  func(int) error
+	closeCalls atomic.Int32
+}
+
+func (i *shutdownTestInstance) Close() error {
+	call := int(i.closeCalls.Add(1))
+	if i.closeFunc != nil {
+		if err := i.closeFunc(call); err != nil {
+			return err
+		}
+	}
+	return i.fakeInstance.Close()
 }
 
 func newFakeInstance() *fakeInstance {

@@ -372,26 +372,78 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 func (m *Manager) ShutdownAll(ctx context.Context) error {
-	_ = ctx
 	m.mu.Lock()
-	running := m.running
-	m.running = nil
-	m.starting = nil
-	m.mu.Unlock()
-
+	results := make(chan managerShutdownResult, len(m.running))
+	pending := 0
 	var errs []error
-	for id, machine := range running {
+	for id, machine := range m.running {
+		if machine.stopping {
+			errs = append(errs, fmt.Errorf("shutdown VM %q: already shutting down", id))
+			continue
+		}
+		machine.stopping = true
 		machine.shutdownOnce.Do(func() {
 			close(machine.shutdownCh)
 		})
-		if err := machine.instance.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, err))
+		pending++
+		go m.closeMachineForShutdownAll(id, machine, results)
+	}
+	m.mu.Unlock()
+
+	for pending > 0 {
+		if ctx == nil {
+			result := <-results
+			pending--
+			if result.err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+			}
+			continue
+		}
+		select {
+		case result := <-results:
+			pending--
+			if result.err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+			}
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
+			for {
+				select {
+				case result := <-results:
+					pending--
+					if result.err != nil {
+						errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+					}
+				default:
+					return errors.Join(errs...)
+				}
+			}
 		}
 	}
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+type managerShutdownResult struct {
+	id  string
+	err error
+}
+
+func (m *Manager) closeMachineForShutdownAll(id string, machine *Machine, results chan<- managerShutdownResult) {
+	err := machine.instance.Close()
+	m.mu.Lock()
+	if err == nil {
+		if m.running != nil && m.running[id] == machine {
+			delete(m.running, id)
+		}
+		delete(m.networkLeases, id)
+	} else if m.running != nil && m.running[id] == machine {
+		machine.stopping = false
+	}
+	m.mu.Unlock()
+	results <- managerShutdownResult{id: id, err: err}
 }
 
 func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
