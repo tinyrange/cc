@@ -2,7 +2,9 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -46,6 +48,92 @@ func TestDialWorkerRejectsNonHello(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWorkerHelloTimesOutForSilentPeer(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	started := time.Now()
+	_, err := receiveWorkerHello(t.Context(), clientConn, NewWorkerCodec(clientConn), 20*time.Millisecond)
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("hello error = %v, want network timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("silent hello took %s", elapsed)
+	}
+}
+
+func TestWorkerHelloCancellationClosesConnection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, err := receiveWorkerHello(ctx, clientConn, NewWorkerCodec(clientConn), time.Second)
+		result <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("hello error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hello did not return after cancellation")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		var buf [1]byte
+		_, err := serverConn.Read(buf[:])
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("peer read error = %v, want closed connection EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer connection remained open after cancellation")
+	}
+}
+
+func TestWorkerHelloDeadlineIsClearedAfterSuccess(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	clientCodec := NewWorkerCodec(clientConn)
+	serverCodec := NewWorkerCodec(serverConn)
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := serverCodec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+			serverErr <- err
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		serverErr <- serverCodec.Send(WorkerFrame{Type: WorkerFrameDone})
+	}()
+
+	frame, err := receiveWorkerHello(t.Context(), clientConn, clientCodec, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("receive hello: %v", err)
+	}
+	if frame.Type != WorkerFrameHello {
+		t.Fatalf("hello frame type = %q", frame.Type)
+	}
+	frame, err = clientCodec.Receive()
+	if err != nil {
+		t.Fatalf("receive after handshake timeout elapsed: %v", err)
+	}
+	if frame.Type != WorkerFrameDone {
+		t.Fatalf("post-handshake frame type = %q", frame.Type)
+	}
+	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
 	}
 }
