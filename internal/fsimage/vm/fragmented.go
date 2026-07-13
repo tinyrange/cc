@@ -3,7 +3,6 @@ package vm
 import (
 	"fmt"
 	"io"
-	"log/slog"
 	"sort"
 )
 
@@ -24,8 +23,8 @@ func (f regionFragment) end() int64   { return f.offset + f.size }
 
 // Return a new region starting at off.
 func (f regionFragment) offsetAt(off int64) *regionFragment {
-	if off > f.size {
-		panic("offsetAt: off > f.size")
+	if off < 0 || off > f.size {
+		return nil
 	}
 
 	return &regionFragment{
@@ -37,8 +36,8 @@ func (f regionFragment) offsetAt(off int64) *regionFragment {
 
 // Return a new region ending at off.
 func (f regionFragment) cutAt(off int64) *regionFragment {
-	if off > f.size {
-		panic("cutAt: off > f.size")
+	if off < 0 || off > f.size {
+		return nil
 	}
 
 	return &regionFragment{
@@ -46,76 +45,6 @@ func (f regionFragment) cutAt(off int64) *regionFragment {
 		offset: f.offset,
 		size:   off,
 	}
-}
-
-func remapRegion(old *regionFragment, new *regionFragment) []*regionFragment {
-	// This function assumes that old and new can't overlap at the start.
-	// That would have been picked up and resolved by mapFragment.
-	oldStart := old.start()
-	oldEnd := old.end()
-
-	newStart := new.start()
-	newEnd := new.end()
-
-	// If old and end don't overlap at all then just return old.
-	if oldEnd <= newStart || newEnd <= oldStart {
-		// slog.Info("case 1", "old", old, "new", new)
-		return []*regionFragment{old}
-	}
-
-	// If old and new completely overlap or new overwrites old then just return new.
-	if newStart == oldStart && newEnd >= oldEnd {
-		// slog.Info("case 2", "old", old, "new", new)
-		return []*regionFragment{new}
-	}
-
-	// If the start of old and new perfectly overlap but the end doesn't overlap
-	// then return new, old[offset]
-	if newStart == oldStart && newEnd < oldEnd {
-		// Find the overlap at the end.
-		endOverlap := new.size
-
-		// slog.Info("case 3", "old", old, "new", new, "endOverlap", endOverlap)
-
-		return []*regionFragment{
-			new,
-			old.offsetAt(endOverlap),
-		}
-	}
-
-	// If new is entirely contained in old then return old[cut], new. old[offset]
-	if newStart > oldStart && newEnd < oldEnd {
-		// Find the overlap at the start
-		startOverlap := newStart - oldStart
-
-		// Find the overlap at the end.
-		endOverlap := old.size - (oldEnd - newEnd)
-
-		// slog.Info("case 4", "old", old, "new", new, "startOverlap", startOverlap, "endOverlap", endOverlap)
-
-		return []*regionFragment{
-			old.cutAt(startOverlap),
-			new,
-			old.offsetAt(endOverlap),
-		}
-	}
-
-	// If old and new overlap on the end only then return [old, new].
-	// This also handles the case that new ends at old's end.
-	if newStart > oldStart && newEnd >= oldEnd {
-		overlap := newStart - oldStart
-
-		// slog.Info("case 5", "old", old, "new", new, "overlap", overlap)
-
-		return []*regionFragment{
-			old.cutAt(overlap),
-			new,
-		}
-	}
-
-	slog.Error("unimplemented", "oldStart", oldStart, "oldEnd", oldEnd, "newStart", newStart, "newEnd", newEnd)
-
-	panic("unimplemented")
 }
 
 // This is a implementation detail so the struct is private.
@@ -266,16 +195,24 @@ func (f *fragmentedRegion) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 func (f *fragmentedRegion) mapFragment(frag MemoryRegion, off int64) error {
-	// Check that the offset is not more than the maximum size.
-	if off > int64(f.totalSize) {
-		return fmt.Errorf("off > int64(f.totalSize)")
+	if frag == nil {
+		return fmt.Errorf("fragment is nil")
 	}
-
-	// create the new fragmentRegion that needs to be inserted.
+	limit := int64(f.totalSize)
+	if off < 0 || off > limit {
+		return fmt.Errorf("fragment offset %d is outside [0,%d]", off, limit)
+	}
+	size := frag.Size()
+	if size < 0 || size > limit-off {
+		return fmt.Errorf("fragment size %d at offset %d exceeds region size %d", size, off, limit)
+	}
+	if size == 0 {
+		return nil
+	}
 	newFragment := &regionFragment{
 		region: frag,
 		offset: off,
-		size:   frag.Size(),
+		size:   size,
 	}
 
 	newFrags := make([]*regionFragment, 0, len(f.fragments)+1)
@@ -291,14 +228,22 @@ func (f *fragmentedRegion) mapFragment(frag MemoryRegion, off int64) error {
 		}
 
 		if old.start() < newFragment.start() {
-			newFrags = append(newFrags, old.cutAt(newFragment.start()-old.start()))
+			left := old.cutAt(newFragment.start() - old.start())
+			if left == nil {
+				return fmt.Errorf("invalid left fragment split")
+			}
+			newFrags = append(newFrags, left)
 		}
 		if !inserted {
 			newFrags = append(newFrags, newFragment)
 			inserted = true
 		}
 		if old.end() > newFragment.end() {
-			newFrags = append(newFrags, old.offsetAt(newFragment.end()-old.start()))
+			right := old.offsetAt(newFragment.end() - old.start())
+			if right == nil {
+				return fmt.Errorf("invalid right fragment split")
+			}
+			newFrags = append(newFrags, right)
 		}
 	}
 	if !inserted {
