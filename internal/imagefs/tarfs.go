@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"sort"
@@ -127,6 +128,10 @@ func (t *TarFS) read(ctx context.Context, r io.Reader, opts TarFSOptions) error 
 		if err != nil {
 			return fmt.Errorf("read tar: %w", err)
 		}
+		metadata, err := validateTarHeaderMetadata(hdr)
+		if err != nil {
+			return fmt.Errorf("validate %q metadata: %w", hdr.Name, err)
+		}
 		clean := cleanTarPath(hdr.Name)
 		if clean == "/" {
 			continue
@@ -138,7 +143,7 @@ func (t *TarFS) read(ctx context.Context, r io.Reader, opts TarFSOptions) error 
 		if err != nil {
 			return err
 		}
-		entry, err := t.entryFromHeader(hdr, tr, clean, byPath)
+		entry, err := t.entryFromHeader(hdr, metadata, tr, clean, byPath)
 		if err != nil {
 			return err
 		}
@@ -173,6 +178,10 @@ func (t *TarFS) readSeekable(ctx context.Context, r io.Reader, opts TarFSOptions
 		if err != nil {
 			return fmt.Errorf("read tar: %w", err)
 		}
+		metadata, err := validateTarHeaderMetadata(hdr)
+		if err != nil {
+			return fmt.Errorf("validate %q metadata: %w", hdr.Name, err)
+		}
 		clean := cleanTarPath(hdr.Name)
 		if clean == "/" {
 			continue
@@ -180,6 +189,9 @@ func (t *TarFS) readSeekable(ctx context.Context, r io.Reader, opts TarFSOptions
 		included := opts.Include == nil || opts.Include(clean, hdr)
 		if !included {
 			if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
+				if err := validateTarPayloadRange(cr.n, hdr.Size); err != nil {
+					return fmt.Errorf("validate %s payload: %w", clean, err)
+				}
 				if _, err := io.CopyN(io.Discard, tr, hdr.Size); err != nil {
 					return fmt.Errorf("skip %s payload: %w", clean, err)
 				}
@@ -190,7 +202,7 @@ func (t *TarFS) readSeekable(ctx context.Context, r io.Reader, opts TarFSOptions
 		if err != nil {
 			return err
 		}
-		entry, err := t.entryFromSeekableHeader(hdr, tr, clean, cr.n, byPath)
+		entry, err := t.entryFromSeekableHeader(hdr, metadata, tr, clean, cr.n, byPath)
 		if err != nil {
 			return err
 		}
@@ -199,14 +211,56 @@ func (t *TarFS) readSeekable(ctx context.Context, r io.Reader, opts TarFSOptions
 	}
 }
 
-func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, byPath map[string]tarEntry) (tarEntry, error) {
+type tarHeaderMetadata struct {
+	size uint64
+	uid  uint32
+	gid  uint32
+	rdev uint32
+}
+
+func validateTarHeaderMetadata(hdr *tar.Header) (tarHeaderMetadata, error) {
+	if hdr.Size < 0 {
+		return tarHeaderMetadata{}, fmt.Errorf("negative size")
+	}
+	if hdr.Uid < 0 || uint64(hdr.Uid) > math.MaxUint32 {
+		return tarHeaderMetadata{}, fmt.Errorf("uid is outside uint32 range")
+	}
+	if hdr.Gid < 0 || uint64(hdr.Gid) > math.MaxUint32 {
+		return tarHeaderMetadata{}, fmt.Errorf("gid is outside uint32 range")
+	}
+	rdev, err := tarRDev(hdr)
+	if err != nil {
+		return tarHeaderMetadata{}, err
+	}
+	return tarHeaderMetadata{
+		size: uint64(hdr.Size),
+		uid:  uint32(hdr.Uid),
+		gid:  uint32(hdr.Gid),
+		rdev: rdev,
+	}, nil
+}
+
+func validateTarPayloadRange(offset, size int64) error {
+	if offset < 0 {
+		return fmt.Errorf("negative backing offset")
+	}
+	if size < 0 {
+		return fmt.Errorf("negative size")
+	}
+	if size > math.MaxInt64-offset {
+		return fmt.Errorf("backing offset and size overflow int64")
+	}
+	return nil
+}
+
+func (t *TarFS) entryFromHeader(hdr *tar.Header, metadata tarHeaderMetadata, tr *tar.Reader, clean string, byPath map[string]tarEntry) (tarEntry, error) {
 	mode := linuxModeToGo(fsmeta.LinuxModeFromTarHeader(hdr))
 	node := tarNode{
 		name:    path.Base(clean),
 		mode:    mode,
-		uid:     uint32(hdr.Uid),
-		gid:     uint32(hdr.Gid),
-		rdev:    tarRDev(hdr),
+		uid:     metadata.uid,
+		gid:     metadata.gid,
+		rdev:    metadata.rdev,
 		modTime: hdr.ModTime,
 	}
 	switch hdr.Typeflag {
@@ -232,6 +286,9 @@ func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, b
 		if err != nil {
 			return tarEntry{}, fmt.Errorf("seek tarfs backing: %w", err)
 		}
+		if err := validateTarPayloadRange(offset, hdr.Size); err != nil {
+			return tarEntry{}, fmt.Errorf("validate %s payload: %w", clean, err)
+		}
 		if _, err := io.CopyN(t.backing, tr, hdr.Size); err != nil {
 			return tarEntry{}, fmt.Errorf("copy %s payload: %w", clean, err)
 		}
@@ -239,7 +296,7 @@ func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, b
 			node:    node,
 			backing: t.backing,
 			offset:  offset,
-			size:    uint64(hdr.Size),
+			size:    metadata.size,
 			key:     clean,
 		}
 		return tarEntry{File: file}, nil
@@ -250,14 +307,14 @@ func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, b
 	}
 }
 
-func (t *TarFS) entryFromSeekableHeader(hdr *tar.Header, tr *tar.Reader, clean string, dataOffset int64, byPath map[string]tarEntry) (tarEntry, error) {
+func (t *TarFS) entryFromSeekableHeader(hdr *tar.Header, metadata tarHeaderMetadata, tr *tar.Reader, clean string, dataOffset int64, byPath map[string]tarEntry) (tarEntry, error) {
 	mode := linuxModeToGo(fsmeta.LinuxModeFromTarHeader(hdr))
 	node := tarNode{
 		name:    path.Base(clean),
 		mode:    mode,
-		uid:     uint32(hdr.Uid),
-		gid:     uint32(hdr.Gid),
-		rdev:    tarRDev(hdr),
+		uid:     metadata.uid,
+		gid:     metadata.gid,
+		rdev:    metadata.rdev,
 		modTime: hdr.ModTime,
 	}
 	switch hdr.Typeflag {
@@ -279,6 +336,9 @@ func (t *TarFS) entryFromSeekableHeader(hdr *tar.Header, tr *tar.Reader, clean s
 		entry.File.addLink(clean)
 		return tarEntry{File: entry.File}, nil
 	case tar.TypeReg, tar.TypeRegA:
+		if err := validateTarPayloadRange(dataOffset, hdr.Size); err != nil {
+			return tarEntry{}, fmt.Errorf("validate %s payload: %w", clean, err)
+		}
 		if _, err := io.CopyN(io.Discard, tr, hdr.Size); err != nil {
 			return tarEntry{}, fmt.Errorf("skip %s payload: %w", clean, err)
 		}
@@ -286,7 +346,7 @@ func (t *TarFS) entryFromSeekableHeader(hdr *tar.Header, tr *tar.Reader, clean s
 			node:    node,
 			backing: t.backing,
 			offset:  dataOffset,
-			size:    uint64(hdr.Size),
+			size:    metadata.size,
 			key:     clean,
 		}
 		return tarEntry{File: file}, nil
@@ -445,9 +505,15 @@ func cleanTarPath(name string) string {
 	return path.Clean("/" + strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(name), "."), "/"))
 }
 
-func tarRDev(hdr *tar.Header) uint32 {
-	if hdr.Devmajor < 0 || hdr.Devminor < 0 {
-		return 0
+func tarRDev(hdr *tar.Header) (uint32, error) {
+	if hdr.Typeflag != tar.TypeChar && hdr.Typeflag != tar.TypeBlock {
+		return 0, nil
 	}
-	return uint32(hdr.Devmajor<<8 | hdr.Devminor)
+	if hdr.Devmajor < 0 || hdr.Devmajor > math.MaxUint32>>8 {
+		return 0, fmt.Errorf("device major is outside representable range")
+	}
+	if hdr.Devminor < 0 || hdr.Devminor > math.MaxUint32 {
+		return 0, fmt.Errorf("device minor is outside uint32 range")
+	}
+	return uint32(uint64(hdr.Devmajor)<<8 | uint64(hdr.Devminor)), nil
 }

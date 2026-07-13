@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -227,6 +229,108 @@ func TestSeekableTarFSReadsPayloadsFromTarFile(t *testing.T) {
 	if got := readFile(t, root, "/etc/config"); got != "config payload" {
 		t.Fatalf("config = %q", got)
 	}
+}
+
+func TestTarFSRejectsUnrepresentableMetadata(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("uint32 overflow metadata requires a 64-bit int")
+	}
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	mustWriteTarFile(t, tw, "valid", "kept only if the archive is accepted")
+	oversizedUID := uint64(math.MaxUint32) + 1
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "invalid",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+		Uid:      int(oversizedUID),
+		Format:   tar.FormatPAX,
+	}); err != nil {
+		t.Fatalf("write invalid metadata header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+
+	t.Run("streaming", func(t *testing.T) {
+		tfs, err := NewTarFS(context.Background(), bytes.NewReader(buf.Bytes()))
+		if tfs != nil {
+			_ = tfs.Close()
+			t.Fatal("malformed archive returned a partially populated filesystem")
+		}
+		if err == nil {
+			t.Fatal("malformed archive was accepted")
+		}
+	})
+
+	t.Run("seekable", func(t *testing.T) {
+		tarPath := filepath.Join(t.TempDir(), "invalid.tar")
+		if err := os.WriteFile(tarPath, buf.Bytes(), 0o600); err != nil {
+			t.Fatalf("write tar: %v", err)
+		}
+		tfs, err := NewSeekableTarFS(context.Background(), tarPath)
+		if tfs != nil {
+			_ = tfs.Close()
+			t.Fatal("malformed archive returned a partially populated filesystem")
+		}
+		if err == nil {
+			t.Fatal("malformed archive was accepted")
+		}
+	})
+}
+
+func FuzzValidateTarFSMetadataBoundaries(f *testing.F) {
+	f.Add(int64(0), int64(0), int64(0), int64(0), int64(0), int64(0))
+	f.Add(int64(math.MaxInt64), int64(math.MaxUint32), int64(math.MaxUint32), int64(math.MaxUint32>>8), int64(math.MaxUint32), int64(0))
+	f.Add(int64(-1), int64(0), int64(0), int64(0), int64(0), int64(0))
+	f.Add(int64(0), int64(-1), int64(0), int64(0), int64(0), int64(0))
+	f.Add(int64(0), int64(math.MaxUint32)+1, int64(0), int64(0), int64(0), int64(0))
+	f.Add(int64(0), int64(0), int64(math.MaxUint32)+1, int64(0), int64(0), int64(0))
+	f.Add(int64(0), int64(0), int64(0), int64(math.MaxUint32>>8)+1, int64(0), int64(0))
+	f.Add(int64(0), int64(0), int64(0), int64(0), int64(math.MaxUint32)+1, int64(0))
+	f.Add(int64(math.MaxInt64), int64(0), int64(0), int64(0), int64(0), int64(1))
+
+	f.Fuzz(func(t *testing.T, size, uidValue, gidValue, major, minor, offset int64) {
+		uid := int(uidValue)
+		gid := int(gidValue)
+		if int64(uid) != uidValue || int64(gid) != gidValue {
+			return
+		}
+		hdr := &tar.Header{
+			Typeflag: tar.TypeChar,
+			Size:     size,
+			Uid:      uid,
+			Gid:      gid,
+			Devmajor: major,
+			Devminor: minor,
+		}
+		metadata, err := validateTarHeaderMetadata(hdr)
+		wantMetadataError := size < 0 ||
+			uidValue < 0 || uidValue > math.MaxUint32 ||
+			gidValue < 0 || gidValue > math.MaxUint32 ||
+			major < 0 || major > math.MaxUint32>>8 ||
+			minor < 0 || minor > math.MaxUint32
+		if (err != nil) != wantMetadataError {
+			t.Fatalf("metadata validation error = %v, want error %t", err, wantMetadataError)
+		}
+		if err != nil {
+			return
+		}
+		if metadata.size != uint64(size) || metadata.uid != uint32(uid) || metadata.gid != uint32(gid) {
+			t.Fatalf("metadata conversion = %#v", metadata)
+		}
+		wantRDev := uint32(uint64(major)<<8 | uint64(minor))
+		if metadata.rdev != wantRDev {
+			t.Fatalf("rdev = %d, want %d", metadata.rdev, wantRDev)
+		}
+
+		rangeErr := validateTarPayloadRange(offset, size)
+		wantRangeError := offset < 0 || size > math.MaxInt64-offset
+		if (rangeErr != nil) != wantRangeError {
+			t.Fatalf("payload range validation error = %v, want error %t", rangeErr, wantRangeError)
+		}
+	})
 }
 
 func direntNames(entries []DirEnt) string {
