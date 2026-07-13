@@ -78,7 +78,10 @@ type server struct {
 }
 
 type ServerOptions struct {
-	Kind                   string
+	Kind string
+	// TokenPath is advertised to clients but remains owned by the caller that
+	// created it. RunServer never unlinks it: only the publisher can safely
+	// coordinate token generation and discovery-state rotation.
 	TokenPath              string
 	Persistent             bool
 	OnStartup              func(client.ServerHello) error
@@ -355,10 +358,6 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
 	}
-	if strings.TrimSpace(opts.TokenPath) != "" {
-		defer os.Remove(opts.TokenPath)
-	}
-
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")

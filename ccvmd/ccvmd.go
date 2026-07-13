@@ -9,7 +9,8 @@ import (
 )
 
 type ServerOptions struct {
-	Kind                   string
+	Kind string
+	// TokenPath is caller-owned. RunServer advertises it but does not remove it.
 	TokenPath              string
 	Persistent             bool
 	OnStartup              func(client.ServerHello) error
