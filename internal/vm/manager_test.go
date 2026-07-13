@@ -6,11 +6,22 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/virtio"
 )
+
+func TestInstanceStatusPreservesSubsecondStartIdentity(t *testing.T) {
+	manager := NewManager()
+	manager.running = make(map[string]*Machine)
+	manager.running[DefaultInstanceID] = &Machine{startedAt: time.Date(2026, 7, 14, 1, 2, 3, 456789, time.UTC)}
+	state := manager.Status()
+	if state.StartedAt != "2026-07-14T01:02:03.000456789Z" {
+		t.Fatalf("started_at = %q, want nanosecond-stable VM identity", state.StartedAt)
+	}
+}
 
 func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	ctx := context.Background()

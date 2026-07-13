@@ -93,6 +93,7 @@ type RuntimeView interface {
 	InstanceStatuses() []client.InstanceState
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
+	AllowServiceProxyPort(context.Context, string, int) error
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -116,6 +117,13 @@ func (s *server) ShutdownInstance(ctx context.Context, id string) error {
 		return fmt.Errorf("runtime is not available")
 	}
 	return s.vms.ShutdownInstance(ctx, id)
+}
+
+func (s *server) AllowServiceProxyPort(ctx context.Context, id string, port int) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.AllowServiceProxyPortTo(ctx, id, port)
 }
 
 type watchdogController struct {
