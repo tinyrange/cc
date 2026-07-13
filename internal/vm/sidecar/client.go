@@ -29,24 +29,15 @@ type workerFrameResult struct {
 	err   error
 }
 
+const (
+	workerConnectTimeout = 5 * time.Second
+	workerRetryDelay     = 10 * time.Millisecond
+)
+
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
-	var conn net.Conn
-	var err error
-	network, address := workerDialTarget(socketPath)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err = net.Dial(network, address)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
+	conn, err := dialWorkerConnection(ctx, socketPath, workerConnectTimeout, (&net.Dialer{}).DialContext)
+	if err != nil {
+		return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
 	}
 	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]chan workerFrameResult{}}
 	frame, err := worker.codec.Receive()
@@ -60,6 +51,37 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 	}
 	go worker.receiveLoop()
 	return worker, nil
+}
+
+type workerDialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func dialWorkerConnection(ctx context.Context, socketPath string, timeout time.Duration, dial workerDialContextFunc) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	network, address := workerDialTarget(socketPath)
+	retry := time.NewTimer(workerRetryDelay)
+	if !retry.Stop() {
+		<-retry.C
+	}
+	defer retry.Stop()
+	for {
+		conn, err := dial(connectCtx, network, address)
+		if err == nil {
+			return conn, nil
+		}
+		if connectCtx.Err() != nil {
+			return nil, connectCtx.Err()
+		}
+		retry.Reset(workerRetryDelay)
+		select {
+		case <-connectCtx.Done():
+			return nil, connectCtx.Err()
+		case <-retry.C:
+		}
+	}
 }
 
 func workerDialTarget(address string) (string, string) {

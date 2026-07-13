@@ -2,6 +2,7 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"testing"
@@ -18,6 +19,80 @@ func TestWorkerDialTarget(t *testing.T) {
 	network, address = workerDialTarget("/tmp/worker.sock")
 	if network != "unix" || address != "/tmp/worker.sock" {
 		t.Fatalf("unix target = %q %q", network, address)
+	}
+}
+
+func TestDialWorkerConnectionUsesContextForUnixAndTCP(t *testing.T) {
+	tests := []struct {
+		target  string
+		network string
+		address string
+	}{
+		{target: "tcp://127.0.0.1:1234", network: "tcp", address: "127.0.0.1:1234"},
+		{target: "/tmp/worker.sock", network: "unix", address: "/tmp/worker.sock"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.network, func(t *testing.T) {
+			peer := make(chan net.Conn, 1)
+			conn, err := dialWorkerConnection(t.Context(), tt.target, time.Second, func(ctx context.Context, network, address string) (net.Conn, error) {
+				if network != tt.network || address != tt.address {
+					t.Fatalf("dial target = %q %q", network, address)
+				}
+				if _, ok := ctx.Deadline(); !ok {
+					t.Fatal("dial context has no connection deadline")
+				}
+				clientConn, serverConn := net.Pipe()
+				peer <- serverConn
+				return clientConn, nil
+			})
+			if err != nil {
+				t.Fatalf("dialWorkerConnection: %v", err)
+			}
+			_ = conn.Close()
+			_ = (<-peer).Close()
+		})
+	}
+}
+
+func TestDialWorkerConnectionHonorsCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := dialWorkerConnection(ctx, "tcp://127.0.0.1:1", time.Second, func(ctx context.Context, _, _ string) (net.Conn, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dial error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial did not return after cancellation")
+	}
+}
+
+func TestDialWorkerConnectionHasTotalBudget(t *testing.T) {
+	started := time.Now()
+	_, err := dialWorkerConnection(t.Context(), "tcp://127.0.0.1:1", 20*time.Millisecond, func(ctx context.Context, _, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dial error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("dial exceeded total budget: %s", elapsed)
 	}
 }
 
