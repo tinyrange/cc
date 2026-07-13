@@ -109,7 +109,9 @@ func (c *Capture) Publish(required ...string) (string, error) {
 }
 
 func syncFile(path string) error {
-	f, err := os.Open(path)
+	// FlushFileBuffers requires a writable handle on Windows. Snapshot
+	// components are still private staging files at this point.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
