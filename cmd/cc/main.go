@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/cachepath"
 	"j5.nz/cc/internal/fulltest"
 )
 
@@ -819,14 +820,14 @@ func writeDaemonState(path string, state daemonState) error {
 
 func resolveCacheDir(arg string) (string, error) {
 	if arg != "" {
-		return arg, os.MkdirAll(arg, 0o755)
+		return arg, cachepath.EnsurePrivateRoot(arg)
 	}
 	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
 	dir := filepath.Join(userCacheDir, "ccx3")
-	return dir, os.MkdirAll(dir, 0o755)
+	return dir, cachepath.EnsurePrivateRoot(dir)
 }
 
 func printJSON(v any) error {

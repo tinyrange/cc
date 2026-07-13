@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/cachepath"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -1666,14 +1667,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 
 func resolveCacheDir(arg string) (string, error) {
 	if arg != "" {
-		return arg, os.MkdirAll(arg, 0o755)
+		return arg, cachepath.EnsurePrivateRoot(arg)
 	}
 	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
 	dir := filepath.Join(userCacheDir, "ccx3")
-	return dir, os.MkdirAll(dir, 0o755)
+	return dir, cachepath.EnsurePrivateRoot(dir)
 }
 
 func registerPprofHandlers(mux *http.ServeMux) {
