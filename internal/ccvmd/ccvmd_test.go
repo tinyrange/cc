@@ -77,6 +77,34 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	}
 }
 
+func TestMuxPprofEnvironmentCombinations(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		debug string
+		plain string
+		want  int
+	}{
+		{name: "disabled", want: http.StatusNotFound},
+		{name: "debug", debug: "1", want: http.StatusOK},
+		{name: "plain", plain: "1", want: http.StatusOK},
+		{name: "both", debug: "1", plain: "1", want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CCX3_DEBUG_PPROF", tc.debug)
+			t.Setenv("CCX3_PPROF", tc.plain)
+			watchdog := newWatchdogController(func() {})
+			defer watchdog.Stop()
+
+			mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{})
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
+			if rr.Code != tc.want {
+				t.Fatalf("pprof status = %d, want %d", rr.Code, tc.want)
+			}
+		})
+	}
+}
+
 func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
 	shutdownCalled := make(chan struct{}, 1)
 	watchdog := newPersistentWatchdogController(func() {
