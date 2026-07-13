@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,9 +29,15 @@ type networkRuntime struct {
 	dev       *virtio.Net
 	txHook    func([]byte)
 	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closing   bool
 	listeners []net.Listener
+	active    map[net.Conn]struct{}
 	forwards  map[string]client.PortForward
 	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type netstackVirtioBackend struct {
@@ -125,6 +132,7 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 		iface:  iface,
 		txHook: cfg.TXHook,
 	}
+	runtime.ctx, runtime.cancel = context.WithCancel(context.Background())
 	dev := virtio.NewNet(cfg.Base, cfg.Size, cfg.IRQ, cfg.MAC, &netstackVirtioBackend{runtime: runtime})
 	dev.CompleteTXChecksum = false
 	runtime.dev = dev
@@ -172,13 +180,34 @@ func (n *networkRuntime) Close() error {
 	if n == nil {
 		return nil
 	}
+	n.closeOnce.Do(func() {
+		n.closeErr = n.close()
+	})
+	return n.closeErr
+}
+
+func (n *networkRuntime) close() error {
 	var err error
 	n.mu.Lock()
+	n.closing = true
 	listeners := append([]net.Listener(nil), n.listeners...)
 	n.listeners = nil
+	connections := make([]net.Conn, 0, len(n.active))
+	for conn := range n.active {
+		connections = append(connections, conn)
+	}
+	cancel := n.cancel
 	n.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	for _, ln := range listeners {
 		if closeErr := ln.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	for _, conn := range connections {
+		if closeErr := conn.Close(); closeErr != nil && err == nil && !errors.Is(closeErr, net.ErrClosed) {
 			err = closeErr
 		}
 	}
@@ -252,6 +281,10 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 	key := strings.Join([]string{protocol, hostAddr, strconv.Itoa(forward.HostPort), guestAddr, strconv.Itoa(forward.GuestPort)}, "\x00")
 
 	n.mu.Lock()
+	if n.closing {
+		n.mu.Unlock()
+		return net.ErrClosed
+	}
 	if existing, ok := n.forwards[key]; ok {
 		n.mu.Unlock()
 		if existing == forward {
@@ -266,6 +299,11 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 		return fmt.Errorf("listen port forward %s:%d: %w", hostAddr, forward.HostPort, err)
 	}
 	n.mu.Lock()
+	if n.closing {
+		n.mu.Unlock()
+		_ = ln.Close()
+		return net.ErrClosed
+	}
 	if n.forwards == nil {
 		n.forwards = make(map[string]client.PortForward)
 	}
@@ -295,31 +333,90 @@ func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string)
 		if err != nil {
 			return
 		}
-		n.wg.Add(1)
+		if !n.registerPortForwardConn(hostConn) {
+			_ = hostConn.Close()
+			return
+		}
 		go n.handlePortForwardConn(hostConn, guestAddress)
 	}
 }
 
 func (n *networkRuntime) handlePortForwardConn(hostConn net.Conn, guestAddress string) {
 	defer n.wg.Done()
+	defer n.unregisterPortForwardConn(hostConn)
 	defer hostConn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	baseCtx := n.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
 	defer cancel()
 	guestConn, err := n.stack.DialInternalContext(ctx, "tcp", guestAddress)
 	if err != nil {
 		return
 	}
+	if !n.registerActiveConn(guestConn) {
+		_ = guestConn.Close()
+		return
+	}
+	defer n.unregisterPortForwardConn(guestConn)
 	defer guestConn.Close()
 
+	proxyPortForward(hostConn, guestConn)
+}
+
+func (n *networkRuntime) registerPortForwardConn(conn net.Conn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closing {
+		return false
+	}
+	if n.active == nil {
+		n.active = make(map[net.Conn]struct{})
+	}
+	n.active[conn] = struct{}{}
+	n.wg.Add(1)
+	return true
+}
+
+func (n *networkRuntime) registerActiveConn(conn net.Conn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closing {
+		return false
+	}
+	if n.active == nil {
+		n.active = make(map[net.Conn]struct{})
+	}
+	n.active[conn] = struct{}{}
+	return true
+}
+
+func (n *networkRuntime) unregisterPortForwardConn(conn net.Conn) {
+	n.mu.Lock()
+	delete(n.active, conn)
+	n.mu.Unlock()
+}
+
+func proxyPortForward(hostConn, guestConn net.Conn) {
 	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(guestConn, hostConn)
+	copyDirection := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
+				err = closeWriter.CloseWrite()
+			} else {
+				err = dst.Close()
+			}
+		}
 		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(hostConn, guestConn)
-		errCh <- err
-	}()
+	}
+	go copyDirection(guestConn, hostConn)
+	go copyDirection(hostConn, guestConn)
+	if err := <-errCh; err != nil {
+		_ = hostConn.Close()
+		_ = guestConn.Close()
+	}
 	<-errCh
 }
