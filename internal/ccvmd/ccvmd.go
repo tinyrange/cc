@@ -517,6 +517,28 @@ type workerActiveExec struct {
 	closed bool
 }
 
+const (
+	workerExecInputQueueCapacity = 64
+	workerExecStdinQueueLimit    = 56
+	workerExecControlQueueLimit  = workerExecInputQueueCapacity - 1
+)
+
+var (
+	errWorkerExecInputsClosed  = errors.New("worker exec input queue is closed")
+	errWorkerExecInputOverflow = errors.New("worker exec input queue is full")
+)
+
+func newWorkerActiveExec(cancel context.CancelFunc, withInputs bool) *workerActiveExec {
+	exec := &workerActiveExec{cancel: cancel}
+	if withInputs {
+		exec.inputs = make(chan client.ExecInput, 16)
+		exec.done = make(chan struct{})
+		exec.cond = sync.NewCond(&exec.mu)
+		exec.queue = make([]client.ExecInput, 0, workerExecInputQueueCapacity)
+	}
+	return exec
+}
+
 func (e *workerActiveExec) closeInputs() {
 	if e == nil || e.inputs == nil {
 		return
@@ -532,21 +554,42 @@ func (e *workerActiveExec) closeInputs() {
 	})
 }
 
-func (e *workerActiveExec) sendInput(input client.ExecInput) bool {
+func (e *workerActiveExec) sendInput(input client.ExecInput) error {
 	if e == nil || e.inputs == nil {
-		return false
+		return errWorkerExecInputsClosed
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return false
+		return errWorkerExecInputsClosed
+	}
+	limit := workerExecControlQueueLimit
+	if input.Kind == "stdin" {
+		limit = workerExecStdinQueueLimit
+	} else if input.Kind == "stdin_close" {
+		limit = workerExecInputQueueCapacity
+	}
+	if len(e.queue) >= limit {
+		return errWorkerExecInputOverflow
 	}
 	if input.Kind == "stdin_close" {
 		e.closed = true
 	}
 	e.queue = append(e.queue, input)
 	e.cond.Signal()
-	return true
+	return nil
+}
+
+func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) error {
+	err := exec.sendInput(input)
+	if !errors.Is(err, errWorkerExecInputOverflow) {
+		return err
+	}
+	if exec.cancel != nil {
+		exec.cancel()
+	}
+	exec.closeInputs()
+	return err
 }
 
 func (e *workerActiveExec) forwardInputs() {
@@ -690,11 +733,11 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 				continue
 			}
 			if req.Closed {
-				_ = exec.sendInput(client.ExecInput{Kind: "stdin_close"})
+				_ = enqueueWorkerExecInput(exec, client.ExecInput{Kind: "stdin_close"})
 				continue
 			}
-			if !exec.sendInput(req.Input) {
-				_ = sendWorkerError(codec, frame.ID, fmt.Errorf("worker exec input queue is full"))
+			if err := enqueueWorkerExecInput(exec, req.Input); errors.Is(err, errWorkerExecInputOverflow) {
+				_ = sendWorkerError(codec, frame.ID, err)
 			}
 		case vm.WorkerFrameCancel:
 			activeMu.Lock()
@@ -729,11 +772,8 @@ func serveWorkerExec(codec *vm.WorkerCodec, srvState *server, frame vm.WorkerFra
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	exec := &workerActiveExec{cancel: cancel}
+	exec := newWorkerActiveExec(cancel, req.InputStream)
 	if req.InputStream {
-		exec.inputs = make(chan client.ExecInput, 16)
-		exec.done = make(chan struct{})
-		exec.cond = sync.NewCond(&exec.mu)
 		go exec.forwardInputs()
 	}
 	activeMu.Lock()
