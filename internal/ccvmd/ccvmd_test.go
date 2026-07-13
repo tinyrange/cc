@@ -3,6 +3,7 @@ package ccvmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,34 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/vm"
 )
+
+func TestWorkerControlTransportRequiresTLSForTCP(t *testing.T) {
+	_, _, _, _, err := workerControlListenEndpoint("tcp://127.0.0.1:0", "")
+	var securityErr *vm.WorkerSecurityError
+	if !errors.As(err, &securityErr) {
+		t.Fatalf("plaintext TCP error type = %T", err)
+	}
+	if securityErr.Reason != vm.WorkerSecurityPlaintextTCPRejected {
+		t.Fatalf("plaintext TCP reason = %q", securityErr.Reason)
+	}
+
+	_, _, _, _, err = workerControlListenEndpoint("tls://127.0.0.1:0", "")
+	if !errors.As(err, &securityErr) {
+		t.Fatalf("missing TLS config error type = %T", err)
+	}
+	if securityErr.Reason != vm.WorkerSecurityTLSConfigRequired {
+		t.Fatalf("missing TLS config reason = %q", securityErr.Reason)
+	}
+
+	network, address, secure, cleanup, err := workerControlListenEndpoint(t.TempDir()+"/control.sock", "")
+	if err != nil {
+		t.Fatalf("Unix endpoint: %v", err)
+	}
+	defer cleanup()
+	if network != "unix" || address == "" || secure {
+		t.Fatalf("Unix endpoint = network:%q address:%q secure:%t", network, address, secure)
+	}
+}
 
 func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	shutdownCalled := make(chan struct{}, 1)
