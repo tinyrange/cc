@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 )
@@ -124,6 +125,9 @@ func TestCachePublicationSerializesWritersPerEntry(t *testing.T) {
 }
 
 func TestCacheStateIsOwnerPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cache privacy is represented by ACLs, not Unix mode bits")
+	}
 	root := filepath.Join(t.TempDir(), "cache")
 	target := cvmfsFileCachePath(root, "repo", "/file")
 	if err := writeAtomicFile(target, func(dst io.Writer) error {

@@ -2128,10 +2128,8 @@ func validatePrivateCacheDir(dir string) error {
 	if err := validateCacheOwner(info); err != nil {
 		return fmt.Errorf("validate CVMFS cache directory %q: %w", dir, err)
 	}
-	if info.Mode().Perm() != 0o700 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("secure CVMFS cache directory %q: %w", dir, err)
-		}
+	if err := secureCacheDirectoryMode(dir, info); err != nil {
+		return fmt.Errorf("secure CVMFS cache directory %q: %w", dir, err)
 	}
 	return nil
 }
@@ -2162,8 +2160,8 @@ func openPrivateCacheFile(cacheRoot, cachePath string) (*os.File, error) {
 	if err := validateCacheOwner(info); err != nil {
 		return nil, fmt.Errorf("validate CVMFS cache entry %q: %w", cachePath, err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("CVMFS cache entry %q has public mode %04o", cachePath, info.Mode().Perm())
+	if err := validateCacheFileMode(cachePath, info); err != nil {
+		return nil, err
 	}
 	file, err := os.Open(cachePath)
 	if err != nil {
