@@ -234,7 +234,7 @@ func (d *LinearDirectory) AddEntry(child *InodeWrapper, name string) error {
 		if int(currentLen-lastRecLen) < requiredLen {
 			// Otherwise increase the size.
 			if err := d.increaseSize(); err != nil {
-				return fmt.Errorf("failed to increase size: %v", err)
+				return fmt.Errorf("increase directory size: %w", err)
 			}
 
 			// Call the method again.
@@ -366,7 +366,7 @@ func mapLinearDirectory(fs *Ext4Filesystem, tree ExtentTree) (*LinearDirectory, 
 
 	extents, err := tree.Extents()
 	if err != nil {
-		return nil, fmt.Errorf("TODO: %v", err)
+		return nil, fmt.Errorf("read directory extents: %w", err)
 	}
 
 	if len(extents) != 1 {
@@ -390,7 +390,7 @@ func mapLinearDirectory(fs *Ext4Filesystem, tree ExtentTree) (*LinearDirectory, 
 		ent := &DirectoryEntry{ent: &DirEntry2{}, offset: int64(currentOffset)}
 
 		if err := fs.vm.Reinterpret(ent.ent, int64(currentOffset)); err != nil {
-			return nil, fmt.Errorf("TODO: %v", err)
+			return nil, fmt.Errorf("map directory entry at offset %d: %w", currentOffset, err)
 		}
 
 		// if err := fs.vm.Reinterpret(ent.ent, int64(currentOffset)); err != nil {
@@ -402,7 +402,7 @@ func mapLinearDirectory(fs *Ext4Filesystem, tree ExtentTree) (*LinearDirectory, 
 		name := make([]byte, ent.ent.NameLen())
 
 		if _, err := fs.vm.ReadAt(name, int64(nameOffset)); err != nil {
-			return nil, fmt.Errorf("TODO: %v", err)
+			return nil, fmt.Errorf("read directory entry name at offset %d: %w", nameOffset, err)
 		}
 
 		ent.name = string(name)
@@ -577,7 +577,7 @@ func mapExtentTree(vm *vm.VirtualMemory, base uint64) (*ExtentTree1, error) {
 	tree := &ExtentTree1{header: &ExtentTreeHeader{}}
 
 	if err := vm.Reinterpret(tree.header, int64(base)); err != nil {
-		return nil, fmt.Errorf("TODO: %v", err)
+		return nil, fmt.Errorf("map extent tree header at offset %d: %w", base, err)
 	}
 	base += uint64(tree.header.Size())
 
@@ -597,7 +597,7 @@ func mapExtentTree(vm *vm.VirtualMemory, base uint64) (*ExtentTree1, error) {
 			leaf := &ExtentTreeNode{}
 
 			if err := vm.Reinterpret(leaf, int64(base)); err != nil {
-				return nil, fmt.Errorf("failed to reinterpret leaf: %v", err)
+				return nil, fmt.Errorf("map extent tree leaf: %w", err)
 			}
 			base += uint64(leaf.Size())
 
@@ -1040,7 +1040,7 @@ func (i *InodeWrapper) addContents(contents vm.MemoryRegion, symlink bool) error
 
 	if symlink && contents.Size() < 60 {
 		if err := i.fs.mapRegion(vm.NewPaddedRegion(contents, 60), int64(i.offset)+40); err != nil {
-			return fmt.Errorf("failed to mapRegion: %+v", err)
+			return fmt.Errorf("map inline file data: %w", err)
 		}
 
 		i.node.SetNSize(uint64(contents.Size()))
@@ -1048,12 +1048,12 @@ func (i *InodeWrapper) addContents(contents vm.MemoryRegion, symlink bool) error
 		blocks := roundUpDiv(int(contents.Size()), int(i.fs.sb.blockSize()))
 
 		if err := i.allocateExtent(int64(blocks)); err != nil {
-			return fmt.Errorf("failed to allocate extent: %+v", err)
+			return fmt.Errorf("allocate file extent: %w", err)
 		}
 
 		ext, err := i.extentTree.Extents()
 		if err != nil {
-			return fmt.Errorf("failed to get extents: %+v", err)
+			return fmt.Errorf("read file extents: %w", err)
 		}
 
 		i.node.SetNSize(uint64(contents.Size()))
@@ -1061,7 +1061,7 @@ func (i *InodeWrapper) addContents(contents vm.MemoryRegion, symlink bool) error
 
 		for _, extent := range ext {
 			if err := i.fs.mapExtent(contents, &extent); err != nil {
-				return fmt.Errorf("failed to addContents: %+v", err)
+				return fmt.Errorf("map file extent contents: %w", err)
 			}
 		}
 	}
@@ -1129,7 +1129,7 @@ type BlockGroup struct {
 }
 
 func (bg *BlockGroup) allocateBlocks(blocks uint32) (*Extent, error) {
-	var start uint32 = 0
+	start := bg.firstFreeBlock
 	var noFreeBlocks = true
 
 	// Check if this block group even has a chance of fitting all the blocks.
@@ -1151,13 +1151,13 @@ func (bg *BlockGroup) allocateBlocks(blocks uint32) (*Extent, error) {
 
 		// Fill the entire block bitmap.
 		if err := bg.blockBitmap.SetAll(true); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("mark all blocks allocated in block group %d: %w", bg.num, err)
 		}
 
 		// Return a new extent.
 		ext, err := NewExtent(0, uint64(bg.firstBlock), uint16(blocks))
 		if err != nil {
-			return nil, fmt.Errorf("failed to allocate full block group: %v", err)
+			return nil, fmt.Errorf("create full block-group extent: %w", err)
 		}
 
 		return &ext, nil
@@ -1166,7 +1166,7 @@ func (bg *BlockGroup) allocateBlocks(blocks uint32) (*Extent, error) {
 	for i := bg.firstFreeBlock; i < bg.blockCount; i++ {
 		used, err := bg.blockBitmap.Get(uint64(i))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read block %d allocation bit in block group %d: %w", i, bg.num, err)
 		}
 
 		if used {
@@ -1181,16 +1181,16 @@ func (bg *BlockGroup) allocateBlocks(blocks uint32) (*Extent, error) {
 			noFreeBlocks = false
 		}
 
-		if i-start != uint32(blocks) {
+		if i-start+1 != blocks {
 			continue
 		}
 
 		// We found the blocks we need.
 
 		// Reserve them in the bitmap.
-		for x := start; x < i; x++ {
+		for x := start; x <= i; x++ {
 			if err := bg.blockBitmap.Set(uint64(x), true); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("mark block %d allocated in block group %d: %w", x, bg.num, err)
 			}
 		}
 
@@ -1208,7 +1208,7 @@ func (bg *BlockGroup) allocateBlocks(blocks uint32) (*Extent, error) {
 			// 	"blocks", blocks,
 			// 	"freeBlocks", bg.desc.FreeBlocksCount(),
 			// )
-			return nil, fmt.Errorf("failed to allocate regular blocks: %v", err)
+			return nil, fmt.Errorf("create block-group extent: %w", err)
 		}
 
 		return &ext, nil
@@ -1225,7 +1225,7 @@ func (bg *BlockGroup) allocateInode() (*InodeWrapper, error) {
 	for i := bg.firstFreeInode; i < bg.inodeCount; i++ {
 		used, err := bg.inodeBitmap.Get(uint64(i))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read inode %d allocation bit in block group %d: %w", i, bg.num, err)
 		}
 
 		if used {
@@ -1236,7 +1236,7 @@ func (bg *BlockGroup) allocateInode() (*InodeWrapper, error) {
 
 		// Found the inode. Set it in the bitmap.
 		if err := bg.inodeBitmap.Set(uint64(i), true); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("mark inode %d allocated in block group %d: %w", i, bg.num, err)
 		}
 
 		// Calculate the inode number and the offset into the inode table.
@@ -1366,6 +1366,30 @@ func (fs *Ext4Filesystem) allocateBlocksForBytes(size int64) (*Extent, error) {
 	blocks := roundUpDiv(size, int64(fs.sb.blockSize()))
 
 	return fs.allocateBlocks(blocks)
+}
+
+func (fs *Ext4Filesystem) reserveSuperblockBlock() error {
+	if len(fs.bgs) == 0 {
+		return fmt.Errorf("no block group contains the superblock")
+	}
+	bg := fs.bgs[0]
+	if bg.firstBlock != 0 || bg.blockCount == 0 || bg.desc.FreeBlocksCount() == 0 {
+		return fmt.Errorf("block zero is unavailable in block group 0")
+	}
+	used, err := bg.blockBitmap.Get(0)
+	if err != nil {
+		return fmt.Errorf("read superblock allocation bit: %w", err)
+	}
+	if used {
+		return fmt.Errorf("block zero is already allocated")
+	}
+	if err := bg.blockBitmap.Set(0, true); err != nil {
+		return fmt.Errorf("mark superblock block allocated: %w", err)
+	}
+	bg.firstFreeBlock = 1
+	bg.desc.SetFreeBlocksCount(bg.desc.FreeBlocksCount() - 1)
+	fs.sb.SetFreeBlocksCount(fs.sb.FreeBlocksCount() - 1)
+	return nil
 }
 
 var (
@@ -1538,15 +1562,15 @@ func (fs *Ext4Filesystem) CreateFile(filename string, content vm.MemoryRegion) e
 
 	f, err := fs.allocateInode()
 	if err != nil {
-		return fmt.Errorf("failed to allocate inode: %v", err)
+		return fmt.Errorf("allocate inode for %s: %w", filename, err)
 	}
 
 	if err := f.addContents(content, false); err != nil {
-		return fmt.Errorf("failed to add contents: %v", err)
+		return fmt.Errorf("add contents for %s: %w", filename, err)
 	}
 
 	if err := node.addDirectoryEntry(f, path.Base(filename)); err != nil {
-		return fmt.Errorf("failed to addDirectoryEntry: %v", err)
+		return fmt.Errorf("add directory entry for %s: %w", filename, err)
 	}
 
 	return nil
@@ -1701,7 +1725,9 @@ func (fs *Ext4Filesystem) MakeDeterministic(fsUuid UUID, createTime time.Time) e
 	fs.sb.SetLastcheck(uint32(createTime.Unix()))
 	fs.sb.SetMkfsTime(uint32(createTime.Unix()))
 
-	fs.sb.WriteAt(fsUuid[:], 104)
+	if err := writeFullAt(fs.sb, fsUuid[:], 104); err != nil {
+		return fmt.Errorf("write deterministic filesystem UUID: %w", err)
+	}
 
 	rootNode := fs.inodes[2]
 
@@ -1753,7 +1779,7 @@ func MountExt4Filesystem(_vm *vm.VirtualMemory, offset int64) (*Ext4Filesystem, 
 
 	// Map the super block.
 	if err := fs.vm.Reinterpret(fs.sb, currentOffset); err != nil {
-		return nil, fmt.Errorf("failed to reinterpret superblock: %v", err)
+		return nil, fmt.Errorf("map existing superblock: %w", err)
 	}
 	if fs.sb.blockSize() == 1024 {
 		currentOffset += fs.sb.Size()
@@ -1784,7 +1810,7 @@ func MountExt4Filesystem(_vm *vm.VirtualMemory, offset int64) (*Ext4Filesystem, 
 		}
 
 		if err := fs.vm.Reinterpret(bg.desc, currentOffset); err != nil {
-			return nil, fmt.Errorf("failed to reinterpret block group: %v", err)
+			return nil, fmt.Errorf("map existing block group %d: %w", i, err)
 		}
 		currentOffset += bg.desc.Size()
 
@@ -1930,7 +1956,9 @@ func CreateExt4Filesystem(_vm *vm.VirtualMemory, offset int64, size int64) (*Ext
 	}
 
 	// Set uuid
-	fs.sb.WriteAt(uuid[:], 104)
+	if err := writeFullAt(fs.sb, uuid[:], 104); err != nil {
+		return nil, fmt.Errorf("write filesystem UUID: %w", err)
+	}
 
 	// Set feature flags.
 	fs.sb.SetFeatureCompat(
@@ -1996,19 +2024,21 @@ func CreateExt4Filesystem(_vm *vm.VirtualMemory, offset int64, size int64) (*Ext
 			if fs.sb.blockSize() == 1024 {
 				return nil, fmt.Errorf("block size of 1024 not implemented")
 			} else {
-				// Allocate a single block (which will be at the start) for the super block.
-				// Ignore errors since we expect this to be a null pointer error.
-				fs.allocateBlocks(1)
+				// Reserve block zero for the superblock. It cannot be represented as an
+				// extent because zero is the null physical-block pointer.
+				if err := fs.reserveSuperblockBlock(); err != nil {
+					return nil, fmt.Errorf("reserve superblock block: %w", err)
+				}
 
-				_, err := fs.allocateBlocksForBytes(blockGroupCount * BlockGroupDescriptor{}.Size())
+				_, err = fs.allocateBlocksForBytes(blockGroupCount * BlockGroupDescriptor{}.Size())
 				if err != nil {
-					return nil, fmt.Errorf("could not allocate bgd blocks: %v", err)
+					return nil, fmt.Errorf("allocate block group descriptor blocks: %w", err)
 				}
 			}
 		}
 
 		if err := fs.mapRegion(bg.desc, blockGroupOffset); err != nil {
-			return nil, fmt.Errorf("failed to reinterpret block group: %v", err)
+			return nil, fmt.Errorf("map block group %d descriptor: %w", i, err)
 		}
 		blockGroupOffset += bg.desc.Size()
 
@@ -2092,6 +2122,17 @@ func CreateExt4Filesystem(_vm *vm.VirtualMemory, offset int64, size int64) (*Ext
 	slog.Debug("created fs", "time", time.Since(start))
 
 	return fs, nil
+}
+
+func writeFullAt(dst io.WriterAt, p []byte, off int64) error {
+	n, err := dst.WriteAt(p, off)
+	if err != nil {
+		return fmt.Errorf("write at offset %d: %w", off, err)
+	}
+	if n != len(p) {
+		return fmt.Errorf("write at offset %d wrote %d of %d bytes: %w", off, n, len(p), io.ErrShortWrite)
+	}
+	return nil
 }
 
 func randomUUID() (UUID, error) {
