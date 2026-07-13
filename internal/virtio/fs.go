@@ -2643,7 +2643,8 @@ func (f *FS) Stats() FSStats {
 	defer f.mu.Unlock()
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
 	ops := make([]FUSEOpStats, 0, len(f.fuseOpStats))
-	for opcode, stat := range f.fuseOpStats {
+	for opcode := range f.fuseOpStats {
+		stat := &f.fuseOpStats[opcode]
 		count := stat.timingStat.count.Load()
 		if count == 0 {
 			continue
@@ -2670,8 +2671,8 @@ func (f *FS) Stats() FSStats {
 		return ops[i].Count > ops[j].Count
 	})
 	stages := make([]TimingStats, 0, len(f.stageStats))
-	for stage, stat := range f.stageStats {
-		if stats, ok := timingStatsSnapshot(fsStageName(stage), &stat); ok {
+	for stage := range f.stageStats {
+		if stats, ok := timingStatsSnapshot(fsStageName(stage), &f.stageStats[stage]); ok {
 			stages = append(stages, stats)
 		}
 	}

@@ -634,7 +634,6 @@ func readStage2Config() ([]byte, error) {
 }
 
 func connectStage2Control(port uint32) (*os.File, error) {
-	var lastErr error
 	start := time.Now()
 	lastLog := start
 	for attempt := 0; ; attempt++ {
@@ -645,7 +644,6 @@ func connectStage2Control(port uint32) (*os.File, error) {
 			}
 			return control, nil
 		}
-		lastErr = err
 		if attempt == 0 {
 			writeKernel("ccx3-init: stage2 waiting for vsock control: " + err.Error())
 			lastLog = time.Now()
@@ -655,7 +653,6 @@ func connectStage2Control(port uint32) (*os.File, error) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil, lastErr
 }
 
 func bootInitSystem(cfg config, bootStart time.Time) error {

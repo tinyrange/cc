@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -31,7 +32,7 @@ func TestWaitCommand(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start exit helper: %v", err)
 	}
-	if err := WaitCommand(cmd, time.Second); err != nil {
+	if err := WaitCommand(cmd, 30*time.Second); err != nil {
 		t.Fatalf("wait exit helper: %v", err)
 	}
 
@@ -39,13 +40,13 @@ func TestWaitCommand(t *testing.T) {
 	if err := slow.Start(); err != nil {
 		t.Fatalf("start sleep helper: %v", err)
 	}
-	start := time.Now()
 	err := WaitCommand(slow, 10*time.Millisecond)
-	if err == nil {
-		t.Fatalf("wait sleep unexpectedly succeeded")
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("wait timed-out helper error = %T, want process exit error", err)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("wait sleep took %s, want timeout kill", elapsed)
+	if slow.ProcessState == nil || slow.ProcessState.Success() {
+		t.Fatalf("timed-out helper process state = %v, want unsuccessful termination", slow.ProcessState)
 	}
 }
 

@@ -272,6 +272,7 @@ func (m *Manager) lookupPackageEntry(ctx context.Context, repo, packageName stri
 	timing.Since(ctx, "kernel.lookup_package_entry.read_apk_index", start)
 	start = time.Now()
 	entry, err := m.packageEntryFromIndex(repo, packageName, indexData)
+	timing.Since(ctx, "kernel.lookup_package_entry.parse_entry", start)
 	if err != nil {
 		return indexEntry{}, err
 	}
