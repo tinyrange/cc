@@ -10,29 +10,55 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
 
+const (
+	clientConnectTimeout        = 30 * time.Second
+	clientTLSHandshakeTimeout   = 10 * time.Second
+	clientResponseHeaderTimeout = 30 * time.Second
+	clientIdleConnTimeout       = 90 * time.Second
+)
+
 type Client struct {
-	url     string
-	dialer  func() (net.Conn, error)
-	headers http.Header
-	client  http.Client
+	url         string
+	dialContext func(context.Context) (net.Conn, error)
+	headers     http.Header
+	client      http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
+	if dialer == nil {
+		return NewClientContext(url, nil)
+	}
+	return NewClientContext(url, func(context.Context) (net.Conn, error) {
+		return dialer()
+	})
+}
+
+func NewClientContext(url string, dialer func(context.Context) (net.Conn, error)) *Client {
 	c := &Client{
-		url:    url,
-		dialer: dialer,
+		url:         url,
+		dialContext: dialer,
+	}
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   clientTLSHandshakeTimeout,
+		ResponseHeaderTimeout: clientResponseHeaderTimeout,
+		IdleConnTimeout:       clientIdleConnTimeout,
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, clientConnectTimeout)
+		defer cancel()
+		if dialer != nil {
+			return dialer(dialCtx)
+		}
+		return (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(dialCtx, network, address)
 	}
 	c.client = http.Client{
 		Transport: &authTransport{
-			base: &http.Transport{
-				Dial: func(_, _ string) (net.Conn, error) {
-					return c.dialer()
-				},
-			},
+			base: transport,
 			token: func() string {
 				return c.headers.Get("Authorization")
 			},
@@ -93,7 +119,15 @@ func (c *Client) SetHeader(key, value string) {
 }
 
 func (c *Client) HealthCheck() error {
-	resp, err := c.client.Get(c.url + "/healthz")
+	return c.HealthCheckContext(context.Background())
+}
+
+func (c *Client) HealthCheckContext(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodGet, c.url+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -105,7 +139,11 @@ func (c *Client) HealthCheck() error {
 }
 
 func (c *Client) Shutdown() error {
-	req, err := http.NewRequest(http.MethodPost, c.url+"/shutdown", nil)
+	return c.ShutdownContext(context.Background())
+}
+
+func (c *Client) ShutdownContext(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodPost, c.url+"/shutdown", nil)
 	if err != nil {
 		return err
 	}
@@ -123,80 +161,97 @@ func (c *Client) Shutdown() error {
 }
 
 func (c *Client) RouteExists(path string) bool {
-	resp, err := c.client.Get(c.url + path)
+	exists, _ := c.RouteExistsContext(context.Background(), path)
+	return exists
+}
+
+func (c *Client) RouteExistsContext(ctx context.Context, path string) (bool, error) {
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodGet, c.url+path, nil)
 	if err != nil {
-		return false
+		return false, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return false, err
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode != http.StatusNotFound
+	return resp.StatusCode != http.StatusNotFound, nil
 }
 
 func (c *Client) KernelStatus() (KernelState, error) {
+	return c.KernelStatusContext(context.Background())
+}
+
+func (c *Client) KernelStatusContext(ctx context.Context) (KernelState, error) {
 	var ret KernelState
-	resp, err := c.client.Get(c.url + "/kernel")
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/kernel", &ret)
 	return ret, err
 }
 
 func (c *Client) DownloadKernel(req DownloadRequest) error {
-	return c.postJSONExpectOK("/kernel/download", req, nil)
+	return c.DownloadKernelContext(context.Background(), req)
+}
+
+func (c *Client) DownloadKernelContext(ctx context.Context, req DownloadRequest) error {
+	return c.postJSONExpectOKContext(ctx, "/kernel/download", req, nil)
 }
 
 func (c *Client) DownloadKernelStream(req DownloadRequest, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStream("/kernel/download", req, onEvent)
+	return c.DownloadKernelStreamContext(context.Background(), req, onEvent)
+}
+
+func (c *Client) DownloadKernelStreamContext(ctx context.Context, req DownloadRequest, onEvent func(ProgressEvent) error) error {
+	return c.postJSONProgressStreamContext(ctx, "/kernel/download", req, onEvent)
 }
 
 func (c *Client) PrepareImageMetadata(name string) (ImageMetadataState, error) {
+	return c.PrepareImageMetadataContext(context.Background(), name)
+}
+
+func (c *Client) PrepareImageMetadataContext(ctx context.Context, name string) (ImageMetadataState, error) {
 	var ret ImageMetadataState
-	err := c.postJSONExpectOK("/image/"+imagePathName(name)+"/metadata", map[string]any{}, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/image/"+imagePathName(name)+"/metadata", map[string]any{}, &ret)
 	return ret, err
 }
 
 func (c *Client) PrepareImageEmulator(name string) (EmulatorState, error) {
+	return c.PrepareImageEmulatorContext(context.Background(), name)
+}
+
+func (c *Client) PrepareImageEmulatorContext(ctx context.Context, name string) (EmulatorState, error) {
 	var ret EmulatorState
-	err := c.postJSONExpectOK("/image/"+imagePathName(name)+"/qemu/download", map[string]any{}, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/image/"+imagePathName(name)+"/qemu/download", map[string]any{}, &ret)
 	return ret, err
 }
 
 func (c *Client) ListImages() ([]ImageState, error) {
-	resp, err := c.client.Get(c.url + "/image")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, decodeErrorResponse(resp)
-	}
+	return c.ListImagesContext(context.Background())
+}
+
+func (c *Client) ListImagesContext(ctx context.Context) ([]ImageState, error) {
 	var ret []ImageState
-	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+	if err := c.getJSONContext(ctx, "/image", &ret); err != nil {
 		return nil, err
 	}
 	return ret, nil
 }
 
 func (c *Client) GetImage(name string) (ImageState, error) {
+	return c.GetImageContext(context.Background(), name)
+}
+
+func (c *Client) GetImageContext(ctx context.Context, name string) (ImageState, error) {
 	var ret ImageState
-	resp, err := c.client.Get(c.url + "/image/" + imagePathName(name))
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/image/"+imagePathName(name), &ret)
 	return ret, err
 }
 
 func (c *Client) PullImage(name string, req PullImageRequest) error {
-	return c.postJSONExpectOK("/image/"+imagePathName(name), req, nil)
+	return c.PullImageContext(context.Background(), name, req)
+}
+
+func (c *Client) PullImageContext(ctx context.Context, name string, req PullImageRequest) error {
+	return c.postJSONExpectOKContext(ctx, "/image/"+imagePathName(name), req, nil)
 }
 
 func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
@@ -208,7 +263,11 @@ func (c *Client) PullImageStreamContext(ctx context.Context, name string, req Pu
 }
 
 func (c *Client) DeleteImage(name string) error {
-	req, err := http.NewRequest(http.MethodDelete, c.url+"/image/"+imagePathName(name), nil)
+	return c.DeleteImageContext(context.Background(), name)
+}
+
+func (c *Client) DeleteImageContext(ctx context.Context, name string) error {
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodDelete, c.url+"/image/"+imagePathName(name), nil)
 	if err != nil {
 		return err
 	}
@@ -224,13 +283,21 @@ func (c *Client) DeleteImage(name string) error {
 }
 
 func (c *Client) SaveInstanceImage(id string, req SaveImageRequest) (ImageState, error) {
+	return c.SaveInstanceImageContext(context.Background(), id, req)
+}
+
+func (c *Client) SaveInstanceImageContext(ctx context.Context, id string, req SaveImageRequest) (ImageState, error) {
 	var ret ImageState
-	err := c.postJSONExpectOK("/vm/"+imagePathName(id)+"/save", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/vm/"+imagePathName(id)+"/save", req, &ret)
 	return ret, err
 }
 
 func (c *Client) FlushInstance(id string) error {
-	return c.postJSONExpectOK("/vm/"+imagePathName(id)+"/flush", map[string]any{}, nil)
+	return c.FlushInstanceContext(context.Background(), id)
+}
+
+func (c *Client) FlushInstanceContext(ctx context.Context, id string) error {
+	return c.postJSONExpectOKContext(ctx, "/vm/"+imagePathName(id)+"/flush", map[string]any{}, nil)
 }
 
 func imagePathName(name string) string {
@@ -238,76 +305,104 @@ func imagePathName(name string) string {
 }
 
 func (c *Client) VMSupported() (VMSupportedResponse, error) {
+	return c.VMSupportedContext(context.Background())
+}
+
+func (c *Client) VMSupportedContext(ctx context.Context) (VMSupportedResponse, error) {
 	var ret VMSupportedResponse
-	resp, err := c.client.Get(c.url + "/vm/supported")
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/vm/supported", &ret)
 	return ret, err
 }
 
 func (c *Client) Capabilities() (CapabilitiesResponse, error) {
+	return c.CapabilitiesContext(context.Background())
+}
+
+func (c *Client) CapabilitiesContext(ctx context.Context) (CapabilitiesResponse, error) {
 	var ret CapabilitiesResponse
-	resp, err := c.client.Get(c.url + "/capabilities")
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/capabilities", &ret)
 	return ret, err
 }
 
 func (c *Client) CreateWatchdogLease(req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
+	return c.CreateWatchdogLeaseContext(context.Background(), req)
+}
+
+func (c *Client) CreateWatchdogLeaseContext(ctx context.Context, req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
 	var ret WatchdogLeaseResponse
-	err := c.postJSONExpectOK("/watchdog/lease", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/watchdog/lease", req, &ret)
 	return ret, err
 }
 
 func (c *Client) FeedWatchdogLease(id string) error {
-	return c.postJSONExpectOK("/watchdog/lease/feed", WatchdogLeaseRequest{LeaseID: id}, nil)
+	return c.FeedWatchdogLeaseContext(context.Background(), id)
+}
+
+func (c *Client) FeedWatchdogLeaseContext(ctx context.Context, id string) error {
+	return c.postJSONExpectOKContext(ctx, "/watchdog/lease/feed", WatchdogLeaseRequest{LeaseID: id}, nil)
 }
 
 func (c *Client) ReleaseWatchdogLease(id string) error {
-	return c.postJSONExpectOK("/watchdog/lease/release", WatchdogLeaseRequest{LeaseID: id}, nil)
+	return c.ReleaseWatchdogLeaseContext(context.Background(), id)
+}
+
+func (c *Client) ReleaseWatchdogLeaseContext(ctx context.Context, id string) error {
+	return c.postJSONExpectOKContext(ctx, "/watchdog/lease/release", WatchdogLeaseRequest{LeaseID: id}, nil)
 }
 
 func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error) {
+	return c.CreateInstanceContext(context.Background(), req)
+}
+
+func (c *Client) CreateInstanceContext(ctx context.Context, req CreateInstanceRequest) (InstanceState, error) {
 	var ret InstanceState
-	err := c.postJSONExpectOK("/vm", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/vm", req, &ret)
 	return ret, err
 }
 
 func (c *Client) CreateInstanceWithID(id string, req CreateInstanceRequest) (InstanceState, error) {
+	return c.CreateInstanceWithIDContext(context.Background(), id, req)
+}
+
+func (c *Client) CreateInstanceWithIDContext(ctx context.Context, id string, req CreateInstanceRequest) (InstanceState, error) {
 	req.ID = id
-	return c.CreateInstance(req)
+	return c.CreateInstanceContext(ctx, req)
 }
 
 func (c *Client) CreateInstanceStream(req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
-	return c.postJSONBootStream("/vm", req, onEvent)
+	return c.CreateInstanceStreamContext(context.Background(), req, onEvent)
+}
+
+func (c *Client) CreateInstanceStreamContext(ctx context.Context, req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.postJSONBootStreamContext(ctx, "/vm", req, onEvent)
 }
 
 func (c *Client) CreateInstanceStreamWithID(id string, req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.CreateInstanceStreamWithIDContext(context.Background(), id, req, onEvent)
+}
+
+func (c *Client) CreateInstanceStreamWithIDContext(ctx context.Context, id string, req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
 	req.ID = id
-	return c.CreateInstanceStream(req, onEvent)
+	return c.CreateInstanceStreamContext(ctx, req, onEvent)
 }
 
 func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) {
+	return c.StartInstanceContext(context.Background(), req)
+}
+
+func (c *Client) StartInstanceContext(ctx context.Context, req StartInstanceRequest) (InstanceState, error) {
 	var ret InstanceState
-	err := c.postJSONExpectOK("/vm/start", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/vm/start", req, &ret)
 	return ret, err
 }
 
 func (c *Client) StartInstanceWithID(id string, req StartInstanceRequest) (InstanceState, error) {
+	return c.StartInstanceWithIDContext(context.Background(), id, req)
+}
+
+func (c *Client) StartInstanceWithIDContext(ctx context.Context, id string, req StartInstanceRequest) (InstanceState, error) {
 	req.ID = id
-	return c.StartInstance(req)
+	return c.StartInstanceContext(ctx, req)
 }
 
 func (c *Client) StartInstanceStream(req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
@@ -328,90 +423,98 @@ func (c *Client) StartInstanceStreamWithIDContext(ctx context.Context, id string
 }
 
 func (c *Client) InstanceStatus() (InstanceState, error) {
+	return c.InstanceStatusContext(context.Background())
+}
+
+func (c *Client) InstanceStatusContext(ctx context.Context) (InstanceState, error) {
 	var ret InstanceState
-	resp, err := c.client.Get(c.url + "/vm/status")
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/vm/status", &ret)
 	return ret, err
 }
 
 func (c *Client) InstanceStatuses() ([]InstanceState, error) {
-	resp, err := c.client.Get(c.url + "/vm")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, decodeErrorResponse(resp)
-	}
+	return c.InstanceStatusesContext(context.Background())
+}
+
+func (c *Client) InstanceStatusesContext(ctx context.Context) ([]InstanceState, error) {
 	var ret []InstanceState
-	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+	if err := c.getJSONContext(ctx, "/vm", &ret); err != nil {
 		return nil, err
 	}
 	return ret, nil
 }
 
 func (c *Client) InstanceStatusOf(id string) (InstanceState, error) {
+	return c.InstanceStatusOfContext(context.Background(), id)
+}
+
+func (c *Client) InstanceStatusOfContext(ctx context.Context, id string) (InstanceState, error) {
 	var ret InstanceState
-	resp, err := c.client.Get(c.url + "/vm/status" + idQuery(id))
-	if err != nil {
-		return ret, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ret, decodeErrorResponse(resp)
-	}
-	err = json.NewDecoder(resp.Body).Decode(&ret)
+	err := c.getJSONContext(ctx, "/vm/status"+idQuery(id), &ret)
 	return ret, err
 }
 
 func (c *Client) ConsoleHistory(id string) (string, error) {
+	return c.ConsoleHistoryContext(context.Background(), id)
+}
+
+func (c *Client) ConsoleHistoryContext(ctx context.Context, id string) (string, error) {
 	var ret ConsoleHistoryResponse
-	resp, err := c.client.Get(c.url + "/vm/console" + idQuery(id))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", decodeErrorResponse(resp)
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+	if err := c.getJSONContext(ctx, "/vm/console"+idQuery(id), &ret); err != nil {
 		return "", err
 	}
 	return ret.History, nil
 }
 
 func (c *Client) ShutdownInstance() error {
-	return c.postJSONExpectOK("/vm/shutdown", nil, nil)
+	return c.ShutdownInstanceContext(context.Background())
+}
+
+func (c *Client) ShutdownInstanceContext(ctx context.Context) error {
+	return c.postJSONExpectOKContext(ctx, "/vm/shutdown", nil, nil)
 }
 
 func (c *Client) ShutdownInstanceWithID(id string) error {
-	return c.postJSONExpectOK("/vm/shutdown"+idQuery(id), nil, nil)
+	return c.ShutdownInstanceWithIDContext(context.Background(), id)
+}
+
+func (c *Client) ShutdownInstanceWithIDContext(ctx context.Context, id string) error {
+	return c.postJSONExpectOKContext(ctx, "/vm/shutdown"+idQuery(id), nil, nil)
 }
 
 func (c *Client) AddPortForwardTo(id string, forward PortForward) error {
-	return c.postJSONExpectOK("/vm/forward"+idQuery(id), forward, nil)
+	return c.AddPortForwardToContext(context.Background(), id, forward)
+}
+
+func (c *Client) AddPortForwardToContext(ctx context.Context, id string, forward PortForward) error {
+	return c.postJSONExpectOKContext(ctx, "/vm/forward"+idQuery(id), forward, nil)
 }
 
 func (c *Client) AllowServiceProxyPortTo(id string, port int) error {
-	return c.postJSONExpectOK("/vm/service-proxy-port"+idQuery(id), ServiceProxyPortRequest{Port: port}, nil)
+	return c.AllowServiceProxyPortToContext(context.Background(), id, port)
+}
+
+func (c *Client) AllowServiceProxyPortToContext(ctx context.Context, id string, port int) error {
+	return c.postJSONExpectOKContext(ctx, "/vm/service-proxy-port"+idQuery(id), ServiceProxyPortRequest{Port: port}, nil)
 }
 
 func (c *Client) Run(req RunRequest) (ExecResponse, error) {
+	return c.RunContext(context.Background(), req)
+}
+
+func (c *Client) RunContext(ctx context.Context, req RunRequest) (ExecResponse, error) {
 	var ret ExecResponse
-	err := c.postJSONExpectOK("/vm/run", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/vm/run", req, &ret)
 	return ret, err
 }
 
 func (c *Client) RunIn(id string, req RunRequest) (ExecResponse, error) {
+	return c.RunInContext(context.Background(), id, req)
+}
+
+func (c *Client) RunInContext(ctx context.Context, id string, req RunRequest) (ExecResponse, error) {
 	req.ID = id
-	return c.Run(req)
+	return c.RunContext(ctx, req)
 }
 
 func (c *Client) RunStream(req RunRequest, onEvent func(ExecEvent) error) error {
@@ -454,7 +557,7 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 		return err
 	}
 	c.applyWebSocketAuth(cfg)
-	if c.dialer != nil {
+	if c.dialContext != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
 	ws, err := websocket.DialConfig(cfg)
@@ -560,7 +663,11 @@ func currentWebSocketSendError(sendErr <-chan error) error {
 }
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
-	return c.ExecEvents(ExecRequest{
+	return c.RunEventsContext(context.Background(), req)
+}
+
+func (c *Client) RunEventsContext(ctx context.Context, req RunRequest) ([]ExecEvent, error) {
+	return c.ExecEventsContext(ctx, ExecRequest{
 		ID:         req.ID,
 		Command:    append([]string(nil), req.Command...),
 		Env:        append([]string(nil), req.Env...),
@@ -576,13 +683,21 @@ func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 }
 
 func (c *Client) RunEventsIn(id string, req RunRequest) ([]ExecEvent, error) {
+	return c.RunEventsInContext(context.Background(), id, req)
+}
+
+func (c *Client) RunEventsInContext(ctx context.Context, id string, req RunRequest) ([]ExecEvent, error) {
 	req.ID = id
-	return c.RunEvents(req)
+	return c.RunEventsContext(ctx, req)
 }
 
 func (c *Client) ExecEvents(req ExecRequest) ([]ExecEvent, error) {
+	return c.ExecEventsContext(context.Background(), req)
+}
+
+func (c *Client) ExecEventsContext(ctx context.Context, req ExecRequest) ([]ExecEvent, error) {
 	var events []ExecEvent
-	err := c.ExecStream(req, nil, func(event ExecEvent) error {
+	err := c.ExecStreamContext(ctx, req, nil, func(event ExecEvent) error {
 		events = append(events, event)
 		return nil
 	})
@@ -590,8 +705,12 @@ func (c *Client) ExecEvents(req ExecRequest) ([]ExecEvent, error) {
 }
 
 func (c *Client) ExecEventsIn(id string, req ExecRequest) ([]ExecEvent, error) {
+	return c.ExecEventsInContext(context.Background(), id, req)
+}
+
+func (c *Client) ExecEventsInContext(ctx context.Context, id string, req ExecRequest) ([]ExecEvent, error) {
 	req.ID = id
-	return c.ExecEvents(req)
+	return c.ExecEventsContext(ctx, req)
 }
 
 func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
@@ -608,7 +727,7 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		return err
 	}
 	c.applyWebSocketAuth(cfg)
-	if c.dialer != nil {
+	if c.dialContext != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
 	ws, err := websocket.DialConfig(cfg)
@@ -695,11 +814,25 @@ func idQuery(id string) string {
 	return "?id=" + url.QueryEscape(id)
 }
 
-func (c *Client) StartVM(req StartVMRequest) (VMState, error) { return c.CreateInstance(req) }
-func (c *Client) VMStatus() (VMState, error)                  { return c.InstanceStatus() }
-func (c *Client) ShutdownVM() error                           { return c.ShutdownInstance() }
+func (c *Client) StartVM(req StartVMRequest) (VMState, error) {
+	return c.StartVMContext(context.Background(), req)
+}
+func (c *Client) StartVMContext(ctx context.Context, req StartVMRequest) (VMState, error) {
+	return c.CreateInstanceContext(ctx, req)
+}
+func (c *Client) VMStatus() (VMState, error) { return c.VMStatusContext(context.Background()) }
+func (c *Client) VMStatusContext(ctx context.Context) (VMState, error) {
+	return c.InstanceStatusContext(ctx)
+}
+func (c *Client) ShutdownVM() error { return c.ShutdownVMContext(context.Background()) }
+func (c *Client) ShutdownVMContext(ctx context.Context) error {
+	return c.ShutdownInstanceContext(ctx)
+}
 func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
-	return c.Run(RunRequest{
+	return c.RunVMContext(context.Background(), req)
+}
+func (c *Client) RunVMContext(ctx context.Context, req StartVMRequest) (RunVMResponse, error) {
+	return c.RunContext(ctx, RunRequest{
 		Image:     req.Image,
 		MemoryMB:  req.MemoryMB,
 		BalloonMB: req.BalloonMB,
@@ -709,6 +842,10 @@ func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
 }
 
 func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error {
+	return c.postJSONExpectOKContext(context.Background(), path, reqBody, respBody)
+}
+
+func (c *Client) postJSONExpectOKContext(ctx context.Context, path string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {
 		buf := &bytes.Buffer{}
@@ -718,7 +855,7 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 		body = buf
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.url+path, body)
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodPost, c.url+path, body)
 	if err != nil {
 		return err
 	}
@@ -740,6 +877,29 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+func (c *Client) getJSONContext(ctx context.Context, path string, target any) error {
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodGet, c.url+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return decodeErrorResponse(resp)
+	}
+	return json.NewDecoder(resp.Body).Decode(target)
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error) error {
@@ -864,7 +1024,7 @@ func (c *Client) postJSONStreamContext(ctx context.Context, path string, reqBody
 		body = buf
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path+"?stream=1", body)
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodPost, c.url+path+"?stream=1", body)
 	if err != nil {
 		return nil, err
 	}

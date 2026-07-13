@@ -789,8 +789,8 @@ func stopDaemon(statePath string) error {
 }
 
 func newClient(addr string) *client.Client {
-	return client.NewClient("http://"+addr, func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	return client.NewClientContext("http://"+addr, func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	})
 }
 
