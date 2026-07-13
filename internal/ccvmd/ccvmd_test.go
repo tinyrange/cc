@@ -2,10 +2,12 @@ package ccvmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -197,6 +199,49 @@ func TestSanitizeExecEventForJSONUsesTextOrBinary(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Data, []byte{0xff, 0x00}) {
 		t.Fatalf("decoded data = %v", decoded.Data)
+	}
+}
+
+func TestWaitForWorkerStateReturnsTerminalState(t *testing.T) {
+	want := client.InstanceState{ID: "vm", Status: "stopped"}
+	got, completed := waitForWorkerState(t.Context(), func() client.InstanceState { return want })
+	if !completed || got != want {
+		t.Fatalf("wait result = %+v, %t", got, completed)
+	}
+}
+
+func TestWaitForWorkerStateCancellationReleasesAllWaiters(t *testing.T) {
+	const waiterCount = 100
+	ctx, cancel := context.WithCancel(t.Context())
+	started := make(chan struct{}, waiterCount)
+	done := make(chan struct{}, waiterCount)
+	for range waiterCount {
+		go func() {
+			var once sync.Once
+			_, completed := waitForWorkerState(ctx, func() client.InstanceState {
+				once.Do(func() { started <- struct{}{} })
+				return client.InstanceState{Status: "running"}
+			})
+			if completed {
+				t.Errorf("canceled wait reported completion")
+			}
+			done <- struct{}{}
+		}()
+	}
+	for range waiterCount {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("waiter did not start")
+		}
+	}
+	cancel()
+	for range waiterCount {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("waiter did not stop after cancellation")
+		}
 	}
 }
 

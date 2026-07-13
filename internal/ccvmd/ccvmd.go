@@ -577,8 +577,11 @@ func (e *workerActiveExec) forwardInputs() {
 }
 
 func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOptions) error {
+	connectionCtx, cancelConnection := context.WithCancel(context.Background())
+	defer cancelConnection()
 	var activeMu sync.Mutex
 	activeExecs := make(map[uint64]*workerActiveExec)
+	activeWaits := make(map[uint64]*workerActiveWait)
 
 	for {
 		frame, err := codec.Receive()
@@ -644,7 +647,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 		case vm.WorkerFrameWait:
 			var req vm.WorkerWaitRequest
 			_ = frame.DecodePayload(&req)
-			go serveWorkerWait(codec, srvState, frame.ID, req.ID)
+			serveWorkerWait(connectionCtx, codec, srvState, frame.ID, req.ID, &activeMu, activeWaits)
 		case vm.WorkerFrameFlush:
 			var req vm.WorkerFlushRequest
 			_ = frame.DecodePayload(&req)
@@ -674,7 +677,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
 		case vm.WorkerFrameExec:
-			if err := serveWorkerExec(codec, srvState, frame, &activeMu, activeExecs); err != nil {
+			if err := serveWorkerExec(connectionCtx, codec, srvState, frame, &activeMu, activeExecs); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 			}
 		case vm.WorkerFrameExecInput:
@@ -699,10 +702,14 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 		case vm.WorkerFrameCancel:
 			activeMu.Lock()
 			exec := activeExecs[frame.ID]
+			wait := activeWaits[frame.ID]
 			activeMu.Unlock()
 			if exec != nil {
 				exec.cancel()
 				exec.closeInputs()
+			}
+			if wait != nil {
+				wait.cancel()
 			}
 		default:
 			_ = sendWorkerError(codec, frame.ID, fmt.Errorf("unsupported worker frame %q", frame.Type))
@@ -710,25 +717,60 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 	}
 }
 
-func serveWorkerWait(codec *vm.WorkerCodec, srvState *server, frameID uint64, id string) {
+type workerActiveWait struct {
+	cancel context.CancelFunc
+}
+
+func serveWorkerWait(parent context.Context, codec *vm.WorkerCodec, srvState *server, frameID uint64, id string, activeMu *sync.Mutex, activeWaits map[uint64]*workerActiveWait) {
+	ctx, cancel := context.WithCancel(parent)
+	wait := &workerActiveWait{cancel: cancel}
+	activeMu.Lock()
+	if previous := activeWaits[frameID]; previous != nil {
+		previous.cancel()
+	}
+	activeWaits[frameID] = wait
+	activeMu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer func() {
+			activeMu.Lock()
+			if activeWaits[frameID] == wait {
+				delete(activeWaits, frameID)
+			}
+			activeMu.Unlock()
+		}()
+		state, completed := waitForWorkerState(ctx, func() client.InstanceState {
+			return srvState.vms.StatusOf(id)
+		})
+		if completed {
+			_ = sendWorkerPayload(codec, frameID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
+		}
+	}()
+}
+
+func waitForWorkerState(ctx context.Context, status func() client.InstanceState) (client.InstanceState, bool) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		state := srvState.vms.StatusOf(id)
+		state := status()
 		if state.Status != "running" && state.Status != "starting" {
-			_ = sendWorkerPayload(codec, frameID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
-			return
+			return state, true
 		}
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return client.InstanceState{}, false
+		case <-ticker.C:
+		}
 	}
 }
 
-func serveWorkerExec(codec *vm.WorkerCodec, srvState *server, frame vm.WorkerFrame, activeMu *sync.Mutex, activeExecs map[uint64]*workerActiveExec) error {
+func serveWorkerExec(parent context.Context, codec *vm.WorkerCodec, srvState *server, frame vm.WorkerFrame, activeMu *sync.Mutex, activeExecs map[uint64]*workerActiveExec) error {
 	var req vm.WorkerExecRequest
 	if err := frame.DecodePayload(&req); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	exec := &workerActiveExec{cancel: cancel}
 	if req.InputStream {
 		exec.inputs = make(chan client.ExecInput, 16)
