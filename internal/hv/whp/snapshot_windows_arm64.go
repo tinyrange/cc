@@ -534,9 +534,9 @@ func loadArm64WHPSnapshot(path string) (whpArm64SnapshotManifest, string, error)
 	if manifest.Format != "ccx3-whp-arm64-snapshot-v0" {
 		return whpArm64SnapshotManifest{}, "", fmt.Errorf("unsupported WHP arm64 snapshot format %q", manifest.Format)
 	}
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(filepath.Dir(manifestPath), memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return whpArm64SnapshotManifest{}, "", err
 	}
 	info, err := os.Stat(memPath)
 	if err != nil {

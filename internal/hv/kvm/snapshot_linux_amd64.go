@@ -516,9 +516,9 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if manifest.Format != "ccx3-kvm-snapshot-v0" {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("unsupported KVM snapshot format %q", manifest.Format)
 	}
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(filepath.Dir(manifestPath), memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return kvmSnapshotManifest{}, "", err
 	}
 	info, err := os.Stat(memPath)
 	if err != nil {
