@@ -789,22 +789,59 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 	}
 }
 
+type apiRoute struct {
+	Method string
+	Path   string
+}
+
+type trackedServeMux struct {
+	*http.ServeMux
+	routes []apiRoute
+}
+
+func newTrackedServeMux() *trackedServeMux {
+	return &trackedServeMux{ServeMux: http.NewServeMux()}
+}
+
+func (m *trackedServeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.record(pattern)
+	m.ServeMux.HandleFunc(pattern, handler)
+}
+
+func (m *trackedServeMux) Handle(pattern string, handler http.Handler) {
+	m.record(pattern)
+	m.ServeMux.Handle(pattern, handler)
+}
+
+func (m *trackedServeMux) record(pattern string) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if !ok || strings.HasPrefix(path, "/debug/pprof") {
+		return
+	}
+	m.routes = append(m.routes, apiRoute{Method: method, Path: path})
+}
+
 func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
-	mux := http.NewServeMux()
+	mux, _ := newMuxWithRoutes(srvState, watchdog, shutdown, opts)
+	return mux
+}
+
+func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) (*http.ServeMux, []apiRoute) {
+	mux := newTrackedServeMux()
 	if debugPprof {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
-		registerPprofHandlers(mux)
+		registerPprofHandlers(mux.ServeMux)
 	}
 
 	if strings.TrimSpace(os.Getenv("CCX3_PPROF")) != "" {
 		runtime.SetMutexProfileFraction(1)
 		runtime.SetBlockProfileRate(1)
-		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		mux.ServeMux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.ServeMux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.ServeMux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.ServeMux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.ServeMux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	}
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -1634,7 +1671,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		writeJSON(w, http.StatusOK, resp)
 	})
-	mux.Handle("/vm/run", websocket.Server{
+	mux.Handle("GET /vm/run", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
 			serveRunWebSocket(ws, func(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -1642,7 +1679,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			})
 		},
 	})
-	mux.Handle("/vm/run/stream", websocket.Server{
+	mux.Handle("GET /vm/run/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
 			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -1661,7 +1698,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			})
 		},
 	})
-	return mux
+	return mux.ServeMux, append([]apiRoute(nil), mux.routes...)
 }
 
 func resolveCacheDir(arg string) (string, error) {
