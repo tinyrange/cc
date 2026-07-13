@@ -395,7 +395,11 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarpkg.D
 		started = false
 		return nil, err
 	}
-	worker, err := sidecarpkg.DialWorker(ctx, hello.Addr)
+	features := sidecarHostFeatures()
+	worker, err := sidecarpkg.DialWorkerWithRequirements(ctx, hello.Addr, sidecarpkg.WorkerRequirements{
+		SupportsFSRPC: features.supportsFSRPC,
+		SupportsL2:    features.supportsL2,
+	})
 	if err != nil {
 		started = false
 		return nil, err

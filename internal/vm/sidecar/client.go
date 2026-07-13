@@ -14,6 +14,7 @@ import (
 type Client struct {
 	conn  net.Conn
 	codec *WorkerCodec
+	hello WorkerHello
 
 	idMu sync.Mutex
 	next uint64
@@ -24,12 +25,38 @@ type Client struct {
 	recvErr   error
 }
 
+type WorkerRequirements struct {
+	SupportsFSRPC bool
+	SupportsL2    bool
+}
+
+type WorkerProtocolVersionError struct {
+	Received  int
+	Supported int
+}
+
+func (e *WorkerProtocolVersionError) Error() string {
+	return fmt.Sprintf("unsupported sidecar worker protocol version %d (supported version: %d)", e.Received, e.Supported)
+}
+
+type MissingWorkerCapabilityError struct {
+	Capability string
+}
+
+func (e *MissingWorkerCapabilityError) Error() string {
+	return fmt.Sprintf("sidecar worker does not support required capability %q", e.Capability)
+}
+
 type workerFrameResult struct {
 	frame WorkerFrame
 	err   error
 }
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
+	return DialWorkerWithRequirements(ctx, socketPath, WorkerRequirements{})
+}
+
+func DialWorkerWithRequirements(ctx context.Context, socketPath string, requirements WorkerRequirements) (*Client, error) {
 	var conn net.Conn
 	var err error
 	network, address := workerDialTarget(socketPath)
@@ -58,8 +85,31 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
 	}
+	var hello WorkerHello
+	if err := frame.DecodePayload(&hello); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("decode sidecar worker hello: %w", err)
+	}
+	if err := validateWorkerHello(hello, requirements); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	worker.hello = hello
 	go worker.receiveLoop()
 	return worker, nil
+}
+
+func validateWorkerHello(hello WorkerHello, requirements WorkerRequirements) error {
+	if hello.Version != WorkerProtocolVersion {
+		return &WorkerProtocolVersionError{Received: hello.Version, Supported: WorkerProtocolVersion}
+	}
+	if requirements.SupportsFSRPC && !hello.Capabilities.SupportsFSRPC {
+		return &MissingWorkerCapabilityError{Capability: "filesystem-rpc"}
+	}
+	if requirements.SupportsL2 && !hello.Capabilities.SupportsL2 {
+		return &MissingWorkerCapabilityError{Capability: "l2-networking"}
+	}
+	return nil
 }
 
 func workerDialTarget(address string) (string, string) {
@@ -74,6 +124,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.conn.Close()
+}
+
+func (c *Client) Hello() WorkerHello {
+	if c == nil {
+		return WorkerHello{}
+	}
+	return c.hello
 }
 
 func (c *Client) receiveLoop() {
