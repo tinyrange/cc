@@ -3,12 +3,15 @@ package ccvmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/vm"
 )
@@ -197,6 +200,80 @@ func TestSanitizeExecEventForJSONUsesTextOrBinary(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Data, []byte{0xff, 0x00}) {
 		t.Fatalf("decoded data = %v", decoded.Data)
+	}
+}
+
+func TestValidateWebSocketOrigin(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  string
+		host    string
+		origins []string
+		wantErr bool
+	}{
+		{name: "non-browser client", target: "http://localhost/vm/run", host: "localhost"},
+		{name: "same origin", target: "http://localhost/vm/run", host: "localhost", origins: []string{"http://localhost"}},
+		{name: "normalized default port", target: "http://localhost/vm/run", host: "localhost:80", origins: []string{"http://LOCALHOST.:80"}},
+		{name: "same secure origin", target: "https://localhost/vm/run", host: "localhost:443", origins: []string{"https://localhost"}},
+		{name: "cross origin", target: "http://localhost/vm/run", host: "localhost", origins: []string{"http://attacker.example"}, wantErr: true},
+		{name: "dns rebinding host", target: "http://127.0.0.1/vm/run", host: "127.0.0.1", origins: []string{"http://attacker.example"}, wantErr: true},
+		{name: "scheme mismatch", target: "http://localhost/vm/run", host: "localhost", origins: []string{"https://localhost"}, wantErr: true},
+		{name: "null origin", target: "http://localhost/vm/run", host: "localhost", origins: []string{"null"}, wantErr: true},
+		{name: "origin path", target: "http://localhost/vm/run", host: "localhost", origins: []string{"http://localhost/path"}, wantErr: true},
+		{name: "multiple origins", target: "http://localhost/vm/run", host: "localhost", origins: []string{"http://localhost", "http://localhost"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			req.Host = tt.host
+			for _, origin := range tt.origins {
+				req.Header.Add("Origin", origin)
+			}
+			err := validateWebSocketOrigin(nil, req)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("validate origin: %v", err)
+				}
+				return
+			}
+			var originErr *websocketOriginError
+			if !errors.As(err, &originErr) {
+				t.Fatalf("origin error = %v", err)
+			}
+			if originErr.Host != tt.host {
+				t.Fatalf("origin error host = %q", originErr.Host)
+			}
+		})
+	}
+}
+
+func TestWebSocketRoutesEnforceOriginPolicy(t *testing.T) {
+	watchdog := newWatchdogController(func() {})
+	defer watchdog.Stop()
+	srv := httptest.NewServer(newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{}))
+	defer srv.Close()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+	for _, path := range []string{"/vm/run", "/vm/run/stream"} {
+		t.Run(path, func(t *testing.T) {
+			crossOrigin, err := websocket.NewConfig(wsBase+path, "http://attacker.example")
+			if err != nil {
+				t.Fatalf("cross-origin config: %v", err)
+			}
+			if conn, err := websocket.DialConfig(crossOrigin); err == nil {
+				_ = conn.Close()
+				t.Fatal("cross-origin upgrade succeeded")
+			}
+
+			sameOrigin, err := websocket.NewConfig(wsBase+path, srv.URL)
+			if err != nil {
+				t.Fatalf("same-origin config: %v", err)
+			}
+			conn, err := websocket.DialConfig(sameOrigin)
+			if err != nil {
+				t.Fatalf("same-origin upgrade: %v", err)
+			}
+			_ = conn.Close()
+		})
 	}
 }
 
