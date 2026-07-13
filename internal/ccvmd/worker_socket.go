@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"syscall"
 	"time"
 )
 
@@ -35,10 +34,10 @@ func prepareWorkerUnixSocket(path string) error {
 		_ = conn.Close()
 		return fmt.Errorf("worker control socket is already active")
 	}
-	if errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ENOENT) {
+	if errors.Is(dialErr, os.ErrNotExist) {
 		return nil
 	}
-	if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+	if !workerSocketConnectionRefused(dialErr) {
 		return fmt.Errorf("worker control socket could not be proven stale: %w", dialErr)
 	}
 	if err := removeWorkerSocketIfSame(path, info); err != nil {
