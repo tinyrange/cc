@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -527,12 +528,16 @@ func streamExecInputsToWebSocket(ws *websocket.Conn, inputs <-chan ExecInput) <-
 }
 
 func receiveExecEventsFromWebSocket(ws *websocket.Conn, onEvent func(ExecEvent) error) error {
+	var state execStreamState
 	for {
 		var event ExecEvent
 		if err := websocket.JSON.Receive(ws, &event); err != nil {
 			if err == io.EOF {
-				break
+				return state.finish()
 			}
+			return err
+		}
+		if err := state.accept(event); err != nil {
 			return err
 		}
 		if onEvent != nil {
@@ -540,11 +545,47 @@ func receiveExecEventsFromWebSocket(ws *websocket.Conn, onEvent func(ExecEvent) 
 				return err
 			}
 		}
-		if event.Kind == "exit" || event.Kind == "error" {
-			break
+	}
+}
+
+var (
+	// ErrExecStreamEndedBeforeTerminal reports a clean transport end without an
+	// exit or error event.
+	ErrExecStreamEndedBeforeTerminal = errors.New("exec stream ended before terminal event")
+	// ErrExecStreamDuplicateTerminal reports more than one exit/error event.
+	ErrExecStreamDuplicateTerminal = errors.New("exec stream sent duplicate terminal event")
+)
+
+type execStreamState struct {
+	lastKind     string
+	terminalKind string
+	terminalErr  error
+}
+
+func (s *execStreamState) accept(event ExecEvent) error {
+	s.lastKind = event.Kind
+	if event.Kind != "exit" && event.Kind != "error" {
+		return nil
+	}
+	if s.terminalKind != "" {
+		return fmt.Errorf("%w: received %q after %q", ErrExecStreamDuplicateTerminal, event.Kind, s.terminalKind)
+	}
+	s.terminalKind = event.Kind
+	if event.Kind == "error" {
+		if event.Error != "" {
+			s.terminalErr = errors.New(event.Error)
+		} else {
+			s.terminalErr = errors.New("streamed exec failed")
 		}
 	}
 	return nil
+}
+
+func (s *execStreamState) finish() error {
+	if s.terminalKind == "" {
+		return fmt.Errorf("%w after event kind %q", ErrExecStreamEndedBeforeTerminal, s.lastKind)
+	}
+	return s.terminalErr
 }
 
 func currentWebSocketSendError(sendErr <-chan error) error {
@@ -825,27 +866,22 @@ func (c *Client) postJSONExecStream(ctx context.Context, path string, reqBody an
 	defer resp.Body.Close()
 
 	dec := json.NewDecoder(resp.Body)
+	var state execStreamState
 	for {
 		var event ExecEvent
 		if err := dec.Decode(&event); err != nil {
 			if err == io.EOF {
-				return nil
+				return state.finish()
 			}
+			return err
+		}
+		if err := state.accept(event); err != nil {
 			return err
 		}
 		if onEvent != nil {
 			if err := onEvent(event); err != nil {
 				return err
 			}
-		}
-		if event.Kind == "error" {
-			if event.Error != "" {
-				return fmt.Errorf("%s", event.Error)
-			}
-			return fmt.Errorf("streamed exec failed")
-		}
-		if event.Kind == "exit" {
-			return nil
 		}
 	}
 }
