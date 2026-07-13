@@ -222,6 +222,9 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	requestID := c.nextID()
 	frames, err := c.registerCall(requestID)
 	if err != nil {
@@ -252,15 +255,11 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.conn.SetReadDeadline(time.Now())
 			_ = c.sendCancel(requestID)
 		case <-cancelDone:
 		}
 	}()
-	defer func() {
-		close(cancelDone)
-		_ = c.conn.SetReadDeadline(time.Time{})
-	}()
+	defer close(cancelDone)
 
 	for {
 		result, err := c.nextFrame(ctx, frames)
