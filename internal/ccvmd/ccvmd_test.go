@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -130,6 +131,100 @@ func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
 	assertNoShutdown(t, shutdownCalled)
 }
 
+func TestWatchdogLeaseFeedsPreserveCreatedTimeout(t *testing.T) {
+	clock := &fakeWatchdogClock{now: time.Unix(100, 0)}
+	expired := 0
+	watchdog := newWatchdogController(func() { expired++ })
+	watchdog.now = clock.Now
+	watchdog.afterFunc = clock.AfterFunc
+	defer watchdog.Stop()
+
+	id, err := watchdog.CreateLease(5 * time.Second)
+	if err != nil {
+		t.Fatalf("create lease: %v", err)
+	}
+	clock.Advance(4 * time.Second)
+	if !watchdog.FeedLease(id) {
+		t.Fatal("first lease feed failed")
+	}
+	clock.Advance(4 * time.Second)
+	if expired != 0 {
+		t.Fatalf("lease expired before its created timeout after first feed")
+	}
+	if !watchdog.FeedLease(id) {
+		t.Fatal("second lease feed failed")
+	}
+	clock.Advance(4 * time.Second)
+	if expired != 0 {
+		t.Fatalf("lease expired before its created timeout after second feed")
+	}
+	clock.Advance(time.Second)
+	if expired != 1 {
+		t.Fatalf("expiry callbacks = %d, want 1 at the preserved deadline", expired)
+	}
+}
+
+type fakeWatchdogClock struct {
+	now   time.Time
+	timer *fakeWatchdogTimer
+}
+
+func (c *fakeWatchdogClock) Now() time.Time { return c.now }
+
+func (c *fakeWatchdogClock) AfterFunc(delay time.Duration, fn func()) watchdogTimer {
+	timer := &fakeWatchdogTimer{clock: c, deadline: c.now.Add(delay), fn: fn}
+	c.timer = timer
+	return timer
+}
+
+func (c *fakeWatchdogClock) Advance(delay time.Duration) {
+	c.now = c.now.Add(delay)
+	if c.timer == nil || c.timer.stopped || c.timer.deadline.After(c.now) {
+		return
+	}
+	c.timer.stopped = true
+	c.timer.fn()
+}
+
+type fakeWatchdogTimer struct {
+	clock    *fakeWatchdogClock
+	deadline time.Time
+	fn       func()
+	stopped  bool
+}
+
+func (t *fakeWatchdogTimer) Stop() bool {
+	wasActive := !t.stopped
+	t.stopped = true
+	return wasActive
+}
+
+func (t *fakeWatchdogTimer) Reset(delay time.Duration) bool {
+	wasActive := !t.stopped
+	t.deadline = t.clock.now.Add(delay)
+	t.stopped = false
+	return wasActive
+}
+
+func TestWatchdogLeaseDurationRejectsInvalidValues(t *testing.T) {
+	for _, seconds := range []float64{
+		-1,
+		0,
+		math.SmallestNonzeroFloat64,
+		math.Inf(1),
+		math.Inf(-1),
+		math.NaN(),
+		1e100,
+	} {
+		if _, err := watchdogLeaseDuration(seconds); err == nil {
+			t.Fatalf("watchdogLeaseDuration(%v) returned no error", seconds)
+		}
+	}
+	if got, err := watchdogLeaseDuration(0.25); err != nil || got != 250*time.Millisecond {
+		t.Fatalf("watchdogLeaseDuration(0.25) = %s, %v", got, err)
+	}
+}
+
 func assertNoShutdown(t *testing.T, shutdownCalled <-chan struct{}) {
 	t.Helper()
 	select {
@@ -152,6 +247,7 @@ func TestMuxBadRequests(t *testing.T) {
 		status int
 	}{
 		{name: "bad lease json", method: http.MethodPost, target: "/watchdog/lease", body: []byte("{"), status: http.StatusBadRequest},
+		{name: "overflowing lease timeout", method: http.MethodPost, target: "/watchdog/lease", body: []byte(`{"timeout_seconds":1e100}`), status: http.StatusBadRequest},
 		{name: "bad run json", method: http.MethodPost, target: "/vm/run", body: []byte("{"), status: http.StatusBadRequest},
 		{name: "forward stopped vm", method: http.MethodPost, target: "/vm/forward?id=alpha", body: mustJSON(t, client.PortForward{HostPort: 8080, GuestPort: 80}), status: http.StatusBadRequest},
 	} {

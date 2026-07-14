@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -124,14 +125,26 @@ type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
 	deadline    time.Time
-	timer       *time.Timer
+	timer       watchdogTimer
 	active      bool
-	leases      map[string]time.Time
+	leases      map[string]watchdogLease
 	onExpired   func()
 	persistent  bool
+	now         func() time.Time
+	afterFunc   func(time.Duration, func()) watchdogTimer
 	cvmfsEvents uint64
 	cvmfsBytes  int64
 	cvmfsLast   time.Time
+}
+
+type watchdogLease struct {
+	timeout  time.Duration
+	deadline time.Time
+}
+
+type watchdogTimer interface {
+	Stop() bool
+	Reset(time.Duration) bool
 }
 
 type watchdogRequest struct {
@@ -139,7 +152,13 @@ type watchdogRequest struct {
 }
 
 func newWatchdogController(onExpired func()) *watchdogController {
-	return &watchdogController{onExpired: onExpired}
+	return &watchdogController{
+		onExpired: onExpired,
+		now:       time.Now,
+		afterFunc: func(delay time.Duration, fn func()) watchdogTimer {
+			return time.AfterFunc(delay, fn)
+		},
+	}
 }
 
 func newPersistentWatchdogController(onExpired func()) *watchdogController {
@@ -152,13 +171,14 @@ func (w *watchdogController) Create(timeout time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.timeout = timeout
-	w.deadline = time.Now().Add(timeout)
+	now := w.now()
+	w.deadline = now.Add(timeout)
 	w.active = true
 	if w.timer == nil {
-		w.timer = time.AfterFunc(timeout, w.expire)
+		w.timer = w.afterFunc(timeout, w.expire)
 		return
 	}
-	w.resetTimerLocked(time.Now())
+	w.resetTimerLocked(now)
 }
 
 func (w *watchdogController) Feed() bool {
@@ -175,7 +195,7 @@ func (w *watchdogController) RecordCVMFSActivity(bytes int) {
 	defer w.mu.Unlock()
 	w.cvmfsEvents++
 	w.cvmfsBytes += int64(bytes)
-	w.cvmfsLast = time.Now()
+	w.cvmfsLast = w.now()
 }
 
 func (w *watchdogController) ActivityState() client.WatchdogActivityState {
@@ -187,7 +207,7 @@ func (w *watchdogController) ActivityState() client.WatchdogActivityState {
 	}
 	if !w.cvmfsLast.IsZero() {
 		cvmfs.LastActivityUnix = w.cvmfsLast.Unix()
-		cvmfs.SecondsSinceLast = time.Since(w.cvmfsLast).Seconds()
+		cvmfs.SecondsSinceLast = w.now().Sub(w.cvmfsLast).Seconds()
 	}
 	return client.WatchdogActivityState{CVMFS: cvmfs}
 }
@@ -203,25 +223,27 @@ func (w *watchdogController) CreateLease(timeout time.Duration) (string, error) 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.leases == nil {
-		w.leases = map[string]time.Time{}
+		w.leases = map[string]watchdogLease{}
 	}
-	now := time.Now()
-	w.leases[id] = now.Add(timeout)
+	now := w.now()
+	w.leases[id] = watchdogLease{timeout: timeout, deadline: now.Add(timeout)}
 	w.resetTimerLocked(now)
 	return id, nil
 }
 
-func (w *watchdogController) FeedLease(id string, timeout time.Duration) bool {
+func (w *watchdogController) FeedLease(id string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.leases == nil {
 		return false
 	}
-	if _, ok := w.leases[id]; !ok {
+	lease, ok := w.leases[id]
+	if !ok {
 		return false
 	}
-	now := time.Now()
-	w.leases[id] = now.Add(timeout)
+	now := w.now()
+	lease.deadline = now.Add(lease.timeout)
+	w.leases[id] = lease
 	w.resetTimerLocked(now)
 	return true
 }
@@ -246,7 +268,7 @@ func (w *watchdogController) ReleaseLease(id string) bool {
 			onExpired = w.onExpired
 		}
 	} else {
-		w.resetTimerLocked(time.Now())
+		w.resetTimerLocked(w.now())
 	}
 	w.mu.Unlock()
 	if onExpired != nil {
@@ -259,8 +281,9 @@ func (w *watchdogController) feedLocked() bool {
 	if !w.active || w.timer == nil {
 		return false
 	}
-	w.deadline = time.Now().Add(w.timeout)
-	w.resetTimerLocked(time.Now())
+	now := w.now()
+	w.deadline = now.Add(w.timeout)
+	w.resetTimerLocked(now)
 	return true
 }
 
@@ -276,9 +299,9 @@ func (w *watchdogController) Stop() {
 func (w *watchdogController) expire() {
 	var onExpired func()
 	w.mu.Lock()
-	now := time.Now()
-	for id, deadline := range w.leases {
-		if !deadline.After(now) {
+	now := w.now()
+	for id, lease := range w.leases {
+		if !lease.deadline.After(now) {
 			delete(w.leases, id)
 		}
 	}
@@ -310,9 +333,9 @@ func (w *watchdogController) resetTimerLocked(now time.Time) {
 	if w.active && !w.deadline.IsZero() {
 		next = w.deadline
 	}
-	for _, deadline := range w.leases {
-		if next.IsZero() || deadline.Before(next) {
-			next = deadline
+	for _, lease := range w.leases {
+		if next.IsZero() || lease.deadline.Before(next) {
+			next = lease.deadline
 		}
 	}
 	if next.IsZero() {
@@ -326,7 +349,7 @@ func (w *watchdogController) resetTimerLocked(now time.Time) {
 		delay = time.Millisecond
 	}
 	if w.timer == nil {
-		w.timer = time.AfterFunc(delay, w.expire)
+		w.timer = w.afterFunc(delay, w.expire)
 		return
 	}
 	w.timer.Stop()
@@ -912,9 +935,9 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
-		if timeout <= 0 {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("watchdog lease timeout must be positive"))
+		timeout, err := watchdogLeaseDuration(req.TimeoutSeconds)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		id, err := watchdog.CreateLease(timeout)
@@ -922,7 +945,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, client.WatchdogLeaseResponse{LeaseID: id, TimeoutSeconds: req.TimeoutSeconds})
+		writeJSON(w, http.StatusOK, client.WatchdogLeaseResponse{LeaseID: id, TimeoutSeconds: timeout.Seconds()})
 	})
 
 	mux.HandleFunc("POST /watchdog/lease/feed", func(w http.ResponseWriter, r *http.Request) {
@@ -935,11 +958,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		if !watchdog.FeedLease(req.LeaseID, timeout) {
+		if !watchdog.FeedLease(req.LeaseID) {
 			writeError(w, http.StatusConflict, fmt.Errorf("watchdog lease is not active"))
 			return
 		}
@@ -1723,6 +1742,21 @@ func registerPprofHandlers(mux *http.ServeMux) {
 	mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
 	mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
 	mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+}
+
+func watchdogLeaseDuration(seconds float64) (time.Duration, error) {
+	if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, fmt.Errorf("watchdog lease timeout must be a finite positive duration")
+	}
+	nanoseconds := seconds * float64(time.Second)
+	if nanoseconds >= float64(uint64(1)<<63) {
+		return 0, fmt.Errorf("watchdog lease timeout is too large")
+	}
+	timeout := time.Duration(nanoseconds)
+	if timeout <= 0 {
+		return 0, fmt.Errorf("watchdog lease timeout is below timer resolution")
+	}
+	return timeout, nil
 }
 
 func sharedRuntimeRoot() string {
