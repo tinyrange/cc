@@ -480,7 +480,7 @@ func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
 	var control strings.Builder
 	var output strings.Builder
 	var exit *int
-	sent := false
+	stage := 0
 	persistentCommand := `__vmsh_uid="$(id -u 2>/dev/null || printf '')"
 __vmsh_passwd="$(awk -F: -v u="$__vmsh_uid" '$3 == u { print $1 ":" $6; exit }' /etc/passwd 2>/dev/null || true)"
 if [ -n "$__vmsh_passwd" ]; then
@@ -523,17 +523,21 @@ while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
 		Shares:    []client.ShareMount{share},
 		TTY:       true,
 		ControlFD: true,
-		Cols:      80,
-		Rows:      24,
+		Cols:      120,
+		Rows:      30,
 	}, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
 			output.WriteString(event.Output)
 		case "control":
 			control.WriteString(event.Output)
-			if !sent && strings.Contains(event.Output, "ready\t0\t"+guestWorkDir) {
-				sent = true
-				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'done:%s\\n' \"$PWD\" >&3\n")}
+			if stage == 0 && strings.Contains(event.Output, "ready\t0\t"+guestWorkDir) {
+				stage = 1
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run \"printf 'first\\n' >&3\"\n")}
+			} else if stage == 1 && strings.Contains(event.Output, "done\t0\t"+guestWorkDir) {
+				stage = 2
+				inputs <- client.ExecInput{Kind: "resize", Cols: 132, Rows: 41}
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run \"stty size >&3\"\n")}
 				close(inputs)
 			}
 		case "exit":
@@ -545,10 +549,10 @@ while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
 	if err != nil {
 		t.Fatalf("Linux TTY control fd exec: %v; stdout=%q control=%q", err, output.String(), control.String())
 	}
-	if !sent || exit == nil || *exit != 0 {
-		t.Fatalf("Linux TTY control fd state: sent=%t exit=%v stdout=%q control=%q", sent, exit, output.String(), control.String())
+	if stage != 2 || exit == nil || *exit != 0 {
+		t.Fatalf("Linux TTY control fd state: stage=%d exit=%v stdout=%q control=%q", stage, exit, output.String(), control.String())
 	}
-	if got, want := strings.TrimSpace(control.String()), "ready\t0\t"+guestWorkDir+"\ndone:"+guestWorkDir; got != want {
+	if got, want := strings.TrimSpace(control.String()), "ready\t0\t"+guestWorkDir+"\nfirst\ndone\t0\t"+guestWorkDir+"\n41 132\ndone\t0\t"+guestWorkDir; got != want {
 		t.Fatalf("Linux TTY control fd output = %q", got)
 	}
 }

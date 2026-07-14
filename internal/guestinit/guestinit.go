@@ -5,18 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 )
 
-var guestInitBuildIdentity struct {
-	sync.Once
-	value string
-	err   error
+var guestInitBuildIdentities struct {
+	sync.Mutex
+	values map[string]string
 }
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
@@ -40,19 +39,19 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create guest init cache: %w", err)
 	}
-	identity, err := currentBuildIdentity()
-	if err != nil {
-		return nil, fmt.Errorf("identify ccvm build: %w", err)
-	}
-	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch+"-"+identity)
-	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
-		return data, nil
-	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return nil, fmt.Errorf("locate guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	identity, err := currentBuildIdentity(ctx, moduleRoot, goarch)
+	if err != nil {
+		return nil, fmt.Errorf("identify guest init build: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch+"-"+identity)
+	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
+		return data, nil
+	}
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/init")
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot
@@ -70,27 +69,33 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 	return bin, nil
 }
 
-func currentBuildIdentity() (string, error) {
-	guestInitBuildIdentity.Do(func() {
-		executable, err := os.Executable()
-		if err != nil {
-			guestInitBuildIdentity.err = err
-			return
-		}
-		file, err := os.Open(executable)
-		if err != nil {
-			guestInitBuildIdentity.err = err
-			return
-		}
-		defer file.Close()
-		hash := sha256.New()
-		if _, err := io.Copy(hash, file); err != nil {
-			guestInitBuildIdentity.err = err
-			return
-		}
-		guestInitBuildIdentity.value = hex.EncodeToString(hash.Sum(nil)[:16])
-	})
-	return guestInitBuildIdentity.value, guestInitBuildIdentity.err
+func currentBuildIdentity(ctx context.Context, moduleRoot, goarch string) (string, error) {
+	guestInitBuildIdentities.Lock()
+	identity := guestInitBuildIdentities.values[goarch]
+	guestInitBuildIdentities.Unlock()
+	if identity != "" {
+		return identity, nil
+	}
+	cmd := exec.CommandContext(ctx, "go", "list", "-export", "-f", "{{.BuildID}}", "./internal/cmd/init")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	cmd.Dir = moduleRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve Linux guest init build identity: %w\n%s", err, output)
+	}
+	buildID := strings.TrimSpace(string(output))
+	if buildID == "" {
+		return "", fmt.Errorf("Linux guest init build identity is empty")
+	}
+	sum := sha256.Sum256([]byte(buildID))
+	identity = hex.EncodeToString(sum[:16])
+	guestInitBuildIdentities.Lock()
+	if guestInitBuildIdentities.values == nil {
+		guestInitBuildIdentities.values = make(map[string]string)
+	}
+	guestInitBuildIdentities.values[goarch] = identity
+	guestInitBuildIdentities.Unlock()
+	return identity, nil
 }
 
 func validateGuestInitPayload(goarch string, payload []byte) error {
