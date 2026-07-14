@@ -307,14 +307,16 @@ type NetworkConfig struct {
 	HostDNSName              string        `json:"host_dns_name,omitempty"`
 	AllowedServiceProxyPorts []int         `json:"allowed_service_proxy_ports,omitempty"`
 	PortForwards             []PortForward `json:"port_forwards,omitempty"`
+	MaxForwardConnections    int           `json:"max_forward_connections,omitempty"`
 }
 
 type PortForward struct {
-	Protocol  string `json:"protocol,omitempty"`
-	HostAddr  string `json:"host_addr,omitempty"`
-	HostPort  int    `json:"host_port,omitempty"`
-	GuestAddr string `json:"guest_addr,omitempty"`
-	GuestPort int    `json:"guest_port,omitempty"`
+	Protocol       string `json:"protocol,omitempty"`
+	HostAddr       string `json:"host_addr,omitempty"`
+	HostPort       int    `json:"host_port,omitempty"`
+	GuestAddr      string `json:"guest_addr,omitempty"`
+	GuestPort      int    `json:"guest_port,omitempty"`
+	MaxConnections int    `json:"max_connections,omitempty"`
 }
 
 type ServiceProxyPortRequest struct {
