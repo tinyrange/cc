@@ -3,6 +3,7 @@ package ccvmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -18,7 +19,7 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	defer watchdog.Stop()
 	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {
 		shutdownCalled <- struct{}{}
-	})
+	}, ServerOptions{})
 
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -76,10 +77,42 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	}
 }
 
+func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
+	shutdownCalled := make(chan struct{}, 1)
+	watchdog := newPersistentWatchdogController(func() {
+		shutdownCalled <- struct{}{}
+	})
+	defer watchdog.Stop()
+
+	leaseID, err := watchdog.CreateLease(10 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("create lease: %v", err)
+	}
+	if !watchdog.ReleaseLease(leaseID) {
+		t.Fatalf("release lease failed")
+	}
+	assertNoShutdown(t, shutdownCalled)
+
+	if _, err := watchdog.CreateLease(10 * time.Millisecond); err != nil {
+		t.Fatalf("create expiring lease: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	assertNoShutdown(t, shutdownCalled)
+}
+
+func assertNoShutdown(t *testing.T, shutdownCalled <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-shutdownCalled:
+		t.Fatalf("persistent watchdog called shutdown")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestMuxBadRequests(t *testing.T) {
 	watchdog := newWatchdogController(func() {})
 	defer watchdog.Stop()
-	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {})
+	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{})
 
 	for _, tc := range []struct {
 		name   string
@@ -106,6 +139,29 @@ func TestMuxBadRequests(t *testing.T) {
 				t.Fatalf("empty error response: %s", rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestMuxNormalizesRunRequestsAfterDecode(t *testing.T) {
+	watchdog := newWatchdogController(func() {})
+	defer watchdog.Stop()
+	var normalized client.RunRequest
+	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{
+		NormalizeRunRequest: func(req *client.RunRequest, _ RuntimeView) error {
+			req.MemoryMB = 4096
+			req.BalloonMB = 512
+			normalized = *req
+			return fmt.Errorf("stop after normalize")
+		},
+	})
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/vm/run", jsonBody(t, client.RunRequest{Command: []string{"true"}})))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want bad request", rr.Code)
+	}
+	if len(normalized.Command) != 1 || normalized.Command[0] != "true" || normalized.MemoryMB != 4096 || normalized.BalloonMB != 512 {
+		t.Fatalf("normalized request = %+v", normalized)
 	}
 }
 

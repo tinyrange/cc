@@ -161,7 +161,7 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
 		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, managedInitDate(), network.Interface, network.GuestIPv4, network.GatewayIPv4))},
 		{"/sbin/cc-freebsd-init", 0o755, initBin},
-		{"/etc/fstab", 0o644, []byte("/dev/vtbd0 / ufs rw 1 1\n")},
+		{"/etc/fstab", 0o644, []byte("/dev/nda0 / ufs rw 1 1\n")},
 		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("hostname=\"%s\"\nifconfig_%s=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"%s\"\n", network.Hostname, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
 		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},

@@ -317,6 +317,15 @@ func (r *RNG) updateIRQLocked() error {
 	return r.irq.SetIRQ(r.IRQ, level)
 }
 
+func (r *RNG) IRQAsserted() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.interruptStatus != 0 || r.irqHigh
+}
+
 func (r *RNG) setQueueAddr(target *uint64, value uint32, low bool) {
 	if r.queueSel != rngQueue {
 		return

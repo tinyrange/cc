@@ -19,16 +19,22 @@ import (
 type Host struct{}
 
 type LinuxManagedMachine struct {
-	Spec      machine.Spec
-	Kernel    []byte
-	Initrd    []byte
-	FSDevices []*virtio.FS
-	NetDevice *virtio.Net
+	Spec            machine.Spec
+	Kernel          []byte
+	Initrd          []byte
+	FSDevices       []*virtio.FS
+	NetDevice       *virtio.Net
+	BalloonMB       uint64
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 type LinuxManagedAttachments struct {
-	FSDevices []*virtio.FS
-	NetDevice *virtio.Net
+	FSDevices       []*virtio.FS
+	NetDevice       *virtio.Net
+	BalloonMB       uint64
+	SnapshotDir     string
+	RestoreSnapshot string
 }
 
 type BSDManagedAttachments struct {
@@ -67,11 +73,14 @@ func (Host) startLinux(ctx context.Context, req managedhost.StartRequest, onEven
 		return nil, fmt.Errorf("kvm linux managed attachments have type %T", req.Attachments)
 	}
 	return Host{}.StartLinuxManaged(ctx, LinuxManagedMachine{
-		Spec:      req.Spec,
-		Kernel:    req.Artifact.Kernel,
-		Initrd:    req.Artifact.Initrd,
-		FSDevices: attachments.FSDevices,
-		NetDevice: attachments.NetDevice,
+		Spec:            req.Spec,
+		Kernel:          req.Artifact.Kernel,
+		Initrd:          req.Artifact.Initrd,
+		FSDevices:       attachments.FSDevices,
+		NetDevice:       attachments.NetDevice,
+		BalloonMB:       attachments.BalloonMB,
+		SnapshotDir:     strings.TrimSpace(attachments.SnapshotDir),
+		RestoreSnapshot: strings.TrimSpace(attachments.RestoreSnapshot),
 	}, onEvent)
 }
 
@@ -146,7 +155,7 @@ func bsdManagedAttachments(value any) (BSDManagedAttachments, error) {
 
 func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	machine = normalizeLinuxManagedMachine(machine)
-	return StartManagedSessionWithNet(
+	return StartManagedSessionWithNetOptions(
 		ctx,
 		machine.Kernel,
 		machine.Initrd,
@@ -155,6 +164,11 @@ func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, 
 		machine.Spec.Dmesg,
 		machine.FSDevices,
 		machine.NetDevice,
+		ManagedSessionOptions{
+			SnapshotDir:     strings.TrimSpace(machine.SnapshotDir),
+			RestoreSnapshot: strings.TrimSpace(machine.RestoreSnapshot),
+			BalloonMB:       machine.BalloonMB,
+		},
 		onEvent,
 	)
 }

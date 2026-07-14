@@ -20,6 +20,7 @@ import (
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/nvme"
 	openbsdarm64 "j5.nz/cc/internal/openbsd/boot/arm64"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
@@ -143,8 +144,9 @@ func startOpenBSDArm64ManagedSession(ctx context.Context, cfg openBSDArm64Sessio
 	}
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(kvmVM, arm64vm.UARTSPI)
-	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, cfg.Root)
-	block.Attach(kvmVM, kvmVM)
+	nvmeBlock := nvme.NewController(cfg.Root)
+	nvmeBlock.Attach(kvmVM, kvmVM)
+	pci := NewArm64PCIHost(NewArm64NVMePCIDevice(1, arm64vm.NVMeBase, arm64vm.NVMeIRQ, nvmeBlock))
 	cfg.NetDevice.Attach(kvmVM, kvmVM)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(kvmVM, kvmVM)
@@ -155,7 +157,7 @@ func startOpenBSDArm64ManagedSession(ctx context.Context, cfg openBSDArm64Sessio
 		NumCPUs:    1,
 		Console:    true,
 		ExtraNodes: []fdt.Node{
-			block.DeviceTreeNode(),
+			pci.DeviceTreeNode(),
 			cfg.NetDevice.DeviceTreeNode(),
 			rng.DeviceTreeNode(),
 		},
@@ -176,7 +178,7 @@ func startOpenBSDArm64ManagedSession(ctx context.Context, cfg openBSDArm64Sessio
 	kvmVM = nil
 	go func() {
 		defer vmForRun.Close()
-		done.finish(runOpenBSDArm64ManagedVM(runCtx, vmForRun, uart, block, cfg.NetDevice, rng, serialOut))
+		done.finish(runOpenBSDArm64ManagedVM(runCtx, vmForRun, uart, pci, cfg.NetDevice, rng, serialOut))
 	}()
 
 	var control net.Conn
@@ -329,7 +331,7 @@ func setupOpenBSDArm64Registers(vm *VM, plan *openbsdarm64.BootPlan) error {
 	return nil
 }
 
-func runOpenBSDArm64ManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, block *virtio.Block, netdev *virtio.Net, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
+func runOpenBSDArm64ManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci *Arm64PCIHost, netdev *virtio.Net, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	vm.SetVCPUTID(unix.Gettid())
@@ -381,7 +383,7 @@ func runOpenBSDArm64ManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250
 		}
 		switch exit.Reason {
 		case ExitMMIO:
-			if err := handleOpenBSDArm64MMIO(vm, uart, block, netdev, rng, exit.MMIO); err != nil {
+			if err := handleOpenBSDArm64MMIO(vm, uart, pci, netdev, rng, exit.MMIO); err != nil {
 				return err
 			}
 		case ExitShutdown:
@@ -395,12 +397,12 @@ func runOpenBSDArm64ManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250
 	}
 }
 
-func handleOpenBSDArm64MMIO(vm *VM, uart *serial.UART8250, block *virtio.Block, netdev *virtio.Net, rng *virtio.RNG, mmio MMIOExit) error {
+func handleOpenBSDArm64MMIO(vm *VM, uart *serial.UART8250, pci *Arm64PCIHost, netdev *virtio.Net, rng *virtio.RNG, mmio MMIOExit) error {
 	if uart.Contains(mmio.Addr, int(mmio.Len)) {
 		return handleUARTExit(vm, uart, mmio)
 	}
-	if block != nil && block.Contains(mmio.Addr, int(mmio.Len)) {
-		return handleMMIODevice(vm, block, mmio)
+	if handled, err := pci.HandleMMIO(vm, mmio); handled || err != nil {
+		return err
 	}
 	if netdev != nil && netdev.Contains(mmio.Addr, int(mmio.Len)) {
 		return handleMMIODevice(vm, netdev, mmio)

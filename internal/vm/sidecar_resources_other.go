@@ -24,6 +24,13 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	return sidecarStartResources{}, nil
 }
 
+func prepareSidecarBuiltinGuestResources(h *sidecarVMHost, id string, cfg *client.NetworkConfig) (sidecarStartResources, error) {
+	_ = h
+	_ = id
+	_ = cfg
+	return sidecarStartResources{}, nil
+}
+
 func sidecarRuntimeShareMount(share client.ShareMount) (virtio.ShareMount, error) {
 	_ = share
 	return virtio.ShareMount{}, fmt.Errorf("sidecar runtime shares are not supported on this platform")

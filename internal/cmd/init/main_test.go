@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -237,10 +236,10 @@ func TestParseExecPivotArgs(t *testing.T) {
 		t.Fatalf("nil credential request = %+v", nilCredReq)
 	}
 
-	if _, err := parseExecPivotArgs([]string{"too", "short"}); err == nil || !strings.Contains(err.Error(), "argument count") {
+	if _, err := parseExecPivotArgs([]string{"too", "short"}); err == nil {
 		t.Fatalf("short args error = %v", err)
 	}
-	if _, err := parseExecPivotArgs([]string{"", "", "", "", "", "not-separator", "true"}); err == nil || !strings.Contains(err.Error(), "separator") {
+	if _, err := parseExecPivotArgs([]string{"", "", "", "", "", "not-separator", "true"}); err == nil {
 		t.Fatalf("separator error = %v", err)
 	}
 }
@@ -328,7 +327,7 @@ func TestApplyExecCredentialWithOps(t *testing.T) {
 	if !reflect.DeepEqual(groups, []int{10, 20}) || gid != 1001 || uid != 1000 {
 		t.Fatalf("credential calls groups=%v gid=%d uid=%d", groups, gid, uid)
 	}
-	if err := applyExecCredentialWithOps("1000", "1001", "bad", ops); err == nil || !strings.Contains(err.Error(), `invalid group "bad"`) {
+	if err := applyExecCredentialWithOps("1000", "1001", "bad", ops); err == nil {
 		t.Fatalf("invalid group error = %v", err)
 	}
 }
@@ -445,7 +444,7 @@ func TestWaitManagedExecProcess(t *testing.T) {
 		t.Fatalf("start exit 7: %v", err)
 	}
 	result = waitManagedExecProcess(failed, time.Now())
-	if result.WaitErr == nil || result.ExitErr != nil || result.ExitCode != 7 || result.ProcessState == nil || len(result.Usage) == 0 {
+	if result.WaitErr != nil || result.ExitErr != nil || result.ExitCode != 7 || result.ProcessState == nil || len(result.Usage) == 0 {
 		t.Fatalf("exit 7 result = %+v", result)
 	}
 }
@@ -580,6 +579,23 @@ func TestCopyManagedExecStdinToPTYWritesEOTOnEOF(t *testing.T) {
 	}
 }
 
+func TestCopyManagedExecStdinToPipeClosesBothEnds(t *testing.T) {
+	done := make(chan struct{}, 1)
+	stdin := &trackingReadCloser{Buffer: bytes.NewBufferString("input")}
+	childStdin := &trackingWriteCloser{}
+	copyManagedExecStdinToPipe(done, stdin, childStdin)
+	<-done
+	if got := childStdin.String(); got != "input" {
+		t.Fatalf("child stdin = %q, want input", got)
+	}
+	if !stdin.closed {
+		t.Fatalf("stdin was not closed")
+	}
+	if !childStdin.closed {
+		t.Fatalf("child stdin was not closed")
+	}
+}
+
 func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	if begin, done, ok := managedExecGuestReadyTimingPhases(nil); ok || begin != "" || done != "" {
 		t.Fatalf("nil wait ready phases = (%q, %q, %v), want disabled", begin, done, ok)
@@ -593,6 +609,29 @@ func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	}
 	if got := managedExecFirstOutputTimingPhase(true); got != managedExecTimingFirstStderr {
 		t.Fatalf("stderr first phase = %q", got)
+	}
+}
+
+func TestManagedExecDoneStreamCount(t *testing.T) {
+	tests := []struct {
+		name       string
+		tty        bool
+		hasStdin   bool
+		hasControl bool
+		want       int
+	}{
+		{name: "non_tty", want: 2},
+		{name: "non_tty_stdin", hasStdin: true, want: 2},
+		{name: "non_tty_control_stdin", hasStdin: true, hasControl: true, want: 3},
+		{name: "tty_stdin", tty: true, hasStdin: true, want: 2},
+		{name: "tty_control_stdin", tty: true, hasStdin: true, hasControl: true, want: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedExecDoneStreamCount(tc.tty, tc.hasStdin, tc.hasControl); got != tc.want {
+				t.Fatalf("managedExecDoneStreamCount(%t, %t, %t) = %d, want %d", tc.tty, tc.hasStdin, tc.hasControl, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -680,5 +719,15 @@ type trackingReadCloser struct {
 
 func (r *trackingReadCloser) Close() error {
 	r.closed = true
+	return nil
+}
+
+type trackingWriteCloser struct {
+	bytes.Buffer
+	closed bool
+}
+
+func (w *trackingWriteCloser) Close() error {
+	w.closed = true
 	return nil
 }

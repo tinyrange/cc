@@ -50,6 +50,23 @@ const (
 	NetSize = 0x1000
 	NetIRQ  = 45
 
+	SnapshotBase = 0x0a106000
+	SnapshotSize = 0x1000
+
+	RTCBase = 0x0a107000
+	RTCSize = 0x1000
+
+	BalloonBase = 0x0a108000
+	BalloonSize = 0x1000
+	BalloonIRQ  = 47
+
+	PCIConfigBase = 0x20000000
+	PCIConfigSize = 0x01000000
+	PCIMMIOBase   = 0x21000000
+	PCIMMIOSize   = 0x01000000
+	NVMeBase      = PCIMMIOBase
+	NVMeIRQ       = 46
+
 	UARTSPI = 33
 
 	RootFSTag   = vmruntime.RootFSTag

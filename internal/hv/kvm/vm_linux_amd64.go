@@ -205,12 +205,24 @@ func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint
 }
 
 func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
-	lowSize := amd64vm.LowMemorySizeBytes(memoryMB)
-	highSize := amd64vm.HighMemorySizeBytes(memoryMB)
-	totalSize := lowSize + highSize
+	totalSize := amd64vm.MemorySizeBytes(memoryMB)
 	mem, err := unix.Mmap(-1, 0, int(totalSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
 	if err != nil {
 		return nil, fmt.Errorf("mmap guest memory: %w", err)
+	}
+	if err := mapAMD64GuestMemoryBytes(vm, memoryMB, mem); err != nil {
+		_ = unix.Munmap(mem)
+		return nil, err
+	}
+	return mem, nil
+}
+
+func mapAMD64GuestMemoryBytes(vm *VM, memoryMB uint64, mem []byte) error {
+	lowSize := amd64vm.LowMemorySizeBytes(memoryMB)
+	highSize := amd64vm.HighMemorySizeBytes(memoryMB)
+	totalSize := lowSize + highSize
+	if uint64(len(mem)) != totalSize {
+		return fmt.Errorf("guest memory size %d does not match requested VM memory %d", len(mem), totalSize)
 	}
 	lowRegion := kvmUserspaceMemoryRegion{
 		Slot:          0,
@@ -219,8 +231,7 @@ func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
 	}
 	if err := setUserMemoryRegion(vm.vmfd, &lowRegion); err != nil {
-		_ = unix.Munmap(mem)
-		return nil, fmt.Errorf("set user memory region: %w", err)
+		return fmt.Errorf("set user memory region: %w", err)
 	}
 	vm.mem = mem
 	vm.lowMemLimit = lowSize
@@ -232,17 +243,16 @@ func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[lowSize]))),
 		}
 		if err := setUserMemoryRegion(vm.vmfd, &highRegion); err != nil {
-			_ = unix.Munmap(mem)
 			vm.mem = nil
 			vm.lowMemLimit = 0
-			return nil, fmt.Errorf("set user memory region: %w", err)
+			return fmt.Errorf("set user memory region: %w", err)
 		}
 		vm.regions = append(vm.regions, memoryMapping{
 			guestPhysAddr: amd64vm.HighMemoryBase,
 			mem:           mem[lowSize : lowSize+highSize],
 		})
 	}
-	return mem, nil
+	return nil
 }
 
 func (v *VM) Run(exit *Exit) error {
@@ -522,6 +532,25 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	return nil
 }
 
+func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
+	if v == nil {
+		return nil, fmt.Errorf("vm is nil")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("invalid slice size %d", size)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	region, off, ok := v.findMemoryRegion(addr)
+	if !ok || uint64(size) > uint64(len(region))-off {
+		return nil, fmt.Errorf("slice guest memory %#x size %d: unmapped", addr, size)
+	}
+	return region[off : off+uint64(size)], nil
+}
+
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	if v == nil {
 		return fmt.Errorf("vm is nil")
@@ -535,6 +564,31 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 		return fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
 	}
 	return nil
+}
+
+func (v *VM) ReclaimGuestPage(ipa uint64) error {
+	return v.madviseGuestPage(ipa, unix.MADV_DONTNEED)
+}
+
+func (v *VM) ReuseGuestPage(ipa uint64) error {
+	return nil
+}
+
+func (v *VM) madviseGuestPage(ipa uint64, advice int) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	const pageSize = 4096
+	if ipa%pageSize != 0 {
+		return fmt.Errorf("guest page %#x is not page aligned", ipa)
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	region, off, ok := v.findMemoryRegion(ipa)
+	if !ok || off+pageSize > uint64(len(region)) {
+		return fmt.Errorf("guest page %#x: unmapped", ipa)
+	}
+	return unix.Madvise(region[off:off+pageSize], advice)
 }
 
 func (v *VM) copyFromGuest(addr uint64, out []byte) error {

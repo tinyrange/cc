@@ -39,12 +39,15 @@ type RunRequest struct {
 	WorkDir           string
 	User              string
 	MemoryMB          uint64
+	BalloonMB         uint64
 	CPUs              int
 	NestedVirt        bool
 	Dmesg             bool
 	Persistent        bool
 	Network           *GuestNetworkConfig
 	NetDevice         *virtio.Net
+	SnapshotDir       string
+	RestoreSnapshot   string
 	UnixTime          int64
 }
 

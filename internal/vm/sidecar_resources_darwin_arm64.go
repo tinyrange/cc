@@ -31,6 +31,7 @@ const (
 	sidecarNetSocketEnv = "CCX3_WORKER_NET_SOCKET"
 	sidecarNetIPv4Env   = "CCX3_WORKER_NET_IPV4"
 	sidecarNetMACEnv    = "CCX3_WORKER_NET_MAC"
+	sidecarNetModeEnv   = "CCX3_WORKER_NET_MODE"
 )
 
 const (
@@ -113,28 +114,41 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	} else {
 		root = virtio.NewImageFS(blankRuntimeRootFS(), "")
 	}
-	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
+	shares, err := sidecarShareMounts(req.Shares)
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, nil))
+	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
 	if err != nil {
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
 	if err != nil {
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	fsResources.resolver = resolver
 	netResources, err := prepareSidecarNetResources(h.cacheDir, req.ID, req.Network)
 	if err != nil {
 		fsResources.closeAll()
-		bootResources.closeAll()
+		return sidecarStartResources{}, err
+	}
+	if strings.TrimSpace(req.RestoreSnapshot) != "" {
+		return combineSidecarResources(fsResources, netResources), nil
+	}
+	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
+	if err != nil {
+		fsResources.closeAll()
+		netResources.closeAll()
 		return sidecarStartResources{}, err
 	}
 	return combineSidecarResources(fsResources, bootResources, netResources), nil
+}
+
+func prepareSidecarBuiltinGuestResources(h *sidecarVMHost, id string, cfg *client.NetworkConfig) (sidecarStartResources, error) {
+	if h == nil {
+		return sidecarStartResources{}, nil
+	}
+	return prepareSidecarNetResourcesWithMode(h.cacheDir, id, cfg, "bridge")
 }
 
 func sidecarSnapshotRoot(backend virtio.FSBackend) (sidecarRootFS, error) {
@@ -289,10 +303,29 @@ func serveSidecarFS(cacheDir string, backend sidecarRootFS) (sidecarStartResourc
 }
 
 func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) (sidecarStartResources, error) {
+	mode := ""
+	if cfg != nil {
+		switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+		case "":
+			mode = "bridge"
+		case "bridge":
+			mode = "bridge"
+		case "remote":
+		default:
+			return sidecarStartResources{}, fmt.Errorf("unsupported sidecar network mode %q", cfg.Mode)
+		}
+	}
+	return prepareSidecarNetResourcesWithMode(cacheDir, id, cfg, mode)
+}
+
+func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.NetworkConfig, mode string) (sidecarStartResources, error) {
 	if cfg == nil || !cfg.Enabled {
 		return sidecarStartResources{}, nil
 	}
-	lease := defaultDarwinSidecarSwitch.Register(id)
+	lease, explicit := darwinSidecarLeaseFromConfig(id, cfg)
+	if !explicit {
+		lease = defaultDarwinSidecarSwitch.Register(id)
+	}
 	var codecMu sync.Mutex
 	var codec *virtio.NetPacketCodec
 	runtime, err := newNetworkRuntime(networkDeviceConfig{
@@ -317,11 +350,15 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 			})
 		},
 		Cleanup: func() {
-			defaultDarwinSidecarSwitch.Unregister(lease.id)
+			if !explicit {
+				defaultDarwinSidecarSwitch.Unregister(lease.id)
+			}
 		},
 	})
 	if err != nil {
-		defaultDarwinSidecarSwitch.Unregister(lease.id)
+		if !explicit {
+			defaultDarwinSidecarSwitch.Unregister(lease.id)
+		}
 		return sidecarStartResources{}, err
 	}
 	socketPath, cleanupListener, err := serveSidecarUnixOnceConn(cacheDir, "net", false, func(conn net.Conn) error {
@@ -347,6 +384,9 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 				return nil
 			}
 			defaultDarwinSidecarSwitch.Forward(lease.id, packet.Frame)
+			if mode == "bridge" {
+				return nil
+			}
 			if runtime == nil {
 				return nil
 			}
@@ -375,12 +415,37 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 			sidecarNetSocketEnv + "=" + socketPath,
 			sidecarNetIPv4Env + "=" + lease.ip.String(),
 			sidecarNetMACEnv + "=" + lease.mac.String(),
+			sidecarNetModeEnv + "=" + mode,
 		},
 		close:       closeFn,
 		remote:      true,
 		networkIPv4: lease.ip.String(),
 		network:     runtime,
 	}, nil
+}
+
+func darwinSidecarLeaseFromConfig(id string, cfg *client.NetworkConfig) (darwinSidecarLease, bool) {
+	if cfg == nil {
+		return darwinSidecarLease{}, false
+	}
+	ip := net.ParseIP(strings.TrimSpace(cfg.GuestIPv4)).To4()
+	if ip == nil {
+		return darwinSidecarLease{}, false
+	}
+	macText := strings.TrimSpace(cfg.GuestMAC)
+	if macText == "" {
+		ip4 := ip.To4()
+		macText = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, ip4[3]}.String()
+	}
+	mac, err := net.ParseMAC(macText)
+	if err != nil {
+		return darwinSidecarLease{}, false
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = DefaultInstanceID
+	}
+	return darwinSidecarLease{id: id, ip: ip, mac: mac}, true
 }
 
 type darwinSidecarSwitch struct {
@@ -414,6 +479,12 @@ func (s *darwinSidecarSwitch) Register(id string) darwinSidecarLease {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if lease, ok := s.leases[id]; ok {
+		return lease
+	}
+	if endpoint, ok := s.endpoints[id]; ok {
+		return darwinSidecarLease{id: endpoint.id, ip: endpoint.ip, mac: endpoint.mac}
+	}
 	used := map[byte]bool{1: true}
 	for _, lease := range s.leases {
 		if ip4 := lease.ip.To4(); ip4 != nil {

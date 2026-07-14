@@ -89,6 +89,11 @@ type WorkerFlushRequest struct {
 	ID string `json:"id,omitempty"`
 }
 
+type WorkerAddShareRequest struct {
+	ID    string            `json:"id,omitempty"`
+	Share client.ShareMount `json:"share"`
+}
+
 type WorkerConsoleRequest struct {
 	ID string `json:"id,omitempty"`
 }
@@ -101,11 +106,6 @@ type WorkerExecRequest struct {
 	ID          string             `json:"id,omitempty"`
 	Request     client.ExecRequest `json:"request"`
 	InputStream bool               `json:"input_stream,omitempty"`
-}
-
-type WorkerAddShareRequest struct {
-	ID    string            `json:"id,omitempty"`
-	Share client.ShareMount `json:"share"`
 }
 
 type WorkerExecInput struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 )
@@ -13,58 +14,54 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 }
 
 func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) {
-	_ = cacheDir
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	payload := embeddedPayload(goarch)
-	if embeddedErr := validateEmbeddedPayload(goarch, payload); embeddedErr != nil {
-		sourcePayload, sourceErr := sourceTreePayload(goarch)
-		if sourceErr != nil {
-			return nil, embeddedErr
-		}
-		if err := validateEmbeddedPayload(goarch, sourcePayload); err != nil {
-			return nil, fmt.Errorf("source guest init payload for %q is invalid: %w", goarch, err)
-		}
-		payload = sourcePayload
+	if goarch == "" {
+		goarch = runtime.GOARCH
 	}
-	return append([]byte(nil), payload...), nil
-}
-
-func embeddedPayload(goarch string) []byte {
-	switch goarch {
-	case "arm64":
-		return guestInitLinuxARM64
-	case "amd64":
-		return guestInitLinuxAMD64
-	default:
-		return nil
-	}
-}
-
-func RequireEmbedded() error {
-	for _, goarch := range []string{"arm64", "amd64"} {
-		if err := validateEmbeddedPayload(goarch, embeddedPayload(goarch)); err != nil {
-			return err
+	if cacheDir == "" {
+		var err error
+		cacheDir, err = os.MkdirTemp("", "cc-linux-guestinit-*")
+		if err != nil {
+			return nil, fmt.Errorf("create guest init cache: %w", err)
 		}
 	}
-	return nil
-}
-
-func sourceTreePayload(goarch string) ([]byte, error) {
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create guest init cache: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch)
+	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
+		return data, nil
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
-		return nil, fmt.Errorf("locate guest init package source")
+		return nil, fmt.Errorf("locate guest init package")
 	}
-	return os.ReadFile(filepath.Join(filepath.Dir(file), "guest-init-linux-"+goarch))
+	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/init")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	cmd.Dir = moduleRoot
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("build Linux guest init: %w\n%s", err, data)
+	}
+	bin, err := os.ReadFile(out)
+	if err != nil {
+		return nil, fmt.Errorf("read Linux guest init: %w", err)
+	}
+	if err := validateGuestInitPayload(goarch, bin); err != nil {
+		return nil, err
+	}
+	return bin, nil
 }
 
-func validateEmbeddedPayload(goarch string, payload []byte) error {
+func validateGuestInitPayload(goarch string, payload []byte) error {
 	if len(payload) == 0 {
-		return fmt.Errorf("guest init payload for %q is not embedded; build ccvm with -tags embed_guestinit", goarch)
+		return fmt.Errorf("guest init payload for %q is empty", goarch)
 	}
 	if len(payload) < 4 || string(payload[:4]) != "\x7fELF" {
-		return fmt.Errorf("guest init payload for %q is not a static Linux ELF; rebuild it with CGO_ENABLED=0 GOOS=linux GOARCH=%s", goarch, goarch)
+		return fmt.Errorf("guest init payload for %q is not a static Linux ELF", goarch)
 	}
 	return nil
 }

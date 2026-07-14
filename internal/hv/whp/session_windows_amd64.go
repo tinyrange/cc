@@ -4,6 +4,7 @@ package whp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -23,23 +24,45 @@ import (
 type ManagedSession struct {
 	cancel     context.CancelFunc
 	doneCh     chan error
-	control    virtio.VsockConn
-	listener   virtio.VsockListener
+	control    io.ReadWriteCloser
+	listener   io.Closer
 	vsock      *virtio.Vsock
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
 	platform   *bootPlatform
+	waitOnce   sync.Once
+	waitErr    error
 	sendMu     sync.Mutex
 	nextID     atomic.Uint64
 	dmesg      bool
 }
+
+type ManagedSessionOptions struct {
+	SnapshotDir     string
+	RestoreSnapshot string
+}
+
+const (
+	execTerminateGrace = 500 * time.Millisecond
+	execKillWait       = 2 * time.Second
+)
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	return StartManagedSessionWithNet(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, onEvent)
 }
 
 func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNetOptions(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, netdev, ManagedSessionOptions{}, onEvent)
+}
+
+func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, netdev, onEvent)
+	}
+	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
+		return nil, err
+	}
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -66,7 +89,7 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = bootWriter
 	}
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, serialWriter)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, strings.TrimSpace(opts.SnapshotDir), serialWriter)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
@@ -79,9 +102,10 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 	runCtx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan error, 1)
 	go func() {
-		defer vm.Close()
-		defer platform.Close()
-		doneCh <- runManagedExecVM(runCtx, vm, platform, serialOut)
+		err := runManagedExecVM(runCtx, vm, platform, serialOut)
+		platform.Close()
+		err = errors.Join(err, vm.Close())
+		doneCh <- err
 	}()
 
 	var control virtio.VsockConn
@@ -139,6 +163,16 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
 	}
+	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
+		cancel()
+		_ = control.Close()
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, err
+	}
 
 	return &ManagedSession{
 		cancel:     cancel,
@@ -160,10 +194,9 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
-	s.sendMu.Lock()
-	err := managedagent.SendExec(s.control, id, req)
-	s.sendMu.Unlock()
-	if err != nil {
+	execReq := req
+	execReq.Kind = "exec_inline"
+	if err := s.sendExecMessage(managedagent.ExecRequest(id, execReq)); err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
 	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
@@ -171,7 +204,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		return ok
 	})
 	if err != nil {
-		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
+		return client.ExecResponse{}, transcriptError(s.withPlatformSummary(err), s.serialOut.String(), s.transcript.String())
 	}
 	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
 	if !ok {
@@ -194,7 +227,7 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 		return ok
 	})
 	if err != nil {
-		return transcriptError(err, s.serialOut.String(), s.transcript.String())
+		return transcriptError(s.withPlatformSummary(err), s.serialOut.String(), s.transcript.String())
 	}
 	code, output, _, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
 	if !ok {
@@ -217,19 +250,36 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	if (req.Kind == "" || req.Kind == "exec") && len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
-	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	id := s.nextExecID()
 	start := s.transcript.Len()
 	if err := s.sendExecStart(id, req); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
+	var cancelInputs context.CancelFunc
+	var inputsDone chan struct{}
 	if inputs != nil {
-		go s.forwardExecInputs(ctx, id, inputs)
-	} else if len(req.Stdin) == 0 {
+		inputCtx, cancel := context.WithCancel(ctx)
+		cancelInputs = cancel
+		inputsDone = make(chan struct{})
+		go func() {
+			defer close(inputsDone)
+			s.forwardExecInputs(inputCtx, id, inputs)
+		}()
+	} else if len(req.Stdin) == 0 && !req.TTY {
 		if err := s.sendStdinClose(id); err != nil {
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	return s.streamExecEvents(ctx, start, id, onEvent)
+	err := s.streamExecEvents(ctx, start, id, onEvent)
+	if cancelInputs != nil {
+		cancelInputs()
+		<-inputsDone
+	}
+	return err
+}
+
+func (s *ManagedSession) nextExecID() string {
+	return strconv.FormatUint(s.nextID.Add(1), 10)
 }
 
 func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error {
@@ -257,15 +307,27 @@ func (s *ManagedSession) sendStdinClose(id string) error {
 func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	return managedagent.Send(s.control, msg)
+	if err := managedagent.Send(s.control, msg); err != nil {
+		return err
+	}
+	if s.vsock != nil {
+		return s.vsock.Kick()
+	}
+	return nil
 }
 
 func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
-	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
+	err := managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
+		OnCallbackFail: func() {
+			s.terminateExecAndWait(id, start)
+		},
+		OnContextDone: func() {
+			s.terminateExecAndWait(id, start)
+		},
 		Wait: func(context.Context) error {
 			select {
 			case vmErr := <-s.doneCh:
@@ -284,19 +346,78 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 			}
 		},
 	})
+	if err != nil {
+		return transcriptError(s.withPlatformSummary(err), s.serialOut.String(), s.transcript.String())
+	}
+	return nil
+}
+
+func (s *ManagedSession) withPlatformSummary(err error) error {
+	if err == nil || s == nil || s.platform == nil {
+		return err
+	}
+	return fmt.Errorf("%w (%s)", err, s.platform.Summary())
+}
+
+func (s *ManagedSession) terminateExecAndWait(id string, start int) {
+	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "TERM"})
+	if s.waitForExecExit(id, start, execTerminateGrace) {
+		return
+	}
+	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "KILL"})
+	_ = s.waitForExecExit(id, start, execKillWait)
+}
+
+func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	return err == nil
 }
 
 func (s *ManagedSession) Wait() error {
+	return s.waitDone()
+}
+
+func (s *ManagedSession) waitDone() error {
 	if s == nil || s.doneCh == nil {
 		return nil
 	}
-	return <-s.doneCh
+	s.waitOnce.Do(func() {
+		s.waitErr = <-s.doneCh
+	})
+	return s.waitErr
+}
+
+func (s *ManagedSession) waitDoneTimeout(timeout time.Duration) error {
+	if s == nil || s.doneCh == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.waitDone()
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for managed session to stop")
+	}
 }
 
 func (s *ManagedSession) Close() error {
 	if s == nil {
 		return nil
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	waitErr := s.waitDoneTimeout(15 * time.Second)
 	if s.control != nil {
 		_ = s.control.Close()
 	}
@@ -309,8 +430,8 @@ func (s *ManagedSession) Close() error {
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
 	}
-	if s.cancel != nil {
-		s.cancel()
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		return waitErr
 	}
 	return nil
 }

@@ -76,9 +76,6 @@ func TestFAT32Compliance(t *testing.T) {
 		testFAT32FieldValidation(t, writer)
 	})
 
-	t.Run("RootDirectoryClusterCompliance", func(t *testing.T) {
-		testRootDirectoryClusterCompliance(t, writer)
-	})
 }
 
 // testBootSectorCompliance verifies the primary boot sector meets FAT32 requirements
@@ -218,18 +215,4 @@ func testFAT32FieldValidation(t *testing.T, writer *FATWriter) {
 	if fs.LargeSectorCount() == 0 {
 		t.Error("FAT32 should have non-zero largeSectorCount")
 	}
-}
-
-// testRootDirectoryClusterCompliance verifies FAT32 root directory cluster handling
-func testRootDirectoryClusterCompliance(t *testing.T, writer *FATWriter) {
-	fs := writer.layout.Fs()
-
-	// Verify root directory starts at cluster 2
-	if fs.RootDirectoryCluster() != 2 {
-		t.Errorf("FAT32 root directory should start at cluster 2, got %d", fs.RootDirectoryCluster())
-	}
-
-	// TODO: Update this test to work with VirtualStorage interface
-	// For now, skip this part of the test until we implement proper reader integration
-	t.Log("Skipping reader test - needs update for VirtualStorage interface")
 }

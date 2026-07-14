@@ -31,7 +31,7 @@ func TestNormalizeBSDPCSessionConfigUsesSpecDevicePlacement(t *testing.T) {
 	cfg := normalizeBSDPCSessionConfig(bsdPCSessionConfig{
 		Spec: machine.Spec{
 			Devices: []machine.DeviceSpec{
-				{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10},
+				{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10},
 				{Kind: "virtio-net", Name: "net0", Bus: "pci", Slot: 4, IOBase: 0x1400, IRQ: 14},
 			},
 		},

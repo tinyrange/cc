@@ -87,6 +87,7 @@ type config struct {
 	PrecopyAMD64Root   bool     `json:"precopy_amd64_root,omitempty"`
 	DisableCgroupMount bool     `json:"disable_cgroup_mount,omitempty"`
 	Network            *network `json:"network,omitempty"`
+	SnapshotMMIOBase   uint64   `json:"snapshot_mmio_base,omitempty"`
 	UnixTime           int64    `json:"unix_time,omitempty"`
 }
 
@@ -292,6 +293,42 @@ func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveE
 	}(req.ID, managed)
 }
 
+func runPreparedExecInline(cfg config, control io.Writer, req preparedExecRequest, waitReady func() error) {
+	managed := &managedExec{start: time.Now()}
+	stdin, cleanup, err := inlineExecStdin(req.Stdin)
+	if err != nil {
+		writeKernel("ccx3-init: prepare inline stdin: " + err.Error())
+		writeExecStderr(cfg, control, req.ID, "ccx3-init: prepare inline stdin: "+err.Error()+"\n")
+		reporterForConfig(cfg, control, req.ID, time.Now()).Exit(126)
+		return
+	}
+	runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdin, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, cleanup)
+}
+
+func inlineExecStdin(data []byte) (io.ReadCloser, func(), error) {
+	if len(data) == 0 {
+		return nil, func() {}, nil
+	}
+	file, err := os.CreateTemp("", "ccx3-stdin-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = os.Remove(file.Name())
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, nil, err
+	}
+	return file, cleanup, nil
+}
+
 func newSystemdCommandGate(initSystem string) *systemdCommandGate {
 	return &systemdCommandGate{
 		enabled: strings.TrimSpace(initSystem) == initSystemSystemd,
@@ -385,8 +422,18 @@ func run() error {
 	}
 	configureMemoryOvercommit("/proc")
 
+	modules := cfg.Modules
+	var deferredModulePaths []string
+	var deferredModules []modulePayload
+	if cfg.SnapshotMMIOBase != 0 {
+		modules, deferredModulePaths = splitSnapshotDeferredModules(cfg.Modules)
+		deferredModules, err = readModulePayloads(deferredModulePaths)
+		if err != nil {
+			return err
+		}
+	}
 	writeStage(bootStart, "loading modules")
-	if err := loadModules(cfg.Modules); err != nil {
+	if err := loadModules(modules); err != nil {
 		return err
 	}
 	writeStage(bootStart, "modules loaded")
@@ -396,15 +443,21 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		writeStage(bootStart, "configuring hostname")
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)
 		}
+		writeStage(bootStart, "hostname configured")
+		writeStage(bootStart, "configuring runtime filesystem")
 		if err := configureRuntimeFilesystem(); err != nil {
 			return fmt.Errorf("configure runtime filesystem: %w", err)
 		}
+		writeStage(bootStart, "runtime filesystem configured")
+		writeStage(bootStart, "configuring package managers")
 		if err := configurePackageManagers(""); err != nil {
 			return fmt.Errorf("configure package managers: %w", err)
 		}
+		writeStage(bootStart, "package managers configured")
 		if cfg.PrecopyAMD64Root {
 			writeStage(bootStart, "precopying amd64 root")
 			if err := precopyAMD64Root(); err != nil {
@@ -438,6 +491,23 @@ func run() error {
 			if strings.TrimSpace(cfg.InitSystem) != "" {
 				return bootInitSystem(cfg, bootStart)
 			}
+			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
+				return fmt.Errorf("trigger snapshot: %w", err)
+			}
+			if cfg.SnapshotMMIOBase != 0 {
+				writeStage(bootStart, "seeding entropy")
+				if err := seedEntropyFromHostRNG(64); err != nil {
+					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
+				}
+				writeStage(bootStart, "entropy seeded")
+			}
+			if len(deferredModules) > 0 {
+				writeStage(bootStart, "loading deferred modules")
+				if err := loadModulePayloads(deferredModules); err != nil {
+					return err
+				}
+				writeStage(bootStart, "deferred modules loaded")
+			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
 			if err != nil {
@@ -449,7 +519,6 @@ func run() error {
 				writeStage(bootStart, "sending ready marker")
 				writeProtocolLineTo(control, cfg.ReadyMarker)
 			}
-			writeStage(bootStart, "entering command loop")
 			return commandLoop(cfg, control)
 		}
 		if cfg.ReadyMarker != "" {
@@ -1050,6 +1119,77 @@ func emptyRootFS(keep string) error {
 		if err := removeRootFSEntry(name); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func triggerSnapshotMMIO(base uint64) error {
+	if base == 0 {
+		return nil
+	}
+	const snapshotMagic = 0x43535833534e4150
+	pageSize := unix.Getpagesize()
+	pageBase := base & ^uint64(pageSize-1)
+	pageOff := int(base - pageBase)
+	if err := ensureDeviceNode("/dev/mem", unix.S_IFCHR|0o600, int(unix.Mkdev(1, 1))); err != nil {
+		writeConsole("__CCX3_SNAPSHOT__\n")
+		return fmt.Errorf("create /dev/mem: %w", err)
+	}
+	mem, err := os.OpenFile("/dev/mem", os.O_RDWR|unix.O_SYNC, 0)
+	if err != nil {
+		writeConsole("__CCX3_SNAPSHOT__\n")
+		return fmt.Errorf("open /dev/mem: %w", err)
+	}
+	defer mem.Close()
+	mapped, err := unix.Mmap(int(mem.Fd()), int64(pageBase), pageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		writeConsole("__CCX3_SNAPSHOT__\n")
+		return fmt.Errorf("map snapshot MMIO: %w", err)
+	}
+	defer unix.Munmap(mapped)
+	if pageOff+8 > len(mapped) {
+		return fmt.Errorf("snapshot mmio offset %#x outside mapped page", pageOff)
+	}
+	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = snapshotMagic
+	writeConsole("__CCX3_SNAPSHOT__\n")
+	return nil
+}
+
+func ensureDeviceNode(path string, mode uint32, dev int) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return unix.Mknod(path, mode, dev)
+}
+
+func seedEntropyFromHostRNG(size int) error {
+	if size <= 0 {
+		return nil
+	}
+	seed := make([]byte, size)
+	rng, err := os.Open("/dev/hwrng")
+	if err != nil {
+		return fmt.Errorf("open /dev/hwrng: %w", err)
+	}
+	if _, err := io.ReadFull(rng, seed); err != nil {
+		_ = rng.Close()
+		return fmt.Errorf("read /dev/hwrng: %w", err)
+	}
+	if err := rng.Close(); err != nil {
+		return fmt.Errorf("close /dev/hwrng: %w", err)
+	}
+	urandom, err := os.OpenFile("/dev/urandom", os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/urandom: %w", err)
+	}
+	if _, err := urandom.Write(seed); err != nil {
+		_ = urandom.Close()
+		return fmt.Errorf("write /dev/urandom: %w", err)
+	}
+	if err := urandom.Close(); err != nil {
+		return fmt.Errorf("close /dev/urandom: %w", err)
 	}
 	return nil
 }
@@ -1788,19 +1928,73 @@ func loadModules(modules []string) error {
 		if err != nil {
 			return fmt.Errorf("read module %s: %w", path, err)
 		}
-		if len(data) == 0 {
-			return fmt.Errorf("module %s is empty", path)
-		}
-		params, err := syscall.BytePtrFromString("")
-		if err != nil {
-			return fmt.Errorf("init module params: %w", err)
-		}
-		_, _, errno := syscall.RawSyscall(syscall.SYS_INIT_MODULE, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(params)))
-		if errno != 0 {
-			return fmt.Errorf("load module %s: errno=%d", path, errno)
+		if err := loadModuleData(path, data); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+type modulePayload struct {
+	path string
+	data []byte
+}
+
+func readModulePayloads(modules []string) ([]modulePayload, error) {
+	payloads := make([]modulePayload, 0, len(modules))
+	for _, path := range modules {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read module %s: %w", path, err)
+		}
+		payloads = append(payloads, modulePayload{path: path, data: data})
+	}
+	return payloads, nil
+}
+
+func loadModulePayloads(modules []modulePayload) error {
+	for _, module := range modules {
+		if err := loadModuleData(module.path, module.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadModuleData(path string, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("module %s is empty", path)
+	}
+	params, err := syscall.BytePtrFromString("")
+	if err != nil {
+		return fmt.Errorf("init module params: %w", err)
+	}
+	_, _, errno := syscall.RawSyscall(syscall.SYS_INIT_MODULE, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(params)))
+	if errno != 0 {
+		return fmt.Errorf("load module %s: errno=%d", path, errno)
+	}
+	return nil
+}
+
+func splitSnapshotDeferredModules(modules []string) ([]string, []string) {
+	var early []string
+	var deferred []string
+	for _, path := range modules {
+		if snapshotDeferredModule(path) {
+			deferred = append(deferred, path)
+			continue
+		}
+		early = append(early, path)
+	}
+	return early, deferred
+}
+
+func snapshotDeferredModule(path string) bool {
+	name := filepath.Base(path)
+	return name == "vsock.ko" ||
+		strings.HasPrefix(name, "vsock.ko.") ||
+		strings.HasPrefix(name, "vmw_vsock_") ||
+		strings.HasPrefix(name, "virtio_vsock")
 }
 
 func execCommand(cfg config) error {
@@ -1996,6 +2190,10 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		if req.Kind == "" {
 			req.Kind = "exec"
 		}
+		inlineExec := req.Kind == "exec_inline"
+		if inlineExec {
+			req.Kind = "exec"
+		}
 		if handleInitControlRequest(cfg, control, active, req) {
 			continue
 		}
@@ -2008,6 +2206,10 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		}
 
 		execReq := prepareExecRequest(cfg, req)
+		if inlineExec {
+			runPreparedExecInline(cfg, control, execReq, systemdGate.WaitForCommand(execReq.Command))
+			continue
+		}
 		startPreparedExec(cfg, control, active, execReq, systemdGate.WaitForCommand(execReq.Command))
 	}
 }
@@ -2287,12 +2489,25 @@ func managedExecExitCode(waitErr error, state *os.ProcessState) (int, error) {
 	if waitErr != nil && errors.Is(waitErr, exec.ErrWaitDelay) {
 		waitErr = nil
 	}
+	if state != nil {
+		status, ok := state.Sys().(syscall.WaitStatus)
+		if !ok {
+			return 126, fmt.Errorf("process state did not include wait status")
+		}
+		if status.Signaled() {
+			return 128 + int(status.Signal()), nil
+		}
+		if status.Exited() {
+			return status.ExitStatus(), nil
+		}
+		return 126, fmt.Errorf("process did not exit normally")
+	}
 	if waitErr == nil {
 		return 0, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
-		return guestagent.ProcessExitCode(state, exitErr.ExitCode()), nil
+		return exitErr.ExitCode(), nil
 	}
 	return 126, waitErr
 }
@@ -2315,16 +2530,17 @@ type managedExecWaitResult struct {
 }
 
 func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitResult {
-	waitErr := cmd.Wait()
-	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(execStart))
-	exitCode, exitErr := managedExecExitCode(waitErr, cmd.ProcessState)
+	state, waitErr := cmd.Process.Wait()
+	cmd.ProcessState = state
+	usage := guestagent.UsageFromProcessState(state, time.Since(execStart))
+	exitCode, exitErr := managedExecExitCode(waitErr, state)
 	var usagePayload string
 	if usage != nil {
 		usagePayload = guestagent.EncodeExecUsage(usage)
 	}
 	return managedExecWaitResult{
 		WaitErr:      waitErr,
-		ProcessState: cmd.ProcessState,
+		ProcessState: state,
 		Usage:        usagePayload,
 		ExitCode:     exitCode,
 		ExitErr:      exitErr,
@@ -2343,6 +2559,13 @@ func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
 		streams++
 	}
 	return streams
+}
+
+func managedExecDoneStreamCount(tty bool, hasStdin bool, hasControl bool) int {
+	if !tty {
+		hasStdin = false
+	}
+	return managedExecStreamCount(tty, hasStdin, hasControl)
 }
 
 func waitManagedExecStreams(done <-chan struct{}, count int) {
@@ -2407,6 +2630,25 @@ func copyManagedExecStdinToPTY(done chan<- struct{}, stdin io.ReadCloser, pty io
 	}
 }
 
+func copyManagedExecStdinToPipe(done chan<- struct{}, stdin io.ReadCloser, childStdin io.WriteCloser) {
+	defer func() { done <- struct{}{} }()
+	defer stdin.Close()
+	defer childStdin.Close()
+	_, _ = io.Copy(childStdin, stdin)
+}
+
+func closeManagedExecStdinPipe(stdin io.ReadCloser, childStdin io.WriteCloser, done <-chan struct{}) {
+	if childStdin != nil {
+		_ = childStdin.Close()
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
 func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, waitReady func() error, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
@@ -2464,8 +2706,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
-		stdoutW    *io.PipeWriter
-		stderrW    *io.PipeWriter
+		stdoutR    io.ReadCloser
+		stderrR    io.ReadCloser
+		stdinW     io.WriteCloser
+		stdinDone  chan struct{}
 		controlR   *os.File
 		controlW   *os.File
 		ptyMaster  *os.File
@@ -2518,7 +2762,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		done = make(chan struct{}, managedExecStreamCount(true, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		var ptyEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			ptyEmit = reporter.Stdout
@@ -2529,8 +2773,15 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 	} else {
 		if stdin != nil {
-			defer stdin.Close()
-			cmd.Stdin = stdin
+			var err error
+			stdinW, err = cmd.StdinPipe()
+			if err != nil {
+				closeManagedExecStdinPipe(stdin, nil, nil)
+				writeKernel("ccx3-init: open stdin pipe: " + err.Error())
+				writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
+				reporter.Exit(126)
+				return
+			}
 		} else {
 			devNull, err := os.Open("/dev/null")
 			if err == nil {
@@ -2539,14 +2790,26 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 		}
 
-		stdoutR, stdoutPipeW := io.Pipe()
-		stderrR, stderrPipeW := io.Pipe()
-		stdoutW = stdoutPipeW
-		stderrW = stderrPipeW
-		cmd.Stdout = stdoutW
-		cmd.Stderr = stderrW
+		var err error
+		stdoutR, err = cmd.StdoutPipe()
+		if err != nil {
+			closeManagedExecStdinPipe(stdin, stdinW, nil)
+			writeKernel("ccx3-init: open stdout pipe: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: open stdout pipe: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
+		stderrR, err = cmd.StderrPipe()
+		if err != nil {
+			_ = stdoutR.Close()
+			closeManagedExecStdinPipe(stdin, stdinW, nil)
+			writeKernel("ccx3-init: open stderr pipe: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: open stderr pipe: "+err.Error()+"\n")
+			reporter.Exit(126)
+			return
+		}
 
-		done = make(chan struct{}, managedExecStreamCount(false, stdin != nil, controlR != nil))
+		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		var stdoutEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			stdoutEmit = reporter.Stdout
@@ -2567,6 +2830,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	startErr := startManagedExecProcess(cmd, &controlW)
 	if startErr != nil {
 		_ = managed.closeStdin()
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 		if ptySlave != nil {
 			_ = ptySlave.Close()
 			ptySlave = nil
@@ -2575,11 +2839,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			_ = ptyMaster.Close()
 			ptyMaster = nil
 		}
-		if stdoutW != nil {
-			_ = stdoutW.Close()
+		if stdoutR != nil {
+			_ = stdoutR.Close()
 		}
-		if stderrW != nil {
-			_ = stderrW.Close()
+		if stderrR != nil {
+			_ = stderrR.Close()
 		}
 		waitManagedExecStreams(done, cap(done))
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
@@ -2588,6 +2852,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		return
 	}
 	reporter.Timing(managedExecTimingStarted)
+	if stdinW != nil {
+		stdinDone = make(chan struct{}, 1)
+		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
+	}
 	managed.setProcess(cmd.Process, signalGroup)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
@@ -2595,19 +2863,23 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	}
 
 	reporter.Timing(managedExecTimingWaitBegin)
-	waitResult := waitManagedExecProcess(cmd, execStart)
+	var waitResult managedExecWaitResult
+	if !tty {
+		waitManagedExecStreams(done, cap(done))
+		reporter.Timing(managedExecTimingStreamsDone)
+	}
+	waitResult = waitManagedExecProcess(cmd, execStart)
 	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()
 	}
-	if stdoutW != nil {
-		_ = stdoutW.Close()
+	if !tty {
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 	}
-	if stderrW != nil {
-		_ = stderrW.Close()
+	if tty {
+		waitManagedExecStreams(done, cap(done))
+		reporter.Timing(managedExecTimingStreamsDone)
 	}
-	waitManagedExecStreams(done, cap(done))
-	reporter.Timing(managedExecTimingStreamsDone)
 
 	if waitResult.ExitErr != nil {
 		writeKernel("ccx3-init: exec error: " + waitResult.ExitErr.Error())

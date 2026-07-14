@@ -1,0 +1,1210 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CC daemon API",
+    "version": "0.1.0",
+    "description": "HTTP API exposed by the CC daemon.",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Local daemon"
+    }
+  ],
+  "security": [],
+  "tags": [
+    { "name": "daemon", "description": "Daemon lifecycle and host capability endpoints." },
+    { "name": "watchdog", "description": "Watchdog timers and activity counters." },
+    { "name": "kernel", "description": "Kernel package status and download operations." },
+    { "name": "images", "description": "Image discovery, pull, metadata, and deletion endpoints." },
+    { "name": "cvmfs", "description": "CVMFS browsing and file range reads." },
+    { "name": "vms", "description": "VM lifecycle, command execution, and networking endpoints." },
+    { "name": "debug", "description": "Debugging and timing endpoints." }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["daemon"],
+        "summary": "Check daemon health",
+        "responses": {
+          "200": {
+            "description": "Daemon is healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/capabilities": {
+      "get": {
+        "tags": ["daemon"],
+        "summary": "Describe host capabilities",
+        "responses": {
+          "200": {
+            "description": "Capability information",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CapabilitiesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/shutdown": {
+      "post": {
+        "tags": ["daemon"],
+        "summary": "Request daemon shutdown",
+        "responses": {
+          "200": {
+            "description": "Shutdown accepted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watchdog": {
+      "post": {
+        "tags": ["watchdog"],
+        "summary": "Create or reset the watchdog",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WatchdogRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Watchdog is active",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WatchdogResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/watchdog/feed": {
+      "post": {
+        "tags": ["watchdog"],
+        "summary": "Feed the watchdog",
+        "responses": {
+          "200": {
+            "description": "Watchdog fed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/watchdog/lease": {
+      "post": {
+        "tags": ["watchdog"],
+        "summary": "Create a watchdog lease",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WatchdogLeaseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Lease created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WatchdogLeaseResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/watchdog/lease/feed": {
+      "post": {
+        "tags": ["watchdog"],
+        "summary": "Feed a watchdog lease",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WatchdogLeaseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Lease fed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/watchdog/lease/release": {
+      "post": {
+        "tags": ["watchdog"],
+        "summary": "Release a watchdog lease",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WatchdogLeaseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Lease released",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/watchdog/activity": {
+      "get": {
+        "tags": ["watchdog"],
+        "summary": "Read watchdog activity counters",
+        "responses": {
+          "200": {
+            "description": "Activity counters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/WatchdogActivityState" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/kernel": {
+      "get": {
+        "tags": ["kernel"],
+        "summary": "Read kernel package status",
+        "responses": {
+          "200": {
+            "description": "Kernel status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KernelState" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kernel/download": {
+      "post": {
+        "tags": ["kernel"],
+        "summary": "Ensure the Linux kernel package is available",
+        "description": "Set query parameter `stream=1` to receive newline-delimited progress events.",
+        "parameters": [{ "$ref": "#/components/parameters/Stream" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DownloadRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Kernel state or progress stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KernelState" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/ProgressEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/image": {
+      "get": {
+        "tags": ["images"],
+        "summary": "List images",
+        "responses": {
+          "200": {
+            "description": "Image states",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ImageState" }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/image/{image}": {
+      "get": {
+        "tags": ["images"],
+        "summary": "Read image status",
+        "parameters": [{ "$ref": "#/components/parameters/ImageName" }],
+        "responses": {
+          "200": {
+            "description": "Image state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ImageState" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "tags": ["images"],
+        "summary": "Pull or prepare an image",
+        "description": "Set query parameter `stream=1` to receive newline-delimited progress events.",
+        "parameters": [
+          { "$ref": "#/components/parameters/ImageName" },
+          { "$ref": "#/components/parameters/Stream" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PullImageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Image state or progress stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ImageState" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/ProgressEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "tags": ["images"],
+        "summary": "Delete an image",
+        "parameters": [{ "$ref": "#/components/parameters/ImageName" }],
+        "responses": {
+          "200": {
+            "description": "Deleted image",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeleteImageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/image/{image}/metadata": {
+      "post": {
+        "tags": ["images"],
+        "summary": "Read prepared image metadata",
+        "parameters": [{ "$ref": "#/components/parameters/ImageName" }],
+        "responses": {
+          "200": {
+            "description": "Image metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ImageMetadataState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/image/{image}/qemu/download": {
+      "post": {
+        "tags": ["images"],
+        "summary": "Download amd64 userspace emulator when needed",
+        "description": "Set query parameter `stream=1` to receive newline-delimited progress events.",
+        "parameters": [
+          { "$ref": "#/components/parameters/ImageName" },
+          { "$ref": "#/components/parameters/Stream" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Emulator state or progress stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EmulatorState" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/ProgressEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/cvmfs/list": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "List a CVMFS directory",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CVMFSListRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Directory listing",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CVMFSListResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/cvmfs/read": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "Read bytes from a CVMFS file",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CVMFSReadRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "File range",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CVMFSReadResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/supported": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "Check whether virtualization is available",
+        "responses": {
+          "200": {
+            "description": "Support result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VMSupportedResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vm/status": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "Read aggregate or single VM status",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "responses": {
+          "200": {
+            "description": "VM status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InstanceState" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vm": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "List VMs",
+        "responses": {
+          "200": {
+            "description": "VM states",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/InstanceState" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["vms"],
+        "summary": "Create and start a VM",
+        "description": "Set query parameter `events=1` to receive boot events as newline-delimited JSON.",
+        "parameters": [{ "$ref": "#/components/parameters/Events" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateInstanceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "VM state or boot event stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InstanceState" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/BootEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/start": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Start a blank VM or existing image",
+        "description": "Set query parameter `events=1` to receive boot events as newline-delimited JSON.",
+        "parameters": [{ "$ref": "#/components/parameters/Events" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StartInstanceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "VM state or boot event stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InstanceState" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/BootEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/{id}/flush": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Flush VM filesystem state",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDPath" }],
+        "responses": {
+          "200": {
+            "description": "Flush complete",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/{id}/save": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Save a VM root filesystem as an image",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDPath" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SaveImageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved image state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ImageState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/shutdown": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Shutdown a VM",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "responses": {
+          "200": {
+            "description": "VM state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InstanceState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/console": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "Read VM console history",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "responses": {
+          "200": {
+            "description": "Console history",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConsoleHistoryResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/forward": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Add a port forward to a VM",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PortForward" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Port forward",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PortForward" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/service-proxy-port": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Allow a VM to access a host service-proxy port",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ServiceProxyPortRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Allowed port",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ServiceProxyPortRequest" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/run": {
+      "post": {
+        "tags": ["vms"],
+        "summary": "Run a command in a VM",
+        "description": "Set query parameter `stream=1` to receive newline-delimited execution events. The same path also accepts a WebSocket upgrade for interactive execution.",
+        "parameters": [{ "$ref": "#/components/parameters/Stream" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RunRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Execution response or event stream",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExecResponse" }
+              },
+              "application/x-ndjson": {
+                "schema": { "$ref": "#/components/schemas/ExecEvent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/debug/virtiofs": {
+      "get": {
+        "tags": ["debug"],
+        "summary": "Read virtiofs debug stats",
+        "parameters": [{ "$ref": "#/components/parameters/VMIDQuery" }],
+        "responses": {
+          "200": {
+            "description": "Debug stats",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "additionalProperties": true }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/debug/exits": {
+      "get": {
+        "tags": ["debug"],
+        "summary": "Read hypervisor exit timings",
+        "responses": {
+          "200": {
+            "description": "Exit timings",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "additionalProperties": true }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "ImageName": {
+        "name": "image",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      },
+      "VMIDPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      },
+      "VMIDQuery": {
+        "name": "id",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" }
+      },
+      "Stream": {
+        "name": "stream",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string", "enum": ["1", "true"] }
+      },
+      "Events": {
+        "name": "events",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string", "enum": ["1", "true"] }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error response",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "WatchdogRequest": {
+        "type": "object",
+        "properties": {
+          "timeout_seconds": { "type": "number" }
+        }
+      },
+      "WatchdogResponse": {
+        "type": "object",
+        "required": ["status", "timeout_seconds"],
+        "properties": {
+          "status": { "type": "string" },
+          "timeout_seconds": { "type": "number" }
+        }
+      },
+      "WatchdogLeaseRequest": {
+        "type": "object",
+        "properties": {
+          "lease_id": { "type": "string" },
+          "timeout_seconds": { "type": "number" }
+        }
+      },
+      "WatchdogLeaseResponse": {
+        "type": "object",
+        "required": ["lease_id", "timeout_seconds"],
+        "properties": {
+          "lease_id": { "type": "string" },
+          "timeout_seconds": { "type": "number" }
+        }
+      },
+      "WatchdogActivityState": {
+        "type": "object",
+        "properties": {
+          "cvmfs": { "$ref": "#/components/schemas/WatchdogActivityCounter" }
+        }
+      },
+      "WatchdogActivityCounter": {
+        "type": "object",
+        "properties": {
+          "events": { "type": "integer", "format": "uint64" },
+          "bytes": { "type": "integer", "format": "int64" },
+          "last_activity_unix": { "type": "integer", "format": "int64" },
+          "seconds_since_last": { "type": "number" }
+        }
+      },
+      "CapabilitiesResponse": {
+        "type": "object",
+        "required": ["host", "vm_supported", "supports_multi_image_exec", "supports_nested_virtualization", "requires_privileged_ccx3"],
+        "properties": {
+          "host": { "type": "string" },
+          "backend": { "type": "string" },
+          "vm_supported": { "type": "boolean" },
+          "vm_error": { "type": "string" },
+          "max_instances": { "type": "integer" },
+          "snapshot_classes": { "type": "array", "items": { "type": "string" } },
+          "network_modes": { "type": "array", "items": { "type": "string" } },
+          "share_consistency": { "type": "array", "items": { "type": "string" } },
+          "resource_limits": { "type": "array", "items": { "type": "string" } },
+          "supports_multi_image_exec": { "type": "boolean" },
+          "supports_nested_virtualization": { "type": "boolean" },
+          "requires_privileged_ccx3": { "type": "boolean" },
+          "notes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "KernelState": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string" },
+          "error": { "type": "string" },
+          "version": { "type": "string" },
+          "source": { "type": "string" }
+        }
+      },
+      "DownloadRequest": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string" }
+        }
+      },
+      "ProgressEvent": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string" },
+          "artifact": { "type": "string" },
+          "progress": { "type": "number" },
+          "bytes_downloaded": { "type": "integer", "format": "int64" },
+          "bytes_total": { "type": "integer", "format": "int64" },
+          "files_downloaded": { "type": "integer", "format": "int64" },
+          "files_total": { "type": "integer", "format": "int64" },
+          "rate_bytes_per_second": { "type": "number" },
+          "eta_seconds": { "type": "number" },
+          "blob": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "ImageState": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string" },
+          "source": { "type": "string" },
+          "source_kind": { "type": "string" },
+          "status": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "ImageMetadataState": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "source_kind": { "type": "string" },
+          "architecture": { "type": "string" },
+          "env": { "type": "array", "items": { "type": "string" } },
+          "error": { "type": "string" }
+        }
+      },
+      "EmulatorState": {
+        "type": "object",
+        "required": ["status", "required"],
+        "properties": {
+          "status": { "type": "string" },
+          "path": { "type": "string" },
+          "required": { "type": "boolean" },
+          "error": { "type": "string" }
+        }
+      },
+      "PullImageRequest": {
+        "type": "object",
+        "required": ["source"],
+        "properties": {
+          "source": {
+            "oneOf": [
+              { "type": "string" },
+              { "$ref": "#/components/schemas/ImageSource" }
+            ]
+          },
+          "architecture": { "type": "string" },
+          "cache_dir": { "type": "string" },
+          "prefetch": { "type": "boolean" },
+          "prefetch_workers": { "type": "integer" }
+        }
+      },
+      "ImageSource": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["cvmfs", "simg", "rootfs-tar", "rootfs", "oci", "docker-archive"] },
+          "format": { "type": "string" },
+          "mirror": { "type": "string" },
+          "mirrors": { "type": "array", "items": { "type": "string" } },
+          "repo": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      },
+      "DeleteImageResponse": {
+        "type": "object",
+        "required": ["status", "image"],
+        "properties": {
+          "status": { "type": "string" },
+          "image": { "type": "string" }
+        }
+      },
+      "CVMFSListRequest": {
+        "type": "object",
+        "required": ["repo"],
+        "properties": {
+          "mirror": { "type": "string" },
+          "mirrors": { "type": "array", "items": { "type": "string" } },
+          "repo": { "type": "string" },
+          "path": { "type": "string" },
+          "cache_dir": { "type": "string" }
+        }
+      },
+      "CVMFSDirectoryEntry": {
+        "type": "object",
+        "required": ["name", "path", "kind"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "kind": { "type": "string", "enum": ["file", "directory", "symlink"] },
+          "size": { "type": "integer", "format": "int64" }
+        }
+      },
+      "CVMFSListResponse": {
+        "type": "object",
+        "required": ["entries"],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CVMFSDirectoryEntry" }
+          }
+        }
+      },
+      "CVMFSReadRequest": {
+        "type": "object",
+        "required": ["repo", "path"],
+        "properties": {
+          "mirror": { "type": "string" },
+          "mirrors": { "type": "array", "items": { "type": "string" } },
+          "repo": { "type": "string" },
+          "path": { "type": "string" },
+          "offset": { "type": "integer", "format": "int64" },
+          "length": { "type": "integer", "format": "int64" },
+          "cache_dir": { "type": "string" }
+        }
+      },
+      "CVMFSReadResponse": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "offset": { "type": "integer", "format": "int64" },
+          "data": { "type": "string", "format": "byte" },
+          "eof": { "type": "boolean" }
+        }
+      },
+      "VMSupportedResponse": {
+        "type": "object",
+        "required": ["supported"],
+        "properties": {
+          "supported": { "type": "boolean" },
+          "error": { "type": "string" }
+        }
+      },
+      "ShareMount": {
+        "type": "object",
+        "required": ["source", "mount"],
+        "properties": {
+          "source": { "type": "string" },
+          "mount": { "type": "string" },
+          "writable": { "type": "boolean" },
+          "map_owner": { "type": "boolean" },
+          "owner_uid": { "type": "integer", "format": "uint32" },
+          "owner_gid": { "type": "integer", "format": "uint32" },
+          "cache": { "type": "string" }
+        }
+      },
+      "NetworkConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "mode": { "type": "string" },
+          "allow_internet": { "type": "boolean" },
+          "block_host_access": { "type": "boolean" },
+          "host_dns_name": { "type": "string" },
+          "allowed_service_proxy_ports": { "type": "array", "items": { "type": "integer" } },
+          "port_forwards": { "type": "array", "items": { "$ref": "#/components/schemas/PortForward" } }
+        }
+      },
+      "PortForward": {
+        "type": "object",
+        "properties": {
+          "protocol": { "type": "string" },
+          "host_addr": { "type": "string" },
+          "host_port": { "type": "integer" },
+          "guest_addr": { "type": "string" },
+          "guest_port": { "type": "integer" }
+        }
+      },
+      "ServiceProxyPortRequest": {
+        "type": "object",
+        "required": ["port"],
+        "properties": {
+          "port": { "type": "integer" }
+        }
+      },
+      "CreateInstanceRequest": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "image": { "type": "string" },
+          "init": { "type": "string" },
+          "kernel": { "type": "string" },
+          "shares": { "type": "array", "items": { "$ref": "#/components/schemas/ShareMount" } },
+          "network": { "$ref": "#/components/schemas/NetworkConfig" },
+          "kernel_modules": { "type": "array", "items": { "type": "string" } },
+          "memory_mb": { "type": "integer", "format": "uint64" },
+          "balloon_mb": { "type": "integer", "format": "uint64" },
+          "cpus": { "type": "integer" },
+          "nested_virtualization": { "type": "boolean" },
+          "dmesg": { "type": "boolean" },
+          "snapshot_dir": { "type": "string", "description": "Directory where the runtime may write a startup snapshot during this boot." },
+          "restore_snapshot": { "type": "string", "description": "Path to a startup snapshot directory to restore instead of cold booting." },
+          "timeout_seconds": { "type": "number" }
+        }
+      },
+      "StartInstanceRequest": {
+        "allOf": [{ "$ref": "#/components/schemas/CreateInstanceRequest" }],
+        "description": "Same shape as CreateInstanceRequest, but image may be omitted to start a blank VM."
+      },
+      "InstanceState": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string" },
+          "image": { "type": "string" },
+          "init": { "type": "string" },
+          "kernel": { "type": "string" },
+          "memory_mb": { "type": "integer", "format": "uint64" },
+          "balloon_mb": { "type": "integer", "format": "uint64" },
+          "cpus": { "type": "integer" },
+          "nested_virtualization": { "type": "boolean" },
+          "started_at": { "type": "string" },
+          "network_ipv4": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "SaveImageRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "image": { "type": "string" }
+        }
+      },
+      "ConsoleHistoryResponse": {
+        "type": "object",
+        "required": ["history"],
+        "properties": {
+          "history": { "type": "string" }
+        }
+      },
+      "RunRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/CreateInstanceRequest" },
+          {
+            "type": "object",
+            "properties": {
+              "command": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "array", "items": { "type": "string" } },
+              "root_dir": { "type": "string" },
+              "replace_env": { "type": "boolean" },
+              "workdir": { "type": "string" },
+              "user": { "type": "string" },
+              "stdin": { "type": "string", "format": "byte" },
+              "tty": { "type": "boolean" },
+              "control_fd": { "type": "boolean" },
+              "cols": { "type": "integer" },
+              "rows": { "type": "integer" }
+            }
+          }
+        ]
+      },
+      "ExecResponse": {
+        "type": "object",
+        "required": ["exit_code"],
+        "properties": {
+          "exit_code": { "type": "integer" },
+          "output": { "type": "string" },
+          "usage": { "$ref": "#/components/schemas/ResourceUsage" }
+        }
+      },
+      "ResourceUsage": {
+        "type": "object",
+        "properties": {
+          "wall_seconds": { "type": "number" },
+          "user_seconds": { "type": "number" },
+          "system_seconds": { "type": "number" },
+          "cpu_seconds": { "type": "number" },
+          "max_rss_bytes": { "type": "integer", "format": "uint64" },
+          "memory_bytes": { "type": "integer", "format": "uint64" }
+        }
+      },
+      "BootEvent": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string" },
+          "message": { "type": "string" },
+          "data": { "type": "string" },
+          "error": { "type": "string" },
+          "state": { "$ref": "#/components/schemas/InstanceState" }
+        }
+      },
+      "ExecEvent": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string" },
+          "stream": { "type": "string" },
+          "output": { "type": "string" },
+          "data": { "type": "string", "format": "byte" },
+          "error": { "type": "string" },
+          "exit_code": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

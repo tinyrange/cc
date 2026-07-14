@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	freebsdarm64 "j5.nz/cc/internal/freebsd/boot/arm64"
 	netbsdarm64 "j5.nz/cc/internal/netbsd/boot/arm64"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/nvme"
 	openbsdarm64 "j5.nz/cc/internal/openbsd/boot/arm64"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
@@ -66,6 +68,7 @@ type bsdManagedConfig struct {
 	Dmesg               bool
 	NetDevice           *virtio.Net
 	NetStack            *netstack.NetStack
+	OwnNetStack         bool
 	BootKind            string
 	MemoryBase          uint64
 	BootArgs            string
@@ -83,19 +86,18 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 768
 	}
-	if cfg.NetDevice == nil || cfg.NetStack == nil {
-		return nil, fmt.Errorf("OpenBSD network device and stack are required")
-	}
+	netdev, stack, ownStack := openBSDManagedNet(cfg.NetDevice, cfg.NetStack, cfg.GuestIPv4, cfg.GuestMAC)
 	return startBSDManagedSession(ctx, bsdManagedConfig{
-		GuestName:  "OpenBSD",
-		Kernel:     cfg.Kernel,
-		Root:       cfg.Root,
-		MemoryMB:   cfg.MemoryMB,
-		Dmesg:      cfg.Dmesg,
-		NetDevice:  cfg.NetDevice,
-		NetStack:   cfg.NetStack,
-		BootKind:   "openbsd",
-		MemoryBase: arm64vm.MemoryBase,
+		GuestName:   "OpenBSD",
+		Kernel:      cfg.Kernel,
+		Root:        cfg.Root,
+		MemoryMB:    cfg.MemoryMB,
+		Dmesg:       cfg.Dmesg,
+		NetDevice:   netdev,
+		NetStack:    stack,
+		OwnNetStack: ownStack,
+		BootKind:    "openbsd",
+		MemoryBase:  arm64vm.MemoryBase,
 	}, onEvent)
 }
 
@@ -109,17 +111,16 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 1024
 	}
-	if cfg.NetDevice == nil || cfg.NetStack == nil {
-		return nil, fmt.Errorf("FreeBSD network device and stack are required")
-	}
+	netdev, stack, ownStack := freeBSDManagedNet(cfg.NetDevice, cfg.NetStack, cfg.GuestIPv4, cfg.GuestMAC)
 	return startBSDManagedSession(ctx, bsdManagedConfig{
 		GuestName:           "FreeBSD",
 		Kernel:              cfg.Kernel,
 		Root:                cfg.Root,
 		MemoryMB:            cfg.MemoryMB,
 		Dmesg:               cfg.Dmesg,
-		NetDevice:           cfg.NetDevice,
-		NetStack:            cfg.NetStack,
+		NetDevice:           netdev,
+		NetStack:            stack,
+		OwnNetStack:         ownStack,
 		BootKind:            "freebsd",
 		MemoryBase:          arm64vm.MemoryBase,
 		FreeBSDVirtioQuirks: true,
@@ -136,20 +137,18 @@ func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onE
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 1024
 	}
-	if cfg.NetDevice == nil || cfg.NetStack == nil {
-		return nil, fmt.Errorf("NetBSD network device and stack are required")
-	}
+	netdev, stack, ownStack := netBSDManagedNet(cfg.NetDevice, cfg.NetStack, cfg.GuestIPv4, cfg.GuestMAC)
 	return startBSDManagedSession(ctx, bsdManagedConfig{
 		GuestName:          "NetBSD",
 		Kernel:             cfg.Kernel,
 		Root:               cfg.Root,
 		MemoryMB:           cfg.MemoryMB,
 		Dmesg:              cfg.Dmesg,
-		NetDevice:          cfg.NetDevice,
-		NetStack:           cfg.NetStack,
+		NetDevice:          netdev,
+		NetStack:           stack,
+		OwnNetStack:        ownStack,
 		BootKind:           "netbsd",
 		MemoryBase:         netBSDArm64MemoryBase,
-		BootArgs:           "root=ld4a",
 		NetBSDVirtioQuirks: true,
 	}, onEvent)
 }
@@ -173,6 +172,9 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			cancel()
 		}
 		_ = ln.Close()
+		if cfg.OwnNetStack && cfg.NetStack != nil {
+			cfg.NetStack.Close()
+		}
 		if bootWriter != nil {
 			_ = bootWriter.Close()
 		}
@@ -218,10 +220,9 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	}
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
-	block := virtio.NewBlock(arm64vm.ShareFSBase, arm64vm.RootFSSize, arm64vm.ShareFSIRQ, cfg.Root)
-	block.DisableSizeMax = cfg.FreeBSDVirtioQuirks
-	block.LegacyMMIO = cfg.NetBSDVirtioQuirks
-	block.Attach(vm, vm)
+	nvmeBlock := nvme.NewController(cfg.Root)
+	nvmeBlock.Attach(vm, vm)
+	pci := newHVFPCIHost(newHVFNVMePCIDevice(1, arm64vm.NVMeBase, arm64vm.NVMeIRQ, nvmeBlock))
 	if cfg.FreeBSDVirtioQuirks {
 		cfg.NetDevice.DisableMergeRX = true
 		cfg.NetDevice.HeaderLength = 12
@@ -234,6 +235,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.LegacyMMIO = cfg.NetBSDVirtioQuirks
 	rng.Attach(vm, vm)
+	rootNodes := []fdt.Node{pci.DeviceTreeNode()}
 
 	switch cfg.BootKind {
 	case "openbsd":
@@ -243,7 +245,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			NumCPUs:    1,
 			GICVersion: openbsdarm64.GICVersionV3,
 			Console:    true,
-			ExtraNodes: []fdt.Node{block.DeviceTreeNode(), cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()},
+			ExtraNodes: append(rootNodes, cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()),
 		})
 		if err != nil {
 			cleanupStartup()
@@ -260,7 +262,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			NumCPUs:    1,
 			GICVersion: freebsdarm64.GICVersionV3,
 			Console:    true,
-			ExtraNodes: []fdt.Node{block.DeviceTreeNode(), cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()},
+			ExtraNodes: append(rootNodes, cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()),
 		})
 		if err != nil {
 			cleanupStartup()
@@ -273,7 +275,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	case "netbsd":
 		bootArgs := cfg.BootArgs
 		if bootArgs == "" {
-			bootArgs = "root=ld0a"
+			bootArgs = "root=ld4a"
 		}
 		plan, err := netbsdarm64.PrepareBoot(mem, cfg.Kernel, netbsdarm64.BootOptions{
 			MemoryBase: memoryBase,
@@ -282,7 +284,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 			GICVersion: netbsdarm64.GICVersionV3,
 			Console:    true,
 			BootArgs:   bootArgs,
-			ExtraNodes: []fdt.Node{block.DeviceTreeNode(), cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()},
+			ExtraNodes: append(rootNodes, cfg.NetDevice.DeviceTreeNode(), rng.DeviceTreeNode()),
 		})
 		if err != nil {
 			cleanupStartup()
@@ -306,7 +308,7 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 	go func() {
 		defer close(closeDone)
 		defer vmForRun.Close()
-		done.finish(runBSDManagedVM(runCtx, vmForRun, cfg.GuestName, uart, block, cfg.NetDevice, rng, serialOut))
+		done.finish(runBSDManagedVM(runCtx, vmForRun, cfg.GuestName, uart, pci, cfg.NetDevice, rng, serialOut))
 	}()
 
 	var control net.Conn
@@ -359,8 +361,61 @@ func startBSDManagedSession(ctx context.Context, cfg bsdManagedConfig, onEvent f
 		bootWriter: bootWriter,
 		transcript: controlTranscript,
 		serialOut:  serialOut,
-		dmesg:      cfg.Dmesg,
+		cleanup: func() {
+			if cfg.OwnNetStack && cfg.NetStack != nil {
+				cfg.NetStack.Close()
+			}
+		},
+		dmesg: cfg.Dmesg,
 	}, nil
+}
+
+func openBSDManagedNet(netdev *virtio.Net, stack *netstack.NetStack, guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *netstack.NetStack, bool) {
+	return newBSDManagedNet(netdev, stack, guestIPv4, mac, false, 0, false)
+}
+
+func freeBSDManagedNet(netdev *virtio.Net, stack *netstack.NetStack, guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *netstack.NetStack, bool) {
+	return newBSDManagedNet(netdev, stack, guestIPv4, mac, true, 12, false)
+}
+
+func netBSDManagedNet(netdev *virtio.Net, stack *netstack.NetStack, guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *netstack.NetStack, bool) {
+	return newBSDManagedNet(netdev, stack, guestIPv4, mac, true, 0, true)
+}
+
+type bsdManagedNetBackend struct {
+	iface *netstack.NetworkInterface
+}
+
+func (b bsdManagedNetBackend) HandleTxPacket(packet []byte) error {
+	return b.iface.DeliverGuestPacket(packet, true)
+}
+
+func newBSDManagedNet(netdev *virtio.Net, stack *netstack.NetStack, guestIPv4 net.IP, mac net.HardwareAddr, disableMergeRX bool, headerLength int, legacyMMIO bool) (*virtio.Net, *netstack.NetStack, bool) {
+	if netdev != nil && stack != nil {
+		return netdev, stack, false
+	}
+	if guestIPv4 == nil {
+		guestIPv4 = net.IPv4(10, 42, 0, 2)
+	}
+	if mac == nil {
+		mac = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
+	}
+	stack = netstack.New(slog.Default())
+	_ = stack.SetGuestMAC(mac)
+	_ = stack.SetGuestIPv4(guestIPv4)
+	iface, _ := stack.AttachNetworkInterface()
+	netdev = virtio.NewNet(arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ, mac, bsdManagedNetBackend{iface: iface})
+	netdev.DisableMergeRX = disableMergeRX
+	netdev.HeaderLength = headerLength
+	netdev.LegacyMMIO = legacyMMIO
+	iface.AttachVirtioBackend(func(frame []byte) error {
+		copied := append([]byte(nil), frame...)
+		go func() {
+			_ = netdev.EnqueueRxPacketOwned(copied)
+		}()
+		return nil
+	})
+	return netdev, stack, true
 }
 
 func setupOpenBSDBootState(vm *VM, plan *openbsdarm64.BootPlan) error {
@@ -418,7 +473,7 @@ func setupNetBSDBootState(vm *VM, plan *netbsdarm64.BootPlan) error {
 	return nil
 }
 
-func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial.UART8250, block *virtio.Block, netdev *virtio.Net, rng *virtio.RNG, serialOut *serialTranscript) error {
+func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial.UART8250, pci *hvfPCIHost, netdev *virtio.Net, rng *virtio.RNG, serialOut *serialTranscript) error {
 	cancelDone := make(chan struct{})
 	defer close(cancelDone)
 	go func() {
@@ -463,13 +518,15 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 		}
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, netdev, exitInfo); err != nil {
-				if !block.Contains(uint64(exitInfo.Exception.PhysicalAddress), 1) {
-					return err
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, nil, netdev, nil, nil, exitInfo); err != nil {
+				addr := uint64(exitInfo.Exception.PhysicalAddress)
+				if pci != nil && pci.Contains(addr, 1) {
+					if err := handleBSDPCIDataAbort(vm, vcpuIndex, pci, exitInfo); err != nil {
+						return err
+					}
+					continue
 				}
-				if err := handleBSDBlockDataAbort(vm, vcpuIndex, block, exitInfo); err != nil {
-					return err
-				}
+				return err
 			}
 		case ExceptionClassSystemRegister:
 			handled, err := vm.HandleSystemInstructionForVCPU(vcpuIndex, exitInfo.Exception.Syndrome)
@@ -498,25 +555,25 @@ func runBSDManagedVM(ctx context.Context, vm *VM, guestName string, uart *serial
 	}
 }
 
-func handleBSDBlockDataAbort(vm *VM, vcpuIndex int, block *virtio.Block, exitInfo *VcpuExit) error {
+func handleBSDPCIDataAbort(vm *VM, vcpuIndex int, pci *hvfPCIHost, exitInfo *VcpuExit) error {
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
 	}
 	addr := uint64(exitInfo.Exception.PhysicalAddress)
-	if !block.Contains(addr, info.SizeBytes) {
-		return fmt.Errorf("unhandled MMIO access addr=%#x size=%d write=%v", addr, info.SizeBytes, info.Write)
+	if !pci.Contains(addr, info.SizeBytes) {
+		return fmt.Errorf("unhandled PCI MMIO access addr=%#x size=%d write=%v", addr, info.SizeBytes, info.Write)
 	}
 	if info.Write {
 		value, err := readAbortValue(vm, vcpuIndex, info)
 		if err != nil {
 			return err
 		}
-		if err := block.Write(addr, info.SizeBytes, value); err != nil {
+		if err := pci.Write(addr, info.SizeBytes, value); err != nil {
 			return err
 		}
 	} else {
-		value, err := block.Read(addr, info.SizeBytes)
+		value, err := pci.Read(addr, info.SizeBytes)
 		if err != nil {
 			return err
 		}
@@ -550,9 +607,16 @@ func answerBSDPrompts(ctx context.Context, guestName string, uart *serial.UART82
 				}
 				continue
 			}
+			if strings.EqualFold(guestName, "NetBSD") {
+				if !answeredRoot.Load() && strings.Contains(serial, "root device:") {
+					answeredRoot.Store(true)
+					_ = uart.InjectRXBytes([]byte("ld4a\n"))
+				}
+				continue
+			}
 			if !answeredMountroot.Load() && strings.Contains(serial, "mountroot>") {
 				answeredMountroot.Store(true)
-				_ = uart.InjectRXBytes([]byte("ufs:/dev/vtbd0\n"))
+				_ = uart.InjectRXBytes([]byte("ufs:/dev/nda0\n"))
 			}
 		}
 	}

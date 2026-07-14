@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -42,10 +43,11 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\necho test init\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\necho test init\n"), machine.NetworkSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	baseTar := strings.TrimSuffix(baseTGZ, filepath.Ext(baseTGZ)) + ".tar"
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
@@ -64,8 +66,10 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "cc-openbsd-init") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", data)
+	if !textHasFields(string(data), "/sbin/ifconfig", "vio0", "inet", "10.42.0.2", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(string(data), "/usr/sbin/arp", "-s", "10.42.0.1", "02:42:0a:2a:00:01", ">/dev/null", "2>&1", "||", "true") ||
+		!textHasFields(string(data), "/sbin/route", "add", "default", "10.42.0.1", "||", "true") {
+		t.Fatalf("init script does not configure the leased network: %q", data)
 	}
 	agentEntry, err := imagefs.LookupPath(root, "/sbin/cc-openbsd-init")
 	if err != nil {
@@ -75,18 +79,11 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(agentData), "test init") {
+	if string(agentData) != "#!/bin/sh\necho test init\n" {
 		t.Fatalf("unexpected /sbin/cc-openbsd-init overlay: %q", agentData)
 	}
-	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vio0 inet 10.42.0.2 ") {
-		t.Fatalf("default init script does not configure default IP: %q", initScript)
-	}
-	if !strings.Contains(initScript, "arp -s 10.42.0.1 02:42:0a:2a:00:01") {
-		t.Fatalf("default init script does not seed gateway ARP entry: %q", initScript)
-	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.2 cc-openbsd") {
+	if !textHasLine(hosts, "10.42.0.2 cc-openbsd") {
 		t.Fatalf("default hosts does not contain default IP: %q", hosts)
 	}
 }
@@ -111,26 +108,16 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeRoot()
-	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vio0 inet 10.42.0.7 ") {
-		t.Fatalf("init script does not configure leased IP: %q", initScript)
-	}
-	if !strings.Contains(initScript, "arp -s 10.42.0.1 02:42:0a:2a:00:01") {
-		t.Fatalf("init script does not seed gateway ARP entry: %q", initScript)
-	}
-	if !strings.Contains(initScript, "route add default 10.42.0.1") {
-		t.Fatalf("init script does not configure default gateway: %q", initScript)
-	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.7 test-openbsd") {
+	if !textHasLine(hosts, "10.42.0.7 test-openbsd") {
 		t.Fatalf("hosts does not contain leased IP: %q", hosts)
 	}
 	resolv := readRootFile(t, root, "/etc/resolv.conf")
-	if !strings.Contains(resolv, "nameserver 10.42.0.9") {
+	if !textHasLine(resolv, "nameserver 10.42.0.9") {
 		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
 	services := readRootFile(t, root, "/etc/services")
-	if !strings.Contains(services, "nfs") || !strings.Contains(services, "2049/tcp") || !strings.Contains(services, "sunrpc") {
+	if !textHasFields(services, "nfs", "2049/tcp") || !textHasFields(services, "sunrpc", "111/tcp") {
 		t.Fatalf("services does not contain NFS RPC entries: %q", services)
 	}
 	myname := readRootFile(t, root, "/etc/myname")
@@ -198,15 +185,8 @@ func TestBuildManagedRootFromOpenBSDBaseSetUsesStructuredNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeRoot()
-	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vio1 inet 10.42.0.11 ") || !strings.Contains(initScript, "route add default 10.42.0.12") {
-		t.Fatalf("init script does not contain structured network identity: %q", initScript)
-	}
-	if !strings.Contains(initScript, "arp -s 10.42.0.12 02:42:0a:2a:00:01") {
-		t.Fatalf("init script does not seed structured gateway ARP entry: %q", initScript)
-	}
 	resolv := readRootFile(t, root, "/etc/resolv.conf")
-	if !strings.Contains(resolv, "nameserver 10.42.0.13") {
+	if !textHasLine(resolv, "nameserver 10.42.0.13") {
 		t.Fatalf("resolv.conf does not contain structured DNS IP: %q", resolv)
 	}
 }
@@ -285,4 +265,22 @@ func readRootFile(t *testing.T, root imagefs.Directory, guestPath string) string
 		t.Fatalf("read %s: %v", guestPath, err)
 	}
 	return string(data)
+}
+
+func textHasLine(text, want string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+func textHasFields(text string, want ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if reflect.DeepEqual(strings.Fields(line), want) {
+			return true
+		}
+	}
+	return false
 }

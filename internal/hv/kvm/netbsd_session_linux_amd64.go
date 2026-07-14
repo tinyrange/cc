@@ -39,15 +39,14 @@ func StartNetBSDManagedSession(ctx context.Context, cfg NetBSDManagedConfig, onE
 	}
 
 	netdev, stack, ownStack := netBSDManagedNet(cfg)
-	devices := []machine.DeviceSpec{{Kind: "virtio-block", Name: "root", Bus: "pci", Slot: 1, IOBase: 0x1000, IRQ: 10}}
+	devices := []machine.DeviceSpec{{Kind: "nvme", Name: "root", Bus: "pci", Slot: 1, IRQ: 10}}
 	for idx := range cfg.ExtraBlocks {
 		devices = append(devices, machine.DeviceSpec{
-			Kind:   "virtio-block",
-			Name:   fmt.Sprintf("extra%d", idx),
-			Bus:    "pci",
-			Slot:   uint8(2 + idx),
-			IOBase: uint16(0x1100 + idx*0x100),
-			IRQ:    uint8(11 + idx),
+			Kind: "nvme",
+			Name: fmt.Sprintf("extra%d", idx),
+			Bus:  "pci",
+			Slot: uint8(2 + idx),
+			IRQ:  uint8(11 + idx),
 		})
 	}
 	netIndex := len(devices) + 1
@@ -163,7 +162,7 @@ func runNetBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci 
 				return err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIOForVCPU(vm, 0, nil, nil, nil, nil, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, nil, nil, nil, nil, nil, exit.MMIO); err != nil {
 				return fmt.Errorf("unhandled NetBSD mmio addr=%#x len=%d write=%v: %w", exit.MMIO.Addr, exit.MMIO.Len, exit.MMIO.Write, err)
 			}
 		case ExitHLT:
@@ -193,6 +192,9 @@ func newNetBSDManagedNet(guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *
 	stack := netstack.New(slog.Default())
 	_ = stack.SetGuestMAC(mac)
 	_ = stack.SetGuestIPv4(guestIPv4)
+	if hostMAC, err := net.ParseMAC("02:42:0a:2a:00:01"); err == nil {
+		_ = stack.SetHostMAC(hostMAC)
+	}
 	iface, _ := stack.AttachNetworkInterface()
 	dev := virtio.NewNet(0, 0x1000, 11, mac, netBSDManagedNetBackend{iface: iface})
 	dev.DisableMergeRX = true

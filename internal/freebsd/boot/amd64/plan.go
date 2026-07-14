@@ -393,7 +393,7 @@ func buildEnv(values []string) []byte {
 			"hint.uart.0.flags=0x10",
 			"hint.smbios.0.disabled=1",
 			"smbios.memory.enabled=0",
-			"vfs.root.mountfrom=ufs:/dev/vtbd0",
+			"vfs.root.mountfrom=ufs:/dev/nda0",
 		}
 	}
 	var out []byte

@@ -11,6 +11,9 @@
 /.tmp-virtiofs-exit-sweep
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
+/internal/freebsd/guestinit/guest-init-freebsd-arm64
+/internal/netbsd/guestinit/guest-init-netbsd-arm64
+/internal/openbsd/guestinit/guest-init-openbsd-arm64
 /tools/__pycache__
 /tools/*.pyc
 /tools/*.pyo
@@ -28,3 +31,5 @@
 /pyneurodesk/src/pyneurodesk/bin/ccvm.exe
 
 *.simg
+!fixtures/alpine.simg
+!fixtures/alpine-arm64.simg

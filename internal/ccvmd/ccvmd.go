@@ -77,6 +77,47 @@ type server struct {
 	cvmfsCacheDir string
 }
 
+type ServerOptions struct {
+	Kind                   string
+	TokenPath              string
+	Persistent             bool
+	OnStartup              func(client.ServerHello) error
+	RegisterHandlers       func(*http.ServeMux, RuntimeView)
+	WrapHandler            func(http.Handler) http.Handler
+	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
+	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
+	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
+}
+
+type RuntimeView interface {
+	InstanceStatuses() []client.InstanceState
+	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ShutdownInstance(context.Context, string) error
+}
+
+func (s *server) InstanceStatuses() []client.InstanceState {
+	if s == nil || s.vms == nil {
+		return nil
+	}
+	return s.vms.Statuses()
+}
+
+func (s *server) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	runCtx, cancel := runRequestContext(ctx, req)
+	defer cancel()
+	return s.vms.RunStreamIn(runCtx, id, req, inputs, onEvent)
+}
+
+func (s *server) ShutdownInstance(ctx context.Context, id string) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.ShutdownInstance(ctx, id)
+}
+
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
@@ -85,6 +126,7 @@ type watchdogController struct {
 	active      bool
 	leases      map[string]time.Time
 	onExpired   func()
+	persistent  bool
 	cvmfsEvents uint64
 	cvmfsBytes  int64
 	cvmfsLast   time.Time
@@ -96,6 +138,12 @@ type watchdogRequest struct {
 
 func newWatchdogController(onExpired func()) *watchdogController {
 	return &watchdogController{onExpired: onExpired}
+}
+
+func newPersistentWatchdogController(onExpired func()) *watchdogController {
+	w := newWatchdogController(onExpired)
+	w.persistent = true
+	return w
 }
 
 func (w *watchdogController) Create(timeout time.Duration) {
@@ -192,7 +240,9 @@ func (w *watchdogController) ReleaseLease(id string) bool {
 		if w.timer != nil {
 			w.timer.Stop()
 		}
-		onExpired = w.onExpired
+		if !w.persistent {
+			onExpired = w.onExpired
+		}
 	} else {
 		w.resetTimerLocked(time.Now())
 	}
@@ -242,7 +292,9 @@ func (w *watchdogController) expire() {
 	}
 	if w.active || w.leases != nil {
 		w.active = false
-		onExpired = w.onExpired
+		if !w.persistent {
+			onExpired = w.onExpired
+		}
 	}
 	w.mu.Unlock()
 
@@ -288,7 +340,7 @@ func newWatchdogLeaseID() (string, error) {
 }
 
 func Main(args []string) {
-	started, err := run(args)
+	started, err := RunServer(args, ServerOptions{})
 	if err == nil {
 		return
 	}
@@ -299,9 +351,12 @@ func Main(args []string) {
 	os.Exit(1)
 }
 
-func run(args []string) (bool, error) {
+func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
 		return false, fmt.Errorf("prepare ccvm executable: %w", err)
+	}
+	if strings.TrimSpace(opts.TokenPath) != "" {
+		defer os.Remove(opts.TokenPath)
 	}
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -334,7 +389,7 @@ func run(args []string) (bool, error) {
 
 	if *worker {
 		if socketPath := strings.TrimSpace(os.Getenv("CCX3_WORKER_CONTROL_SOCKET")); socketPath != "" {
-			return runWorkerControlSocket(socketPath, srvState)
+			return runWorkerControlSocket(socketPath, srvState, opts)
 		}
 	}
 
@@ -343,21 +398,40 @@ func run(args []string) (bool, error) {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{
-		Addr: l.Addr().String(),
-	}); err != nil {
+	hello := client.ServerHello{
+		Addr:      l.Addr().String(),
+		Kind:      opts.Kind,
+		TokenPath: opts.TokenPath,
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
+	}
+	if opts.OnStartup != nil {
+		if err := opts.OnStartup(hello); err != nil {
+			_ = l.Close()
+			return false, fmt.Errorf("startup callback: %w", err)
+		}
 	}
 
 	var httpServer http.Server
 	shutdown := newServerShutdown(srvState, &httpServer)
 	watchdog := newWatchdogController(shutdown)
+	if opts.Persistent {
+		watchdog = newPersistentWatchdogController(shutdown)
+	}
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
-	mux := newMux(srvState, watchdog, shutdown)
+	mux := newMux(srvState, watchdog, shutdown, opts)
+	if opts.RegisterHandlers != nil {
+		opts.RegisterHandlers(mux, srvState)
+	}
 
-	httpServer = http.Server{Handler: mux}
+	var handler http.Handler = mux
+	if opts.WrapHandler != nil {
+		handler = opts.WrapHandler(handler)
+	}
+	httpServer = http.Server{Handler: handler}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return true, fmt.Errorf("serve daemon API: %w", err)
 	}
@@ -372,7 +446,7 @@ func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) err
 	})
 }
 
-func runWorkerControlSocket(socketPath string, srvState *server) (bool, error) {
+func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOptions) (bool, error) {
 	listenNetwork, listenAddress, cleanup, err := workerControlListenEndpoint(socketPath)
 	if err != nil {
 		return false, err
@@ -410,7 +484,7 @@ func runWorkerControlSocket(socketPath string, srvState *server) (bool, error) {
 	if err := codec.Send(hello); err != nil {
 		return true, fmt.Errorf("send worker hello: %w", err)
 	}
-	return true, serveWorkerControl(codec, srvState)
+	return true, serveWorkerControl(codec, srvState, opts)
 }
 
 func workerControlListenEndpoint(address string) (network string, listenAddress string, cleanup func(), err error) {
@@ -502,7 +576,7 @@ func (e *workerActiveExec) forwardInputs() {
 	}
 }
 
-func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
+func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOptions) error {
 	var activeMu sync.Mutex
 	activeExecs := make(map[uint64]*workerActiveExec)
 
@@ -521,6 +595,12 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
 			}
+			if opts.NormalizeCreateRequest != nil {
+				if err := opts.NormalizeCreateRequest(&req, srvState); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					continue
+				}
+			}
 			state, err := srvState.vms.StartStream(context.Background(), req, func(event client.BootEvent) error {
 				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
 			})
@@ -534,6 +614,12 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 			if err := frame.DecodePayload(&req); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
+			}
+			if opts.NormalizeStartRequest != nil {
+				if err := opts.NormalizeStartRequest(&req, srvState); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					continue
+				}
 			}
 			state, err := srvState.vms.StartBlankStream(context.Background(), req, func(event client.BootEvent) error {
 				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
@@ -567,15 +653,6 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				continue
 			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
-		case vm.WorkerFrameConsole:
-			var req vm.WorkerConsoleRequest
-			_ = frame.DecodePayload(&req)
-			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
 		case vm.WorkerFrameAddShare:
 			var req vm.WorkerAddShareRequest
 			if err := frame.DecodePayload(&req); err != nil {
@@ -586,7 +663,16 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
 			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "ok"})
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
+		case vm.WorkerFrameConsole:
+			var req vm.WorkerConsoleRequest
+			_ = frame.DecodePayload(&req)
+			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
+			if err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
 		case vm.WorkerFrameExec:
 			if err := serveWorkerExec(codec, srvState, frame, &activeMu, activeExecs); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
@@ -703,7 +789,7 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 	}
 }
 
-func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *http.ServeMux {
+func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
 	mux := http.NewServeMux()
 	if debugPprof {
 		runtime.SetBlockProfileRate(1)
@@ -1192,6 +1278,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts.NormalizeStartRequest != nil {
+			if err := opts.NormalizeStartRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -1288,20 +1380,37 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			}
 		}
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting VM"})
-			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+			var streamMu sync.Mutex
+			streamOpen := true
+			writeStreamEvent := func(event client.BootEvent) error {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if !streamOpen {
+					return nil
+				}
 				return writeBootEvent(w, event)
+			}
+			closeStream := func() {
+				streamMu.Lock()
+				streamOpen = false
+				streamMu.Unlock()
+			}
+			defer closeStream()
+
+			writeStreamEvent(client.BootEvent{Kind: "status", Message: "starting VM"})
+			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeStreamEvent(event)
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+					_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
-				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
-			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm/start total=%s", time.Since(start))
 			return
 		}
@@ -1328,6 +1437,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+		if opts.NormalizeCreateRequest != nil {
+			if err := opts.NormalizeCreateRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
@@ -1481,6 +1596,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts.NormalizeRunRequest != nil {
+			if err := opts.NormalizeRunRequest(&req, srvState); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if req.Image != "" && !builtInBSDImage {
 			if _, err := srvState.images.Open(req.Image); err != nil {
@@ -1524,7 +1645,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux.Handle("/vm/run/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
-			serveRunRequestWebSocket(ws, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
 				if err := srvState.vms.RunStream(runCtx, req, inputs, onEvent); err != nil {
@@ -1653,13 +1774,19 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}
 }
 
-func serveRunRequestWebSocket(ws *websocket.Conn, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
 	defer ws.Close()
 
 	var req client.RunRequest
 	if err := websocket.JSON.Receive(ws, &req); err != nil {
 		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: fmt.Sprintf("decode run request: %v", err)})
 		return
+	}
+	if normalize != nil {
+		if err := normalize(&req, runtime); err != nil {
+			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
+			return
+		}
 	}
 
 	inputs := make(chan client.ExecInput, 16)

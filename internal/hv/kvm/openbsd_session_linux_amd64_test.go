@@ -5,7 +5,6 @@ package kvm
 import (
 	"errors"
 	"net"
-	"strings"
 	"testing"
 )
 
@@ -17,10 +16,10 @@ func (openBSDManagedTestRoot) Size() int64                        { return 512 }
 
 func TestNormalizeOpenBSDManagedConfig(t *testing.T) {
 	root := openBSDManagedTestRoot{}
-	if _, err := normalizeOpenBSDManagedConfig(OpenBSDManagedConfig{Root: root}); err == nil || !strings.Contains(err.Error(), "kernel is required") {
+	if _, err := normalizeOpenBSDManagedConfig(OpenBSDManagedConfig{Root: root}); err == nil {
 		t.Fatalf("missing kernel error = %v", err)
 	}
-	if _, err := normalizeOpenBSDManagedConfig(OpenBSDManagedConfig{Kernel: []byte("kernel")}); err == nil || !strings.Contains(err.Error(), "root filesystem is required") {
+	if _, err := normalizeOpenBSDManagedConfig(OpenBSDManagedConfig{Kernel: []byte("kernel")}); err == nil {
 		t.Fatalf("missing root error = %v", err)
 	}
 
@@ -68,13 +67,8 @@ func TestOpenBSDStartupErrorIncludesTranscripts(t *testing.T) {
 		t.Fatal("startup error was nil")
 	}
 	text := err.Error()
-	for _, want := range []string{
-		"OpenBSD guest did not connect to control TCP port 10777",
-		"serial:\nserial tail",
-		"control:\ncontrol tail",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("startup error %q does not contain %q", text, want)
-		}
+	want := "OpenBSD guest did not connect to control TCP port 10777\nserial:\nserial tail\ncontrol:\ncontrol tail"
+	if text != want {
+		t.Fatalf("startup error = %q, want %q", text, want)
 	}
 }

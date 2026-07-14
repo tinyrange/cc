@@ -28,6 +28,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,11 +139,7 @@ var (
 			return make([]byte, 0, defaultPacketCapacity)
 		},
 	}
-	ethernetFramePool = sync.Pool{
-		New: func() any {
-			return make([]byte, 0, defaultPacketCapacity+ethernetHeaderLen)
-		},
-	}
+	ethernetFramePool = newByteSlicePool(defaultPacketCapacity+ethernetHeaderLen, maxEthernetFramePoolLen)
 )
 
 func getTCPPacketBuffer(payloadLen int) []byte {
@@ -205,12 +202,7 @@ func getEthernetFrameBuffer(payloadLen int) []byte {
 	if total > maxEthernetFramePoolLen {
 		return make([]byte, total)
 	}
-	raw := ethernetFramePool.Get().([]byte)
-	if cap(raw) < total {
-		ethernetFramePool.Put(raw[:0])
-		return make([]byte, total)
-	}
-	return raw[:total]
+	return ethernetFramePool.get(total)
 }
 
 func putEthernetFrameBuffer(buf []byte) {
@@ -220,7 +212,7 @@ func putEthernetFrameBuffer(buf []byte) {
 	if cap(buf) > maxEthernetFramePoolLen {
 		return
 	}
-	ethernetFramePool.Put(buf[:0])
+	ethernetFramePool.put(buf)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -250,6 +242,7 @@ type NetStack struct {
 	serviceProxyEnabled bool // Forward connections destined to serviceIPv4
 	hostAccessEnabled   bool // Expose host/service addresses to guest-originated flows
 	allowInternet       bool // Allow DNS fallback et al
+	validateChecksums   atomic.Bool
 	serviceProxyPortsMu sync.RWMutex
 	serviceProxyPorts   map[uint16]struct{}
 
@@ -270,7 +263,11 @@ type NetStack struct {
 	randSource *rand.Rand
 
 	// UDP state.
-	udpSockets sync.Map
+	udpMu      sync.RWMutex
+	udpSockets map[uint16]udpEndpoint
+
+	udpProxyMu        sync.Mutex
+	udpServiceProxies map[udpProxyKey]*udpServiceProxyConn
 
 	// Embedded DNS server (optional).
 	dnsServer *dnsServer
@@ -303,6 +300,8 @@ func New(l *slog.Logger) *NetStack {
 		allowInternet:       true,
 		tcpListen:           make(map[uint16]*tcpListener),
 		tcpConns:            make(map[tcpFourTuple]*tcpConn),
+		udpSockets:          make(map[uint16]udpEndpoint),
+		udpServiceProxies:   make(map[udpProxyKey]*udpServiceProxyConn),
 		randSource:          rand.New(rand.NewSource(now)),
 	}
 	stack.tcpDial = stack.defaultOutboundTCPDial
@@ -408,14 +407,35 @@ func (ns *NetStack) Close() error {
 			_ = c.Close()
 		}
 
-		// Close UDP endpoints.
-		ns.udpSockets.Range(func(key, value any) bool {
-			if c, ok := value.(io.Closer); ok {
-				_ = c.Close()
+		var udpEndpoints []udpEndpoint
+		ns.udpMu.Lock()
+		if ns.udpSockets != nil {
+			udpEndpoints = make([]udpEndpoint, 0, len(ns.udpSockets))
+			for _, ep := range ns.udpSockets {
+				udpEndpoints = append(udpEndpoints, ep)
 			}
-			ns.udpSockets.Delete(key)
-			return true
-		})
+			ns.udpSockets = make(map[uint16]udpEndpoint)
+		}
+		ns.udpMu.Unlock()
+
+		for _, ep := range udpEndpoints {
+			_ = ep.Close()
+		}
+
+		var udpProxies []*udpServiceProxyConn
+		ns.udpProxyMu.Lock()
+		if ns.udpServiceProxies != nil {
+			udpProxies = make([]*udpServiceProxyConn, 0, len(ns.udpServiceProxies))
+			for _, proxy := range ns.udpServiceProxies {
+				udpProxies = append(udpProxies, proxy)
+			}
+			ns.udpServiceProxies = make(map[udpProxyKey]*udpServiceProxyConn)
+		}
+		ns.udpProxyMu.Unlock()
+		for _, proxy := range udpProxies {
+			_ = proxy.conn.Close()
+			<-proxy.done
+		}
 
 		// Stop packet capture.
 		ns.pcapMu.Lock()
@@ -524,6 +544,14 @@ func (ns *NetStack) AllowServiceProxyPort(port int) {
 // SetInternetAccessEnabled toggles access to real DNS lookups, etc.
 func (ns *NetStack) SetInternetAccessEnabled(enabled bool) {
 	ns.allowInternet = enabled
+}
+
+// SetChecksumValidationEnabled toggles inbound IPv4, ICMP, UDP, and TCP
+// checksum validation. Validation is disabled by default because the managed
+// guest path is a same-host virtual link where the checksum cost is usually
+// higher than its value as a corruption detector.
+func (ns *NetStack) SetChecksumValidationEnabled(enabled bool) {
+	ns.validateChecksums.Store(enabled)
 }
 
 // SetHostDNSName configures the synthetic DNS name for the host computer.
@@ -1096,15 +1124,16 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 			srcMAC.String(), hdr.src.String(), hdr.dst.String(), hdr.protocol.String(), len(hdr.payload), releaseUnsafe)
 	}
 
-	// Validate IPv4 header checksum before processing.
-	// A correct checksum will result in 0 when computed over the entire header.
-	headerLen := int(hdr.ihl) * 4
-	if headerLen <= len(payload) {
-		computed := ipv4Checksum(payload[:headerLen])
-		if computed != 0 {
-			tracef("netstack.handleIPv4 drop invalidHeaderChecksum", "computed=0x%04x", computed)
-			// Invalid checksum, drop silently
-			return nil
+	if ns.validateChecksums.Load() {
+		// A correct IPv4 header checksum results in 0 when computed over the
+		// entire header, including the checksum field itself.
+		headerLen := int(hdr.ihl) * 4
+		if headerLen <= len(payload) {
+			computed := ipv4Checksum(payload[:headerLen])
+			if computed != 0 {
+				tracef("netstack.handleIPv4 drop invalidHeaderChecksum", "computed=0x%04x", computed)
+				return nil
+			}
 		}
 	}
 
@@ -1149,17 +1178,18 @@ func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 	}
 	tracef("netstack.handleICMP echoRequest", "src=%s dst=%s len=%d", h.src.String(), h.dst.String(), len(payload))
 
-	// Validate ICMP checksum
-	receivedChecksum := binary.BigEndian.Uint16(payload[2:4])
-	binary.BigEndian.PutUint16(payload[2:4], 0) // Zero checksum for validation
-	calculatedChecksum := checksum(payload)
-	binary.BigEndian.PutUint16(payload[2:4], receivedChecksum) // Restore original
-	if receivedChecksum != calculatedChecksum {
-		tracef("netstack.handleICMP drop invalidChecksum", "received=0x%04x calculated=0x%04x", receivedChecksum, calculatedChecksum)
-		slog.Error("raw: drop icmp packet with invalid checksum",
-			"received", fmt.Sprintf("0x%04x", receivedChecksum),
-			"calculated", fmt.Sprintf("0x%04x", calculatedChecksum))
-		return nil
+	if ns.validateChecksums.Load() {
+		receivedChecksum := binary.BigEndian.Uint16(payload[2:4])
+		binary.BigEndian.PutUint16(payload[2:4], 0)
+		calculatedChecksum := checksum(payload)
+		binary.BigEndian.PutUint16(payload[2:4], receivedChecksum)
+		if receivedChecksum != calculatedChecksum {
+			tracef("netstack.handleICMP drop invalidChecksum", "received=0x%04x calculated=0x%04x", receivedChecksum, calculatedChecksum)
+			slog.Error("raw: drop icmp packet with invalid checksum",
+				"received", fmt.Sprintf("0x%04x", receivedChecksum),
+				"calculated", fmt.Sprintf("0x%04x", calculatedChecksum))
+			return nil
+		}
 	}
 
 	return ns.sendICMPEchoReply(h.dst, h.src, payload)
@@ -1198,6 +1228,22 @@ type udpPacket struct {
 	addr    net.UDPAddr
 }
 
+type udpProxyKey struct {
+	srcIP   [4]byte
+	srcPort uint16
+	dstPort uint16
+}
+
+type udpServiceProxyConn struct {
+	stack    *NetStack
+	key      udpProxyKey
+	conn     *net.UDPConn
+	done     chan struct{}
+	lastUsed atomic.Int64
+}
+
+const udpServiceProxyIdleTimeout = 30 * time.Second
+
 // handleUDP parses the UDP header and enqueues payloads to bound endpoints.
 func (ns *NetStack) handleUDP(h ipv4Header, payload []byte) error {
 	return ns.handleUDPWithReuse(h, payload, false)
@@ -1221,27 +1267,35 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 		return fmt.Errorf("udp length exceeds payload: %d > %d", length, len(payload))
 	}
 
-	// Validate UDP checksum if present (checksum of 0 means not computed).
-	udpChksum := binary.BigEndian.Uint16(payload[6:8])
-	if udpChksum != 0 {
+	if ns.validateChecksums.Load() && binary.BigEndian.Uint16(payload[6:8]) != 0 {
 		computed := udpChecksum(h.src, h.dst, payload[:length])
 		if computed != 0 {
 			tracef("netstack.udpEndpointConn drop invalidChecksum", "src=%s:%d dst=%s:%d computed=0x%04x", h.src.String(), srcPort, h.dst.String(), dstPort, computed)
-			// Invalid checksum, drop silently
 			return nil
 		}
 	}
 
 	data := payload[8:length]
-	tracef("netstack.udpEndpointConn", "src=%s:%d dst=%s:%d dataLen=%d releaseUnsafe=%t", h.src.String(), srcPort, h.dst.String(), dstPort, len(data), releaseUnsafe)
+	if netstackTraceEnabled {
+		tracef("netstack.udpEndpointConn", "src=%s:%d dst=%s:%d dataLen=%d releaseUnsafe=%t", h.src.String(), srcPort, h.dst.String(), dstPort, len(data), releaseUnsafe)
+	}
 
-	v, ok := ns.udpSockets.Load(dstPort)
+	dstIP := h.dst.To4()
+	if ns.shouldProxyService(dstIP) {
+		if !ns.serviceProxyEnabled || !ns.serviceProxyAllowed(dstIP, dstPort) {
+			tracef("netstack.handleUDP service proxy disabled", "src=%s:%d dst=%s:%d", h.src.String(), srcPort, h.dst.String(), dstPort)
+			return nil
+		}
+		return ns.proxyServiceUDP(h.src.To4(), srcPort, dstPort, data)
+	}
+
+	ns.udpMu.RLock()
+	ep, ok := ns.udpSockets[dstPort]
+	ns.udpMu.RUnlock()
 	if !ok {
 		tracef("netstack.udpEndpointConn drop noSocket", "dstPort=%d", dstPort)
 		return nil
 	}
-
-	ep := v.(udpEndpoint)
 
 	addrIP := h.src.To4()
 	if addrIP == nil {
@@ -1251,12 +1305,6 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	addr := net.UDPAddr{
 		IP:   addrIP,
 		Port: int(srcPort),
-	}
-
-	if releaseUnsafe {
-		if _, ok := ep.(*udpCallbackEndpoint); ok {
-			addr.IP = append([]byte(nil), addr.IP...)
-		}
 	}
 
 	if err := ep.enqueue(data, addr); err != nil {
@@ -1269,6 +1317,111 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	// reflect packets actually delivered to the application.
 	ns.udpRxPackets.Add(1)
 	return nil
+}
+
+func (ns *NetStack) proxyServiceUDP(srcIP net.IP, srcPort, dstPort uint16, payload []byte) error {
+	if srcIP == nil {
+		return fmt.Errorf("udp service proxy source ip is not ipv4")
+	}
+	var key udpProxyKey
+	copy(key.srcIP[:], srcIP)
+	key.srcPort = srcPort
+	key.dstPort = dstPort
+
+	proxy, err := ns.getUDPServiceProxy(key)
+	if err != nil {
+		return err
+	}
+	proxy.lastUsed.Store(time.Now().UnixNano())
+	if _, err := proxy.conn.Write(payload); err != nil {
+		return err
+	}
+	ns.udpRxPackets.Add(1)
+	return nil
+}
+
+func (ns *NetStack) getUDPServiceProxy(key udpProxyKey) (*udpServiceProxyConn, error) {
+	ns.udpProxyMu.Lock()
+	if proxy, ok := ns.udpServiceProxies[key]; ok {
+		ns.udpProxyMu.Unlock()
+		return proxy, nil
+	}
+	ns.udpProxyMu.Unlock()
+
+	addr := &net.UDPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: int(key.dstPort),
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	proxy := &udpServiceProxyConn{
+		stack: ns,
+		key:   key,
+		conn:  conn,
+		done:  make(chan struct{}),
+	}
+	proxy.lastUsed.Store(time.Now().UnixNano())
+
+	ns.udpProxyMu.Lock()
+	if existing, ok := ns.udpServiceProxies[key]; ok {
+		ns.udpProxyMu.Unlock()
+		_ = conn.Close()
+		return existing, nil
+	}
+	ns.udpServiceProxies[key] = proxy
+	ns.udpProxyMu.Unlock()
+
+	go proxy.readLoop()
+	return proxy, nil
+}
+
+func (p *udpServiceProxyConn) readLoop() {
+	defer func() {
+		p.stack.udpProxyMu.Lock()
+		if p.stack.udpServiceProxies[p.key] == p {
+			delete(p.stack.udpServiceProxies, p.key)
+		}
+		p.stack.udpProxyMu.Unlock()
+		_ = p.conn.Close()
+		close(p.done)
+	}()
+
+	buf := make([]byte, maxEthernetFramePoolLen)
+	for {
+		if err := p.conn.SetReadDeadline(time.Now().Add(udpServiceProxyIdleTimeout)); err != nil {
+			return
+		}
+		n, err := p.conn.Read(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Since(time.Unix(0, p.lastUsed.Load())) < udpServiceProxyIdleTimeout {
+					continue
+				}
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			slog.Debug("raw: udp service proxy read failed", "port", p.key.dstPort, "err", err)
+			return
+		}
+
+		frameLen := ethernetHeaderLen + ipv4HeaderLen + udpHeaderLen + n
+		frame := getEthernetFrameBuffer(frameLen)
+		copy(frame[ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen:], buf[:n])
+		dstIP := net.IP(p.key.srcIP[:])
+		err = p.stack.sendUDP(frame, p.key.dstPort, p.key.srcPort, net.IP(p.stack.serviceIPv4[:]), dstIP, n)
+		putEthernetFrameBuffer(frame)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			slog.Debug("raw: udp service proxy send failed", "port", p.key.dstPort, "err", err)
+			return
+		}
+	}
 }
 
 // sendUDP crafts and transmits a UDP packet to the guest.
@@ -1285,13 +1438,15 @@ func (ns *NetStack) sendUDP(
 	tracef("netstack.sendUDPPacket", "src=%s:%d dst=%s:%d payloadLen=%d", srcIP.String(), srcPort, dstIP.String(), dstPort, payloadLen)
 
 	totalLen := 8 + payloadLen
-	packet := buf[ethernetHeaderLen+ipv4HeaderLen:]
+	packet := buf[ethernetHeaderLen+ipv4HeaderLen : ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+payloadLen]
 	binary.BigEndian.PutUint16(packet[0:2], srcPort)
 	binary.BigEndian.PutUint16(packet[2:4], dstPort)
 	binary.BigEndian.PutUint16(packet[4:6], uint16(totalLen))
 	copy(packet[8:], buf[ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen:])
 
 	zeroOut := packet[6:8]
+	zeroOut[0] = 0
+	zeroOut[1] = 0
 	check := udpChecksum(srcIP, dstIP, packet)
 	binary.BigEndian.PutUint16(zeroOut, check)
 
@@ -1459,7 +1614,9 @@ func (ep *udpEndpointConn) Close() error {
 		case pkt := <-ep.incoming:
 			releasePayload(pkt.payload)
 		default:
-			ep.stack.udpSockets.Delete(ep.port)
+			ep.stack.udpMu.Lock()
+			delete(ep.stack.udpSockets, ep.port)
+			ep.stack.udpMu.Unlock()
 			return nil
 		}
 	}
@@ -1758,12 +1915,12 @@ func (c *tcpConn) completeDial(err error) {
 
 // handleTCP demuxes by 4-tuple to an existing conn or establishes a new one.
 func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
-	// Validate TCP checksum with pseudo-header before parsing.
-	computed := tcpChecksum(h.src, h.dst, payload)
-	if computed != 0 {
-		tracef("netstack.handleTCP drop invalidChecksum", "src=%s dst=%s computed=0x%04x", h.src.String(), h.dst.String(), computed)
-		// Invalid checksum, drop silently
-		return nil
+	if ns.validateChecksums.Load() {
+		computed := tcpChecksum(h.src, h.dst, payload)
+		if computed != 0 {
+			tracef("netstack.handleTCP drop invalidChecksum", "src=%s dst=%s computed=0x%04x", h.src.String(), h.dst.String(), computed)
+			return nil
+		}
 	}
 
 	hdr, err := parseTCPHeader(payload)
@@ -2001,6 +2158,12 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		return nil
 	case tcpStateSynRcvd:
 		if hdr.flags&tcpFlagACK != 0 {
+			if hdr.ack != c.hostSeq {
+				tracef("netstack.tcpConn synrcvd drop badAck", "ack=%d want=%d", hdr.ack, c.hostSeq)
+				c.mu.Unlock()
+				return nil
+			}
+			tracef("netstack.tcpConn established", "seq=%d ack=%d payloadLen=%d", hdr.seq, hdr.ack, len(hdr.payload))
 			c.state = tcpStateEstablished
 			cb := c.onEstablished
 			listener := c.listener
@@ -2308,6 +2471,9 @@ func (c *tcpConn) Read(b []byte) (int, error) {
 // buffer before the kernel write.
 func (c *tcpConn) WriteTo(w io.Writer) (int64, error) {
 	var written int64
+	batch := getProxyCopyBuffer(64 * 1024)
+	defer releaseProxyCopyBuffer(batch)
+
 	for {
 		data, owned, err := c.nextReadPayload()
 		if err != nil {
@@ -2316,23 +2482,76 @@ func (c *tcpConn) WriteTo(w io.Writer) (int64, error) {
 			}
 			return written, err
 		}
-		remaining := data
-		for len(remaining) > 0 {
-			n, writeErr := w.Write(remaining)
-			if n > 0 {
-				written += int64(n)
-				remaining = remaining[n:]
+		if len(data) >= cap(batch) {
+			n, err := writeFull(w, data)
+			written += n
+			releasePayload(owned)
+			if err != nil {
+				return written, err
 			}
-			if writeErr != nil {
-				releasePayload(owned)
-				return written, writeErr
+			continue
+		}
+
+		batch = batch[:0]
+		eofAfterBatch := false
+		for {
+			if len(data) > cap(batch)-len(batch) {
+				n, err := writeFull(w, batch)
+				written += n
+				if err != nil {
+					releasePayload(owned)
+					return written, err
+				}
+				batch = batch[:0]
 			}
-			if n == 0 {
+			batch = append(batch, data...)
+			releasePayload(owned)
+
+			var ok bool
+			data, owned, ok, err = c.tryNextReadPayload()
+			if err != nil {
+				if err == io.EOF {
+					eofAfterBatch = true
+					break
+				}
+				n, writeErr := writeFull(w, batch)
+				written += n
+				if writeErr != nil {
+					return written, writeErr
+				}
+				return written, err
+			}
+			if !ok {
+				break
+			}
+			if len(data) >= cap(batch) && len(batch) > 0 {
+				n, err := writeFull(w, batch)
+				written += n
+				if err != nil {
+					releasePayload(owned)
+					return written, err
+				}
+				batch = batch[:0]
+			}
+			if len(data) >= cap(batch) {
+				n, err := writeFull(w, data)
+				written += n
 				releasePayload(owned)
-				return written, io.ErrShortWrite
+				if err != nil {
+					return written, err
+				}
+				break
 			}
 		}
-		releasePayload(owned)
+
+		n, err := writeFull(w, batch)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if eofAfterBatch {
+			return written, nil
+		}
 	}
 }
 
@@ -2380,6 +2599,51 @@ func (c *tcpConn) nextReadPayload() ([]byte, []byte, error) {
 	case <-timeout:
 		return nil, nil, &net.OpError{Op: "read", Net: "tcp", Err: tcpTimeoutError{}}
 	}
+}
+
+func (c *tcpConn) tryNextReadPayload() ([]byte, []byte, bool, error) {
+	c.mu.Lock()
+	if len(c.readPending) > 0 {
+		data := c.readPending
+		owned := c.readPendingBuf
+		c.readPending = nil
+		c.readPendingBuf = nil
+		c.mu.Unlock()
+		return data, owned, true, nil
+	}
+	buf := c.recvBuf
+	c.mu.Unlock()
+
+	select {
+	case data, ok := <-buf:
+		if !ok {
+			return nil, nil, false, net.ErrClosed
+		}
+		if data == nil {
+			return nil, nil, false, io.EOF
+		}
+		return data, data, true, nil
+	default:
+		return nil, nil, false, nil
+	}
+}
+
+func writeFull(w io.Writer, data []byte) (int64, error) {
+	var written int64
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			written += int64(n)
+			data = data[n:]
+		}
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
 }
 
 // Write transmits payload to the guest.
@@ -2966,6 +3230,7 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 			_ = conn.Close()
 			return
 		}
+		tuneProxyTCPConn(outbound)
 		defer outbound.Close()
 		defer conn.Close()
 
@@ -2996,6 +3261,9 @@ func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
 			_ = conn.Close()
 			return
 		}
+		if tcpConn, ok := outbound.(*net.TCPConn); ok {
+			tuneProxyTCPConn(tcpConn)
+		}
 		defer outbound.Close()
 		defer conn.Close()
 
@@ -3005,6 +3273,15 @@ func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
 			slog.Error("raw: outbound proxy", "err", err)
 		}
 	}()
+}
+
+func tuneProxyTCPConn(conn *net.TCPConn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetNoDelay(true)
+	_ = conn.SetReadBuffer(4 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3024,15 +3301,21 @@ func (ns *NetStack) ListenPacketInternal(
 		return nil, err
 	}
 
-	ep, loaded := ns.udpSockets.LoadOrStore(addr.Port, newUDPEndpointConn(ns, addr.Port))
-	if loaded {
+	ep := newUDPEndpointConn(ns, addr.Port)
+	ns.udpMu.Lock()
+	if _, ok := ns.udpSockets[addr.Port]; ok {
+		ns.udpMu.Unlock()
 		return nil, fmt.Errorf("udp port %d already in use", addr.Port)
 	}
+	ns.udpSockets[addr.Port] = ep
+	ns.udpMu.Unlock()
 
-	return ep.(*udpEndpointConn), nil
+	return ep, nil
 }
 
-// UDPCallback is a function type for handling UDP packets
+// UDPCallback is a function type for handling UDP packets. The data and addr
+// are borrowed for the duration of the callback; copy anything retained after
+// the callback returns.
 type UDPCallback func(ep *udpCallbackEndpoint, data []byte, addr net.UDPAddr)
 
 type udpCallbackEndpoint struct {
@@ -3094,7 +3377,9 @@ func (ep *udpCallbackEndpoint) Close() error {
 	}
 	ep.closed.Store(true)
 
-	ep.stack.udpSockets.Delete(ep.port)
+	ep.stack.udpMu.Lock()
+	delete(ep.stack.udpSockets, ep.port)
+	ep.stack.udpMu.Unlock()
 	return nil
 }
 
@@ -3109,10 +3394,14 @@ func (ns *NetStack) BindUDPCallback(address string, callback UDPCallback) error 
 		return err
 	}
 
-	_, loaded := ns.udpSockets.LoadOrStore(addr.Port, newUDPCallbackEndpoint(ns, addr.Port, callback))
-	if loaded {
+	ep := newUDPCallbackEndpoint(ns, addr.Port, callback)
+	ns.udpMu.Lock()
+	if _, ok := ns.udpSockets[addr.Port]; ok {
+		ns.udpMu.Unlock()
 		return fmt.Errorf("udp port %d already in use", addr.Port)
 	}
+	ns.udpSockets[addr.Port] = ep
+	ns.udpMu.Unlock()
 
 	return nil
 }
@@ -3549,12 +3838,11 @@ func (ns *NetStack) collectDebugStatus() debugStatus {
 	}
 	ns.tcpMu.Unlock()
 
-	ns.udpSockets.Range(func(key, value any) bool {
-		if port, ok := key.(uint16); ok {
-			status.UDPSockets = append(status.UDPSockets, port)
-		}
-		return true
-	})
+	ns.udpMu.RLock()
+	for port := range ns.udpSockets {
+		status.UDPSockets = append(status.UDPSockets, port)
+	}
+	ns.udpMu.RUnlock()
 
 	sort.Slice(status.TCPListeners, func(i, j int) bool { return status.TCPListeners[i] < status.TCPListeners[j] })
 	sort.Strings(status.TCPConnections)
@@ -3693,9 +3981,14 @@ func itoa(v int) string {
 	return strconv.Itoa(v)
 }
 
-const netstackTraceEnabled = false
+var netstackTraceEnabled = os.Getenv("CC_NETSTACK_TRACE") != ""
 
-func tracef(_ string, _ string, _ ...any) {}
+func tracef(event string, format string, args ...any) {
+	if !netstackTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, event+": "+format+"\n", args...)
+}
 
 // proxyConns bridges bytes between a and b until one side closes.
 func proxyConns(a, b net.Conn, bufSize int) error {

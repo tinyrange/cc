@@ -46,17 +46,19 @@ const (
 )
 
 type BootOptions struct {
-	MemoryBase uint64
-	MemorySize uint64
-	Cmdline    string
-	NumCPUs    int
-	GICVersion GICVersion
-	UART       *UARTConfig
-	Console    bool
-	Initrd     []byte
-	InitrdGPA  uint64
-	ExtraNodes []fdt.Node
-	RecordTime func(name string, duration time.Duration)
+	MemoryBase  uint64
+	MemorySize  uint64
+	Cmdline     string
+	NumCPUs     int
+	GICVersion  GICVersion
+	UART        *UARTConfig
+	DisableUART bool
+	Console     bool
+	HyperVTimer bool
+	Initrd      []byte
+	InitrdGPA   uint64
+	ExtraNodes  []fdt.Node
+	RecordTime  func(name string, duration time.Duration)
 }
 
 type UARTConfig struct {
@@ -103,7 +105,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if opts.NumCPUs <= 0 {
 		opts.NumCPUs = 1
 	}
-	if opts.UART == nil {
+	if opts.UART == nil && !opts.DisableUART {
 		opts.UART = &UARTConfig{
 			Base:      DefaultUARTBase,
 			Size:      DefaultUARTSize,
@@ -163,16 +165,17 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 
 	start = time.Now()
 	dtb, err := buildDeviceTree(deviceTreeConfig{
-		MemoryBase: opts.MemoryBase,
-		MemorySize: opts.MemorySize,
-		NumCPUs:    opts.NumCPUs,
-		Cmdline:    opts.Cmdline,
-		GICVersion: opts.GICVersion,
-		UART:       opts.UART,
-		Console:    opts.Console,
-		InitrdGPA:  initrdAddr,
-		InitrdSize: uint64(len(opts.Initrd)),
-		ExtraNodes: append([]fdt.Node(nil), opts.ExtraNodes...),
+		MemoryBase:  opts.MemoryBase,
+		MemorySize:  opts.MemorySize,
+		NumCPUs:     opts.NumCPUs,
+		Cmdline:     opts.Cmdline,
+		GICVersion:  opts.GICVersion,
+		UART:        opts.UART,
+		Console:     opts.Console,
+		HyperVTimer: opts.HyperVTimer,
+		InitrdGPA:   initrdAddr,
+		InitrdSize:  uint64(len(opts.Initrd)),
+		ExtraNodes:  append([]fdt.Node(nil), opts.ExtraNodes...),
 	})
 	record("build_device_tree", start)
 	if err != nil {
@@ -217,16 +220,17 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 }
 
 type deviceTreeConfig struct {
-	MemoryBase uint64
-	MemorySize uint64
-	NumCPUs    int
-	Cmdline    string
-	GICVersion GICVersion
-	UART       *UARTConfig
-	Console    bool
-	InitrdGPA  uint64
-	InitrdSize uint64
-	ExtraNodes []fdt.Node
+	MemoryBase  uint64
+	MemorySize  uint64
+	NumCPUs     int
+	Cmdline     string
+	GICVersion  GICVersion
+	UART        *UARTConfig
+	Console     bool
+	HyperVTimer bool
+	InitrdGPA   uint64
+	InitrdSize  uint64
+	ExtraNodes  []fdt.Node
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -298,19 +302,20 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 				"serial0": {Strings: []string{fmt.Sprintf("/%s", serialNode.Name)}},
 			},
 		})
-		chosen := fdt.Node{
-			Name: "chosen",
-			Properties: map[string]fdt.Property{
-				"bootargs": {Strings: []string{cfg.Cmdline}},
-			},
-		}
-		if cfg.Console {
-			consolePath := fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)
-			chosen.Properties["stdout-path"] = fdt.Property{Strings: []string{consolePath}}
-			chosen.Properties["linux,stdout-path"] = fdt.Property{Strings: []string{consolePath}}
-		}
-		root.Children = append(root.Children, chosen)
 	}
+
+	chosen := fdt.Node{
+		Name: "chosen",
+		Properties: map[string]fdt.Property{
+			"bootargs": {Strings: []string{cfg.Cmdline}},
+		},
+	}
+	if cfg.Console && cfg.UART != nil {
+		consolePath := fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)
+		chosen.Properties["stdout-path"] = fdt.Property{Strings: []string{consolePath}}
+		chosen.Properties["linux,stdout-path"] = fdt.Property{Strings: []string{consolePath}}
+	}
+	root.Children = append(root.Children, chosen)
 
 	if cfg.InitrdSize > 0 {
 		chosenIndex := -1
@@ -339,13 +344,18 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 		},
 	})
 
+	timerProperties := map[string]fdt.Property{
+		"compatible": {Strings: []string{"arm,armv8-timer"}},
+		"always-on":  {Flag: true},
+		"interrupts": {U32: []uint32{1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4}},
+	}
+	if cfg.HyperVTimer {
+		timerProperties["interrupt-names"] = fdt.Property{Strings: []string{"virt"}}
+		timerProperties["interrupts"] = fdt.Property{U32: []uint32{1, 4, 8}}
+	}
 	root.Children = append(root.Children, fdt.Node{
-		Name: "timer",
-		Properties: map[string]fdt.Property{
-			"compatible": {Strings: []string{"arm,armv8-timer"}},
-			"always-on":  {Flag: true},
-			"interrupts": {U32: []uint32{1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4}},
-		},
+		Name:       "timer",
+		Properties: timerProperties,
 	})
 
 	root.Children = append(root.Children, fdt.Node{

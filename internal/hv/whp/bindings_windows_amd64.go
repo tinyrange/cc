@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -27,6 +29,8 @@ var (
 	procWHvRunVirtualProcessor          = winhvplatform.NewProc("WHvRunVirtualProcessor")
 	procWHvGetVirtualProcessorRegisters = winhvplatform.NewProc("WHvGetVirtualProcessorRegisters")
 	procWHvSetVirtualProcessorRegisters = winhvplatform.NewProc("WHvSetVirtualProcessorRegisters")
+	procWHvGetVirtualProcessorState     = winhvplatform.NewProc("WHvGetVirtualProcessorState")
+	procWHvSetVirtualProcessorState     = winhvplatform.NewProc("WHvSetVirtualProcessorState")
 	procWHvCancelRunVirtualProcessor    = winhvplatform.NewProc("WHvCancelRunVirtualProcessor")
 	procWHvRequestInterrupt             = winhvplatform.NewProc("WHvRequestInterrupt")
 	procWHvEmulatorCreateEmulator       = winhvemulation.NewProc("WHvEmulatorCreateEmulator")
@@ -64,9 +68,11 @@ const capabilityCodeHypervisorPresent capabilityCode = 0
 
 type partitionPropertyCode uint32
 
-const partitionPropertyCodeProcessorCount partitionPropertyCode = 0x00001fff
-
-const partitionPropertyCodeLocalAPICEmulationMode partitionPropertyCode = 0x00001005
+const (
+	partitionPropertyCodeExtendedVMExits        partitionPropertyCode = 0x00000001
+	partitionPropertyCodeLocalAPICEmulationMode partitionPropertyCode = 0x00001005
+	partitionPropertyCodeProcessorCount         partitionPropertyCode = 0x00001fff
+)
 
 type localAPICEmulationMode uint32
 
@@ -113,6 +119,13 @@ type translateGVAResult struct {
 
 type registerName uint32
 
+type virtualProcessorStateType uint32
+
+const (
+	virtualProcessorStateTypeInterruptControllerState2 virtualProcessorStateType = 0x00001000
+	virtualProcessorStateTypeXsaveState                virtualProcessorStateType = 0x00001001
+)
+
 const (
 	registerRax    registerName = 0x00000000
 	registerRcx    registerName = 0x00000001
@@ -138,10 +151,49 @@ const (
 	registerDs     registerName = 0x00000015
 	registerFs     registerName = 0x00000016
 	registerGs     registerName = 0x00000017
+	registerLdtr   registerName = 0x00000018
+	registerTr     registerName = 0x00000019
+	registerIdtr   registerName = 0x0000001a
+	registerGdtr   registerName = 0x0000001b
 	registerCr0    registerName = 0x0000001c
+	registerCr2    registerName = 0x0000001d
 	registerCr3    registerName = 0x0000001e
 	registerCr4    registerName = 0x0000001f
-	registerEfer   registerName = 0x00002001
+	registerCr8    registerName = 0x00000020
+	registerXCr0   registerName = 0x00000027
+
+	registerXmm0             registerName = 0x00001000
+	registerXmm15            registerName = 0x0000100f
+	registerFpMmx0           registerName = 0x00001010
+	registerFpMmx7           registerName = 0x00001017
+	registerFpControlStatus  registerName = 0x00001018
+	registerXmmControlStatus registerName = 0x00001019
+
+	registerTsc          registerName = 0x00002000
+	registerEfer         registerName = 0x00002001
+	registerKernelGsBase registerName = 0x00002002
+	registerApicBase     registerName = 0x00002003
+	registerPat          registerName = 0x00002004
+	registerSysenterCs   registerName = 0x00002005
+	registerSysenterEip  registerName = 0x00002006
+	registerSysenterEsp  registerName = 0x00002007
+	registerStar         registerName = 0x00002008
+	registerLstar        registerName = 0x00002009
+	registerCstar        registerName = 0x0000200a
+	registerSfmask       registerName = 0x0000200b
+	registerXss          registerName = 0x0000208b
+	registerUCet         registerName = 0x0000208c
+	registerSCet         registerName = 0x0000208d
+	registerSsp          registerName = 0x0000208e
+	registerPl0Ssp       registerName = 0x0000208f
+	registerPl1Ssp       registerName = 0x00002090
+	registerPl2Ssp       registerName = 0x00002091
+	registerPl3Ssp       registerName = 0x00002092
+	registerInterruptSsp registerName = 0x00002093
+	registerTscDeadline  registerName = 0x00002095
+	registerTscAdjust    registerName = 0x00002096
+	registerXfd          registerName = 0x00002099
+	registerXfdErr       registerName = 0x0000209a
 
 	registerPendingInterruption         registerName = 0x80000000
 	registerDeliverabilityNotifications registerName = 0x80000004
@@ -285,6 +337,10 @@ func (c *runVPExitContext) memoryAccess() *memoryAccessContext {
 	return (*memoryAccessContext)(unsafe.Pointer(&c.Payload[0]))
 }
 
+func (c *runVPExitContext) instructionLength() uint8 {
+	return uint8(c.VpContext.InstructionLengthCr8 & 0xf)
+}
+
 type x64IOPortAccessInfo struct {
 	AsUint32 uint32
 }
@@ -316,6 +372,25 @@ func (c *runVPExitContext) ioPortAccess() *x64IOPortAccessContext {
 	return (*x64IOPortAccessContext)(unsafe.Pointer(&c.Payload[0]))
 }
 
+type x64MSRAccessInfo struct {
+	AsUint32 uint32
+}
+
+func (i x64MSRAccessInfo) isWrite() bool {
+	return i.AsUint32&0x1 != 0
+}
+
+type x64MSRAccessContext struct {
+	AccessInfo x64MSRAccessInfo
+	MSRNumber  uint32
+	Rax        uint64
+	Rdx        uint64
+}
+
+func (c *runVPExitContext) msrAccess() *x64MSRAccessContext {
+	return (*x64MSRAccessContext)(unsafe.Pointer(&c.Payload[0]))
+}
+
 type x64ApicEoiContext struct {
 	InterruptVector uint32
 }
@@ -325,8 +400,9 @@ func (c *runVPExitContext) apicEoi() *x64ApicEoiContext {
 }
 
 type allocation struct {
-	addr uintptr
-	size uintptr
+	addr    uintptr
+	size    uintptr
+	mapping windows.Handle
 }
 
 func virtualAlloc(size uintptr) (*allocation, error) {
@@ -345,6 +421,40 @@ func virtualAlloc(size uintptr) (*allocation, error) {
 	return &allocation{addr: ptr, size: size}, nil
 }
 
+func virtualMapFile(path string, size uintptr) (*allocation, error) {
+	if size == 0 {
+		return nil, fmt.Errorf("memory mapping size must be non-zero")
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	file, err := windows.CreateFile(
+		name,
+		windows.GENERIC_READ|windows.GENERIC_EXECUTE,
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(file)
+
+	mapping, err := windows.CreateFileMapping(file, nil, windows.PAGE_EXECUTE_WRITECOPY, 0, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := windows.MapViewOfFile(mapping, windows.FILE_MAP_COPY|windows.FILE_MAP_EXECUTE, 0, 0, size)
+	if err != nil {
+		_ = windows.CloseHandle(mapping)
+		return nil, err
+	}
+	return &allocation{addr: addr, size: size, mapping: mapping}, nil
+}
+
 func (a *allocation) bytes() []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(a.addr)), int(a.size))
 }
@@ -352,6 +462,19 @@ func (a *allocation) bytes() []byte {
 func (a *allocation) free() error {
 	if a == nil || a.addr == 0 {
 		return nil
+	}
+	if a.mapping != 0 {
+		var first error
+		if err := windows.UnmapViewOfFile(a.addr); err != nil && first == nil {
+			first = err
+		}
+		if err := windows.CloseHandle(a.mapping); err != nil && first == nil {
+			first = err
+		}
+		a.addr = 0
+		a.size = 0
+		a.mapping = 0
+		return first
 	}
 	const memRelease = 0x8000
 	r1, _, err := procVirtualFree.Call(a.addr, 0, memRelease)
@@ -499,6 +622,59 @@ func setVirtualProcessorRegisters(part partitionHandle, vpIndex uint32, names []
 	runtime.KeepAlive(names)
 	runtime.KeepAlive(values)
 	runtime.KeepAlive(backing)
+	return err
+}
+
+func getVirtualProcessorState(part partitionHandle, vpIndex uint32, stateType virtualProcessorStateType) ([]byte, error) {
+	var written uint32
+	probe := []byte{0}
+	err := callGetVirtualProcessorState(part, vpIndex, stateType, probe, &written)
+	if err == nil {
+		return probe[:written], nil
+	}
+	if written == 0 {
+		return nil, err
+	}
+	buf := make([]byte, written)
+	if err := callGetVirtualProcessorState(part, vpIndex, stateType, buf, &written); err != nil {
+		return nil, err
+	}
+	return buf[:written], nil
+}
+
+func callGetVirtualProcessorState(part partitionHandle, vpIndex uint32, stateType virtualProcessorStateType, buf []byte, written *uint32) error {
+	if len(buf) == 0 {
+		return fmt.Errorf("virtual processor state buffer is empty")
+	}
+	r1, _, callErr := procWHvGetVirtualProcessorState.Call(
+		uintptr(part),
+		uintptr(vpIndex),
+		uintptr(stateType),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		uintptr(unsafe.Pointer(written)),
+	)
+	if callErr != syscall.Errno(0) && r1 == 0 {
+		return callErr
+	}
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(written)
+	return hresult(int32(r1)).Err()
+}
+
+func setVirtualProcessorState(part partitionHandle, vpIndex uint32, stateType virtualProcessorStateType, buf []byte) error {
+	if len(buf) == 0 {
+		return fmt.Errorf("virtual processor state buffer is empty")
+	}
+	err := callHRESULT(
+		procWHvSetVirtualProcessorState,
+		uintptr(part),
+		uintptr(vpIndex),
+		uintptr(stateType),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	runtime.KeepAlive(buf)
 	return err
 }
 

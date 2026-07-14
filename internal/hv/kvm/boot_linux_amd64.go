@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/nvme"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
@@ -54,7 +55,7 @@ func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []by
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -63,30 +64,35 @@ func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initr
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
-func BootInitramfsToMarkerWithPCIBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *virtio.Block) (string, error) {
+func BootInitramfsToMarkerWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *nvme.Controller) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, func(serial string) bool {
+	return bootToConditionWithNVMeBlock(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, nil, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, done)
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, block *virtio.Block, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, done func(string) bool) (string, error) {
+	return bootToConditionWithNVMeBlock(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, nil, done)
+}
+
+func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, nvmeBlock *nvme.Controller, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
 	}
 	defer vm.Close()
+	defer closeFSDevices(fsdevs)
 
 	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {
@@ -107,9 +113,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		netdev.Attach(vm, vm)
 	}
 	var pci *PCIBus
-	if block != nil {
-		block.Attach(vm, vm)
-		pci = NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+	if nvmeBlock != nil {
+		nvmeBlock.Attach(vm, vm)
+		pci = NewPCIBus(NewNVMePCIDevice(1, 0xfeb00000, 10, nvmeBlock))
 	}
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	rng.Attach(vm, vm)
@@ -121,11 +127,11 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
-	if block != nil {
+	if nvmeBlock != nil {
 		extraCmdline = append(extraCmdline, "acpi=off", "pci=conf1")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
-	if block == nil {
+	if nvmeBlock == nil {
 		extraCmdline = append(extraCmdline, linuxKVMHostKernelArgs()...)
 	}
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
@@ -179,7 +185,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
+			if err := handleBootMMIOWithPCI(vm, 0, pci, fsdevs, vsock, rng, nil, netdev, exit.MMIO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitHLT, ExitShutdown:
@@ -247,11 +253,11 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 	return nil
 }
 
-func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
-	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, netdev, mmio)
+func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
+	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, balloon, netdev, mmio)
 }
 
-func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
@@ -282,6 +288,17 @@ func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *vi
 			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := rng.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
+		return nil
+	}
+	if balloon != nil && balloon.Contains(mmio.Addr, int(mmio.Len)) {
+		if mmio.Write {
+			return balloon.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := balloon.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

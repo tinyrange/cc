@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -42,10 +43,11 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\necho test init\n"), machine.NetworkSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	baseTar := strings.TrimSuffix(baseTXZ, filepath.Ext(baseTXZ)) + ".tar"
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
@@ -64,8 +66,9 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "cc-freebsd-init") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", data)
+	if !textHasFields(string(data), "/sbin/ifconfig", "vtnet0", "inet", "10.42.0.2", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(string(data), "/sbin/route", "add", "default", "10.42.0.1", "||", "true") {
+		t.Fatalf("init script does not configure the leased network: %q", data)
 	}
 	agentEntry, err := imagefs.LookupPath(root, "/sbin/cc-freebsd-init")
 	if err != nil {
@@ -75,15 +78,11 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(agentData), "test init") {
+	if string(agentData) != "#!/bin/sh\necho test init\n" {
 		t.Fatalf("unexpected /sbin/cc-freebsd-init overlay: %q", agentData)
 	}
-	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vtnet0 inet 10.42.0.2 ") {
-		t.Fatalf("default init script does not configure default IP: %q", initScript)
-	}
 	rcConf := readRootFile(t, root, "/etc/rc.conf")
-	if !strings.Contains(rcConf, `ifconfig_vtnet0="inet 10.42.0.2 netmask 255.255.255.0"`) {
+	if !textHasLine(rcConf, `ifconfig_vtnet0="inet 10.42.0.2 netmask 255.255.255.0"`) {
 		t.Fatalf("default rc.conf does not contain default IP: %q", rcConf)
 	}
 }
@@ -106,30 +105,23 @@ func TestBuildManagedRootFromFreeBSDBaseSetUsesGuestIPv4(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeRoot()
-	initScript := readRootFile(t, root, "/sbin/init")
-	if !strings.Contains(initScript, "ifconfig vtnet1 inet 10.42.0.8 ") {
-		t.Fatalf("init script does not configure leased IP: %q", initScript)
-	}
-	if !strings.Contains(initScript, "route add default 10.42.0.9") {
-		t.Fatalf("init script does not configure gateway: %q", initScript)
-	}
 	rcConf := readRootFile(t, root, "/etc/rc.conf")
-	if !strings.Contains(rcConf, `ifconfig_vtnet1="inet 10.42.0.8 netmask 255.255.255.0"`) {
+	if !textHasLine(rcConf, `ifconfig_vtnet1="inet 10.42.0.8 netmask 255.255.255.0"`) {
 		t.Fatalf("rc.conf does not contain leased IP: %q", rcConf)
 	}
-	if !strings.Contains(rcConf, `hostname="test-freebsd"`) || !strings.Contains(rcConf, `defaultrouter="10.42.0.9"`) {
+	if !textHasLine(rcConf, `hostname="test-freebsd"`) || !textHasLine(rcConf, `defaultrouter="10.42.0.9"`) {
 		t.Fatalf("rc.conf does not contain structured network identity: %q", rcConf)
 	}
 	hosts := readRootFile(t, root, "/etc/hosts")
-	if !strings.Contains(hosts, "10.42.0.8 test-freebsd") {
+	if !textHasLine(hosts, "10.42.0.8 test-freebsd") {
 		t.Fatalf("hosts does not contain leased IP: %q", hosts)
 	}
 	resolv := readRootFile(t, root, "/etc/resolv.conf")
-	if !strings.Contains(resolv, "nameserver 10.42.0.10") {
+	if !textHasLine(resolv, "nameserver 10.42.0.10") {
 		t.Fatalf("resolv.conf does not contain DNS IP: %q", resolv)
 	}
 	services := readRootFile(t, root, "/etc/services")
-	if !strings.Contains(services, "nfs") || !strings.Contains(services, "2049/tcp") || !strings.Contains(services, "sunrpc") {
+	if !textHasFields(services, "nfs", "2049/tcp") || !textHasFields(services, "sunrpc", "111/tcp") {
 		t.Fatalf("services does not contain NFS RPC entries: %q", services)
 	}
 }
@@ -205,6 +197,24 @@ func writeTXZFixture(t *testing.T, entries []tarFixtureEntry) string {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func textHasLine(text, want string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+func textHasFields(text string, want ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if reflect.DeepEqual(strings.Fields(line), want) {
+			return true
+		}
+	}
+	return false
 }
 
 func localFreeBSDFixture(t *testing.T, name string) string {

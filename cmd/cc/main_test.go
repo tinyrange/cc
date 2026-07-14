@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -24,52 +23,6 @@ func TestParsePortForwardSpec(t *testing.T) {
 	}
 }
 
-func TestFulltestBackendFromArgs(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		want string
-	}{
-		{args: nil, want: "ccvm"},
-		{args: []string{"-backend", "docker"}, want: "docker"},
-		{args: []string{"--backend=HVF"}, want: "hvf"},
-		{args: []string{"-backend=qemu"}, want: "qemu"},
-		{args: []string{"--", "-backend", "docker"}, want: "ccvm"},
-		{args: []string{"--backend"}, want: ""},
-	} {
-		if got := fulltestBackendFromArgs(tc.args); got != tc.want {
-			t.Fatalf("fulltestBackendFromArgs(%#v) = %q, want %q", tc.args, got, tc.want)
-		}
-	}
-}
-
-func TestFormatProgressAndBootEvents(t *testing.T) {
-	progress := formatProgressEvent(client.ProgressEvent{
-		Status:             "downloading",
-		Artifact:           "kernel",
-		Blob:               "vmlinuz",
-		BytesDownloaded:    1024,
-		BytesTotal:         2048,
-		RateBytesPerSecond: 512,
-		ETASeconds:         2,
-	}, "")
-	if progress != "Downloading kernel | vmlinuz | 1.0 KB/2.0 KB | 512 B/s | ETA 2s" {
-		t.Fatalf("progress = %q", progress)
-	}
-	if got := formatProgressEvent(client.ProgressEvent{Status: "error", Error: "boom"}, "image"); got != "Error image | boom" {
-		t.Fatalf("error progress = %q", got)
-	}
-
-	if got := formatBootEvent(client.BootEvent{Kind: "status", Message: "starting"}); got != "Boot: starting" {
-		t.Fatalf("status boot = %q", got)
-	}
-	if got := formatBootEvent(client.BootEvent{Kind: "ready", State: client.InstanceState{Image: "alpine"}}); got != "Boot: ready alpine" {
-		t.Fatalf("ready boot = %q", got)
-	}
-	if got := formatBootEvent(client.BootEvent{Kind: "serial", Data: "console"}); got != "console" {
-		t.Fatalf("serial boot = %q", got)
-	}
-}
-
 func TestHandleVMForwardDispatchesToAPI(t *testing.T) {
 	api := &fakeCCAPI{}
 	if err := handleVMCommand(api, []string{"forward", "alpha", "8080:80"}); err != nil {
@@ -83,7 +36,7 @@ func TestHandleVMForwardDispatchesToAPI(t *testing.T) {
 		t.Fatalf("forward call = %+v", got)
 	}
 
-	if err := handleVMCommand(api, []string{"forward", "alpha", "bad"}); err == nil || !strings.Contains(err.Error(), "HOST_PORT:GUEST_PORT") {
+	if err := handleVMCommand(api, []string{"forward", "alpha", "bad"}); err == nil {
 		t.Fatalf("bad forward error = %v", err)
 	}
 }

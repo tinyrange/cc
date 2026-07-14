@@ -307,6 +307,25 @@ func (v *Vsock) Summary() string {
 	)
 }
 
+func (v *Vsock) IRQAsserted() bool {
+	if v == nil {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.interruptStatus != 0 || v.irqHigh
+}
+
+func (v *Vsock) Kick() error {
+	if v == nil {
+		return nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.interruptStatus |= vsockInterruptVring
+	return v.updateIRQLocked()
+}
+
 func (v *Vsock) processTXLocked() error {
 	q := &v.queues[vsockQueueTX]
 	if !q.ready || q.size == 0 || v.mem == nil {
@@ -707,6 +726,9 @@ func (v *Vsock) updateIRQLocked() error {
 	}
 	level := v.interruptStatus != 0
 	if v.irqHigh == level {
+		if level {
+			return v.irq.SetIRQ(v.IRQ, true)
+		}
 		return nil
 	}
 	v.irqHigh = level

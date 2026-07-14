@@ -139,6 +139,8 @@ target_binary_name() {
 }
 
 build_guestinit_payloads() {
+  local target_goarch="$1"
+
   mkdir -p "${ROOT_DIR}/build"
   CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
     go build -o "${ROOT_DIR}/build/init-linux-arm64" ./internal/cmd/init
@@ -147,6 +149,13 @@ build_guestinit_payloads() {
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -o "${ROOT_DIR}/build/init-linux-amd64" ./internal/cmd/init
   install -m 644 "${ROOT_DIR}/build/init-linux-amd64" "${GUESTINIT_AMD64_EMBED_PATH}"
+
+  for bsd in openbsd freebsd netbsd; do
+    CGO_ENABLED=0 GOOS="${bsd}" GOARCH="${target_goarch}" \
+      go build -o "${ROOT_DIR}/build/guest-init-${bsd}-${target_goarch}" "./internal/cmd/${bsd}-init"
+    install -m 644 "${ROOT_DIR}/build/guest-init-${bsd}-${target_goarch}" \
+      "${ROOT_DIR}/internal/${bsd}/guestinit/guest-init-${bsd}-${target_goarch}"
+  done
 }
 
 build_ccvm_for_target() {
@@ -157,8 +166,10 @@ build_ccvm_for_target() {
   suffix="$(target_suffix "${target}")"
   local output="${ROOT_DIR}/build/ccvm-${goos}-${goarch}${suffix}"
 
+  build_guestinit_payloads "${goarch}"
+
   CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-    go build -tags embed_guestinit -o "${output}" ./cmd/ccvm
+    go build -o "${output}" ./cmd/ccvm
 
   rm -rf "${PACKAGE_BIN_DIR}"
   mkdir -p "${PACKAGE_BIN_DIR}"

@@ -47,16 +47,16 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if b == nil || b.kernel == nil || b.images == nil {
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
+	if b == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
 	}
-	kernel, err := b.kernel.ReadKernel()
-	if err != nil {
-		return nil, err
-	}
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
 	image, err := b.images.Open(req.Image)
 	if err != nil {
 		return nil, err
@@ -65,10 +65,6 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withWindowsRuntimeMountDirs(image)
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
-	if err != nil {
-		return nil, err
-	}
 	network, err := newWindowsAMD64NetworkRuntime(req.Network)
 	if err != nil {
 		return nil, err
@@ -87,19 +83,60 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
-	if err != nil {
-		return nil, fmt.Errorf("build guest init: %w", err)
-	}
 	workDir := image.Config.WorkingDir
 	if workDir == "" {
 		workDir = "/"
+	}
+	if restoreSnapshot != "" {
+		started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+			Profile: managedguest.LinuxProfile,
+			Host:    whp.Host{},
+			Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+			Attachments: whp.LinuxManagedAttachments{
+				FSDevices:       fsdevs,
+				NetDevice:       windowsNetworkDevice(network),
+				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+				RestoreSnapshot: restoreSnapshot,
+			},
+		}, onEvent)
+		if err != nil {
+			if network != nil {
+				_ = network.Close()
+			}
+			return nil, err
+		}
+		return &windowsInstance{
+			managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
+			image:               image,
+			rootFS:              rootFS,
+			fsdevs:              fsdevs,
+			network:             network,
+			dmesg:               req.Dmesg,
+		}, nil
+	}
+	if b.kernel == nil {
+		return nil, fmt.Errorf("runtime backend is not configured")
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return nil, err
+	}
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
+	if err != nil {
+		return nil, err
+	}
+	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+	if err != nil {
+		return nil, fmt.Errorf("build guest init: %w", err)
 	}
 	initCfg := windowsGuestInitConfig(modules, true)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
@@ -113,8 +150,10 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			Initrd: initrd,
 		},
 		Attachments: whp.LinuxManagedAttachments{
-			FSDevices: fsdevs,
-			NetDevice: windowsNetworkDevice(network),
+			FSDevices:       fsdevs,
+			NetDevice:       windowsNetworkDevice(network),
+			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
 	}, onEvent)
 	if err != nil {
@@ -135,19 +174,31 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	if b == nil || b.kernel == nil || b.images == nil {
+	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
+	if b == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
 	}
-	kernel, err := b.kernel.ReadKernel()
-	if err != nil {
-		return nil, err
-	}
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(req.Image) != "" {
+		return b.StartStream(ctx, client.CreateInstanceRequest{
+			ID:              req.ID,
+			Image:           req.Image,
+			InitSystem:      req.InitSystem,
+			Kernel:          req.Kernel,
+			Network:         req.Network,
+			KernelModules:   append([]string(nil), req.KernelModules...),
+			MemoryMB:        req.MemoryMB,
+			CPUs:            req.CPUs,
+			NestedVirt:      req.NestedVirt,
+			Dmesg:           req.Dmesg,
+			SnapshotDir:     req.SnapshotDir,
+			RestoreSnapshot: req.RestoreSnapshot,
+			TimeoutSeconds:  req.TimeoutSeconds,
+		}, onEvent)
 	}
 	network, err := newWindowsAMD64NetworkRuntime(req.Network)
 	if err != nil {
@@ -167,6 +218,44 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
+	if restoreSnapshot != "" {
+		started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
+			Profile: managedguest.LinuxProfile,
+			Host:    whp.Host{},
+			Spec:    windowsLinuxMachineSpec(req.MemoryMB, req.CPUs, req.Dmesg),
+			Attachments: whp.LinuxManagedAttachments{
+				FSDevices:       fsdevs,
+				NetDevice:       windowsNetworkDevice(network),
+				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+				RestoreSnapshot: restoreSnapshot,
+			},
+		}, onEvent)
+		if err != nil {
+			if network != nil {
+				_ = network.Close()
+			}
+			return nil, err
+		}
+		return &windowsInstance{
+			managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(nil), "/"),
+			rootFS:              rootFS,
+			fsdevs:              fsdevs,
+			network:             network,
+			dmesg:               req.Dmesg,
+		}, nil
+	}
+	if b.kernel == nil {
+		return nil, fmt.Errorf("runtime backend is not configured")
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return nil, err
+	}
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
+	if err != nil {
+		return nil, err
+	}
 	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
@@ -176,6 +265,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
@@ -189,8 +281,10 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Initrd: initrd,
 		},
 		Attachments: whp.LinuxManagedAttachments{
-			FSDevices: fsdevs,
-			NetDevice: windowsNetworkDevice(network),
+			FSDevices:       fsdevs,
+			NetDevice:       windowsNetworkDevice(network),
+			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
+			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
 	}, onEvent)
 	if err != nil {
@@ -206,6 +300,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
+	}
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -595,7 +692,11 @@ func (i *windowsInstance) Close() error {
 	if core := i.core(); core != nil {
 		session = core.Session()
 	}
-	return hostmanaged.CloseSessionWithNetwork(session, i.network)
+	var network hostmanaged.NetworkCloser
+	if i.network != nil {
+		network = i.network
+	}
+	return hostmanaged.CloseSessionWithNetwork(session, network)
 }
 
 func (i *windowsInstance) NetworkIPv4() string {

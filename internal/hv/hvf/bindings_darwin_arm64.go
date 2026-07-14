@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/timing"
 
 	"github.com/ebitengine/purego"
+	"golang.org/x/sys/unix"
 )
 
 type Return int32
@@ -123,7 +124,22 @@ const (
 	hvRegXZR                    Reg         = 0xffffffff
 
 	hvSysRegSP_EL1           SysReg = 0xe208
+	hvSysRegSPSR_EL1         SysReg = 0xc200
+	hvSysRegELR_EL1          SysReg = 0xc201
+	hvSysRegSP_EL0           SysReg = 0xc208
+	hvSysRegSCTLR_EL1        SysReg = 0xc080
+	hvSysRegCPACR_EL1        SysReg = 0xc082
+	hvSysRegTCR_EL1          SysReg = 0xc102
+	hvSysRegTTBR0EL1         SysReg = 0xc100
 	hvSysRegTTBR1EL1         SysReg = 0xc101
+	hvSysRegESR_EL1          SysReg = 0xc290
+	hvSysRegFAR_EL1          SysReg = 0xc300
+	hvSysRegMAIR_EL1         SysReg = 0xc510
+	hvSysRegAMAIR_EL1        SysReg = 0xc518
+	hvSysRegCONTEXTIDR_EL1   SysReg = 0xc681
+	hvSysRegTPIDR_EL1        SysReg = 0xc684
+	hvSysRegTPIDR_EL0        SysReg = 0xde82
+	hvSysRegTPIDRRO_EL0      SysReg = 0xde83
 	hvSysRegMPIDR_EL1        SysReg = 0xc005
 	hvSysRegID_AA64PFR0_EL1  SysReg = 0xc020
 	hvSysRegID_AA64PFR1_EL1  SysReg = 0xc021
@@ -135,6 +151,13 @@ const (
 	hvSysRegVBAR_EL1         SysReg = 0xc600
 	hvSysRegCNTHCTL_EL2      SysReg = 0xe708
 	hvSysRegCNTVOFF_EL2      SysReg = 0xe703
+	hvSysRegCNTFRQ_EL0       SysReg = 0xdf00
+	hvSysRegCNTP_TVAL_EL0    SysReg = 0xdf10
+	hvSysRegCNTP_CTL_EL0     SysReg = 0xdf11
+	hvSysRegCNTP_CVAL_EL0    SysReg = 0xdf12
+	hvSysRegCNTV_TVAL_EL0    SysReg = 0xdf18
+	hvSysRegCNTV_CTL_EL0     SysReg = 0xdf19
+	hvSysRegCNTV_CVAL_EL0    SysReg = 0xdf1a
 	hvSysRegCPTR_EL2         SysReg = 0xe08a
 	hvSysRegHCR_EL2          SysReg = 0xe088
 	hvSysRegSP_EL2           SysReg = 0xf208
@@ -828,6 +851,41 @@ func (v *VM) SetVTimerMask(masked bool) error {
 	v.threadCh <- func() {
 		if ret := hvVcpuSetVtimerMask(v.vcpu, masked); ret != hvSuccess {
 			errCh <- fmt.Errorf("set vtimer mask: %w", ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) GetVTimerOffset() (uint64, error) {
+	respCh := make(chan struct {
+		offset uint64
+		err    error
+	}, 1)
+	v.threadCh <- func() {
+		var offset uint64
+		if ret := hvVcpuGetVtimerOffset(v.vcpu, &offset); ret != hvSuccess {
+			respCh <- struct {
+				offset uint64
+				err    error
+			}{err: fmt.Errorf("get vtimer offset: %w", ret)}
+			return
+		}
+		respCh <- struct {
+			offset uint64
+			err    error
+		}{offset: offset}
+	}
+	res := <-respCh
+	return res.offset, res.err
+}
+
+func (v *VM) SetVTimerOffset(offset uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuSetVtimerOffset(v.vcpu, offset); ret != hvSuccess {
+			errCh <- fmt.Errorf("set vtimer offset: %w", ret)
 			return
 		}
 		errCh <- nil
@@ -1672,6 +1730,24 @@ func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
 		return m.mem[off : off+uint64(size)], nil
 	}
 	return nil, fmt.Errorf("slice guest memory %#x size %d: unmapped", addr, size)
+}
+
+func (v *VM) ReclaimGuestPage(ipa uint64) error {
+	page, err := v.SliceIPA(ipa, 4096)
+	if err != nil {
+		return err
+	}
+	if uintptr(unsafe.Pointer(&page[0]))%4096 != 0 {
+		return fmt.Errorf("reclaim guest page %#x: host mapping is not page-aligned", ipa)
+	}
+	if err := unix.Madvise(page, unix.MADV_FREE); err != nil {
+		return fmt.Errorf("reclaim guest page %#x: %w", ipa, err)
+	}
+	return nil
+}
+
+func (v *VM) ReuseGuestPage(ipa uint64) error {
+	return nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {

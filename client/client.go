@@ -15,23 +15,81 @@ import (
 )
 
 type Client struct {
-	url    string
-	dialer func() (net.Conn, error)
-	client http.Client
+	url     string
+	dialer  func() (net.Conn, error)
+	headers http.Header
+	client  http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
-	return &Client{
+	c := &Client{
 		url:    url,
 		dialer: dialer,
-		client: http.Client{
-			Transport: &http.Transport{
+	}
+	c.client = http.Client{
+		Transport: &authTransport{
+			base: &http.Transport{
 				Dial: func(_, _ string) (net.Conn, error) {
-					return dialer()
+					return c.dialer()
 				},
+			},
+			token: func() string {
+				return c.headers.Get("Authorization")
+			},
+			headers: func() http.Header {
+				return c.headers.Clone()
 			},
 		},
 	}
+	return c
+}
+
+type authTransport struct {
+	base    http.RoundTripper
+	token   func() string
+	headers func() http.Header
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	if t.headers != nil {
+		for key, values := range t.headers() {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
+	if t.token != nil {
+		if token := strings.TrimSpace(t.token()); token != "" {
+			req.Header.Set("Authorization", token)
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
+func (c *Client) SetBearerToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		c.SetHeader("Authorization", "")
+		return
+	}
+	c.SetHeader("Authorization", "Bearer "+token)
+}
+
+func (c *Client) SetHeader(key, value string) {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" {
+		return
+	}
+	if c.headers == nil {
+		c.headers = http.Header{}
+	}
+	if value == "" {
+		c.headers.Del(key)
+		return
+	}
+	c.headers.Set(key, value)
 }
 
 func (c *Client) HealthCheck() error {
@@ -62,6 +120,15 @@ func (c *Client) Shutdown() error {
 		return decodeErrorResponse(resp)
 	}
 	return nil
+}
+
+func (c *Client) RouteExists(path string) bool {
+	resp, err := c.client.Get(c.url + path)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode != http.StatusNotFound
 }
 
 func (c *Client) KernelStatus() (KernelState, error) {
@@ -386,6 +453,7 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 	if err != nil {
 		return err
 	}
+	c.applyWebSocketAuth(cfg)
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
@@ -539,6 +607,7 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 	if err != nil {
 		return err
 	}
+	c.applyWebSocketAuth(cfg)
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
@@ -572,6 +641,22 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		return sendErrValue
 	}
 	return err
+}
+
+func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
+	if cfg == nil {
+		return
+	}
+	if c.headers != nil {
+		if cfg.Header == nil {
+			cfg.Header = http.Header{}
+		}
+		for key, values := range c.headers {
+			for _, value := range values {
+				cfg.Header.Add(key, value)
+			}
+		}
+	}
 }
 
 func (c *Client) ExecStreamIn(id string, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
@@ -615,10 +700,11 @@ func (c *Client) VMStatus() (VMState, error)                  { return c.Instanc
 func (c *Client) ShutdownVM() error                           { return c.ShutdownInstance() }
 func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
 	return c.Run(RunRequest{
-		Image:    req.Image,
-		MemoryMB: req.MemoryMB,
-		CPUs:     req.CPUs,
-		Dmesg:    req.Dmesg,
+		Image:     req.Image,
+		MemoryMB:  req.MemoryMB,
+		BalloonMB: req.BalloonMB,
+		CPUs:      req.CPUs,
+		Dmesg:     req.Dmesg,
 	})
 }
 

@@ -10,12 +10,15 @@ import (
 )
 
 type BootConfig struct {
-	MemoryMB   uint64
-	NumCPUs    int
-	GICVersion bootarm64.GICVersion
-	Dmesg      bool
-	ExtraNodes []fdt.Node
-	RecordTime func(name string, duration time.Duration)
+	MemoryMB             uint64
+	NumCPUs              int
+	GICVersion           bootarm64.GICVersion
+	Dmesg                bool
+	DisableUART          bool
+	DisableSerialConsole bool
+	HyperVTimer          bool
+	ExtraNodes           []fdt.Node
+	RecordTime           func(name string, duration time.Duration)
 }
 
 func MemorySizeBytes(memoryMB uint64) uint64 {
@@ -25,12 +28,14 @@ func MemorySizeBytes(memoryMB uint64) uint64 {
 	return memoryMB << 20
 }
 
-func BootCommandLine(dmesg bool) string {
+func BootCommandLine(dmesg bool, serialConsole bool) string {
 	args := []string{
-		"console=ttyS0,115200n8",
 		"nokaslr",
 		"panic=-1",
 		"rdinit=/init",
+	}
+	if serialConsole {
+		args = append([]string{"console=ttyS0,115200n8"}, args...)
 	}
 	if dmesg {
 		args = append([]string{
@@ -43,15 +48,19 @@ func BootCommandLine(dmesg bool) string {
 }
 
 func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*bootarm64.BootPlan, error) {
+	serialConsole := !cfg.DisableUART && !cfg.DisableSerialConsole
+	cmdline := BootCommandLine(cfg.Dmesg, serialConsole)
 	return bootarm64.PrepareBoot(memory, kernel, bootarm64.BootOptions{
-		MemoryBase: MemoryBase,
-		MemorySize: MemorySizeBytes(cfg.MemoryMB),
-		NumCPUs:    cfg.NumCPUs,
-		GICVersion: cfg.GICVersion,
-		Initrd:     initrd,
-		Console:    true,
-		ExtraNodes: append([]fdt.Node(nil), cfg.ExtraNodes...),
-		RecordTime: cfg.RecordTime,
-		Cmdline:    BootCommandLine(cfg.Dmesg),
+		MemoryBase:  MemoryBase,
+		MemorySize:  MemorySizeBytes(cfg.MemoryMB),
+		NumCPUs:     cfg.NumCPUs,
+		GICVersion:  cfg.GICVersion,
+		Initrd:      initrd,
+		DisableUART: cfg.DisableUART,
+		Console:     serialConsole,
+		HyperVTimer: cfg.HyperVTimer,
+		ExtraNodes:  append([]fdt.Node(nil), cfg.ExtraNodes...),
+		RecordTime:  cfg.RecordTime,
+		Cmdline:     cmdline,
 	})
 }

@@ -26,10 +26,15 @@ const (
 	defaultGICDistributorSize           = 0x00010000
 	defaultGICv2CPUInterfaceBase        = 0x08010000
 	defaultGICv2CPUInterfaceSize        = 0x00002000
+	defaultGICITSBase                   = 0x08080000
+	defaultGICITSSize                   = 0x00020000
 	defaultGICRedistributorBase         = 0x080a0000
 	defaultGICRedistributorSize         = 0x00020000
 	gicDefaultPhandle            uint32 = 1
+	gicITSDefaultPhandle         uint32 = 2
 )
+
+const DefaultGICITSPhandle = gicITSDefaultPhandle
 
 type GICVersion int
 
@@ -40,13 +45,17 @@ const (
 )
 
 type BootOptions struct {
-	MemoryBase uint64
-	MemorySize uint64
-	NumCPUs    int
-	GICVersion GICVersion
-	UART       *UARTConfig
-	Console    bool
-	ExtraNodes []fdt.Node
+	MemoryBase                      uint64
+	MemorySize                      uint64
+	NumCPUs                         int
+	GICVersion                      GICVersion
+	UART                            *UARTConfig
+	Console                         bool
+	VirtualTimerPPI                 uint32
+	EnableGICITS                    bool
+	UsePMRShiftForInterruptPriority bool
+	DisableNVMeINTxMasking          bool
+	ExtraNodes                      []fdt.Node
 }
 
 type UARTConfig struct {
@@ -103,15 +112,26 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if err != nil {
 		return nil, err
 	}
-
+	if opts.UsePMRShiftForInterruptPriority {
+		if err := patchAGINTCPriorityShift(memory, kernelFile); err != nil {
+			return nil, err
+		}
+	}
+	if opts.DisableNVMeINTxMasking {
+		if err := patchNVMeINTxMasking(memory, kernelFile); err != nil {
+			return nil, err
+		}
+	}
 	dtb, err := buildDeviceTree(deviceTreeConfig{
-		MemoryBase: opts.MemoryBase,
-		MemorySize: opts.MemorySize,
-		NumCPUs:    opts.NumCPUs,
-		GICVersion: opts.GICVersion,
-		UART:       opts.UART,
-		Console:    opts.Console,
-		ExtraNodes: append([]fdt.Node(nil), opts.ExtraNodes...),
+		MemoryBase:      opts.MemoryBase,
+		MemorySize:      opts.MemorySize,
+		NumCPUs:         opts.NumCPUs,
+		GICVersion:      opts.GICVersion,
+		UART:            opts.UART,
+		Console:         opts.Console,
+		VirtualTimerPPI: opts.VirtualTimerPPI,
+		EnableGICITS:    opts.EnableGICITS,
+		ExtraNodes:      append([]fdt.Node(nil), opts.ExtraNodes...),
 	})
 	if err != nil {
 		return nil, err
@@ -178,14 +198,133 @@ func loadELF(memory []byte, kernel []byte, memoryBase uint64) (uint64, uint64, u
 	return entryGPA, kernelEndVA, kernelEndGPA, nil
 }
 
+func patchAGINTCPriorityShift(memory []byte, kernel []byte) error {
+	f, err := elf.NewFile(bytes.NewReader(kernel))
+	if err != nil {
+		return fmt.Errorf("parse OpenBSD kernel ELF for agintc priority patch: %w", err)
+	}
+	syms, err := f.Symbols()
+	if err != nil {
+		return fmt.Errorf("read OpenBSD kernel symbols for agintc priority patch: %w", err)
+	}
+	if err := patchAGINTCFunctionPriorityShift(memory, syms, "agintc_set_priority", 96); err != nil {
+		return err
+	}
+	if err := patchAGINTCFunctionPriorityShift(memory, syms, "agintc_calc_irq", 768); err != nil {
+		return err
+	}
+	return nil
+}
+
+func patchAGINTCFunctionPriorityShift(memory []byte, syms []elf.Symbol, name string, scanSize uint64) error {
+	var symbol *elf.Symbol
+	for i := range syms {
+		if syms[i].Name == name {
+			symbol = &syms[i]
+			break
+		}
+	}
+	if symbol == nil {
+		return fmt.Errorf("OpenBSD kernel missing %s symbol", name)
+	}
+	if symbol.Value < kernelBaseVA {
+		return fmt.Errorf("OpenBSD %s value %#x below kernel base %#x", name, symbol.Value, uint64(kernelBaseVA))
+	}
+	start := symbol.Value - kernelBaseVA
+	if start >= uint64(len(memory)) {
+		return fmt.Errorf("OpenBSD %s offset %#x exceeds guest memory %#x", name, start, len(memory))
+	}
+
+	code := memory[start:min(start+scanSize, uint64(len(memory)))]
+	old := []byte{0x0a, 0x30, 0x43, 0xb9}     // ldr w10, [x0, #816]  ; sc_prio_shift
+	newInst := []byte{0x0a, 0x34, 0x43, 0xb9} // ldr w10, [x0, #820]  ; sc_pmr_shift
+	idx := bytes.Index(code, old)
+	if idx < 0 {
+		return fmt.Errorf("OpenBSD %s patch instruction not found", name)
+	}
+	if bytes.Index(code[idx+1:], old) >= 0 {
+		return fmt.Errorf("OpenBSD %s patch instruction is ambiguous", name)
+	}
+	copy(code[idx:], newInst)
+	return nil
+}
+
+func patchNVMeINTxMasking(memory []byte, kernel []byte) error {
+	f, err := elf.NewFile(bytes.NewReader(kernel))
+	if err != nil {
+		return fmt.Errorf("parse OpenBSD kernel ELF for nvme intx patch: %w", err)
+	}
+	syms, err := f.Symbols()
+	if err != nil {
+		return fmt.Errorf("read OpenBSD kernel symbols for nvme intx patch: %w", err)
+	}
+	symbol, err := openBSDKernelSymbol(syms, "nvme_intr_intx")
+	if err != nil {
+		return err
+	}
+	start := symbol.Value - kernelBaseVA
+	if start >= uint64(len(memory)) {
+		return fmt.Errorf("OpenBSD nvme_intr_intx offset %#x exceeds guest memory %#x", start, len(memory))
+	}
+	code := memory[start:min(start+192, uint64(len(memory)))]
+	nop := []byte{0x1f, 0x20, 0x03, 0xd5}
+	patterns := [][]byte{
+		{
+			0x00, 0x2c, 0x40, 0xf9, // ldr x0, [x0, #88]
+			0x82, 0x01, 0x80, 0x52, // mov w2, #12 ; NVME_INTMS
+			0x61, 0x32, 0x40, 0xf9, // ldr x1, [x19, #96]
+			0x23, 0x00, 0x80, 0x52, // mov w3, #1
+			0x08, 0x1c, 0x40, 0xf9, // ldr x8, [x0, #56]
+			0x00, 0x01, 0x3f, 0xd6, // blr x8
+		},
+		{
+			0x68, 0x86, 0x45, 0xa9, // ldp x8, x1, [x19, #88]
+			0x09, 0x00, 0x14, 0x2a, // orr w9, w0, w20
+			0x3f, 0x01, 0x00, 0x71, // cmp w9, #0
+			0x02, 0x02, 0x80, 0x52, // mov w2, #16 ; NVME_INTMC
+			0x23, 0x00, 0x80, 0x52, // mov w3, #1
+			0xf3, 0x07, 0x9f, 0x1a, // cset w19, ne
+			0x09, 0x1d, 0x40, 0xf9, // ldr x9, [x8, #56]
+			0xe0, 0x03, 0x08, 0xaa, // mov x0, x8
+			0x20, 0x01, 0x3f, 0xd6, // blr x9
+		},
+	}
+	for _, pattern := range patterns {
+		idx := bytes.Index(code, pattern)
+		if idx < 0 {
+			return fmt.Errorf("OpenBSD nvme_intr_intx patch pattern not found")
+		}
+		if bytes.Index(code[idx+1:], pattern) >= 0 {
+			return fmt.Errorf("OpenBSD nvme_intr_intx patch pattern is ambiguous")
+		}
+		copy(code[idx+len(pattern)-4:], nop)
+	}
+	return nil
+}
+
+func openBSDKernelSymbol(syms []elf.Symbol, name string) (*elf.Symbol, error) {
+	for i := range syms {
+		if syms[i].Name != name {
+			continue
+		}
+		if syms[i].Value < kernelBaseVA {
+			return nil, fmt.Errorf("OpenBSD %s value %#x below kernel base %#x", name, syms[i].Value, uint64(kernelBaseVA))
+		}
+		return &syms[i], nil
+	}
+	return nil, fmt.Errorf("OpenBSD kernel missing %s symbol", name)
+}
+
 type deviceTreeConfig struct {
-	MemoryBase uint64
-	MemorySize uint64
-	NumCPUs    int
-	GICVersion GICVersion
-	UART       *UARTConfig
-	Console    bool
-	ExtraNodes []fdt.Node
+	MemoryBase      uint64
+	MemorySize      uint64
+	NumCPUs         int
+	GICVersion      GICVersion
+	UART            *UARTConfig
+	Console         bool
+	VirtualTimerPPI uint32
+	EnableGICITS    bool
+	ExtraNodes      []fdt.Node
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -278,12 +417,16 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			"method":     {Strings: []string{"hvc"}},
 		},
 	})
+	virtualTimerPPI := cfg.VirtualTimerPPI
+	if virtualTimerPPI == 0 {
+		virtualTimerPPI = 11
+	}
 	root.Children = append(root.Children, fdt.Node{
 		Name: "timer",
 		Properties: map[string]fdt.Property{
 			"compatible": {Strings: []string{"arm,armv8-timer"}},
 			"always-on":  {Flag: true},
-			"interrupts": {U32: []uint32{1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4}},
+			"interrupts": {U32: []uint32{1, 13, 4, 1, 14, 4, 1, virtualTimerPPI, 4, 1, 10, 4}},
 		},
 	})
 	root.Children = append(root.Children, fdt.Node{
@@ -306,6 +449,19 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			defaultGICDistributorBase, defaultGICDistributorSize,
 			defaultGICRedistributorBase, redistributorSize,
 		}}
+		if cfg.EnableGICITS {
+			root.Children[len(root.Children)-1].Children = append(root.Children[len(root.Children)-1].Children, fdt.Node{
+				Name: fmt.Sprintf("msi-controller@%x", defaultGICITSBase),
+				Properties: map[string]fdt.Property{
+					"compatible":     {Strings: []string{"arm,gic-v3-its"}},
+					"msi-controller": {Flag: true},
+					"#msi-cells":     {U32: []uint32{1}},
+					"phandle":        {U32: []uint32{gicITSDefaultPhandle}},
+					"linux,phandle":  {U32: []uint32{gicITSDefaultPhandle}},
+					"reg":            {U64: []uint64{defaultGICITSBase, defaultGICITSSize}},
+				},
+			})
+		}
 	} else {
 		gicProps["compatible"] = fdt.Property{Strings: []string{"arm,gic-400"}}
 		gicProps["reg"] = fdt.Property{U64: []uint64{

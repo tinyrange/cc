@@ -8,10 +8,11 @@ import (
 )
 
 type ServerHello struct {
-	Addr   string `json:"addr,omitempty"`
-	Kind   string `json:"kind,omitempty"`
-	Error  string `json:"error,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	Addr      string `json:"addr,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	TokenPath string `json:"token_path,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type ErrorResponse struct {
@@ -298,8 +299,11 @@ type ShareMount struct {
 
 type NetworkConfig struct {
 	Enabled                  bool          `json:"enabled,omitempty"`
+	Mode                     string        `json:"mode,omitempty"`
 	AllowInternet            bool          `json:"allow_internet,omitempty"`
 	BlockHostAccess          bool          `json:"block_host_access,omitempty"`
+	GuestIPv4                string        `json:"guest_ipv4,omitempty"`
+	GuestMAC                 string        `json:"guest_mac,omitempty"`
 	HostDNSName              string        `json:"host_dns_name,omitempty"`
 	AllowedServiceProxyPorts []int         `json:"allowed_service_proxy_ports,omitempty"`
 	PortForwards             []PortForward `json:"port_forwards,omitempty"`
@@ -339,33 +343,39 @@ type CapabilitiesResponse struct {
 }
 
 type CreateInstanceRequest struct {
-	ID             string         `json:"id,omitempty"`
-	Image          string         `json:"image"`
-	InitSystem     string         `json:"init,omitempty"`
-	Kernel         string         `json:"kernel,omitempty"`
-	Shares         []ShareMount   `json:"shares,omitempty"`
-	Network        *NetworkConfig `json:"network,omitempty"`
-	KernelModules  []string       `json:"kernel_modules,omitempty"`
-	MemoryMB       uint64         `json:"memory_mb,omitempty"`
-	CPUs           int            `json:"cpus,omitempty"`
-	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
-	Dmesg          bool           `json:"dmesg,omitempty"`
-	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
+	ID              string         `json:"id,omitempty"`
+	Image           string         `json:"image"`
+	InitSystem      string         `json:"init,omitempty"`
+	Kernel          string         `json:"kernel,omitempty"`
+	Shares          []ShareMount   `json:"shares,omitempty"`
+	Network         *NetworkConfig `json:"network,omitempty"`
+	KernelModules   []string       `json:"kernel_modules,omitempty"`
+	MemoryMB        uint64         `json:"memory_mb,omitempty"`
+	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
+	CPUs            int            `json:"cpus,omitempty"`
+	NestedVirt      bool           `json:"nested_virtualization,omitempty"`
+	Dmesg           bool           `json:"dmesg,omitempty"`
+	SnapshotDir     string         `json:"snapshot_dir,omitempty"`
+	RestoreSnapshot string         `json:"restore_snapshot,omitempty"`
+	TimeoutSeconds  float64        `json:"timeout_seconds,omitempty"`
 }
 
 type StartInstanceRequest struct {
-	ID             string         `json:"id,omitempty"`
-	Image          string         `json:"image,omitempty"`
-	InitSystem     string         `json:"init,omitempty"`
-	Kernel         string         `json:"kernel,omitempty"`
-	Shares         []ShareMount   `json:"shares,omitempty"`
-	Network        *NetworkConfig `json:"network,omitempty"`
-	KernelModules  []string       `json:"kernel_modules,omitempty"`
-	MemoryMB       uint64         `json:"memory_mb,omitempty"`
-	CPUs           int            `json:"cpus,omitempty"`
-	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
-	Dmesg          bool           `json:"dmesg,omitempty"`
-	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
+	ID              string         `json:"id,omitempty"`
+	Image           string         `json:"image,omitempty"`
+	InitSystem      string         `json:"init,omitempty"`
+	Kernel          string         `json:"kernel,omitempty"`
+	Shares          []ShareMount   `json:"shares,omitempty"`
+	Network         *NetworkConfig `json:"network,omitempty"`
+	KernelModules   []string       `json:"kernel_modules,omitempty"`
+	MemoryMB        uint64         `json:"memory_mb,omitempty"`
+	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
+	CPUs            int            `json:"cpus,omitempty"`
+	NestedVirt      bool           `json:"nested_virtualization,omitempty"`
+	Dmesg           bool           `json:"dmesg,omitempty"`
+	SnapshotDir     string         `json:"snapshot_dir,omitempty"`
+	RestoreSnapshot string         `json:"restore_snapshot,omitempty"`
+	TimeoutSeconds  float64        `json:"timeout_seconds,omitempty"`
 }
 
 type InstanceState struct {
@@ -375,6 +385,7 @@ type InstanceState struct {
 	InitSystem  string `json:"init,omitempty"`
 	Kernel      string `json:"kernel,omitempty"`
 	MemoryMB    uint64 `json:"memory_mb,omitempty"`
+	BalloonMB   uint64 `json:"balloon_mb,omitempty"`
 	CPUs        int    `json:"cpus,omitempty"`
 	NestedVirt  bool   `json:"nested_virtualization,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
@@ -406,6 +417,7 @@ type RunRequest struct {
 	Cols           int            `json:"cols,omitempty"`
 	Rows           int            `json:"rows,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
+	BalloonMB      uint64         `json:"balloon_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
 	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`

@@ -168,6 +168,95 @@ func TestFSInfoResponseIncludesProperties(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusParentEntryUsesParentHandle(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server := New(nil)
+	exp, err := server.AddShare(client.ShareMount{Source: dir, Mount: "/host"})
+	if err != nil {
+		t.Fatalf("AddShare: %v", err)
+	}
+	aID := lookupNode(t, server, exp, 1, "a")
+	bID := lookupNode(t, server, exp, aID, "b")
+
+	req := xdrWriter{}
+	req.Opaque(fileHandle(exp.ID, bID))
+	req.Uint64(0)
+	req.FixedOpaque(make([]byte, 8))
+	req.Uint32(4096)
+	req.Uint32(4096)
+	body, err := server.handleNFSProc(nfsProcReaddirPlus, req.Bytes())
+	if err != nil {
+		t.Fatalf("READDIRPLUS: %v", err)
+	}
+	r := newXDRReader(body)
+	status, _ := r.Uint32()
+	if status != nfsOK {
+		t.Fatalf("READDIRPLUS status = %d", status)
+	}
+	if err := skipPostOpAttr(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := skipFixedOpaque(r, 8); err != nil {
+		t.Fatal(err)
+	}
+	handles := map[string]uint64{}
+	fileIDs := map[string]uint64{}
+	attrFileIDs := map[string]uint64{}
+	for {
+		present, err := r.Uint32()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if present == 0 {
+			break
+		}
+		fileID, _ := r.Uint64()
+		name, err := r.String(255)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileIDs[name] = fileID
+		_, _ = r.Uint64()
+		attrFileID, haveAttr, err := readPostOpAttrFileID(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if haveAttr {
+			attrFileIDs[name] = attrFileID
+		}
+		haveHandle, err := r.Uint32()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if haveHandle != 0 {
+			fh, err := r.Opaque(64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, nodeID, err := parseFileHandle(newXDRReader(encodeOpaque(fh)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handles[name] = nodeID
+		}
+	}
+	if got := handles["."]; got != bID {
+		t.Fatalf("READDIRPLUS . handle node = %d, want %d", got, bID)
+	}
+	if got := handles[".."]; got != aID {
+		t.Fatalf("READDIRPLUS .. handle node = %d, want %d", got, aID)
+	}
+	if fileIDs[".."] == 0 || attrFileIDs[".."] == 0 {
+		t.Fatalf("READDIRPLUS .. file IDs missing: entry=%d attr=%d", fileIDs[".."], attrFileIDs[".."])
+	}
+	if fileIDs[".."] != attrFileIDs[".."] {
+		t.Fatalf("READDIRPLUS .. file ID = %d, attr file ID = %d", fileIDs[".."], attrFileIDs[".."])
+	}
+}
+
 func TestRPCBindGetAddrReturnsTCPUniversalAddress(t *testing.T) {
 	server := New(nil)
 	req := xdrWriter{}
@@ -301,6 +390,88 @@ func skipFAttr(r *xdrReader) error {
 		}
 	}
 	return nil
+}
+
+func skipPostOpAttr(r *xdrReader) error {
+	present, err := r.Uint32()
+	if err != nil || present == 0 {
+		return err
+	}
+	return skipFAttr(r)
+}
+
+func readPostOpAttrFileID(r *xdrReader) (uint64, bool, error) {
+	present, err := r.Uint32()
+	if err != nil || present == 0 {
+		return 0, false, err
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := r.Uint32(); err != nil {
+			return 0, false, err
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Uint64(); err != nil {
+			return 0, false, err
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Uint32(); err != nil {
+			return 0, false, err
+		}
+	}
+	if _, err := r.Uint64(); err != nil {
+		return 0, false, err
+	}
+	fileID, err := r.Uint64()
+	if err != nil {
+		return 0, false, err
+	}
+	for i := 0; i < 6; i++ {
+		if _, err := r.Uint32(); err != nil {
+			return 0, false, err
+		}
+	}
+	return fileID, true, nil
+}
+
+func skipFixedOpaque(r *xdrReader, n int) error {
+	if r.remaining() < n+xdrPad(n) {
+		return os.ErrInvalid
+	}
+	r.off += n + xdrPad(n)
+	return nil
+}
+
+func encodeOpaque(data []byte) []byte {
+	w := xdrWriter{}
+	w.Opaque(data)
+	return w.Bytes()
+}
+
+func lookupNode(t *testing.T, server *Server, exp *Export, parent uint64, name string) uint64 {
+	t.Helper()
+	req := xdrWriter{}
+	req.Opaque(fileHandle(exp.ID, parent))
+	req.String(name)
+	body, err := server.handleNFSProc(nfsProcLookup, req.Bytes())
+	if err != nil {
+		t.Fatalf("LOOKUP %s: %v", name, err)
+	}
+	r := newXDRReader(body)
+	status, _ := r.Uint32()
+	if status != nfsOK {
+		t.Fatalf("LOOKUP %s status = %d", name, status)
+	}
+	fh, err := r.Opaque(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, nodeID, err := parseFileHandle(newXDRReader(encodeOpaque(fh)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nodeID
 }
 
 func contains(s, sub string) bool {

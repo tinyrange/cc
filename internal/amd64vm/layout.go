@@ -23,6 +23,13 @@ const (
 	ShareFSIRQ  = 9
 	FSStride    = 0x1000
 
+	SnapshotBase = 0xd0009000
+	SnapshotSize = 0x1000
+
+	BalloonBase = 0xd000a000
+	BalloonSize = 0x1000
+	BalloonIRQ  = 10
+
 	RootFSTag   = vmruntime.RootFSTag
 	EmulatorTag = vmruntime.EmulatorTag
 	GuestCID    = vmruntime.GuestCID

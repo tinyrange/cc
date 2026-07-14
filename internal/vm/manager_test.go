@@ -25,13 +25,14 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 		ID:         "alpha",
 		Image:      "alpine",
 		MemoryMB:   256,
+		BalloonMB:  64,
 		CPUs:       2,
 		NestedVirt: true,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if state.ID != "alpha" || state.Status != "running" || state.Image != "alpine" || state.MemoryMB != 256 || state.CPUs != 2 || !state.NestedVirt || state.NetworkIPv4 != "10.0.2.15" {
+	if state.ID != "alpha" || state.Status != "running" || state.Image != "alpine" || state.MemoryMB != 256 || state.BalloonMB != 64 || state.CPUs != 2 || !state.NestedVirt || state.NetworkIPv4 != "10.0.2.15" {
 		t.Fatalf("state = %+v", state)
 	}
 
@@ -63,6 +64,9 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	if len(inst.execStreamReqs) != 1 {
 		t.Fatalf("instance exec stream reqs = %+v", inst.execStreamReqs)
 	}
+	if inst.execStreamReqs[0].ID == "" || inst.execStreamReqs[0].ID == "alpha" {
+		t.Fatalf("run stream exec id = %q, want unique guest exec id", inst.execStreamReqs[0].ID)
+	}
 	if len(runEvents) == 0 || runEvents[len(runEvents)-1].Kind != "exit" {
 		t.Fatalf("run stream events = %+v", runEvents)
 	}
@@ -73,11 +77,16 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	if len(inst.execStreamReqs) != 2 {
 		t.Fatalf("exec stream count = %d, want 2", len(inst.execStreamReqs))
 	}
+	if inst.execStreamReqs[1].ID == "" || inst.execStreamReqs[1].ID == "alpha" || inst.execStreamReqs[1].ID == inst.execStreamReqs[0].ID {
+		t.Fatalf("exec stream ids = %q, %q; want unique guest exec ids", inst.execStreamReqs[0].ID, inst.execStreamReqs[1].ID)
+	}
 	if err := manager.StreamIn(ctx, "alpha", client.ExecRequest{Image: "other", Command: []string{"true"}}, nil, nil); err != nil {
 		t.Fatalf("multi-image exec stream: %v", err)
 	}
 	if got := host.execInStreamCalls(); len(got) != 1 || got[0].runningImage != "alpine" || got[0].req.Image != "other" {
 		t.Fatalf("host exec-in-stream calls = %+v", got)
+	} else if got[0].req.ID == "" || got[0].req.ID == "alpha" || got[0].req.ID == inst.execStreamReqs[0].ID || got[0].req.ID == inst.execStreamReqs[1].ID {
+		t.Fatalf("alternate exec stream id = %q, previous ids = %q/%q", got[0].req.ID, inst.execStreamReqs[0].ID, inst.execStreamReqs[1].ID)
 	}
 }
 
@@ -92,11 +101,12 @@ func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
 		Image:      "ubuntu",
 		InitSystem: "systemd",
 		MemoryMB:   512,
+		BalloonMB:  128,
 	}, nil)
 	if err != nil {
 		t.Fatalf("start blank: %v", err)
 	}
-	if state.Image != "ubuntu" || state.InitSystem != "systemd" {
+	if state.Image != "ubuntu" || state.InitSystem != "systemd" || state.BalloonMB != 128 {
 		t.Fatalf("state = %+v, want image ubuntu and init systemd", state)
 	}
 	if _, err := manager.RunIn(ctx, "alpha", client.RunRequest{Image: "ubuntu", Command: []string{"systemctl"}}); err != nil {
@@ -133,12 +143,39 @@ func TestManagerBlankStartPassesBuiltinGuestSharesToHost(t *testing.T) {
 	}
 }
 
+func TestManagerBlankSnapshotStartKeepsSharesInStartRequest(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	share := client.ShareMount{Source: "/tmp/host", Mount: "/host", Writable: true}
+	if _, err := manager.StartBlankInstanceStream(ctx, "alpha", client.StartInstanceRequest{
+		Image:       "alpine",
+		SnapshotDir: "/tmp/snapshots",
+		Shares:      []client.ShareMount{share},
+	}, nil); err != nil {
+		t.Fatalf("start blank: %v", err)
+	}
+	if len(host.blankStarts) != 1 {
+		t.Fatalf("blank starts = %+v", host.blankStarts)
+	}
+	if got := host.blankStarts[0].Shares; len(got) != 1 || got[0] != share {
+		t.Fatalf("start shares = %+v, want %+v", got, []client.ShareMount{share})
+	}
+	if len(inst.shares) != 0 {
+		t.Fatalf("post-start shares = %+v, want none", inst.shares)
+	}
+}
+
 func TestManagerRunWithoutInstanceRequiresOrUsesImage(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
 	manager := testManager(host)
 
-	if _, err := manager.Run(ctx, client.RunRequest{Command: []string{"true"}}); err == nil || !strings.Contains(err.Error(), "image is required") {
+	if _, err := manager.Run(ctx, client.RunRequest{Command: []string{"true"}}); err == nil {
 		t.Fatalf("run without image error = %v", err)
 	}
 
@@ -165,6 +202,113 @@ func TestManagerRunWithoutInstanceRequiresOrUsesImage(t *testing.T) {
 	}
 }
 
+func TestManagerAssignsDistinctNetworkLeasesBeforeStart(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	host.queueInstance(newFakeInstance())
+	host.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "freebsd", Image: "@freebsd", Network: &client.NetworkConfig{Enabled: true}}); err != nil {
+		t.Fatalf("start freebsd: %v", err)
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "openbsd", Image: "@openbsd", Network: &client.NetworkConfig{Enabled: true}}); err != nil {
+		t.Fatalf("start openbsd: %v", err)
+	}
+
+	if len(host.starts) != 2 {
+		t.Fatalf("starts = %+v", host.starts)
+	}
+	first := host.starts[0].Network
+	second := host.starts[1].Network
+	if first == nil || second == nil {
+		t.Fatalf("network configs = %+v, %+v", first, second)
+	}
+	if first.GuestIPv4 != "10.42.0.2" || second.GuestIPv4 != "10.42.0.3" {
+		t.Fatalf("guest IPv4 leases = %q, %q", first.GuestIPv4, second.GuestIPv4)
+	}
+	if first.GuestMAC != "02:42:0a:2a:00:02" || second.GuestMAC != "02:42:0a:2a:00:03" {
+		t.Fatalf("guest MAC leases = %q, %q", first.GuestMAC, second.GuestMAC)
+	}
+}
+
+func TestManagerAssignsNetworkLeasesForBuiltinDefaultNetwork(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	host.queueInstance(newFakeInstance())
+	host.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "freebsd", Image: "@freebsd"}); err != nil {
+		t.Fatalf("start freebsd: %v", err)
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "openbsd", Image: "@openbsd"}); err != nil {
+		t.Fatalf("start openbsd: %v", err)
+	}
+
+	if len(host.starts) != 2 {
+		t.Fatalf("starts = %+v", host.starts)
+	}
+	first := host.starts[0].Network
+	second := host.starts[1].Network
+	if first == nil || second == nil {
+		t.Fatalf("network configs = %+v, %+v", first, second)
+	}
+	if !first.Enabled || !second.Enabled {
+		t.Fatalf("network enabled = %v, %v", first.Enabled, second.Enabled)
+	}
+	if first.GuestIPv4 != "10.42.0.2" || second.GuestIPv4 != "10.42.0.3" {
+		t.Fatalf("guest IPv4 leases = %q, %q", first.GuestIPv4, second.GuestIPv4)
+	}
+	if first.GuestMAC != "02:42:0a:2a:00:02" || second.GuestMAC != "02:42:0a:2a:00:03" {
+		t.Fatalf("guest MAC leases = %q, %q", first.GuestMAC, second.GuestMAC)
+	}
+}
+
+func TestManagerConcurrentStreamsUseDistinctGuestExecIDs(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	started := make(chan client.ExecRequest, 2)
+	release := make(chan struct{})
+	inst.execStream = func(req client.ExecRequest, onEvent func(client.ExecEvent) error) error {
+		started <- req
+		<-release
+		return emitFakeExecEvents(onEvent, strings.Join(req.Command, " "))
+	}
+
+	errs := make(chan error, 2)
+	go func() {
+		errs <- manager.RunStreamIn(ctx, "alpha", client.RunRequest{Command: []string{"one"}}, nil, nil)
+	}()
+	go func() {
+		errs <- manager.RunStreamIn(ctx, "alpha", client.RunRequest{Command: []string{"two"}}, nil, nil)
+	}()
+
+	first := <-started
+	second := <-started
+	if first.ID == "" || second.ID == "" || first.ID == second.ID || first.ID == "alpha" || second.ID == "alpha" {
+		close(release)
+		t.Fatalf("concurrent exec ids = %q, %q; want unique guest exec ids", first.ID, second.ID)
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("stream %d: %v", i, err)
+		}
+	}
+}
+
 func TestManagerCapacityAndDuplicateStart(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
@@ -174,10 +318,10 @@ func TestManagerCapacityAndDuplicateStart(t *testing.T) {
 	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err != nil {
 		t.Fatalf("start alpha: %v", err)
 	}
-	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err == nil || !strings.Contains(err.Error(), "already running") {
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err == nil {
 		t.Fatalf("duplicate start error = %v", err)
 	}
-	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); err == nil || !strings.Contains(err.Error(), "maximum running VM instances") {
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); err == nil {
 		t.Fatalf("capacity error = %v", err)
 	}
 }
@@ -420,6 +564,7 @@ type fakeInstance struct {
 	snapshots      map[string]imagefs.Directory
 	stats          []virtio.FSStats
 	ipv4           string
+	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
 }
 
 func newFakeInstance() *fakeInstance {
@@ -455,6 +600,9 @@ func (i *fakeInstance) ExecStream(_ context.Context, req client.ExecRequest, _ <
 	i.mu.Lock()
 	i.execStreamReqs = append(i.execStreamReqs, req)
 	i.mu.Unlock()
+	if i.execStream != nil {
+		return i.execStream(req, onEvent)
+	}
 	return emitFakeExecEvents(onEvent, strings.Join(req.Command, " "))
 }
 

@@ -27,7 +27,12 @@ install -m 644 "${BUILD_DIR}/init-linux-arm64" "${GUESTINIT_ARM64_EMBED_PATH}"
 GOOS=linux GOARCH=amd64 go build -o "${BUILD_DIR}/init-linux-amd64" ./internal/cmd/init
 install -m 644 "${BUILD_DIR}/init-linux-amd64" "${GUESTINIT_AMD64_EMBED_PATH}"
 
-GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -tags embed_guestinit -o "${CCVM_OUTPUT}" ./cmd/ccvm
+for bsd in openbsd freebsd netbsd; do
+  GOOS="${bsd}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/guest-init-${bsd}-${TARGET_GOARCH}" "./internal/cmd/${bsd}-init"
+  install -m 644 "${BUILD_DIR}/guest-init-${bsd}-${TARGET_GOARCH}" "${ROOT_DIR}/internal/${bsd}/guestinit/guest-init-${bsd}-${TARGET_GOARCH}"
+done
+
+GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${CCVM_OUTPUT}" ./cmd/ccvm
 GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/cc-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}" ./cmd/cc
 
 install -m 755 "${CCVM_OUTPUT}" "${PYNEURODESK_CCVM_OUTPUT}"

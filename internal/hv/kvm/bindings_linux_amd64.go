@@ -17,6 +17,7 @@ const kvmCPUIDFlagSignificantIndex = 1
 
 const (
 	kvmCreateVM            = 0xae01
+	kvmCheckExtension      = 0xae03
 	kvmGetVcpuMmapSize     = 0xae04
 	kvmGetSupportedCpuid   = 0xc008ae05
 	kvmSetUserMemoryRegion = 0x4020ae46
@@ -24,16 +25,40 @@ const (
 	kvmCreateVCPU          = 0xae41
 	kvmSetTssAddr          = 0xae47
 	kvmCreateIrqchip       = 0xae60
+	kvmGetIRQChip          = 0xc208ae62
+	kvmSetIRQChip          = 0x8208ae63
 	kvmCreatePit2          = 0x4040ae77
+	kvmSetClock            = 0x4030ae7b
+	kvmGetClock            = 0x8030ae7c
 	kvmRun                 = 0xae80
 	kvmGetRegs             = 0x8090ae81
 	kvmSetRegs             = 0x4090ae82
 	kvmGetSregs            = 0x8138ae83
 	kvmSetSregs            = 0x4138ae84
+	kvmGetMSRS             = 0xc008ae88
 	kvmSetMSRS             = 0x4008ae89
+	kvmGetFPU              = 0x81a0ae8c
+	kvmSetFPU              = 0x41a0ae8d
+	kvmGetLAPIC            = 0x8400ae8e
+	kvmSetLAPIC            = 0x4400ae8f
 	kvmSetCpuid2           = 0x4008ae90
+	kvmGetMPState          = 0x8004ae98
+	kvmSetMPState          = 0x4004ae99
+	kvmGetVCPUEvents       = 0x8040ae9f
+	kvmGetPIT2             = 0x8070ae9f
+	kvmSetVCPUEvents       = 0x4040aea0
+	kvmSetPIT2             = 0x4070aea0
+	kvmGetDebugRegs        = 0x8080aea1
+	kvmSetDebugRegs        = 0x4080aea2
+	kvmGetXSAVE            = 0x9000aea4
+	kvmSetXSAVE            = 0x5000aea5
+	kvmGetXCRS             = 0x8188aea6
+	kvmSetXCRS             = 0x4188aea7
 	kvmGetTSCKHz           = 0xaea3
+	kvmGetXSAVE2           = 0x9000aecf
 )
+
+const kvmCapXSAVE2 = 208
 
 const (
 	ia32TSCMSR        = 0x00000010
@@ -60,6 +85,14 @@ func ioctlWithRetry(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 		}
 		return v1, err
 	}
+}
+
+func checkExtension(fd int, cap int) (uint64, error) {
+	v1, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(kvmCheckExtension), uintptr(cap))
+	if err != 0 {
+		return 0, err
+	}
+	return uint64(v1), nil
 }
 
 func ioctlRunVCPU(fd uintptr) (uintptr, error) {
@@ -128,6 +161,39 @@ func createPIT(vmFd int) error {
 	return err
 }
 
+func getIRQChip(vmFd int, chipID uint32) (kvmIRQChip, error) {
+	chip := kvmIRQChip{ChipID: chipID}
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmGetIRQChip), uintptr(unsafe.Pointer(&chip)))
+	return chip, err
+}
+
+func setIRQChip(vmFd int, chip *kvmIRQChip) error {
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSetIRQChip), uintptr(unsafe.Pointer(chip)))
+	return err
+}
+
+func getPIT2(vmFd int) (kvmPITState2, error) {
+	var state kvmPITState2
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmGetPIT2), uintptr(unsafe.Pointer(&state)))
+	return state, err
+}
+
+func setPIT2(vmFd int, state *kvmPITState2) error {
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSetPIT2), uintptr(unsafe.Pointer(state)))
+	return err
+}
+
+func getClock(vmFd int) (kvmClockData, error) {
+	var clock kvmClockData
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmGetClock), uintptr(unsafe.Pointer(&clock)))
+	return clock, err
+}
+
+func setClock(vmFd int, clock *kvmClockData) error {
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSetClock), uintptr(unsafe.Pointer(clock)))
+	return err
+}
+
 func getSupportedCPUID(kvmFd int) (*kvmCPUID2, error) {
 	size := unsafe.Sizeof(kvmCPUID2{}) + unsafe.Sizeof(kvmCPUIDEntry2{})*cpuidMaxEntries
 	buf := make([]byte, size)
@@ -155,6 +221,23 @@ func getVCPUTSCKHz(vcpuFd int) (uint32, error) {
 	return uint32(value), nil
 }
 
+func getVCPUMSR(vcpuFd int, index uint32) (uint64, error) {
+	msrs := kvmMSRs1{
+		NMSRs: 1,
+		Entry: kvmMSREntry{
+			Index: index,
+		},
+	}
+	ret, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetMSRS), uintptr(unsafe.Pointer(&msrs)))
+	if err != nil {
+		return 0, err
+	}
+	if ret != 1 {
+		return 0, unix.EIO
+	}
+	return msrs.Entry.Data, nil
+}
+
 func setVCPUMSR(vcpuFd int, index uint32, value uint64) error {
 	msrs := kvmMSRs1{
 		NMSRs: 1,
@@ -171,6 +254,141 @@ func setVCPUMSR(vcpuFd int, index uint32, value uint64) error {
 		return unix.EIO
 	}
 	return nil
+}
+
+func getFPU(vcpuFd int) (kvmFPU, error) {
+	var fpu kvmFPU
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetFPU), uintptr(unsafe.Pointer(&fpu))); err != nil {
+		return kvmFPU{}, err
+	}
+	return fpu, nil
+}
+
+func setFPU(vcpuFd int, fpu *kvmFPU) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetFPU), uintptr(unsafe.Pointer(fpu)))
+	return err
+}
+
+func getLAPIC(vcpuFd int) (kvmLAPICState, error) {
+	var lapic kvmLAPICState
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetLAPIC), uintptr(unsafe.Pointer(&lapic))); err != nil {
+		return kvmLAPICState{}, err
+	}
+	return lapic, nil
+}
+
+func setLAPIC(vcpuFd int, lapic *kvmLAPICState) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetLAPIC), uintptr(unsafe.Pointer(lapic)))
+	return err
+}
+
+func getMPState(vcpuFd int) (kvmMPState, error) {
+	var state kvmMPState
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetMPState), uintptr(unsafe.Pointer(&state))); err != nil {
+		return kvmMPState{}, err
+	}
+	return state, nil
+}
+
+func setMPState(vcpuFd int, state *kvmMPState) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetMPState), uintptr(unsafe.Pointer(state)))
+	return err
+}
+
+func getVCPUEvents(vcpuFd int) (kvmVCPUEvents, error) {
+	var events kvmVCPUEvents
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetVCPUEvents), uintptr(unsafe.Pointer(&events))); err != nil {
+		return kvmVCPUEvents{}, err
+	}
+	return events, nil
+}
+
+func setVCPUEvents(vcpuFd int, events *kvmVCPUEvents) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetVCPUEvents), uintptr(unsafe.Pointer(events)))
+	return err
+}
+
+func getDebugRegs(vcpuFd int) (kvmDebugRegs, error) {
+	var regs kvmDebugRegs
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetDebugRegs), uintptr(unsafe.Pointer(&regs))); err != nil {
+		return kvmDebugRegs{}, err
+	}
+	return regs, nil
+}
+
+func setDebugRegs(vcpuFd int, regs *kvmDebugRegs) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetDebugRegs), uintptr(unsafe.Pointer(regs)))
+	return err
+}
+
+func getXSAVE(vcpuFd int) (kvmXSAVE, error) {
+	var xsave kvmXSAVE
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetXSAVE), uintptr(unsafe.Pointer(&xsave))); err != nil {
+		return kvmXSAVE{}, err
+	}
+	return xsave, nil
+}
+
+func setXSAVE(vcpuFd int, xsave *kvmXSAVE) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetXSAVE), uintptr(unsafe.Pointer(xsave)))
+	return err
+}
+
+func getXSAVEBytes(vmFd int, vcpuFd int) ([]byte, error) {
+	size := kvmXSAVEBufferSize(vmFd)
+	buf := make([]byte, size)
+	request := uint64(kvmGetXSAVE)
+	if size > int(unsafe.Sizeof(kvmXSAVE{})) {
+		request = uint64(kvmGetXSAVE2)
+	}
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), request, uintptr(unsafe.Pointer(&buf[0]))); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func setXSAVEBytes(vmFd int, vcpuFd int, data []byte) error {
+	size := kvmXSAVEBufferSize(vmFd)
+	if len(data) > size {
+		return unix.EINVAL
+	}
+	buf := make([]byte, size)
+	copy(buf, data)
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetXSAVE), uintptr(unsafe.Pointer(&buf[0])))
+	return err
+}
+
+func legacyXSAVEBytes(xsave *kvmXSAVE) []byte {
+	if xsave == nil {
+		return nil
+	}
+	size := int(unsafe.Sizeof(*xsave))
+	out := make([]byte, size)
+	src := unsafe.Slice((*byte)(unsafe.Pointer(xsave)), size)
+	copy(out, src)
+	return out
+}
+
+func kvmXSAVEBufferSize(vmFd int) int {
+	const legacySize = int(unsafe.Sizeof(kvmXSAVE{}))
+	size, err := checkExtension(vmFd, kvmCapXSAVE2)
+	if err != nil || size < uint64(legacySize) {
+		return legacySize
+	}
+	return int(size)
+}
+
+func getXCRS(vcpuFd int) (kvmXCRS, error) {
+	var xcrs kvmXCRS
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetXCRS), uintptr(unsafe.Pointer(&xcrs))); err != nil {
+		return kvmXCRS{}, err
+	}
+	return xcrs, nil
+}
+
+func setXCRS(vcpuFd int, xcrs *kvmXCRS) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetXCRS), uintptr(unsafe.Pointer(xcrs)))
+	return err
 }
 
 func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
@@ -219,7 +437,16 @@ func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 					e.Eax = 1
 				}
 				e.Ebx &^= (uint32(1) << 6) | (uint32(1) << 13)
+				e.Ecx &^= uint32(1) << 7
+				e.Edx &^= uint32(1) << 20
 			case 2:
+				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, 0, 0
+			}
+		case 0xd:
+			switch e.Index {
+			case 0:
+				e.Eax &^= (uint32(1) << 11) | (uint32(1) << 12)
+			case 11, 12:
 				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, 0, 0
 			}
 		case 1:

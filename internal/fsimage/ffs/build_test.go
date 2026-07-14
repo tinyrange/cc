@@ -22,19 +22,17 @@ import (
 )
 
 func TestBuildFFSWritesOpenBSDRoot(t *testing.T) {
-	root := t.TempDir()
-	mustMkdir(t, filepath.Join(root, "sbin"))
-	mustMkdir(t, filepath.Join(root, "dev"))
-	mustMkdir(t, filepath.Join(root, "etc"))
-	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello openbsd\n", 0o755)
-	mustWriteMode(t, filepath.Join(root, "dev", "console"), "", 0o600)
-	if err := os.Symlink("/sbin/init", filepath.Join(root, "etc", "init")); err != nil {
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddFile("/sbin/init", 0o755, []byte("hello openbsd\n")); err != nil {
 		t.Fatal(err)
 	}
-	meta := map[string]fsmeta.Entry{
-		"/dev/console": {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o600), RDev: 0},
+	if err := overlay.AddDevice("/dev/console", fs.ModeDevice|fs.ModeCharDevice|0o600, 0); err != nil {
+		t.Fatal(err)
 	}
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
+	if err := overlay.AddSymlink("/etc/init", "/sbin/init"); err != nil {
+		t.Fatal(err)
+	}
+	img, err := Build(context.Background(), overlay.Root(), Options{
 		SizeBytes:         16 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 	})
@@ -83,7 +81,10 @@ func TestBuildFFSRawLayoutStartsAtBlockDeviceRoot(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         16 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,
@@ -113,7 +114,10 @@ func TestBuildFFSRawLayoutLargeCylinderGroupsAtFreeBSDOffsets(t *testing.T) {
 	root := t.TempDir()
 	mustMkdir(t, filepath.Join(root, "sbin"))
 	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         5 << 30,
 		DeterministicTime: time.Unix(1234, 0),
 		Layout:            LayoutRaw,
@@ -180,7 +184,10 @@ func TestBuildFFSDynamicInodeTableKeepsDirectoriesReadable(t *testing.T) {
 	for i := 0; i < 900; i++ {
 		mustMkdir(t, filepath.Join(root, "usr", "share", "dir"+strconv.Itoa(i)))
 	}
-	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+	meta := map[string]fsmeta.Entry{
+		"/sbin/init": {Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         32 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 	})
