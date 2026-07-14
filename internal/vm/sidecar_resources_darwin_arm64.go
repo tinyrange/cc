@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/ubuntu"
+	"j5.nz/cc/internal/netstack"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/mounts"
@@ -449,9 +451,10 @@ func darwinSidecarLeaseFromConfig(id string, cfg *client.NetworkConfig) (darwinS
 }
 
 type darwinSidecarSwitch struct {
-	mu        sync.Mutex
-	leases    map[string]darwinSidecarLease
-	endpoints map[string]darwinSidecarEndpoint
+	mu               sync.Mutex
+	leases           map[string]darwinSidecarLease
+	endpoints        map[string]darwinSidecarEndpoint
+	sourceViolations [5]uint64
 }
 
 type darwinSidecarLease struct {
@@ -514,6 +517,8 @@ func (s *darwinSidecarSwitch) Register(id string) darwinSidecarLease {
 func (s *darwinSidecarSwitch) Attach(endpoint darwinSidecarEndpoint) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	endpoint.ip = append(net.IP(nil), endpoint.ip...)
+	endpoint.mac = append(net.HardwareAddr(nil), endpoint.mac...)
 	delete(s.leases, endpoint.id)
 	s.endpoints[endpoint.id] = endpoint
 }
@@ -530,7 +535,13 @@ func (s *darwinSidecarSwitch) Unregister(id string) {
 }
 
 func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
-	if len(frame) < 14 {
+	source, ok := s.sourceEndpoint(sourceID)
+	if !ok {
+		s.recordSourceViolation(sourceID, netstack.SourceMalformed)
+		return
+	}
+	if violation := netstack.ValidateGuestSource(frame, source.mac, source.ip); violation != netstack.SourceValid {
+		s.recordSourceViolation(sourceID, violation)
 		return
 	}
 	dst := append(net.HardwareAddr(nil), frame[0:6]...)
@@ -550,6 +561,41 @@ func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
 	if target := s.endpointByMAC(sourceID, dst); target.rx != nil {
 		target.rx(frame)
 	}
+}
+
+func (s *darwinSidecarSwitch) sourceEndpoint(id string) (darwinSidecarEndpoint, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	endpoint, ok := s.endpoints[id]
+	if !ok {
+		return darwinSidecarEndpoint{}, false
+	}
+	endpoint.ip = append(net.IP(nil), endpoint.ip...)
+	endpoint.mac = append(net.HardwareAddr(nil), endpoint.mac...)
+	return endpoint, true
+}
+
+func (s *darwinSidecarSwitch) recordSourceViolation(sourceID string, violation netstack.SourceViolation) {
+	if violation <= netstack.SourceValid || int(violation) >= len(s.sourceViolations) {
+		return
+	}
+	s.mu.Lock()
+	s.sourceViolations[violation]++
+	count := s.sourceViolations[violation]
+	s.mu.Unlock()
+	if count&(count-1) == 0 {
+		slog.Warn("dropping sidecar frame with invalid source identity",
+			"source_id", sourceID, "reason", violation.String(), "count", count)
+	}
+}
+
+func (s *darwinSidecarSwitch) sourceViolationCount(violation netstack.SourceViolation) uint64 {
+	if violation <= netstack.SourceValid || int(violation) >= len(s.sourceViolations) {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sourceViolations[violation]
 }
 
 func (s *darwinSidecarSwitch) endpointByIP(sourceID string, ip net.IP) darwinSidecarEndpoint {

@@ -54,6 +54,43 @@ func TestSetHostMACRejectsMulticast(t *testing.T) {
 	}
 }
 
+func TestNetworkInterfaceDropsSpoofedGuestSources(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	deliveries := 0
+	if err := h.stack.BindUDPCallback("10.42.0.1:9000", func(_ *udpCallbackEndpoint, _ []byte, _ net.UDPAddr) {
+		deliveries++
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	valid := buildBenchmarkUDPFrame(40000, 9000, []byte("valid"))
+	if err := h.nic.DeliverGuestPacket(valid, true); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("valid packet deliveries = %d, want 1", deliveries)
+	}
+
+	spoofedIP := append([]byte(nil), valid...)
+	copy(spoofedIP[ethernetHeaderLen+12:ethernetHeaderLen+16], net.IPv4(10, 42, 0, 3).To4())
+	if err := h.nic.DeliverGuestPacket(spoofedIP, true); err != nil {
+		t.Fatal(err)
+	}
+	spoofedMAC := append([]byte(nil), valid...)
+	copy(spoofedMAC[6:12], []byte{0x02, 0x42, 0x0a, 0x2a, 0, 3})
+	if err := h.nic.DeliverGuestPacket(spoofedMAC, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if deliveries != 1 {
+		t.Fatalf("spoofed packets reached host endpoint: deliveries = %d", deliveries)
+	}
+	status := h.stack.collectDebugStatus()
+	if status.SourceIPv4Violations != 1 || status.SourceMACViolations != 1 {
+		t.Fatalf("source violation counters = IPv4:%d MAC:%d, want 1 each", status.SourceIPv4Violations, status.SourceMACViolations)
+	}
+}
+
 func TestServiceProxyBridgesUDP(t *testing.T) {
 	host, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
