@@ -114,17 +114,25 @@ type WalkEntry struct {
 }
 
 type Client struct {
-	HTTPClient   *http.Client
-	Context      context.Context
-	CacheDir     string
-	TraceLogPath string
-	OnActivity   func(ActivityEvent)
-	Mirrors      []string
+	HTTPClient             *http.Client
+	Context                context.Context
+	MaxExpandedObjectBytes int64
+	CacheDir               string
+	TraceLogPath           string
+	OnActivity             func(ActivityEvent)
+	Mirrors                []string
 
 	mu           sync.Mutex
 	repos        map[string]*repository
 	mirrorStats  map[string]*mirrorStat
 	mirrorCursor uint64
+}
+
+func (c *Client) expandedObjectBudget() int64 {
+	if c != nil && c.MaxExpandedObjectBytes > 0 {
+		return c.MaxExpandedObjectBytes
+	}
+	return maxCVMFSExpandedObjectBytes
 }
 
 type ActivityEvent struct {
@@ -1467,7 +1475,7 @@ func (r *repository) fetchCatalogDB(hash string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return download.ReadAllReader(ctx, zr, maxCVMFSExpandedObjectBytes)
+	return download.ReadAllReader(ctx, zr, r.client.expandedObjectBudget())
 }
 
 func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) {
@@ -1488,7 +1496,7 @@ func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return download.ReadAllReader(ctx, zr, maxCVMFSExpandedObjectBytes)
+	return download.ReadAllReader(ctx, zr, r.client.expandedObjectBudget())
 }
 
 func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) {
