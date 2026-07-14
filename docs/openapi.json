@@ -1092,7 +1092,8 @@
           "block_host_access": { "type": "boolean" },
           "host_dns_name": { "type": "string" },
           "allowed_service_proxy_ports": { "type": "array", "items": { "type": "integer" } },
-          "port_forwards": { "type": "array", "items": { "$ref": "#/components/schemas/PortForward" } }
+          "port_forwards": { "type": "array", "items": { "$ref": "#/components/schemas/PortForward" } },
+          "max_forward_connections": { "type": "integer" }
         }
       },
       "PortForward": {
@@ -1102,7 +1103,8 @@
           "host_addr": { "type": "string" },
           "host_port": { "type": "integer" },
           "guest_addr": { "type": "string" },
-          "guest_port": { "type": "integer" }
+          "guest_port": { "type": "integer" },
+          "max_connections": { "type": "integer" }
         }
       },
       "ServiceProxyPortRequest": {
@@ -1249,7 +1251,17 @@
           "tty": { "type": "boolean" },
           "control_fd": { "type": "boolean" },
           "cols": { "type": "integer" },
-          "rows": { "type": "integer" }
+          "rows": { "type": "integer" },
+          "archive_limits": { "$ref": "#/components/schemas/ArchiveLimits" }
+        }
+      },
+      "ArchiveLimits": {
+        "type": "object",
+        "properties": {
+          "max_entries": { "type": "integer", "format": "uint64" },
+          "max_file_bytes": { "type": "integer", "format": "int64" },
+          "max_expanded_bytes": { "type": "integer", "format": "int64" },
+          "timeout_seconds": { "type": "number" }
         }
       },
       "ExecInput": {
