@@ -535,6 +535,21 @@ type ExtentTree1 struct {
 	arr    *vm.RegionArray[vm.MemoryRegion]
 }
 
+const MaxInlineExtents int64 = 4
+
+type ExtentLimitError struct {
+	RequiredExtents  int64
+	SupportedExtents int64
+}
+
+func (e *ExtentLimitError) Error() string {
+	return fmt.Sprintf("ext4 layout requires %d extents; writer supports at most %d inline extents", e.RequiredExtents, e.SupportedExtents)
+}
+
+func newExtentLimitError(required int64) error {
+	return &ExtentLimitError{RequiredExtents: required, SupportedExtents: MaxInlineExtents}
+}
+
 // AllocateBlocks implements ExtentTree.
 func (e *ExtentTree1) AllocateBlocks(blocks int64) error {
 	return fmt.Errorf("not implemented")
@@ -624,7 +639,7 @@ func newExtentTree1(fs *Ext4Filesystem, base uint64, blocks int64) (*ExtentTree1
 		return nil, err
 	}
 
-	if len(extents) <= 4 {
+	if len(extents) <= int(MaxInlineExtents) {
 		// Set the fields on the header.
 		tree.header.SetMagic(0xF30A)
 		tree.header.SetEntries(uint16(len(extents)))
@@ -655,7 +670,7 @@ func newExtentTree1(fs *Ext4Filesystem, base uint64, blocks int64) (*ExtentTree1
 			return nil, err
 		}
 	} else {
-		panic("unimplemented")
+		return nil, newExtentLimitError(int64(len(extents)))
 	}
 
 	return tree, nil
@@ -669,8 +684,12 @@ type ExtentTree2 struct {
 // AllocateBlocks implements ExtentTree.
 func (t *ExtentTree2) AllocateBlocks(blocks int64) error {
 	// Check that we have enough space in the extentTree to allocate blocks.
-	if t.count > 3 {
-		return fmt.Errorf("no remaining space in extent tree to allocate blocks")
+	if t.count >= int(MaxInlineExtents) {
+		return newExtentLimitError(int64(t.count + 1))
+	}
+	requiredExtents := roundUpDiv(blocks, int64(t.i.fs.sb.BlocksPerGroup()))
+	if int64(t.count)+requiredExtents > MaxInlineExtents {
+		return newExtentLimitError(int64(t.count) + requiredExtents)
 	}
 
 	// Allocate more extents.
@@ -679,8 +698,8 @@ func (t *ExtentTree2) AllocateBlocks(blocks int64) error {
 		return err
 	}
 
-	if len(extents)+t.count > 4 {
-		return fmt.Errorf("allocation would exceed the size constraint of a ExtentTree2")
+	if len(extents)+t.count > int(MaxInlineExtents) {
+		return newExtentLimitError(int64(len(extents) + t.count))
 	}
 
 	i := 0
@@ -793,8 +812,8 @@ func newExtentTree2(fs *Ext4Filesystem, i *InodeWrapper, blocks int64) (*ExtentT
 		return nil, err
 	}
 
-	if len(extents) > 4 {
-		panic("newExtentTree2 called with more than 4 extents.")
+	if len(extents) > int(MaxInlineExtents) {
+		return nil, newExtentLimitError(int64(len(extents)))
 	}
 
 	// Set the fields on the header.
@@ -856,10 +875,10 @@ func newExtentTree(fs *Ext4Filesystem, i *InodeWrapper, blocks int64) (ExtentTre
 
 	// slog.Debug("", "requiredBlockGroups", requiredBlockGroups)
 
-	if requiredBlockGroups <= 4 {
+	if requiredBlockGroups <= MaxInlineExtents {
 		return newExtentTree2(fs, i, blocks)
 	} else {
-		return nil, fmt.Errorf("extent tree is over 4 extents in length")
+		return nil, newExtentLimitError(requiredBlockGroups)
 	}
 }
 

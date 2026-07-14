@@ -21,7 +21,6 @@ import (
 const (
 	defaultImageSize = 64 << 20
 	defaultPageSize  = 16 << 10
-	maxInlineExtents = 4
 )
 
 type Options struct {
@@ -136,7 +135,12 @@ func scan(ctx context.Context, dir imagefs.Directory, guestPath string) (treeSta
 			size, mode := entry.File.Stat()
 			if mode.Type() == 0 {
 				if size > maxSupportedFileSize() {
-					return treeStats{}, fmt.Errorf("%s is too large for the current ext4 writer: %d bytes", childPath, size)
+					extentBytes := uint64(32768 * 4096)
+					requiredExtents := int64((size-1)/extentBytes + 1)
+					return treeStats{}, fmt.Errorf("%s: %w", childPath, &ext4.ExtentLimitError{
+						RequiredExtents:  requiredExtents,
+						SupportedExtents: ext4.MaxInlineExtents,
+					})
 				}
 				stats.files++
 				stats.bytes += size
@@ -298,7 +302,7 @@ func roundUp(v, align int64) int64 {
 }
 
 func maxSupportedFileSize() uint64 {
-	return uint64(maxInlineExtents * 32768 * 4096)
+	return uint64(ext4.MaxInlineExtents * 32768 * 4096)
 }
 
 func sortedDirEnts(entries []imagefs.DirEnt) []imagefs.DirEnt {
