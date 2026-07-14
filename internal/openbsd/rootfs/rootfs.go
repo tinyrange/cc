@@ -155,15 +155,7 @@ func buildManagedRootFromBase(base imagefs.Directory, closeBase func() error, in
 		_ = closeBase()
 		return nil, nil, err
 	}
-	if err := rootplan.AddDevices(overlay, []rootplan.Device{
-		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
-		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 514},
-		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 515},
-		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o644, 565},
-		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, 566},
-		{"/dev/sd0a", fs.ModeDevice | 0o640, 1024},
-		{"/dev/sd0b", fs.ModeDevice | 0o640, 1025},
-	}); err != nil {
+	if err := rootplan.AddDevices(overlay, openBSDManagedDevices()); err != nil {
 		_ = closeBase()
 		return nil, nil, err
 	}
@@ -177,12 +169,12 @@ func buildManagedRootFromBase(base imagefs.Directory, closeBase func() error, in
 func buildManagedRootFromPreparedBase(root imagefs.Directory, closeRoot func() error, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{"/sbin/cc-openbsd-init", 0o755, initBin},
-		{"/etc/fstab", 0o644, []byte("/dev/sd0a / ffs rw,noatime 1 1\n")},
-		{"/etc/myname", 0o644, []byte(network.Hostname + "\n")},
-		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
-		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
-		{"/etc/services", 0o644, []byte(bsdNetworkServices)},
+		{Path: "/sbin/cc-openbsd-init", Mode: 0o755, Data: initBin},
+		{Path: "/etc/fstab", Mode: 0o644, Data: []byte("/dev/sd0a / ffs rw,noatime 1 1\n")},
+		{Path: "/etc/myname", Mode: 0o644, Data: []byte(network.Hostname + "\n")},
+		{Path: "/etc/resolv.conf", Mode: 0o644, Data: []byte("nameserver " + network.DNSIPv4 + "\n")},
+		{Path: "/etc/hosts", Mode: 0o644, Data: []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{Path: "/etc/services", Mode: 0o644, Data: []byte(bsdNetworkServices)},
 	}); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
@@ -249,15 +241,7 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		_ = tfs.Close()
 		return nil, nil, err
 	}
-	if err := rootplan.AddDevices(overlay, []rootplan.Device{
-		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
-		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 514},
-		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 515},
-		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o644, 565},
-		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, 566},
-		{"/dev/sd0a", fs.ModeDevice | 0o640, 1024},
-		{"/dev/sd0b", fs.ModeDevice | 0o640, 1025},
-	}); err != nil {
+	if err := rootplan.AddDevices(overlay, openBSDManagedDevices()); err != nil {
 		_ = tfs.Close()
 		return nil, nil, err
 	}
@@ -266,6 +250,18 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		return nil, nil, fmt.Errorf("overlay /sbin/init: %w", err)
 	}
 	return overlay.Root(), tfs.Close, nil
+}
+
+func openBSDManagedDevices() []rootplan.Device {
+	return []rootplan.Device{
+		{Path: "/dev/console", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600, RDev: 0},
+		{Path: "/dev/null", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 514},
+		{Path: "/dev/zero", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 515},
+		{Path: "/dev/random", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: 565},
+		{Path: "/dev/urandom", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: 566},
+		{Path: "/dev/sd0a", Mode: fs.ModeDevice | 0o640, RDev: 1024},
+		{Path: "/dev/sd0b", Mode: fs.ModeDevice | 0o640, RDev: 1025},
+	}
 }
 
 func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
