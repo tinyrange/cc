@@ -444,23 +444,35 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
-	Kind        string   `json:"kind,omitempty"`
-	ID          string   `json:"id,omitempty"`
-	Image       string   `json:"image,omitempty"`
-	Command     []string `json:"command"`
-	Env         []string `json:"env,omitempty"`
-	RootDir     string   `json:"root_dir,omitempty"`
-	Path        string   `json:"path,omitempty"`
-	Directory   bool     `json:"directory,omitempty"`
-	ReplaceEnv  bool     `json:"replace_env,omitempty"`
-	SkipResolve bool     `json:"skip_resolve,omitempty"`
-	WorkDir     string   `json:"workdir,omitempty"`
-	User        string   `json:"user,omitempty"`
-	Stdin       []byte   `json:"stdin,omitempty"`
-	TTY         bool     `json:"tty,omitempty"`
-	ControlFD   bool     `json:"control_fd,omitempty"`
-	Cols        int      `json:"cols,omitempty"`
-	Rows        int      `json:"rows,omitempty"`
+	Kind          string         `json:"kind,omitempty"`
+	ID            string         `json:"id,omitempty"`
+	Image         string         `json:"image,omitempty"`
+	Command       []string       `json:"command"`
+	Env           []string       `json:"env,omitempty"`
+	RootDir       string         `json:"root_dir,omitempty"`
+	Path          string         `json:"path,omitempty"`
+	Directory     bool           `json:"directory,omitempty"`
+	ReplaceEnv    bool           `json:"replace_env,omitempty"`
+	SkipResolve   bool           `json:"skip_resolve,omitempty"`
+	WorkDir       string         `json:"workdir,omitempty"`
+	User          string         `json:"user,omitempty"`
+	Stdin         []byte         `json:"stdin,omitempty"`
+	TTY           bool           `json:"tty,omitempty"`
+	ControlFD     bool           `json:"control_fd,omitempty"`
+	Cols          int            `json:"cols,omitempty"`
+	Rows          int            `json:"rows,omitempty"`
+	ArchiveLimits *ArchiveLimits `json:"archive_limits,omitempty"`
+}
+
+// ArchiveLimits bounds the expanded work performed by an fs_extract request.
+// Zero fields use limits derived from the destination filesystem's current
+// capacity. TimeoutSeconds is optional because callers are best placed to set
+// a deadline appropriate to the amount of data they are sending.
+type ArchiveLimits struct {
+	MaxEntries       uint64  `json:"max_entries,omitempty"`
+	MaxFileBytes     int64   `json:"max_file_bytes,omitempty"`
+	MaxExpandedBytes int64   `json:"max_expanded_bytes,omitempty"`
+	TimeoutSeconds   float64 `json:"timeout_seconds,omitempty"`
 }
 
 type ExecInput struct {

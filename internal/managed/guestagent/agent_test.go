@@ -5,6 +5,8 @@ package guestagent
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"j5.nz/cc/client"
 )
 
 func TestRootPathCleansRootAndName(t *testing.T) {
@@ -175,6 +179,57 @@ func TestExtractTarToPathConflictSemantics(t *testing.T) {
 			t.Fatalf("dst dir stat = %v info=%v", err, info)
 		}
 	})
+}
+
+func TestExtractTarToPathEnforcesCallerBudgets(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "payload", "0123456789"); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "payload")
+	err := ExtractTarToPathContext(context.Background(), bytes.NewReader(archive.Bytes()), "/", dst, false, &client.ArchiveLimits{
+		MaxEntries:       1,
+		MaxFileBytes:     9,
+		MaxExpandedBytes: 100,
+	})
+	var limitErr *ArchiveLimitError
+	if !errors.As(err, &limitErr) || limitErr.Resource != "file bytes" || limitErr.Limit != 9 || limitErr.Actual != 10 {
+		t.Fatalf("limit error = %#v", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("oversized archive published destination: %v", statErr)
+	}
+}
+
+func TestExtractTarToPathCancellationPreservesExistingFile(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "payload", strings.Repeat("x", 4096)); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "payload")
+	if err := os.WriteFile(dst, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer := io.Pipe()
+	wrotePrefix := make(chan struct{})
+	go func() {
+		_, _ = writer.Write(archive.Bytes()[:1024])
+		close(wrotePrefix)
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ExtractTarToPathContext(ctx, reader, "/", dst, false, &client.ArchiveLimits{MaxFileBytes: 4096, MaxExpandedBytes: 4096})
+	}()
+	<-wrotePrefix
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("extraction error = %v, want context cancellation", err)
+	}
+	if got := readTestFile(t, dst); got != "keep" {
+		t.Fatalf("existing file after canceled extraction = %q", got)
+	}
 }
 
 func TestParseSignal(t *testing.T) {
