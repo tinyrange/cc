@@ -1956,7 +1956,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		writeJSON(w, http.StatusOK, resp)
 	})
 	mux.Handle("GET /vm/run", websocket.Server{
-		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handshake: validateWebSocketOrigin,
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
 			_ = ws.SetDeadline(time.Time{})
@@ -1966,7 +1966,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		},
 	})
 	mux.Handle("GET /vm/run/stream", websocket.Server{
-		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handshake: validateWebSocketOrigin,
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
 			_ = ws.SetDeadline(time.Time{})
@@ -2033,6 +2033,68 @@ func watchdogLeaseDuration(seconds float64) (time.Duration, error) {
 		return 0, fmt.Errorf("watchdog lease timeout is below timer resolution")
 	}
 	return timeout, nil
+}
+
+type websocketOriginError struct {
+	Origin string
+	Host   string
+}
+
+func (e *websocketOriginError) Error() string {
+	return fmt.Sprintf("websocket origin %q does not match request host %q", e.Origin, e.Host)
+}
+
+func validateWebSocketOrigin(_ *websocket.Config, r *http.Request) error {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return nil
+	}
+	if len(origins) != 1 {
+		return &websocketOriginError{Origin: strings.Join(origins, ", "), Host: r.Host}
+	}
+	origin, err := url.Parse(origins[0])
+	if err != nil || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	expectedScheme := "http"
+	if r.TLS != nil {
+		expectedScheme = "https"
+	}
+	if !strings.EqualFold(origin.Scheme, expectedScheme) {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	originAuthority, err := canonicalWebSocketAuthority(origin.Host, expectedScheme)
+	if err != nil {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	hostAuthority, err := canonicalWebSocketAuthority(r.Host, expectedScheme)
+	if err != nil || originAuthority != hostAuthority {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	return nil
+}
+
+func canonicalWebSocketAuthority(authority, scheme string) (string, error) {
+	parsed, err := url.Parse("//" + authority)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" {
+		return "", fmt.Errorf("invalid authority")
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := parsed.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func sharedRuntimeRoot() string {
