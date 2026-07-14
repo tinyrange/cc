@@ -708,6 +708,8 @@ func extractTarToPath(ctx context.Context, r io.Reader, rootDir, dst string, dst
 	return ExtractTarToPathContext(ctx, r, rootDir, dst, dstDir, limits)
 }
 
+var ErrUnsafeTarExtractionPath = errors.New("unsafe tar extraction path")
+
 func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 	return ExtractTarToPathContext(context.Background(), r, rootDir, dst, dstDir, nil)
 }
@@ -757,8 +759,22 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		}()
 		defer close(stopClose)
 	}
-	if info, err := os.Stat(dst); err == nil && info.IsDir() {
-		dstDir = true
+	if info, err := os.Lstat(dst); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: destination is a symlink: %s", ErrUnsafeTarExtractionPath, dst)
+		}
+		if info.IsDir() {
+			dstDir = true
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	extractionRoot := filepath.Dir(dst)
+	if dstDir {
+		extractionRoot = dst
+	}
+	if err := os.MkdirAll(extractionRoot, 0o755); err != nil {
+		return err
 	}
 	tr := tar.NewReader(r)
 	sawEntry := false
@@ -801,19 +817,25 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+				return err
+			}
 			if err := ensureTarTargetCompatible(target, true); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+			if err := os.Mkdir(target, os.FileMode(header.Mode).Perm()); err != nil && !os.IsExist(err) {
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
-			if err := ensureTarTargetCompatible(target, false); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := validateTarSymlinkTarget(extractionRoot, target, header.Linkname); err != nil {
+				return err
+			}
+			if err := ensureTarTargetCompatible(target, false); err != nil {
 				return err
 			}
 			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
@@ -823,10 +845,10 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
-			if err := ensureTarTargetCompatible(target, false); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := ensureTarTargetCompatible(target, false); err != nil {
 				return err
 			}
 			file, err := os.CreateTemp(filepath.Dir(target), ".cc-extract-*")
@@ -927,6 +949,9 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	if err != nil {
 		return err
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: target is a symlink: %s", ErrUnsafeTarExtractionPath, target)
+	}
 	existingDir := info.IsDir()
 	switch {
 	case incomingDir && !existingDir:
@@ -936,6 +961,49 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	default:
 		return nil
 	}
+}
+
+func ensureTarParents(root, parent string) error {
+	rel, err := filepath.Rel(root, parent)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: target parent escapes destination: %s", ErrUnsafeTarExtractionPath, parent)
+	}
+	if rel == "." {
+		return nil
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: target parent is a symlink: %s", ErrUnsafeTarExtractionPath, current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("tar target parent is not a directory: %s", current)
+		}
+	}
+	return nil
+}
+
+func validateTarSymlinkTarget(root, target, linkname string) error {
+	if filepath.IsAbs(linkname) {
+		return fmt.Errorf("%w: absolute symlink target %q", ErrUnsafeTarExtractionPath, linkname)
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(target), filepath.FromSlash(linkname)))
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: symlink target escapes destination: %q", ErrUnsafeTarExtractionPath, linkname)
+	}
+	return nil
 }
 
 func tarTarget(dst string, dstDir bool, name string) (string, error) {
