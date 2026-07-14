@@ -15,6 +15,7 @@ import (
 type Client struct {
 	conn  net.Conn
 	codec *WorkerCodec
+	hello WorkerHello
 
 	idMu sync.Mutex
 	next uint64
@@ -32,6 +33,28 @@ var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflo
 type workerCall struct {
 	frames chan WorkerFrame
 	done   chan error
+}
+
+type WorkerRequirements struct {
+	SupportsFSRPC bool
+	SupportsL2    bool
+}
+
+type WorkerProtocolVersionError struct {
+	Received  int
+	Supported int
+}
+
+func (e *WorkerProtocolVersionError) Error() string {
+	return fmt.Sprintf("unsupported sidecar worker protocol version %d (supported version: %d)", e.Received, e.Supported)
+}
+
+type MissingWorkerCapabilityError struct {
+	Capability string
+}
+
+func (e *MissingWorkerCapabilityError) Error() string {
+	return fmt.Sprintf("sidecar worker does not support required capability %q", e.Capability)
 }
 
 func newWorkerCall() *workerCall {
@@ -55,18 +78,26 @@ const (
 )
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
-	return dialWorker(ctx, socketPath, nil)
+	return dialWorker(ctx, socketPath, nil, WorkerRequirements{})
+}
+
+func DialWorkerWithRequirements(ctx context.Context, socketPath string, requirements WorkerRequirements) (*Client, error) {
+	return dialWorker(ctx, socketPath, nil, requirements)
 }
 
 func DialWorkerTLS(ctx context.Context, endpoint, configPath string) (*Client, error) {
+	return DialWorkerTLSWithRequirements(ctx, endpoint, configPath, WorkerRequirements{})
+}
+
+func DialWorkerTLSWithRequirements(ctx context.Context, endpoint, configPath string, requirements WorkerRequirements) (*Client, error) {
 	security, err := LoadWorkerClientSecurity(configPath)
 	if err != nil {
 		return nil, err
 	}
-	return dialWorker(ctx, endpoint, security)
+	return dialWorker(ctx, endpoint, security, requirements)
 }
 
-func dialWorker(ctx context.Context, socketPath string, security *WorkerTransportSecurity) (*Client, error) {
+func dialWorker(ctx context.Context, socketPath string, security *WorkerTransportSecurity, requirements WorkerRequirements) (*Client, error) {
 	target, err := workerDialTarget(socketPath)
 	if err != nil {
 		return nil, err
@@ -105,9 +136,9 @@ func dialWorker(ctx context.Context, socketPath string, security *WorkerTranspor
 		_ = conn.Close()
 		return nil, fmt.Errorf("decode sidecar worker hello: %w", err)
 	}
-	if hello.Version != WorkerProtocolVersion {
+	if err := validateWorkerHello(hello, requirements); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("sidecar worker protocol version %d is not supported", hello.Version)
+		return nil, err
 	}
 	if target.secure && hello.WorkerID != security.Scope {
 		_ = conn.Close()
@@ -117,8 +148,22 @@ func dialWorker(ctx context.Context, socketPath string, security *WorkerTranspor
 			Detail:   "worker hello identity does not match the authenticated certificate scope",
 		}
 	}
+	worker.hello = hello
 	go worker.receiveLoop()
 	return worker, nil
+}
+
+func validateWorkerHello(hello WorkerHello, requirements WorkerRequirements) error {
+	if hello.Version != WorkerProtocolVersion {
+		return &WorkerProtocolVersionError{Received: hello.Version, Supported: WorkerProtocolVersion}
+	}
+	if requirements.SupportsFSRPC && !hello.Capabilities.SupportsFSRPC {
+		return &MissingWorkerCapabilityError{Capability: "filesystem-rpc"}
+	}
+	if requirements.SupportsL2 && !hello.Capabilities.SupportsL2 {
+		return &MissingWorkerCapabilityError{Capability: "l2-networking"}
+	}
+	return nil
 }
 
 func receiveWorkerHello(ctx context.Context, conn net.Conn, codec *WorkerCodec, timeout time.Duration) (WorkerFrame, error) {
@@ -218,6 +263,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.conn.Close()
+}
+
+func (c *Client) Hello() WorkerHello {
+	if c == nil {
+		return WorkerHello{}
+	}
+	return c.hello
 }
 
 func (c *Client) receiveLoop() {

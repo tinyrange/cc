@@ -402,11 +402,16 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarpkg.D
 		started = false
 		return nil, err
 	}
+	features := sidecarHostFeatures()
+	requirements := sidecarpkg.WorkerRequirements{
+		SupportsFSRPC: features.supportsFSRPC,
+		SupportsL2:    features.supportsL2,
+	}
 	var worker *sidecarpkg.Client
 	if control.clientTLSConfig == "" {
-		worker, err = sidecarpkg.DialWorker(ctx, hello.Addr)
+		worker, err = sidecarpkg.DialWorkerWithRequirements(ctx, hello.Addr, requirements)
 	} else {
-		worker, err = sidecarpkg.DialWorkerTLS(ctx, hello.Addr, control.clientTLSConfig)
+		worker, err = sidecarpkg.DialWorkerTLSWithRequirements(ctx, hello.Addr, control.clientTLSConfig, requirements)
 	}
 	if err != nil {
 		started = false

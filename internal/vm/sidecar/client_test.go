@@ -116,7 +116,7 @@ func TestDialWorkerConnectionHasTotalBudget(t *testing.T) {
 
 func TestDialWorkerReadsHello(t *testing.T) {
 	endpoint, clientConfig, done := serveWorkerFrame(t, func(scope string) WorkerFrame {
-		return mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion, WorkerID: scope})
+		return mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion, WorkerID: scope, Backend: "test"})
 	})
 	worker, err := DialWorkerTLS(context.Background(), endpoint, clientConfig)
 	if err != nil {
@@ -124,6 +124,81 @@ func TestDialWorkerReadsHello(t *testing.T) {
 	}
 	if worker == nil || worker.codec == nil {
 		t.Fatalf("worker client was not initialized")
+	}
+	if hello := worker.Hello(); hello.Version != WorkerProtocolVersion || hello.WorkerID == "" || hello.Backend != "test" {
+		t.Fatalf("worker hello = %+v", hello)
+	}
+	_ = worker.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestDialWorkerRejectsUnsupportedVersion(t *testing.T) {
+	endpoint, clientConfig, done := serveWorkerFrame(t, func(scope string) WorkerFrame {
+		return mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion + 1, WorkerID: scope})
+	})
+	worker, err := DialWorkerTLS(context.Background(), endpoint, clientConfig)
+	if worker != nil {
+		_ = worker.Close()
+	}
+	var versionErr *WorkerProtocolVersionError
+	if !errors.As(err, &versionErr) {
+		t.Fatalf("DialWorker error = %v, want WorkerProtocolVersionError", err)
+	}
+	if versionErr.Received != WorkerProtocolVersion+1 || versionErr.Supported != WorkerProtocolVersion {
+		t.Fatalf("version error = %+v", versionErr)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestDialWorkerChecksRequiredCapabilities(t *testing.T) {
+	endpoint, clientConfig, done := serveWorkerFrame(t, func(scope string) WorkerFrame {
+		return mustWorkerFrame(0, WorkerFrameHello, WorkerHello{
+			Version:      WorkerProtocolVersion,
+			WorkerID:     scope,
+			Capabilities: HostCapabilities{SupportsFSRPC: true},
+		})
+	})
+	worker, err := DialWorkerTLSWithRequirements(context.Background(), endpoint, clientConfig, WorkerRequirements{
+		SupportsFSRPC: true,
+		SupportsL2:    true,
+	})
+	if worker != nil {
+		_ = worker.Close()
+	}
+	var capabilityErr *MissingWorkerCapabilityError
+	if !errors.As(err, &capabilityErr) {
+		t.Fatalf("DialWorkerWithRequirements error = %v, want MissingWorkerCapabilityError", err)
+	}
+	if capabilityErr.Capability != "l2-networking" {
+		t.Fatalf("missing capability = %q", capabilityErr.Capability)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestDialWorkerToleratesOptionalHelloFields(t *testing.T) {
+	endpoint, clientConfig, done := serveWorkerFrame(t, func(scope string) WorkerFrame {
+		return mustWorkerFrame(0, WorkerFrameHello, map[string]any{
+			"version":      WorkerProtocolVersion,
+			"worker_id":    scope,
+			"future_field": map[string]any{"enabled": true},
+			"capabilities": map[string]any{"SupportsFSRPC": true, "SupportsL2": true, "FutureCapability": true},
+		})
+	})
+	worker, err := DialWorkerTLSWithRequirements(context.Background(), endpoint, clientConfig, WorkerRequirements{
+		SupportsFSRPC: true,
+		SupportsL2:    true,
+	})
+	if err != nil {
+		t.Fatalf("DialWorkerWithRequirements: %v", err)
+	}
+	if worker.Hello().WorkerID == "" {
+		t.Fatalf("worker hello = %+v", worker.Hello())
 	}
 	_ = worker.Close()
 	if err := <-done; err != nil {
