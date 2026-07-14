@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,30 +13,42 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
 
 type Client struct {
-	url       string
-	dialer    func() (net.Conn, error)
-	headersMu sync.RWMutex
-	headers   http.Header
-	client    http.Client
+	url         string
+	dialContext func(context.Context) (net.Conn, error)
+	headersMu   sync.RWMutex
+	headers     http.Header
+	client      http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
+	if dialer == nil {
+		return NewClientContext(url, nil)
+	}
+	return NewClientContext(url, func(context.Context) (net.Conn, error) {
+		return dialer()
+	})
+}
+
+func NewClientContext(url string, dialer func(context.Context) (net.Conn, error)) *Client {
 	c := &Client{
-		url:    url,
-		dialer: dialer,
+		url:         url,
+		dialContext: dialer,
+	}
+	transport := &http.Transport{}
+	if dialer != nil {
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer(ctx)
+		}
 	}
 	c.client = http.Client{
 		Transport: &authTransport{
-			base: &http.Transport{
-				Dial: func(_, _ string) (net.Conn, error) {
-					return c.dialer()
-				},
-			},
+			base:    transport,
 			headers: c.headerSnapshot,
 		},
 	}
@@ -460,10 +473,7 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 		return err
 	}
 	c.applyWebSocketAuth(cfg)
-	if c.dialer != nil {
-		cfg.Dialer = &net.Dialer{}
-	}
-	ws, err := dialWebSocketContext(ctx, cfg)
+	ws, err := c.dialWebSocket(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -685,10 +695,7 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		return err
 	}
 	c.applyWebSocketAuth(cfg)
-	if c.dialer != nil {
-		cfg.Dialer = &net.Dialer{}
-	}
-	ws, err := dialWebSocketContext(ctx, cfg)
+	ws, err := c.dialWebSocket(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -749,6 +756,60 @@ func dialWebSocketContext(ctx context.Context, cfg *websocket.Config) (*websocke
 		endpoint = cfg.Location.String()
 	}
 	return nil, &WebSocketDialError{Endpoint: endpoint, Err: err}
+}
+
+func (c *Client) dialWebSocket(ctx context.Context, cfg *websocket.Config) (*websocket.Conn, error) {
+	if c.dialContext == nil {
+		return dialWebSocketContext(ctx, cfg)
+	}
+
+	conn, err := c.dialContext(ctx)
+	if err != nil {
+		return nil, &WebSocketDialError{Endpoint: cfg.Location.String(), Err: fmt.Errorf("transport: %w", err)}
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = conn.Close()
+		}
+	}()
+
+	if cfg.Location.Scheme == "wss" {
+		tlsConfig := &tls.Config{}
+		if cfg.TlsConfig != nil {
+			tlsConfig = cfg.TlsConfig.Clone()
+		}
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = cfg.Location.Hostname()
+		}
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, &WebSocketDialError{Endpoint: cfg.Location.String(), Err: fmt.Errorf("TLS handshake: %w", err)}
+		}
+		conn = tlsConn
+	}
+
+	type result struct {
+		ws  *websocket.Conn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ws, err := websocket.NewClient(cfg, conn)
+		done <- result{ws: ws, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		_ = conn.SetDeadline(time.Now())
+		<-done
+		return nil, &WebSocketDialError{Endpoint: cfg.Location.String(), Err: ctx.Err()}
+	case result := <-done:
+		if result.err != nil {
+			return nil, &WebSocketDialError{Endpoint: cfg.Location.String(), Err: fmt.Errorf("handshake: %w", result.err)}
+		}
+		success = true
+		return result.ws, nil
+	}
 }
 
 func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
