@@ -1146,6 +1146,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.Context = r.Context()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		cvmfsClient.Mirrors = req.Mirrors
 		if watchdog != nil {
@@ -1185,6 +1186,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.Context = r.Context()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		cvmfsClient.Mirrors = req.Mirrors
 		if watchdog != nil {

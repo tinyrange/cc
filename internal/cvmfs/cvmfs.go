@@ -3,6 +3,7 @@ package cvmfs
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,11 +22,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/linuxabi"
 	intsqlite "j5.nz/cc/internal/sqlite"
 )
 
 const DefaultMirror = "https://cvmfs.neurodesk.org/cvmfs"
+const maxCVMFSExpandedObjectBytes int64 = 4 << 30
 
 const (
 	flagDir          = 1
@@ -112,6 +115,7 @@ type WalkEntry struct {
 
 type Client struct {
 	HTTPClient   *http.Client
+	Context      context.Context
 	CacheDir     string
 	TraceLogPath string
 	OnActivity   func(ActivityEvent)
@@ -923,7 +927,16 @@ func (r *repository) getFromMirrors(op string, urlFor func(string) string, handl
 	for _, mirror := range r.orderedMirrors() {
 		url := urlFor(mirror)
 		id, started := r.client.traceStart(op, "", url, "")
-		resp, err := r.client.HTTPClient.Get(url)
+		ctx := r.client.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := r.client.HTTPClient.Do(req)
 		if err != nil {
 			r.client.traceDone(id, started, op, "", url, "", 0, 0, err)
 			r.client.recordMirrorResult(mirror, time.Since(started), err, 0)
@@ -936,6 +949,17 @@ func (r *repository) getFromMirrors(op string, urlFor func(string) string, handl
 				what = "fetch manifest"
 			}
 			err := fmt.Errorf("%s: unexpected status %s", what, resp.Status)
+			_ = resp.Body.Close()
+			r.client.traceDone(id, started, op, "", url, "", 0, resp.StatusCode, err)
+			r.client.recordMirrorResult(mirror, time.Since(started), err, resp.StatusCode)
+			lastErr = err
+			continue
+		}
+		maxBytes := int64(0)
+		if op == "HTTPManifest" {
+			maxBytes = 16 << 20
+		}
+		if err := download.BoundResponse(resp, maxBytes); err != nil {
 			_ = resp.Body.Close()
 			r.client.traceDone(id, started, op, "", url, "", 0, resp.StatusCode, err)
 			r.client.recordMirrorResult(mirror, time.Since(started), err, resp.StatusCode)
@@ -1347,7 +1371,11 @@ func (r *repository) fetchManifest() ([]byte, error) {
 	err := r.getFromMirrors("HTTPManifest", func(mirror string) string {
 		return fmt.Sprintf("%s/%s/.cvmfspublished", mirror, r.repo)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
-		data, readErr := io.ReadAll(resp.Body)
+		ctx := r.client.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		data, readErr := download.ReadAllReader(ctx, resp.Body, 16<<20)
 		if readErr != nil {
 			r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(data), resp.StatusCode, readErr)
 			return readErr
@@ -1435,7 +1463,11 @@ func (r *repository) fetchCatalogDB(hash string) ([]byte, error) {
 		return nil, err
 	}
 	defer zr.Close()
-	return io.ReadAll(zr)
+	ctx := r.client.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return download.ReadAllReader(ctx, zr, maxCVMFSExpandedObjectBytes)
 }
 
 func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) {
@@ -1452,7 +1484,11 @@ func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) 
 		return nil, err
 	}
 	defer zr.Close()
-	return io.ReadAll(zr)
+	ctx := r.client.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return download.ReadAllReader(ctx, zr, maxCVMFSExpandedObjectBytes)
 }
 
 func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) {

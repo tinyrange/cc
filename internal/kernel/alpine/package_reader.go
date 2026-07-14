@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/timing"
 )
 
@@ -40,7 +41,7 @@ func (m *Manager) ReadPackageFile(ctx context.Context, repo, packageName, innerP
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("stat package file: %w", err)
 		}
-		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, nil); err != nil {
+		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, entry, nil); err != nil {
 			return nil, fmt.Errorf("download package %q: %w", packageName, err)
 		}
 	}
@@ -111,7 +112,7 @@ func (m *Manager) ExtractPackageFileWithProgress(
 			return "", fmt.Errorf("stat package file: %w", err)
 		}
 		start = time.Now()
-		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, report); err != nil {
+		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, entry, report); err != nil {
 			return "", fmt.Errorf("download package %q: %w", packageName, err)
 		}
 		timing.Since(ctx, "kernel.extract_package.download_apk", start)
@@ -263,6 +264,9 @@ func (m *Manager) lookupPackageEntry(ctx context.Context, repo, packageName stri
 	timing.Since(ctx, "kernel.lookup_package_entry.http_do", start)
 	if resp.StatusCode != http.StatusOK {
 		return indexEntry{}, fmt.Errorf("request APKINDEX: status %s", resp.Status)
+	}
+	if err := download.BoundResponse(resp, 64<<20); err != nil {
+		return indexEntry{}, fmt.Errorf("request APKINDEX: %w", err)
 	}
 	start = time.Now()
 	indexData, err := readAPKIndex(resp.Body)

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 
+	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/kernel/alpine"
 )
 
@@ -65,6 +67,8 @@ type packageEntry struct {
 	Depends       []string `json:"depends,omitempty"`
 	RawDepends    string   `json:"raw_depends,omitempty"`
 	InstalledSize string   `json:"installed_size,omitempty"`
+	Size          int64    `json:"size,omitempty"`
+	SHA256        string   `json:"sha256,omitempty"`
 }
 
 type resolvedPackages struct {
@@ -364,20 +368,20 @@ func decompressModule(path string, data []byte) ([]byte, error) {
 			return nil, fmt.Errorf("open zstd module %q: %w", path, err)
 		}
 		defer dec.Close()
-		return io.ReadAll(dec)
+		return download.ReadAllReader(context.Background(), dec, 256<<20)
 	case strings.HasSuffix(path, ".xz"):
 		dec, err := xz.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, fmt.Errorf("open xz module %q: %w", path, err)
 		}
-		return io.ReadAll(dec)
+		return download.ReadAllReader(context.Background(), dec, 256<<20)
 	case strings.HasSuffix(path, ".gz"):
 		dec, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, fmt.Errorf("open gzip module %q: %w", path, err)
 		}
 		defer dec.Close()
-		return io.ReadAll(dec)
+		return download.ReadAllReader(context.Background(), dec, 256<<20)
 	default:
 		return data, nil
 	}
@@ -501,6 +505,9 @@ func (m *Manager) packageIndex(ctx context.Context) (map[string]packageEntry, er
 		return nil, fmt.Errorf("request Ubuntu package index: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, 64<<20); err != nil {
+		return nil, fmt.Errorf("request Ubuntu package index: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("request Ubuntu package index: status %s", resp.Status)
 	}
@@ -540,7 +547,9 @@ func parsePackagesIndex(r io.Reader) (map[string]packageEntry, error) {
 			Depends:       depends,
 			RawDepends:    fields["Depends"],
 			InstalledSize: fields["Installed-Size"],
+			SHA256:        fields["SHA256"],
 		}
+		entry.Size, _ = strconv.ParseInt(fields["Size"], 10, 64)
 		if entry.Name != "" && entry.Filename != "" {
 			index[entry.Name] = entry
 		}
@@ -606,6 +615,9 @@ func (m *Manager) ensurePackage(ctx context.Context, entry packageEntry) (string
 		return "", fmt.Errorf("download Ubuntu package %q: %w", entry.Name, err)
 	}
 	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, 0); err != nil {
+		return "", fmt.Errorf("download Ubuntu package %q: %w", entry.Name, err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download Ubuntu package %q: status %s", entry.Name, resp.Status)
 	}
@@ -614,7 +626,15 @@ func (m *Manager) ensurePackage(ctx context.Context, entry packageEntry) (string
 	if err != nil {
 		return "", fmt.Errorf("create Ubuntu package %q: %w", entry.Name, err)
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	budget := download.Budget{MaxBytes: resp.ContentLength, ExpectedBytes: resp.ContentLength}
+	if entry.Size > 0 {
+		budget.MaxBytes = entry.Size
+		budget.ExpectedBytes = entry.Size
+	}
+	if entry.SHA256 != "" {
+		budget.ExpectedSHA256 = entry.SHA256
+	}
+	if _, err := download.Copy(ctx, f, resp, budget); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("write Ubuntu package %q: %w", entry.Name, err)

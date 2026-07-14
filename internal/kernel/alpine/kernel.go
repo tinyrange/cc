@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +17,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/download"
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
@@ -69,9 +74,11 @@ type metadata struct {
 }
 
 type indexEntry struct {
-	Name    string
-	Version string
-	Arch    string
+	Name     string
+	Version  string
+	Arch     string
+	Size     int64
+	Checksum string
 }
 
 type tarIndexEntry struct {
@@ -336,7 +343,7 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 	apkPath := filepath.Join(destDir, filename)
 	tarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", entry.Name, entry.Version))
 
-	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath, report); err != nil {
+	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath, entry, report); err != nil {
 		return err
 	}
 	if err := decompressAPKToTar(apkPath, tarPath); err != nil {
@@ -516,7 +523,7 @@ func (m *Manager) readModuleFile(path string) ([]byte, error) {
 			return nil, fmt.Errorf("open module gzip %q: %w", path, err)
 		}
 		defer gzr.Close()
-		data, err = io.ReadAll(gzr)
+		data, err = download.ReadAllReader(context.Background(), gzr, 256<<20)
 		if err != nil {
 			return nil, fmt.Errorf("read module %q: %w", path, err)
 		}
@@ -586,6 +593,9 @@ func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
 		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, 64<<20); err != nil {
+		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return indexEntry{}, fmt.Errorf("download kernel index: status %s", resp.Status)
@@ -606,7 +616,7 @@ func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
 	return entry, nil
 }
 
-func (m *Manager) downloadFile(ctx context.Context, url, destPath string, report progressReporter) error {
+func (m *Manager) downloadFile(ctx context.Context, url, destPath string, entry indexEntry, report progressReporter) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -616,6 +626,9 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, report
 		return fmt.Errorf("download kernel package: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, 0); err != nil {
+		return fmt.Errorf("download kernel package: %w", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download kernel package: status %s", resp.Status)
@@ -626,7 +639,8 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, report
 	if err != nil {
 		return fmt.Errorf("create kernel package file: %w", err)
 	}
-	if err := copyWithProgress(f, resp.Body, resp.ContentLength, filepath.Base(destPath), report); err != nil {
+	hasher := sha1.New()
+	if err := copyWithProgress(io.MultiWriter(f, hasher), resp.Body, resp.ContentLength, filepath.Base(destPath), report); err != nil {
 		f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write kernel package: %w", err)
@@ -634,6 +648,17 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, report
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close kernel package: %w", err)
+	}
+	if entry.Size > 0 && resp.ContentLength != entry.Size {
+		_ = os.Remove(tmpPath)
+		return &download.LengthError{Expected: entry.Size, Actual: resp.ContentLength}
+	}
+	if expected, ok := alpineChecksumHex(entry.Checksum); ok {
+		actual := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(expected, actual) {
+			_ = os.Remove(tmpPath)
+			return &download.DigestError{Expected: "sha1:" + expected, Actual: "sha1:" + actual}
+		}
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -873,6 +898,10 @@ func parseAPKIndex(r io.Reader) (map[string]indexEntry, error) {
 			current.Version = value
 		case "A":
 			current.Arch = value
+		case "S":
+			current.Size, _ = strconv.ParseInt(value, 10, 64)
+		case "C":
+			current.Checksum = value
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -880,6 +909,17 @@ func parseAPKIndex(r io.Reader) (map[string]indexEntry, error) {
 	}
 	flush()
 	return out, nil
+}
+
+func alpineChecksumHex(value string) (string, bool) {
+	if !strings.HasPrefix(value, "Q1") {
+		return "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(value, "Q1"))
+	if err != nil || len(raw) != sha1.Size {
+		return "", false
+	}
+	return hex.EncodeToString(raw), true
 }
 
 func (m *Manager) readMetadata() (metadata, error) {

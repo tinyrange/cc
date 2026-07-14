@@ -2,12 +2,15 @@ package release
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"j5.nz/cc/internal/download"
 )
 
 type ReaderFactory func(io.Reader) (io.ReadCloser, error)
@@ -111,7 +114,25 @@ func Download(ctx context.Context, url, target string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: unexpected HTTP status %s", url, resp.Status)
 	}
-	return writeFileAtomically(ctx, target, resp.Body)
+	if resp.ContentLength <= 0 {
+		return fmt.Errorf("download %s: server did not provide a positive content length", url)
+	}
+	return writeResponseAtomically(ctx, target, resp)
+}
+
+func writeResponseAtomically(ctx context.Context, target string, resp *http.Response) error {
+	tmp := target + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmp, err)
+	}
+	_, copyErr := download.Copy(ctx, out, resp, download.Budget{MaxBytes: resp.ContentLength, ExpectedBytes: resp.ContentLength})
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		return errors.Join(copyErr, closeErr)
+	}
+	return os.Rename(tmp, target)
 }
 
 func writeFileAtomically(ctx context.Context, target string, r io.Reader) error {
@@ -120,7 +141,13 @@ func writeFileAtomically(ctx context.Context, target string, r io.Reader) error 
 	if err != nil {
 		return fmt.Errorf("create %s: %w", tmp, err)
 	}
-	_, copyErr := io.Copy(out, contextReader{ctx: ctx, r: r})
+	maxBytes, budgetErr := download.FilesystemBudget(target)
+	if budgetErr != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("determine expanded artifact budget: %w", budgetErr)
+	}
+	_, copyErr := download.CopyReader(ctx, out, r, maxBytes)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
@@ -135,16 +162,4 @@ func writeFileAtomically(ctx context.Context, target string, r io.Reader) error 
 		return fmt.Errorf("install %s: %w", target, err)
 	}
 	return nil
-}
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r contextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.r.Read(p)
 }

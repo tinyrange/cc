@@ -1,22 +1,27 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "cvmfs:", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, stdout io.Writer) error {
+func run(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("cvmfs", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -26,6 +31,7 @@ func run(args []string, stdout io.Writer) error {
 		return fmt.Errorf("usage: cvmfs <ls|cat> <target>")
 	}
 	client := intcvmfs.NewClient()
+	client.Context = ctx
 	switch args[0] {
 	case "ls":
 		entries, err := client.ReadDir(args[1])
