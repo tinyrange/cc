@@ -943,6 +943,44 @@ func (w *contextResponseWriter) Write([]byte) (int, error) {
 	return 0, w.ctx.Err()
 }
 
+func TestServerShutdownReportsErrorsAndAttemptsEveryResource(t *testing.T) {
+	vmErr := errors.New("vm shutdown failed")
+	httpErr := errors.New("http shutdown failed")
+	var calls []string
+	shutdown := &serverShutdown{
+		shutdownVMs: func(context.Context) error {
+			calls = append(calls, "vm")
+			return vmErr
+		},
+		shutdownHTTP: func(context.Context) error {
+			calls = append(calls, "http")
+			return httpErr
+		},
+	}
+
+	err := shutdown.Err()
+	if !errors.Is(err, vmErr) || !errors.Is(err, httpErr) {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if len(calls) != 2 || calls[0] != "vm" || calls[1] != "http" {
+		t.Fatalf("shutdown calls = %v", calls)
+	}
+	shutdown.Shutdown()
+	if len(calls) != 2 {
+		t.Fatalf("repeated shutdown calls = %v", calls)
+	}
+}
+
+func TestDaemonServeErrorDistinguishesNormalShutdown(t *testing.T) {
+	if err := daemonServeError(http.ErrServerClosed); err != nil {
+		t.Fatalf("normal shutdown error = %v", err)
+	}
+	serveErr := errors.New("listener failed")
+	if err := daemonServeError(serveErr); !errors.Is(err, serveErr) {
+		t.Fatalf("serve error = %v", err)
+	}
+}
+
 func jsonBody(t *testing.T, value any) *bytes.Reader {
 	t.Helper()
 	return bytes.NewReader(mustJSON(t, value))
