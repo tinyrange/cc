@@ -15,6 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  api-contract:
+    name: OpenAPI contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate OpenAPI and route inventory
+        run: go test ./internal/ccvmd -run '^TestOpenAPIContract$' -count=1
+
   go-test:
     name: Go tests (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}

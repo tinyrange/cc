@@ -1086,14 +1086,50 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 	}
 }
 
+type apiRoute struct {
+	Method string
+	Path   string
+}
+
+type trackedServeMux struct {
+	*http.ServeMux
+	routes []apiRoute
+}
+
+func newTrackedServeMux() *trackedServeMux {
+	return &trackedServeMux{ServeMux: http.NewServeMux()}
+}
+
+func (m *trackedServeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.record(pattern)
+	m.ServeMux.HandleFunc(pattern, handler)
+}
+
+func (m *trackedServeMux) Handle(pattern string, handler http.Handler) {
+	m.record(pattern)
+	m.ServeMux.Handle(pattern, handler)
+}
+
+func (m *trackedServeMux) record(pattern string) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if !ok || strings.HasPrefix(path, "/debug/pprof") {
+		return
+	}
+	m.routes = append(m.routes, apiRoute{Method: method, Path: path})
+}
+
 func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
-	mux := http.NewServeMux()
+	mux, _ := newMuxWithRoutes(srvState, watchdog, shutdown, opts)
+	return mux
+}
+
+func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) (*http.ServeMux, []apiRoute) {
+	mux := newTrackedServeMux()
 	if pprofEnabled() {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
-		registerPprofHandlers(mux)
+		registerPprofHandlers(mux.ServeMux)
 	}
-
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -1919,7 +1955,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		writeJSON(w, http.StatusOK, resp)
 	})
-	mux.Handle("/vm/run", websocket.Server{
+	mux.Handle("GET /vm/run", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
@@ -1929,7 +1965,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			})
 		},
 	})
-	mux.Handle("/vm/run/stream", websocket.Server{
+	mux.Handle("GET /vm/run/stream", websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
@@ -1950,7 +1986,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			})
 		},
 	})
-	return mux
+	return mux.ServeMux, append([]apiRoute(nil), mux.routes...)
 }
 
 func pprofEnabled() bool {

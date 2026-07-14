@@ -692,6 +692,19 @@
       }
     },
     "/vm/run": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "Interactively run a command in an existing VM",
+        "description": "Upgrade to WebSocket. The client sends one ExecRequest, may then send ExecInput messages, and receives ExecEvent messages.",
+        "responses": {
+          "101": { "description": "WebSocket protocol upgrade" }
+        },
+        "x-websocket": {
+          "initialClientMessage": { "$ref": "#/components/schemas/ExecRequest" },
+          "clientMessages": { "$ref": "#/components/schemas/ExecInput" },
+          "serverMessages": { "$ref": "#/components/schemas/ExecEvent" }
+        }
+      },
       "post": {
         "tags": ["vms"],
         "summary": "Run a command in a VM",
@@ -719,6 +732,21 @@
           },
           "400": { "$ref": "#/components/responses/Error" },
           "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/vm/run/stream": {
+      "get": {
+        "tags": ["vms"],
+        "summary": "Interactively create a VM and run a command",
+        "description": "Upgrade to WebSocket. The client sends one RunRequest, may then send ExecInput messages, and receives ExecEvent messages.",
+        "responses": {
+          "101": { "description": "WebSocket protocol upgrade" }
+        },
+        "x-websocket": {
+          "initialClientMessage": { "$ref": "#/components/schemas/RunRequest" },
+          "clientMessages": { "$ref": "#/components/schemas/ExecInput" },
+          "serverMessages": { "$ref": "#/components/schemas/ExecEvent" }
         }
       }
     },
@@ -1142,25 +1170,33 @@
         }
       },
       "RunRequest": {
-        "allOf": [
-          { "$ref": "#/components/schemas/CreateInstanceRequest" },
-          {
-            "type": "object",
-            "properties": {
-              "command": { "type": "array", "items": { "type": "string" } },
-              "env": { "type": "array", "items": { "type": "string" } },
-              "root_dir": { "type": "string" },
-              "replace_env": { "type": "boolean" },
-              "workdir": { "type": "string" },
-              "user": { "type": "string" },
-              "stdin": { "type": "string", "format": "byte" },
-              "tty": { "type": "boolean" },
-              "control_fd": { "type": "boolean" },
-              "cols": { "type": "integer" },
-              "rows": { "type": "integer" }
-            }
-          }
-        ]
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "image": { "type": "string" },
+          "init": { "type": "string" },
+          "kernel": { "type": "string" },
+          "shares": { "type": "array", "items": { "$ref": "#/components/schemas/ShareMount" } },
+          "network": { "$ref": "#/components/schemas/NetworkConfig" },
+          "kernel_modules": { "type": "array", "items": { "type": "string" } },
+          "command": { "type": "array", "items": { "type": "string" } },
+          "env": { "type": "array", "items": { "type": "string" } },
+          "root_dir": { "type": "string" },
+          "replace_env": { "type": "boolean" },
+          "workdir": { "type": "string" },
+          "user": { "type": "string" },
+          "stdin": { "type": "string", "format": "byte" },
+          "tty": { "type": "boolean" },
+          "control_fd": { "type": "boolean" },
+          "cols": { "type": "integer" },
+          "rows": { "type": "integer" },
+          "memory_mb": { "type": "integer", "format": "uint64" },
+          "balloon_mb": { "type": "integer", "format": "uint64" },
+          "cpus": { "type": "integer" },
+          "nested_virtualization": { "type": "boolean" },
+          "dmesg": { "type": "boolean" },
+          "timeout_seconds": { "type": "number" }
+        }
       },
       "ExecResponse": {
         "type": "object",
@@ -1191,6 +1227,41 @@
           "data": { "type": "string" },
           "error": { "type": "string" },
           "state": { "$ref": "#/components/schemas/InstanceState" }
+        }
+      },
+      "ExecRequest": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "kind": { "type": "string" },
+          "id": { "type": "string" },
+          "image": { "type": "string" },
+          "command": { "type": "array", "items": { "type": "string" } },
+          "env": { "type": "array", "items": { "type": "string" } },
+          "root_dir": { "type": "string" },
+          "path": { "type": "string" },
+          "directory": { "type": "boolean" },
+          "replace_env": { "type": "boolean" },
+          "skip_resolve": { "type": "boolean" },
+          "workdir": { "type": "string" },
+          "user": { "type": "string" },
+          "stdin": { "type": "string", "format": "byte" },
+          "tty": { "type": "boolean" },
+          "control_fd": { "type": "boolean" },
+          "cols": { "type": "integer" },
+          "rows": { "type": "integer" }
+        }
+      },
+      "ExecInput": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string" },
+          "input": { "type": "string" },
+          "data": { "type": "string", "format": "byte" },
+          "signal": { "type": "string" },
+          "cols": { "type": "integer" },
+          "rows": { "type": "integer" }
         }
       },
       "ExecEvent": {
