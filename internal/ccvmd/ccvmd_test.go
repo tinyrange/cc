@@ -981,6 +981,58 @@ func TestDaemonServeErrorDistinguishesNormalShutdown(t *testing.T) {
 	}
 }
 
+func TestWorkerExecInputQueueBoundsAndReservesControlCapacity(t *testing.T) {
+	exec := newWorkerActiveExec(nil, true)
+	for i := 0; i < workerExecStdinQueueLimit; i++ {
+		if err := exec.sendInput(client.ExecInput{Kind: "stdin", Data: []byte{byte(i)}}); err != nil {
+			t.Fatalf("enqueue stdin %d: %v", i, err)
+		}
+	}
+	if err := exec.sendInput(client.ExecInput{Kind: "stdin"}); !errors.Is(err, errWorkerExecInputOverflow) {
+		t.Fatalf("stdin overflow error = %v", err)
+	}
+	for len(exec.queue) < workerExecControlQueueLimit {
+		if err := exec.sendInput(client.ExecInput{Kind: "resize", Cols: len(exec.queue)}); err != nil {
+			t.Fatalf("enqueue reserved control input: %v", err)
+		}
+	}
+	if err := exec.sendInput(client.ExecInput{Kind: "signal", Signal: "TERM"}); !errors.Is(err, errWorkerExecInputOverflow) {
+		t.Fatalf("control overflow error = %v", err)
+	}
+	if err := exec.sendInput(client.ExecInput{Kind: "stdin_close"}); err != nil {
+		t.Fatalf("enqueue reserved stdin close: %v", err)
+	}
+	if len(exec.queue) != workerExecInputQueueCapacity || cap(exec.queue) != workerExecInputQueueCapacity {
+		t.Fatalf("queue length/capacity = %d/%d", len(exec.queue), cap(exec.queue))
+	}
+}
+
+func TestWorkerExecInputOverflowCancelsOnlyExec(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	exec := newWorkerActiveExec(cancel, true)
+	for i := 0; i < workerExecStdinQueueLimit; i++ {
+		if err := exec.sendInput(client.ExecInput{Kind: "stdin"}); err != nil {
+			t.Fatalf("enqueue stdin %d: %v", i, err)
+		}
+	}
+	if err := enqueueWorkerExecInput(exec, client.ExecInput{Kind: "stdin"}); !errors.Is(err, errWorkerExecInputOverflow) {
+		t.Fatalf("overflow error = %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("overflow did not cancel exec")
+	}
+	select {
+	case <-exec.done:
+	case <-time.After(time.Second):
+		t.Fatal("overflow did not close exec inputs")
+	}
+	if len(exec.queue) != workerExecStdinQueueLimit || cap(exec.queue) != workerExecInputQueueCapacity {
+		t.Fatalf("queue length/capacity = %d/%d", len(exec.queue), cap(exec.queue))
+	}
+}
+
 func jsonBody(t *testing.T, value any) *bytes.Reader {
 	t.Helper()
 	return bytes.NewReader(mustJSON(t, value))
