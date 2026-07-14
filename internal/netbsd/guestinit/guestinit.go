@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	guestbuildid "j5.nz/cc/internal/guestinit/buildid"
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
@@ -27,15 +29,19 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, err
 	}
-	out := filepath.Join(cacheDir, "guest-init-netbsd-"+arch)
-	if data, err := os.ReadFile(out); err == nil && len(data) != 0 {
-		return data, nil
-	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return nil, fmt.Errorf("locate NetBSD guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
+	identity, err := guestbuildid.Resolve(ctx, moduleRoot, "netbsd", arch, "./internal/cmd/netbsd-init")
+	if err != nil {
+		return nil, fmt.Errorf("identify NetBSD guest init build: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-netbsd-"+arch+"-"+identity)
+	if data, err := os.ReadFile(out); err == nil && len(data) != 0 {
+		return data, nil
+	}
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/netbsd-init")
 	cmd.Dir = moduleRoot
 	cmd.Env = append(os.Environ(), "GOOS=netbsd", "GOARCH="+arch, "CGO_ENABLED=0")

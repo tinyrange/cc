@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -52,9 +53,32 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
 	}
-	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/sbin/cc-openbsd-init", "/usr/lib/libc.so", "/usr/lib/libpthread.so", "/dev/console"} {
+	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/sbin/cc-openbsd-init", "/usr/lib/libc.so", "/usr/lib/libpthread.so", "/dev/console", "/dev/ptm", "/dev/ptyp0", "/dev/ttyp0", "/dev/ptypZ", "/dev/ttypZ"} {
 		if _, err := imagefs.LookupPath(root, guestPath); err != nil {
 			t.Fatalf("lookup %s: %v", guestPath, err)
+		}
+	}
+	ptm, err := imagefs.LookupPath(root, "/dev/ptm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ptmMode := ptm.File.Stat()
+	if ptmMode != fs.ModeDevice|fs.ModeCharDevice|0o666 || ptm.File.RDev() != 81<<8 {
+		t.Fatalf("/dev/ptm mode=%v rdev=%d", ptmMode, ptm.File.RDev())
+	}
+	for guestPath, wantRDev := range map[string]uint32{
+		"/dev/ttyp0": 5 << 8,
+		"/dev/ptyp0": 6 << 8,
+		"/dev/ttypZ": 5<<8 | 61,
+		"/dev/ptypZ": 6<<8 | 61,
+	} {
+		entry, err := imagefs.LookupPath(root, guestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, mode := entry.File.Stat()
+		if mode != fs.ModeDevice|fs.ModeCharDevice|0o666 || entry.File.RDev() != wantRDev {
+			t.Fatalf("%s mode=%v rdev=%d, want rdev=%d", guestPath, mode, entry.File.RDev(), wantRDev)
 		}
 	}
 	initEntry, err := imagefs.LookupPath(root, "/sbin/init")

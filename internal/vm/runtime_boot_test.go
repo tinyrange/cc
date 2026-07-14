@@ -313,6 +313,41 @@ func bootManagedBSDRuntimeContract(t *testing.T, tc managedBSDRuntimeBootCase) (
 		t.Fatalf("%s control fd output = %q, want %s", tc.name, controlOutput, expectedControl)
 	}
 
+	inputs := make(chan client.ExecInput, 2)
+	var ttyControl strings.Builder
+	var ttyExit *int
+	resizeSent := false
+	if err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"sh", "-c", "test -t 0 || exit 91; printf 'tty-ready\\n' >&3; IFS= read -r command; eval \"$command\""},
+		TTY:       true,
+		ControlFD: true,
+		Cols:      80,
+		Rows:      24,
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			ttyControl.WriteString(event.Output)
+			if !resizeSent && strings.Contains(ttyControl.String(), "tty-ready\n") {
+				resizeSent = true
+				inputs <- client.ExecInput{Kind: "resize", Cols: 91, Rows: 37}
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("stty size >&3\n")}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			ttyExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("%s runtime TTY exec: %v", tc.name, err)
+	}
+	if !resizeSent || ttyExit == nil || *ttyExit != 0 {
+		t.Fatalf("%s TTY state resize_sent=%t exit=%v control=%q", tc.name, resizeSent, ttyExit, ttyControl.String())
+	}
+	if got, want := strings.TrimSpace(ttyControl.String()), "tty-ready\n37 91"; got != want {
+		t.Fatalf("%s TTY control output = %q, want %q", tc.name, got, want)
+	}
+
 	flusher, ok := inst.(instanceFlushProvider)
 	if !ok {
 		t.Fatalf("%s runtime does not expose flush", tc.name)

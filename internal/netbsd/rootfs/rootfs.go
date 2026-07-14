@@ -180,6 +180,7 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 		{Path: "/etc/ifconfig." + network.Interface, Mode: 0o644, Data: []byte(fmt.Sprintf("inet %s netmask 255.255.255.0\n", network.GuestIPv4))},
 		{Path: "/etc/resolv.conf", Mode: 0o644, Data: []byte("nameserver " + network.DNSIPv4 + "\n")},
 		{Path: "/etc/hosts", Mode: 0o644, Data: []byte(fmt.Sprintf("127.0.0.1 localhost\n%s %s\n", network.GuestIPv4, network.Hostname))},
+		{Path: "/etc/group", Mode: 0o644, Data: netBSDManagedGroup(root)},
 		{Path: "/etc/services", Mode: 0o644, Data: []byte(bsdNetworkServices)},
 		{Path: "/etc/protocols", Mode: 0o644, Data: []byte(bsdNetworkProtocols)},
 		{Path: "/etc/netconfig", Mode: 0o644, Data: []byte(netBSDNetconfig)},
@@ -190,6 +191,10 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/pkg/bin:/usr/pkg/sbin
 		_ = closeRoot()
 		return nil, nil, err
 	}
+	if err := overlay.AddDir("/dev/pts", fs.ModeDir|0o755); err != nil {
+		_ = closeRoot()
+		return nil, nil, fmt.Errorf("overlay /dev/pts: %w", err)
+	}
 	if err := rootplan.AddDevices(overlay, netBSDManagedDevices(arch)); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
@@ -197,11 +202,32 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/pkg/bin:/usr/pkg/sbin
 	return overlay.Root(), closeRoot, nil
 }
 
+func netBSDManagedGroup(root imagefs.Directory) []byte {
+	const ttyGroup = "tty:*:4:root"
+	var group []byte
+	if entry, err := imagefs.LookupPath(root, "/etc/group"); err == nil && entry.File != nil {
+		size, _ := entry.File.Stat()
+		if data, readErr := entry.File.ReadAt(0, uint32(size)); readErr == nil {
+			group = data
+		}
+	}
+	for _, line := range strings.Split(string(group), "\n") {
+		if fields := strings.SplitN(line, ":", 2); len(fields) != 0 && fields[0] == "tty" {
+			return group
+		}
+	}
+	if len(group) != 0 && group[len(group)-1] != '\n' {
+		group = append(group, '\n')
+	}
+	return append(group, (ttyGroup + "\n")...)
+}
+
 type netBSDDeviceMajors struct {
 	consChar uint32
 	cttyChar uint32
 	memChar  uint32
 	rndChar  uint32
+	ptmChar  uint32
 	ldBlock  uint32
 	ldChar   uint32
 }
@@ -213,6 +239,7 @@ func netBSDDeviceMajorsForArch(arch string) netBSDDeviceMajors {
 			cttyChar: 3,
 			memChar:  0,
 			rndChar:  52,
+			ptmChar:  165,
 			ldBlock:  92,
 			ldChar:   92,
 		}
@@ -222,6 +249,7 @@ func netBSDDeviceMajorsForArch(arch string) netBSDDeviceMajors {
 		cttyChar: 1,
 		memChar:  2,
 		rndChar:  46,
+		ptmChar:  165,
 		ldBlock:  19,
 		ldChar:   69,
 	}
@@ -237,6 +265,8 @@ func netBSDManagedDevices(arch string) []rootplan.Device {
 		{Path: "/dev/zero", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.memChar, 12)},
 		{Path: "/dev/random", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o444, RDev: rdev(maj.rndChar, 0)},
 		{Path: "/dev/urandom", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: rdev(maj.rndChar, 1)},
+		{Path: "/dev/ptmx", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.ptmChar, 0)},
+		{Path: "/dev/ptm", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: rdev(maj.ptmChar, 1)},
 		{Path: "/dev/ld0", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 3)},
 		{Path: "/dev/ld0a", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 0)},
 		{Path: "/dev/ld0d", Mode: fs.ModeDevice | 0o640, RDev: rdev(maj.ldBlock, 3)},
@@ -447,6 +477,10 @@ const managedInitScript = `#!/bin/sh
 exec >/dev/console 2>&1
 /sbin/mount -u -o rw / || {
 	echo NETBSD_MANAGED_REMOUNT_FAILED
+	while :; do /bin/sleep 3600; done
+}
+/sbin/mount_ptyfs ptyfs /dev/pts || {
+	echo NETBSD_MANAGED_PTYFS_FAILED
 	while :; do /bin/sleep 3600; done
 }
 /bin/date -u %s >/dev/null 2>&1 || true

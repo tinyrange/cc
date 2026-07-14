@@ -2,21 +2,14 @@ package guestinit
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
-	"sync"
-)
 
-var guestInitBuildIdentities struct {
-	sync.Mutex
-	values map[string]string
-}
+	guestbuildid "j5.nz/cc/internal/guestinit/buildid"
+)
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 	return BuildForArch(ctx, cacheDir, runtime.GOARCH)
@@ -44,7 +37,7 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 		return nil, fmt.Errorf("locate guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
-	identity, err := currentBuildIdentity(ctx, moduleRoot, goarch)
+	identity, err := guestbuildid.Resolve(ctx, moduleRoot, "linux", goarch, "./internal/cmd/init")
 	if err != nil {
 		return nil, fmt.Errorf("identify guest init build: %w", err)
 	}
@@ -67,35 +60,6 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 		return nil, err
 	}
 	return bin, nil
-}
-
-func currentBuildIdentity(ctx context.Context, moduleRoot, goarch string) (string, error) {
-	guestInitBuildIdentities.Lock()
-	identity := guestInitBuildIdentities.values[goarch]
-	guestInitBuildIdentities.Unlock()
-	if identity != "" {
-		return identity, nil
-	}
-	cmd := exec.CommandContext(ctx, "go", "list", "-export", "-f", "{{.BuildID}}", "./internal/cmd/init")
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
-	cmd.Dir = moduleRoot
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("resolve Linux guest init build identity: %w\n%s", err, output)
-	}
-	buildID := strings.TrimSpace(string(output))
-	if buildID == "" {
-		return "", fmt.Errorf("Linux guest init build identity is empty")
-	}
-	sum := sha256.Sum256([]byte(buildID))
-	identity = hex.EncodeToString(sum[:16])
-	guestInitBuildIdentities.Lock()
-	if guestInitBuildIdentities.values == nil {
-		guestInitBuildIdentities.values = make(map[string]string)
-	}
-	guestInitBuildIdentities.values[goarch] = identity
-	guestInitBuildIdentities.Unlock()
-	return identity, nil
 }
 
 func validateGuestInitPayload(goarch string, payload []byte) error {

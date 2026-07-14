@@ -333,15 +333,23 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 }
 
 func openBSDManagedDevices() []rootplan.Device {
-	return []rootplan.Device{
+	devices := []rootplan.Device{
 		{Path: "/dev/console", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600, RDev: 0},
 		{Path: "/dev/null", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 514},
 		{Path: "/dev/zero", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 515},
 		{Path: "/dev/random", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: 565},
 		{Path: "/dev/urandom", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o644, RDev: 566},
+		{Path: "/dev/ptm", Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: 81 << 8},
 		{Path: "/dev/sd0a", Mode: fs.ModeDevice | 0o640, RDev: 1024},
 		{Path: "/dev/sd0b", Mode: fs.ModeDevice | 0o640, RDev: 1025},
 	}
+	for minor, suffix := range "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+		devices = append(devices,
+			rootplan.Device{Path: fmt.Sprintf("/dev/ttyp%c", suffix), Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: uint32(5<<8 | minor)},
+			rootplan.Device{Path: fmt.Sprintf("/dev/ptyp%c", suffix), Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666, RDev: uint32(6<<8 | minor)},
+		)
+	}
+	return devices
 }
 
 func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
