@@ -25,6 +25,7 @@ type RuntimeView interface {
 	InstanceStatuses() []client.InstanceState
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
+	AllowServiceProxyPort(context.Context, string, int) error
 }
 
 func Main(args []string) {

@@ -779,7 +779,7 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		BalloonMB:  machine.balloonMB,
 		CPUs:       machine.cpus,
 		NestedVirt: machine.nestedVirt,
-		StartedAt:  machine.startedAt.Format(time.RFC3339),
+		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
 	}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
 		state.NetworkIPv4 = provider.NetworkIPv4()
