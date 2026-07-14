@@ -71,7 +71,7 @@ func TestKVMARM64StartupBenchmark(t *testing.T) {
 			cancel()
 			t.Fatalf("sample %d did not return a managed Linux session", i)
 		}
-		_, commandErr := linuxInst.managedInstance.session.Exec(ctx, client.ExecRequest{Kind: "sync"})
+		commandErr := linuxInst.managedInstance.session.Flush(ctx)
 		commandDuration := time.Since(commandStart)
 		closeErr := inst.Close()
 		cancel()
