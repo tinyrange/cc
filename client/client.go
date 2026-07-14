@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -152,7 +153,7 @@ func (c *Client) DownloadKernel(req DownloadRequest) error {
 }
 
 func (c *Client) DownloadKernelStream(req DownloadRequest, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStream("/kernel/download", req, onEvent)
+	return c.postJSONProgressStream("/kernel/download", req, onEvent, progressStatusDownloaded)
 }
 
 func (c *Client) PrepareImageMetadata(name string) (ImageMetadataState, error) {
@@ -206,7 +207,7 @@ func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func
 }
 
 func (c *Client) PullImageStreamContext(ctx context.Context, name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStreamContext(ctx, "/image/"+imagePathName(name), req, onEvent)
+	return c.postJSONProgressStreamContext(ctx, "/image/"+imagePathName(name), req, onEvent, progressStatusDownloaded)
 }
 
 func (c *Client) DeleteImage(name string) error {
@@ -798,11 +799,17 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 	return json.NewDecoder(resp.Body).Decode(respBody)
 }
 
-func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStreamContext(context.Background(), path, reqBody, onEvent)
+const progressStatusDownloaded = "downloaded"
+
+// ErrProgressStreamEndedBeforeTerminal reports a stream that ended before its
+// operation-level success event.
+var ErrProgressStreamEndedBeforeTerminal = errors.New("progress stream ended before terminal event")
+
+func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error, terminalStatus string) error {
+	return c.postJSONProgressStreamContext(context.Background(), path, reqBody, onEvent, terminalStatus)
 }
 
-func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string, reqBody any, onEvent func(ProgressEvent) error) error {
+func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string, reqBody any, onEvent func(ProgressEvent) error, terminalStatus string) error {
 	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
 	if err != nil {
 		return err
@@ -810,14 +817,16 @@ func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string,
 	defer resp.Body.Close()
 
 	dec := json.NewDecoder(resp.Body)
+	lastStatus := ""
 	for {
 		var event ProgressEvent
 		if err := dec.Decode(&event); err != nil {
 			if err == io.EOF {
-				return nil
+				return fmt.Errorf("%w: expected status %q after %q", ErrProgressStreamEndedBeforeTerminal, terminalStatus, lastStatus)
 			}
 			return err
 		}
+		lastStatus = event.Status
 		if onEvent != nil {
 			if err := onEvent(event); err != nil {
 				return err
@@ -828,6 +837,9 @@ func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string,
 				return fmt.Errorf("%s", event.Error)
 			}
 			return fmt.Errorf("streamed operation failed")
+		}
+		if event.Status == terminalStatus && event.Blob == "" {
+			return nil
 		}
 	}
 }
