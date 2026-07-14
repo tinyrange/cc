@@ -50,6 +50,16 @@ const (
 
 var errStopWalk = errors.New("stop walk")
 
+var cachePublicationLocks = struct {
+	sync.Mutex
+	locks map[string]*cachePublicationLock
+}{locks: make(map[string]*cachePublicationLock)}
+
+type cachePublicationLock struct {
+	refs int
+	mu   sync.Mutex
+}
+
 type Target struct {
 	Raw       string
 	Mirror    string
@@ -375,9 +385,9 @@ func (c *Client) PrefetchFile(target string) (uint64, error) {
 		return uint64(info.Size()), nil
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
-	if info, err := os.Stat(cachePath); err == nil {
-		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, int(info.Size()), 0, nil)
-		return uint64(info.Size()), nil
+	if size, err := privateCacheFileSize(c.CacheDir, cachePath); err == nil {
+		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, int(size), 0, nil)
+		return uint64(size), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, 0, 0, err)
 		return 0, err
@@ -414,17 +424,14 @@ func (c *Client) CachedFileSize(target string) (uint64, bool, error) {
 	if cachePath == "" {
 		return 0, false, nil
 	}
-	info, err := os.Stat(cachePath)
+	size, err := privateCacheFileSize(c.CacheDir, cachePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, false, nil
 		}
 		return 0, false, err
 	}
-	if info.IsDir() {
-		return 0, false, fmt.Errorf("%q is a directory", cachePath)
-	}
-	return uint64(info.Size()), true, nil
+	return uint64(size), true, nil
 }
 
 func (c *Client) WriteFileTo(target string, dst io.Writer) (uint64, error) {
@@ -446,7 +453,7 @@ func (c *Client) WriteFileTo(target string, dst io.Writer) (uint64, error) {
 		return uint64(n), err
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
-	if file, err := os.Open(cachePath); err == nil {
+	if file, err := openPrivateCacheFile(c.CacheDir, cachePath); err == nil {
 		defer file.Close()
 		n, err := io.Copy(dst, file)
 		c.traceDone(id, started, "WriteFileTo", target, "", cachePath, int(n), 0, err)
@@ -488,7 +495,7 @@ func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, boo
 		return data, eof, nil
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
-	if file, err := os.Open(cachePath); err == nil {
+	if file, err := openPrivateCacheFile(c.CacheDir, cachePath); err == nil {
 		defer file.Close()
 		info, statErr := file.Stat()
 		if statErr != nil {
@@ -821,8 +828,8 @@ func (r *repository) PrefetchFile(filePath string) (uint64, error) {
 		}
 		return uint64(len(data)), nil
 	}
-	if info, err := os.Stat(cachePath); err == nil {
-		return uint64(info.Size()), nil
+	if size, err := privateCacheFileSize(r.client.CacheDir, cachePath); err == nil {
+		return uint64(size), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, err
 	}
@@ -1124,7 +1131,7 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 		return r.objectURL(mirror, hash, suffix)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		reader := r.client.activityReader("HTTPObject", "", url, cachePath, resp.Body)
-		var cacheWriter io.WriteCloser
+		var cacheWriter *atomicFile
 		if cacheCompressed && cachePath != "" {
 			cacheFile, err := createAtomicFile(cachePath)
 			if err != nil {
@@ -1137,6 +1144,9 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 
 		zr, err := zlib.NewReader(reader)
 		if err != nil {
+			if cacheWriter != nil {
+				_ = cacheWriter.Abort()
+			}
 			r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
 			return err
 		}
@@ -1150,7 +1160,7 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 			if err == nil {
 				err = cacheWriter.Close()
 			} else {
-				_ = cacheWriter.Close()
+				_ = cacheWriter.Abort()
 			}
 			cacheWriter = nil
 		}
@@ -1180,7 +1190,7 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 		return r.objectURL(mirror, hash, suffix)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		reader := r.client.activityReader("HTTPObjectRange", "", url, cachePath, resp.Body)
-		var cacheWriter io.WriteCloser
+		var cacheWriter *atomicFile
 		if cachePath != "" {
 			cacheFile, err := createAtomicFile(cachePath)
 			if err != nil {
@@ -1194,7 +1204,7 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 		zr, err := zlib.NewReader(reader)
 		if err != nil {
 			if cacheWriter != nil {
-				_ = cacheWriter.Close()
+				_ = cacheWriter.Abort()
 			}
 			r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
 			return err
@@ -1212,7 +1222,7 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 			if err == nil {
 				err = cacheWriter.Close()
 			} else {
-				_ = cacheWriter.Close()
+				_ = cacheWriter.Abort()
 			}
 			cacheWriter = nil
 		}
@@ -1427,7 +1437,7 @@ func (r *repository) readCachedManifest() ([]byte, error) {
 	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
 		return nil, os.ErrNotExist
 	}
-	return os.ReadFile(filepath.Join(r.client.CacheDir, "state", r.repo, "manifest"))
+	return readPrivateCacheFile(r.client.CacheDir, filepath.Join(r.client.CacheDir, "state", r.repo, "manifest"))
 }
 
 func (r *repository) writeCachedManifest(data []byte) error {
@@ -1435,10 +1445,10 @@ func (r *repository) writeCachedManifest(data []byte) error {
 		return nil
 	}
 	manifestPath := filepath.Join(r.client.CacheDir, "state", r.repo, "manifest")
-	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
-		return fmt.Errorf("create cvmfs manifest cache dir: %w", err)
-	}
-	return os.WriteFile(manifestPath, data, 0o644)
+	return writeAtomicFile(manifestPath, func(dst io.Writer) error {
+		_, err := dst.Write(data)
+		return err
+	})
 }
 
 func (r *repository) openCatalog(hash string) (*catalog, error) {
@@ -1543,7 +1553,7 @@ func (r *repository) readCachedObject(hash, suffix string) ([]byte, error) {
 	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
 		return nil, os.ErrNotExist
 	}
-	return os.ReadFile(cvmfsObjectCachePath(r.client.CacheDir, hash, suffix))
+	return readPrivateCacheFile(r.client.CacheDir, cvmfsObjectCachePath(r.client.CacheDir, hash, suffix))
 }
 
 func (r *repository) writeCachedObject(hash, suffix string, data []byte) error {
@@ -1551,31 +1561,10 @@ func (r *repository) writeCachedObject(hash, suffix string, data []byte) error {
 		return nil
 	}
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		return fmt.Errorf("create cvmfs cache dir: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(cachePath), "cvmfs-object-*")
-	if err != nil {
-		return fmt.Errorf("create cvmfs cache temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		return fmt.Errorf("write cvmfs cache temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close cvmfs cache temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, cachePath); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil
-		}
-		return fmt.Errorf("commit cvmfs cache object: %w", err)
-	}
-	return nil
+	return writeAtomicFile(cachePath, func(dst io.Writer) error {
+		_, err := dst.Write(data)
+		return err
+	})
 }
 
 func (r *repository) objectURL(mirror, hash, suffix string) string {
@@ -1692,14 +1681,24 @@ func (c *Client) writeTrace(event traceEvent) {
 	if tracePath == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(tracePath), 0o755); err != nil {
-		return
+	cacheRoot := strings.TrimSpace(c.CacheDir)
+	if cacheRoot != "" && pathWithinBase(cacheRoot, tracePath) {
+		if err := ensurePrivateCacheDir(cacheRoot, filepath.Dir(tracePath)); err != nil {
+			return
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(tracePath), 0o700); err != nil {
+			return
+		}
 	}
-	file, err := os.OpenFile(tracePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(tracePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
 	}
 	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		return
+	}
 	_ = json.NewEncoder(file).Encode(event)
 }
 
@@ -1970,7 +1969,7 @@ func (c *Client) readCachedFile(parsed Target) ([]byte, error) {
 	if strings.TrimSpace(c.CacheDir) == "" {
 		return nil, os.ErrNotExist
 	}
-	return os.ReadFile(cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path))
+	return readPrivateCacheFile(c.CacheDir, cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path))
 }
 
 func (c *Client) writeCachedFile(parsed Target, data []byte) error {
@@ -1985,15 +1984,12 @@ func (c *Client) writeCachedFile(parsed Target, data []byte) error {
 }
 
 func writeAtomicFile(cachePath string, write func(dst io.Writer) error) error {
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		return fmt.Errorf("create cvmfs file cache dir: %w", err)
-	}
 	tmp, err := createAtomicFile(cachePath)
 	if err != nil {
 		return err
 	}
 	if err := write(tmp); err != nil {
-		_ = tmp.Close()
+		_ = tmp.Abort()
 		return fmt.Errorf("write cvmfs file cache temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -2006,17 +2002,33 @@ type atomicFile struct {
 	file       *os.File
 	targetPath string
 	closed     bool
+	unlock     func()
 }
 
 func createAtomicFile(targetPath string) (*atomicFile, error) {
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+	cacheRoot, err := cacheRootForPath(targetPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateCacheDir(cacheRoot, filepath.Dir(targetPath)); err != nil {
 		return nil, fmt.Errorf("create cvmfs cache dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(targetPath), "cvmfs-cache-*")
+	unlock, err := lockCachePublication(targetPath)
+	if err != nil {
+		return nil, fmt.Errorf("lock cvmfs cache entry: %w", err)
+	}
+	failed := true
+	defer func() {
+		if failed {
+			unlock()
+		}
+	}()
+	tmp, err := os.CreateTemp(filepath.Dir(targetPath), ".cvmfs-cache-*")
 	if err != nil {
 		return nil, fmt.Errorf("create cvmfs cache temp file: %w", err)
 	}
-	return &atomicFile{file: tmp, targetPath: targetPath}, nil
+	failed = false
+	return &atomicFile{file: tmp, targetPath: targetPath, unlock: unlock}, nil
 }
 
 func (a *atomicFile) Write(p []byte) (int, error) {
@@ -2028,10 +2040,20 @@ func (a *atomicFile) Close() error {
 		return nil
 	}
 	a.closed = true
+	defer a.unlock()
 	tmpPath := a.file.Name()
+	if err := a.file.Sync(); err != nil {
+		_ = a.file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("sync cvmfs cache temp file: %w", err)
+	}
 	if err := a.file.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close cvmfs cache temp file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("secure cvmfs cache temp file: %w", err)
 	}
 	if err := os.Rename(tmpPath, a.targetPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -2041,6 +2063,182 @@ func (a *atomicFile) Close() error {
 		return fmt.Errorf("commit cvmfs cache: %w", err)
 	}
 	return nil
+}
+
+func (a *atomicFile) Abort() error {
+	if a.closed {
+		return nil
+	}
+	a.closed = true
+	defer a.unlock()
+	tmpPath := a.file.Name()
+	closeErr := a.file.Close()
+	removeErr := os.Remove(tmpPath)
+	if closeErr != nil {
+		return closeErr
+	}
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return removeErr
+	}
+	return nil
+}
+
+func lockCachePublication(path string) (func(), error) {
+	path = filepath.Clean(path)
+	cachePublicationLocks.Lock()
+	lock := cachePublicationLocks.locks[path]
+	if lock == nil {
+		lock = &cachePublicationLock{}
+		cachePublicationLocks.locks[path] = lock
+	}
+	lock.refs++
+	cachePublicationLocks.Unlock()
+
+	lock.mu.Lock()
+	unlockFile, err := lockCacheFile(path + ".lock")
+	if err != nil {
+		lock.mu.Unlock()
+		cachePublicationLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(cachePublicationLocks.locks, path)
+		}
+		cachePublicationLocks.Unlock()
+		return nil, err
+	}
+	return func() {
+		unlockFile()
+		lock.mu.Unlock()
+		cachePublicationLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(cachePublicationLocks.locks, path)
+		}
+		cachePublicationLocks.Unlock()
+	}, nil
+}
+
+func cacheRootForPath(targetPath string) (string, error) {
+	clean := filepath.Clean(targetPath)
+	for dir := filepath.Dir(clean); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		switch filepath.Base(dir) {
+		case "files", "objects", "state":
+			return filepath.Dir(dir), nil
+		}
+	}
+	return "", fmt.Errorf("CVMFS cache path %q is outside a cache namespace", targetPath)
+}
+
+func ensurePrivateCacheDir(cacheRoot, targetDir string) error {
+	cacheRoot = filepath.Clean(cacheRoot)
+	targetDir = filepath.Clean(targetDir)
+	if !pathWithinBase(cacheRoot, targetDir) {
+		return fmt.Errorf("cache directory %q escapes root %q", targetDir, cacheRoot)
+	}
+	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
+		return err
+	}
+	if err := validatePrivateCacheDir(cacheRoot); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(cacheRoot, targetDir)
+	if err != nil {
+		return err
+	}
+	current := cacheRoot
+	if rel == "." {
+		return nil
+	}
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if err := validatePrivateCacheDir(current); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePrivateCacheDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("CVMFS cache path %q is not a directory", dir)
+	}
+	if err := validateCacheOwner(info); err != nil {
+		return fmt.Errorf("validate CVMFS cache directory %q: %w", dir, err)
+	}
+	if err := secureCacheDirectoryMode(dir, info); err != nil {
+		return fmt.Errorf("secure CVMFS cache directory %q: %w", dir, err)
+	}
+	return nil
+}
+
+func readPrivateCacheFile(cacheRoot, cachePath string) ([]byte, error) {
+	file, err := openPrivateCacheFile(cacheRoot, cachePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+func openPrivateCacheFile(cacheRoot, cachePath string) (*os.File, error) {
+	if strings.TrimSpace(cacheRoot) == "" || strings.TrimSpace(cachePath) == "" {
+		return nil, os.ErrNotExist
+	}
+	if err := ensurePrivateCacheDir(cacheRoot, filepath.Dir(cachePath)); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("CVMFS cache entry %q is not a regular file", cachePath)
+	}
+	if err := validateCacheOwner(info); err != nil {
+		return nil, fmt.Errorf("validate CVMFS cache entry %q: %w", cachePath, err)
+	}
+	if err := validateCacheFileMode(cachePath, info); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, fmt.Errorf("CVMFS cache entry %q changed while opening", cachePath)
+	}
+	return file, nil
+}
+
+func privateCacheFileSize(cacheRoot, cachePath string) (int64, error) {
+	file, err := openPrivateCacheFile(cacheRoot, cachePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func pathWithinBase(base, target string) bool {
+	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(target))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 type countingWriter struct {
