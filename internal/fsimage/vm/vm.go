@@ -152,8 +152,8 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 			newFrag := newFragmentRegion(vm.pageSize)
 
 			// Add the existing region.
-			if err := newFrag.mapFragment(existingRegion, 0); err != nil {
-				return nil
+			if err := newFrag.mapFragment(NewTruncatedRegion(existingRegion, int64(vm.pageSize)), 0); err != nil {
+				return errors.Join(fmt.Errorf("failed to preserve existing page fragment"), err)
 			}
 
 			// Add the new fragment last so it can overwrite the old region.
@@ -214,20 +214,25 @@ func (vm *VirtualMemory) Map(region MemoryRegion, offset int64) error {
 
 	// slog.Info("map", "region", region, "offset", offset)
 
-	// Get the size of the region.
+	if region == nil {
+		return fmt.Errorf("cannot map a nil region")
+	}
 	regionSize := region.Size()
+	if offset < 0 || regionSize < 0 || offset > vm.totalSize || regionSize > vm.totalSize-offset {
+		return fmt.Errorf("mapping offset %d size %d exceeds virtual memory size %d", offset, regionSize, vm.totalSize)
+	}
 
 	var regionOffset int64 = 0
 
 	// Check if the offset is aligned.
 	if offset%int64(vm.pageSize) != 0 {
-		// The offset is unaligned so we need to use a subdivided region.
-		if err := vm.mapFragment(region, offset); err != nil {
-			return nil
-		}
-
-		// Calculate the size of the fragment.
 		fragmentSize := int64(vm.pageSize) - (offset % int64(vm.pageSize))
+		if fragmentSize > regionSize {
+			fragmentSize = regionSize
+		}
+		if err := vm.mapFragment(NewTruncatedRegion(region, fragmentSize), offset); err != nil {
+			return errors.Join(fmt.Errorf("failed to map leading fragment"), err)
+		}
 
 		// Update the offsets.
 		regionOffset += fragmentSize
