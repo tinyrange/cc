@@ -51,6 +51,7 @@ func (c *workerCall) finish(err error) {
 const (
 	workerConnectTimeout = 5 * time.Second
 	workerRetryDelay     = 10 * time.Millisecond
+	workerHelloTimeout   = 5 * time.Second
 )
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
@@ -90,7 +91,7 @@ func dialWorker(ctx context.Context, socketPath string, security *WorkerTranspor
 		}
 	}
 	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]*workerCall{}}
-	frame, err := worker.codec.Receive()
+	frame, err := receiveWorkerHello(ctx, conn, worker.codec, workerHelloTimeout)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read sidecar worker hello: %w", err)
@@ -118,6 +119,37 @@ func dialWorker(ctx context.Context, socketPath string, security *WorkerTranspor
 	}
 	go worker.receiveLoop()
 	return worker, nil
+}
+
+func receiveWorkerHello(ctx context.Context, conn net.Conn, codec *WorkerCodec, timeout time.Duration) (WorkerFrame, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return WorkerFrame{}, err
+	}
+
+	cancelWatchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-cancelWatchDone:
+		}
+	}()
+	frame, err := codec.Receive()
+	close(cancelWatchDone)
+	if clearErr := conn.SetReadDeadline(time.Time{}); err == nil && clearErr != nil {
+		err = clearErr
+	}
+	if ctx.Err() != nil {
+		return WorkerFrame{}, ctx.Err()
+	}
+	return frame, err
 }
 
 type workerDialEndpoint struct {
