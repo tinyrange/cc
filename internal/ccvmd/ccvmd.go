@@ -39,7 +39,6 @@ func isBuiltInBSDImage(name string) bool {
 }
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
-var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
 var bootEventWriteMu sync.Mutex
 
 const defaultVMBootTimeout = 5 * time.Second
@@ -790,20 +789,10 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 
 func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
 	mux := http.NewServeMux()
-	if debugPprof {
+	if pprofEnabled() {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
 		registerPprofHandlers(mux)
-	}
-
-	if strings.TrimSpace(os.Getenv("CCX3_PPROF")) != "" {
-		runtime.SetMutexProfileFraction(1)
-		runtime.SetBlockProfileRate(1)
-		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	}
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -1661,6 +1650,11 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		},
 	})
 	return mux
+}
+
+func pprofEnabled() bool {
+	return strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != "" ||
+		strings.TrimSpace(os.Getenv("CCX3_PPROF")) != ""
 }
 
 func resolveCacheDir(arg string) (string, error) {
