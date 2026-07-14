@@ -118,7 +118,9 @@ type WorkerCancelRequest struct {
 }
 
 type WorkerError struct {
-	Error string `json:"error"`
+	Error       string `json:"error"`
+	RequestID   uint64 `json:"request_id,omitempty"`
+	RequestType string `json:"request_type,omitempty"`
 }
 
 func (r WorkerStartRequest) Validate() error {

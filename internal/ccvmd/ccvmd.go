@@ -638,8 +638,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 		switch frame.Type {
 		case vm.WorkerFrameStart:
 			var req client.CreateInstanceRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
+			if !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
 			if opts.NormalizeCreateRequest != nil {
@@ -658,8 +660,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStartBlank:
 			var req client.StartInstanceRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
+			if !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
 			if opts.NormalizeStartRequest != nil {
@@ -678,11 +682,15 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStatus:
 			var req vm.WorkerStatusRequest
-			_ = frame.DecodePayload(&req)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
 		case vm.WorkerFrameStop:
 			var req vm.WorkerStopRequest
-			_ = frame.DecodePayload(&req)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
 			if err := srvState.vms.ShutdownInstance(context.Background(), req.ID); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
@@ -690,11 +698,15 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
 		case vm.WorkerFrameWait:
 			var req vm.WorkerWaitRequest
-			_ = frame.DecodePayload(&req)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
 			serveWorkerWait(connectionCtx, codec, srvState, frame.ID, req.ID, &activeMu, activeWaits)
 		case vm.WorkerFrameFlush:
 			var req vm.WorkerFlushRequest
-			_ = frame.DecodePayload(&req)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
 			if err := srvState.vms.FlushInstance(context.Background(), req.ID); err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
@@ -702,8 +714,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
 		case vm.WorkerFrameAddShare:
 			var req vm.WorkerAddShareRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
 			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
@@ -713,7 +724,9 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
 		case vm.WorkerFrameConsole:
 			var req vm.WorkerConsoleRequest
-			_ = frame.DecodePayload(&req)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
 			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
 			if err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
@@ -722,12 +735,11 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
 		case vm.WorkerFrameExec:
 			if err := serveWorkerExec(connectionCtx, codec, srvState, frame, &activeMu, activeExecs); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+				_ = sendWorkerRequestError(codec, frame, err)
 			}
 		case vm.WorkerFrameExecInput:
 			var req vm.WorkerExecInput
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
 				continue
 			}
 			activeMu.Lock()
@@ -744,6 +756,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 				_ = sendWorkerError(codec, frame.ID, fmt.Errorf("worker exec input queue is full"))
 			}
 		case vm.WorkerFrameCancel:
+			var req vm.WorkerCancelRequest
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
 			activeMu.Lock()
 			exec := activeExecs[frame.ID]
 			wait := activeWaits[frame.ID]
@@ -814,6 +830,9 @@ func serveWorkerExec(parent context.Context, codec *vm.WorkerCodec, srvState *se
 	if err := frame.DecodePayload(&req); err != nil {
 		return err
 	}
+	if strings.TrimSpace(req.ID) == "" {
+		return fmt.Errorf("worker instance id is required")
+	}
 	ctx, cancel := context.WithCancel(parent)
 	exec := &workerActiveExec{cancel: cancel}
 	if req.InputStream {
@@ -857,6 +876,30 @@ func sendWorkerPayload(codec *vm.WorkerCodec, id uint64, frameType string, paylo
 
 func sendWorkerError(codec *vm.WorkerCodec, id uint64, err error) error {
 	return sendWorkerPayload(codec, id, vm.WorkerFrameError, vm.WorkerError{Error: err.Error()})
+}
+
+func decodeWorkerRequest(codec *vm.WorkerCodec, frame vm.WorkerFrame, dst any) bool {
+	if err := frame.DecodePayload(dst); err != nil {
+		_ = sendWorkerRequestError(codec, frame, fmt.Errorf("decode payload: %w", err))
+		return false
+	}
+	return true
+}
+
+func validateWorkerInstanceID(codec *vm.WorkerCodec, frame vm.WorkerFrame, id string) bool {
+	if strings.TrimSpace(id) != "" {
+		return true
+	}
+	_ = sendWorkerRequestError(codec, frame, fmt.Errorf("worker instance id is required"))
+	return false
+}
+
+func sendWorkerRequestError(codec *vm.WorkerCodec, frame vm.WorkerFrame, err error) error {
+	return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameError, vm.WorkerError{
+		Error:       err.Error(),
+		RequestID:   frame.ID,
+		RequestType: frame.Type,
+	})
 }
 
 func newServerShutdown(srvState *server, httpServer *http.Server) func() {

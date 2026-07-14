@@ -316,6 +316,118 @@ func shortWorkerSocketTempDir(t *testing.T) string {
 	return dir
 }
 
+func TestWorkerControlRejectsMalformedPayloadsAndRemainsUsable(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	clientCodec := vm.NewWorkerCodec(clientConn)
+	serverCodec := vm.NewWorkerCodec(serverConn)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveWorkerControl(serverCodec, &server{vms: vm.NewManagerWithHost(nil)}, ServerOptions{})
+	}()
+	defer serverConn.Close()
+
+	frameTypes := []string{
+		vm.WorkerFrameStart,
+		vm.WorkerFrameStartBlank,
+		vm.WorkerFrameStatus,
+		vm.WorkerFrameStop,
+		vm.WorkerFrameWait,
+		vm.WorkerFrameFlush,
+		vm.WorkerFrameAddShare,
+		vm.WorkerFrameConsole,
+		vm.WorkerFrameExec,
+		vm.WorkerFrameExecInput,
+		vm.WorkerFrameCancel,
+	}
+	for i, frameType := range frameTypes {
+		id := uint64(i + 1)
+		if err := clientCodec.Send(vm.WorkerFrame{
+			ID:      id,
+			Service: vm.WorkerServiceControl,
+			Type:    frameType,
+			Payload: json.RawMessage(`"invalid"`),
+		}); err != nil {
+			t.Fatalf("send malformed %s frame: %v", frameType, err)
+		}
+		assertWorkerRequestError(t, clientCodec, id, frameType)
+	}
+
+	emptyIDTypes := []string{
+		vm.WorkerFrameStart,
+		vm.WorkerFrameStartBlank,
+		vm.WorkerFrameStatus,
+		vm.WorkerFrameStop,
+		vm.WorkerFrameWait,
+		vm.WorkerFrameFlush,
+		vm.WorkerFrameAddShare,
+		vm.WorkerFrameConsole,
+		vm.WorkerFrameExec,
+	}
+	for i, frameType := range emptyIDTypes {
+		id := uint64(100 + i)
+		frame, err := vm.NewWorkerFrame(id, vm.WorkerServiceControl, frameType, map[string]any{})
+		if err != nil {
+			t.Fatalf("create empty-id %s frame: %v", frameType, err)
+		}
+		if err := clientCodec.Send(frame); err != nil {
+			t.Fatalf("send empty-id %s frame: %v", frameType, err)
+		}
+		assertWorkerRequestError(t, clientCodec, id, frameType)
+	}
+
+	valid, err := vm.NewWorkerFrame(999, vm.WorkerServiceControl, vm.WorkerFrameStatus, vm.WorkerStatusRequest{ID: "named"})
+	if err != nil {
+		t.Fatalf("create valid status frame: %v", err)
+	}
+	if err := clientCodec.Send(valid); err != nil {
+		t.Fatalf("send valid status frame: %v", err)
+	}
+	response, err := clientCodec.Receive()
+	if err != nil {
+		t.Fatalf("receive valid status response: %v", err)
+	}
+	if response.ID != 999 || response.Type != vm.WorkerFrameDone {
+		t.Fatalf("valid response = %+v", response)
+	}
+	var status vm.WorkerStatusResponse
+	if err := response.DecodePayload(&status); err != nil {
+		t.Fatalf("decode valid status response: %v", err)
+	}
+	if status.State.ID != "named" {
+		t.Fatalf("valid status targeted %q, want named", status.State.ID)
+	}
+
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("close worker client: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("worker server after client close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker server did not stop after client close")
+	}
+}
+
+func assertWorkerRequestError(t *testing.T, codec *vm.WorkerCodec, id uint64, requestType string) {
+	t.Helper()
+	response, err := codec.Receive()
+	if err != nil {
+		t.Fatalf("receive %s error: %v", requestType, err)
+	}
+	if response.ID != id || response.Type != vm.WorkerFrameError {
+		t.Fatalf("%s error envelope = %+v", requestType, response)
+	}
+	var workerErr vm.WorkerError
+	if err := response.DecodePayload(&workerErr); err != nil {
+		t.Fatalf("decode %s error: %v", requestType, err)
+	}
+	if workerErr.Error == "" || workerErr.RequestID != id || workerErr.RequestType != requestType {
+		t.Fatalf("%s structured error = %+v", requestType, workerErr)
+	}
+}
+
 func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
 	shutdownCalled := make(chan struct{}, 1)
 	watchdog := newPersistentWatchdogController(func() {
