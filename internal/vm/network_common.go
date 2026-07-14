@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"j5.nz/cc/client"
@@ -18,19 +19,30 @@ import (
 )
 
 const defaultGatewayMAC = "02:42:0a:2a:00:01"
+const defaultForwardConnections = 32
+const defaultTotalForwardConnections = 128
+
+type PortForwardRuntimeStats struct {
+	Active   int64
+	Rejected uint64
+	Limit    int
+}
 
 type networkRuntime struct {
-	id        string
-	ip        net.IP
-	mac       net.HardwareAddr
-	stack     *netstack.NetStack
-	iface     *netstack.NetworkInterface
-	dev       *virtio.Net
-	txHook    func([]byte)
-	mu        sync.Mutex
-	listeners []net.Listener
-	forwards  map[string]client.PortForward
-	wg        sync.WaitGroup
+	id              string
+	ip              net.IP
+	mac             net.HardwareAddr
+	stack           *netstack.NetStack
+	iface           *netstack.NetworkInterface
+	dev             *virtio.Net
+	txHook          func([]byte)
+	mu              sync.Mutex
+	listeners       []net.Listener
+	forwards        map[string]client.PortForward
+	wg              sync.WaitGroup
+	forwardSlots    chan struct{}
+	forwardActive   atomic.Int64
+	forwardRejected atomic.Uint64
 }
 
 type netstackVirtioBackend struct {
@@ -53,6 +65,10 @@ type networkDeviceConfig struct {
 func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error) {
 	if cfg.Config == nil || !cfg.Config.Enabled {
 		return nil, nil
+	}
+	totalForwardLimit := cfg.Config.MaxForwardConnections
+	if totalForwardLimit <= 0 {
+		totalForwardLimit = defaultTotalForwardConnections
 	}
 	if cfg.IP == nil {
 		if ip := net.ParseIP(strings.TrimSpace(cfg.Config.GuestIPv4)).To4(); ip != nil {
@@ -118,12 +134,13 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 	}
 
 	runtime := &networkRuntime{
-		id:     cfg.ID,
-		ip:     cfg.IP,
-		mac:    cfg.MAC,
-		stack:  stack,
-		iface:  iface,
-		txHook: cfg.TXHook,
+		id:           cfg.ID,
+		ip:           cfg.IP,
+		mac:          cfg.MAC,
+		stack:        stack,
+		iface:        iface,
+		txHook:       cfg.TXHook,
+		forwardSlots: make(chan struct{}, totalForwardLimit),
 	}
 	dev := virtio.NewNet(cfg.Base, cfg.Size, cfg.IRQ, cfg.MAC, &netstackVirtioBackend{runtime: runtime})
 	dev.CompleteTXChecksum = false
@@ -273,7 +290,11 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 	n.listeners = append(n.listeners, ln)
 	n.wg.Add(1)
 	n.mu.Unlock()
-	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)))
+	limit := forward.MaxConnections
+	if limit <= 0 {
+		limit = defaultForwardConnections
+	}
+	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)), make(chan struct{}, limit))
 	return nil
 }
 
@@ -288,16 +309,61 @@ func (n *networkRuntime) AllowServiceProxyPort(port int) error {
 	return nil
 }
 
-func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string) {
+func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string, slots chan struct{}) {
 	defer n.wg.Done()
 	for {
 		hostConn, err := ln.Accept()
 		if err != nil {
 			return
 		}
+		if !tryAcquireForwardSlot(slots) {
+			n.forwardRejected.Add(1)
+			_ = hostConn.Close()
+			continue
+		}
+		if !tryAcquireForwardSlot(n.forwardSlots) {
+			releaseForwardSlot(slots)
+			n.forwardRejected.Add(1)
+			_ = hostConn.Close()
+			continue
+		}
+		n.forwardActive.Add(1)
 		n.wg.Add(1)
-		go n.handlePortForwardConn(hostConn, guestAddress)
+		go func() {
+			defer releaseForwardSlot(slots)
+			defer releaseForwardSlot(n.forwardSlots)
+			defer n.forwardActive.Add(-1)
+			n.handlePortForwardConn(hostConn, guestAddress)
+		}()
 	}
+}
+
+func tryAcquireForwardSlot(slots chan struct{}) bool {
+	if slots == nil {
+		return false
+	}
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+func releaseForwardSlot(slots chan struct{}) {
+	if slots == nil {
+		return
+	}
+	select {
+	case <-slots:
+	default:
+	}
+}
+
+func (n *networkRuntime) PortForwardStats() PortForwardRuntimeStats {
+	if n == nil {
+		return PortForwardRuntimeStats{}
+	}
+	return PortForwardRuntimeStats{Active: n.forwardActive.Load(), Rejected: n.forwardRejected.Load(), Limit: cap(n.forwardSlots)}
 }
 
 func (n *networkRuntime) handlePortForwardConn(hostConn net.Conn, guestAddress string) {
