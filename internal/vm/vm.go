@@ -584,6 +584,7 @@ func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
 			delete(m.running, machine.id)
 		}
 		delete(m.networkLeases, machine.id)
+		m.recordExitLocked(machine, nil)
 	} else if machine.stop == stop {
 		machine.stopping = false
 	}
@@ -965,10 +966,21 @@ func (m *Manager) watch(machine *Machine) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// An explicit stop owns exit publication. Close implementations commonly
+	// cancel their run context, so Wait may report context.Canceled even though
+	// the requested shutdown completed successfully. A failed Close keeps the
+	// machine registered so cleanup can be retried.
+	if machine.stopping || machine.stop != nil && machine.stop.err != nil {
+		return
+	}
 	if m.running != nil && m.running[machine.id] == machine {
 		delete(m.running, machine.id)
 	}
 	delete(m.networkLeases, machine.id)
+	m.recordExitLocked(machine, err)
+}
+
+func (m *Manager) recordExitLocked(machine *Machine, err error) {
 	machine.lastErr = err
 	machine.exitedAt = time.Now().UTC()
 	if m.exited == nil {

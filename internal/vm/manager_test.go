@@ -290,6 +290,24 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 	_ = manager.ShutdownAll(context.Background())
 }
 
+func TestManagerExplicitShutdownRecordsStoppedState(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 1})
+	instance := newFakeInstance()
+	instance.waitErr = context.Canceled
+	host.queueInstance(instance)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err != nil {
+		t.Fatalf("start instance: %v", err)
+	}
+	if err := manager.ShutdownInstance(context.Background(), "alpha"); err != nil {
+		t.Fatalf("shutdown instance: %v", err)
+	}
+	state := manager.StatusOf("alpha")
+	if state.Status != "stopped" || state.Error != "" || state.ExitedAt == "" {
+		t.Fatalf("state after explicit shutdown = %+v", state)
+	}
+}
+
 func TestManagerRejectsInvalidResourcesBeforeHostAllocation(t *testing.T) {
 	host := newFakeHost(VMHostCapabilities{MaxVMs: 4})
 	manager := testManager(host)
