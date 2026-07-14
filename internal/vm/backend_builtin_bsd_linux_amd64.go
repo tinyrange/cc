@@ -137,7 +137,7 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 	if def.BuildArtifact == nil {
 		return nil, fmt.Errorf("%s runtime root builder is not configured", displayName)
 	}
-	network, err := newLinuxPCINetworkRuntime(req.ID, managedBSDNetworkConfig(req.Network))
+	network, err := newLinuxPCINetworkRuntime(req.ID, managedBSDNetworkConfig(req.Network), b.networkSwitch)
 	if err != nil {
 		return nil, err
 	}

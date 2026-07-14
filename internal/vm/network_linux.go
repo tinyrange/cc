@@ -4,9 +4,11 @@ package vm
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
@@ -17,32 +19,51 @@ import (
 type linuxNetworkRuntime struct {
 	*networkRuntime
 	switchNet *linuxVirtualSwitch
+	rxQueue   chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+	worker    sync.WaitGroup
+	dropped   atomic.Uint64
 }
 
-func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
+func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig, switches ...*linuxVirtualSwitch) (*linuxNetworkRuntime, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
-	return newLinuxSwitchNetworkRuntime(id, cfg, amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ)
+	return newLinuxSwitchNetworkRuntimeOn(selectLinuxSwitch(switches), id, cfg, amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ)
 }
 
-func newLinuxARM64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
+func newLinuxARM64NetworkRuntime(id string, cfg *client.NetworkConfig, switches ...*linuxVirtualSwitch) (*linuxNetworkRuntime, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
-	return newLinuxSwitchNetworkRuntime(id, cfg, arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ)
+	return newLinuxSwitchNetworkRuntimeOn(selectLinuxSwitch(switches), id, cfg, arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ)
 }
 
-func newLinuxPCINetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
+func newLinuxPCINetworkRuntime(id string, cfg *client.NetworkConfig, switches ...*linuxVirtualSwitch) (*linuxNetworkRuntime, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
-	return newLinuxSwitchNetworkRuntime(id, cfg, 0, 0x1000, 11)
+	return newLinuxSwitchNetworkRuntimeOn(selectLinuxSwitch(switches), id, cfg, 0, 0x1000, 11)
+}
+
+func selectLinuxSwitch(switches []*linuxVirtualSwitch) *linuxVirtualSwitch {
+	if len(switches) != 0 && switches[0] != nil {
+		return switches[0]
+	}
+	return defaultLinuxVirtualSwitch
 }
 
 func newLinuxSwitchNetworkRuntime(id string, cfg *client.NetworkConfig, base, size uint64, irq uint32) (*linuxNetworkRuntime, error) {
-	lease := defaultLinuxVirtualSwitch.Register(id)
-	runtime := &linuxNetworkRuntime{switchNet: defaultLinuxVirtualSwitch}
+	return newLinuxSwitchNetworkRuntimeOn(newLinuxVirtualSwitch(), id, cfg, base, size, irq)
+}
+
+func newLinuxSwitchNetworkRuntimeOn(switchNet *linuxVirtualSwitch, id string, cfg *client.NetworkConfig, base, size uint64, irq uint32) (*linuxNetworkRuntime, error) {
+	lease, err := switchNet.Register(id, cfg)
+	if err != nil {
+		return nil, err
+	}
+	runtime := &linuxNetworkRuntime{switchNet: switchNet, rxQueue: make(chan []byte, 256), done: make(chan struct{})}
 	common, err := newNetworkRuntime(networkDeviceConfig{
 		ID:     lease.id,
 		Config: cfg,
@@ -52,17 +73,19 @@ func newLinuxSwitchNetworkRuntime(id string, cfg *client.NetworkConfig, base, si
 		Size:   size,
 		IRQ:    irq,
 		TXHook: func(packet []byte) {
-			defaultLinuxVirtualSwitch.Forward(runtime, packet)
+			switchNet.Forward(runtime, packet)
 		},
 		Cleanup: func() {
-			defaultLinuxVirtualSwitch.Unregister(lease.id)
+			switchNet.Unregister(lease.id)
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
 	runtime.networkRuntime = common
-	defaultLinuxVirtualSwitch.Attach(runtime)
+	switchNet.Attach(runtime)
+	runtime.worker.Add(1)
+	go runtime.runRX()
 	return runtime, nil
 }
 
@@ -74,6 +97,7 @@ func (n *linuxNetworkRuntime) Close() error {
 		n.switchNet.Unregister(n.id)
 		n.switchNet = nil
 	}
+	n.closeOnce.Do(func() { close(n.done); n.worker.Wait() })
 	if n.networkRuntime == nil {
 		return nil
 	}
@@ -113,14 +137,15 @@ type linuxNetworkLease struct {
 	mac net.HardwareAddr
 }
 
-var defaultLinuxVirtualSwitch = &linuxVirtualSwitch{
-	leases:    make(map[string]linuxNetworkLease),
-	endpoints: make(map[string]*linuxNetworkRuntime),
+func newLinuxVirtualSwitch() *linuxVirtualSwitch {
+	return &linuxVirtualSwitch{leases: make(map[string]linuxNetworkLease), endpoints: make(map[string]*linuxNetworkRuntime)}
 }
 
-func (s *linuxVirtualSwitch) Register(id string) linuxNetworkLease {
+var defaultLinuxVirtualSwitch = newLinuxVirtualSwitch()
+
+func (s *linuxVirtualSwitch) Register(id string, cfg ...*client.NetworkConfig) (linuxNetworkLease, error) {
 	if s == nil {
-		return linuxNetworkLease{id: id, ip: net.IPv4(10, 42, 0, 2), mac: net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}}
+		return linuxNetworkLease{}, fmt.Errorf("network switch is required")
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -128,6 +153,30 @@ func (s *linuxVirtualSwitch) Register(id string) linuxNetworkLease {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var requested *client.NetworkConfig
+	if len(cfg) != 0 {
+		requested = cfg[0]
+	}
+	if requested != nil && (strings.TrimSpace(requested.GuestIPv4) != "" || strings.TrimSpace(requested.GuestMAC) != "") {
+		ip := net.ParseIP(strings.TrimSpace(requested.GuestIPv4)).To4()
+		mac, err := net.ParseMAC(strings.TrimSpace(requested.GuestMAC))
+		if ip == nil || err != nil || len(mac) != 6 {
+			return linuxNetworkLease{}, fmt.Errorf("explicit network identity requires valid guest_ipv4 and guest_mac")
+		}
+		for otherID, lease := range s.leases {
+			if otherID != id && (lease.ip.Equal(ip) || bytesEqualMAC(lease.mac, mac)) {
+				return linuxNetworkLease{}, fmt.Errorf("network identity conflicts with VM %q", otherID)
+			}
+		}
+		for otherID, endpoint := range s.endpoints {
+			if otherID != id && endpoint != nil && (endpoint.ip.Equal(ip) || bytesEqualMAC(endpoint.mac, mac)) {
+				return linuxNetworkLease{}, fmt.Errorf("network identity conflicts with VM %q", otherID)
+			}
+		}
+		lease := linuxNetworkLease{id: id, ip: append(net.IP(nil), ip...), mac: append(net.HardwareAddr(nil), mac...)}
+		s.leases[id] = lease
+		return lease, nil
+	}
 
 	used := map[byte]bool{1: true}
 	for _, lease := range s.leases {
@@ -157,7 +206,7 @@ func (s *linuxVirtualSwitch) Register(id string) linuxNetworkLease {
 		s.leases = make(map[string]linuxNetworkLease)
 	}
 	s.leases[id] = lease
-	return lease
+	return lease, nil
 }
 
 func (s *linuxVirtualSwitch) Attach(endpoint *linuxNetworkRuntime) {
@@ -271,13 +320,36 @@ func (s *linuxVirtualSwitch) forwardToAll(sourceID string, frame []byte) {
 }
 
 func (n *linuxNetworkRuntime) enqueueSwitchFrame(frame []byte) {
-	if n == nil || n.dev == nil {
+	if n == nil {
 		return
 	}
 	copied := append([]byte(nil), frame...)
-	go func() {
-		_ = n.dev.EnqueueRxPacketOwned(copied)
-	}()
+	select {
+	case n.rxQueue <- copied:
+	default:
+		n.dropped.Add(1)
+	}
+}
+
+func (n *linuxNetworkRuntime) runRX() {
+	defer n.worker.Done()
+	for {
+		select {
+		case frame := <-n.rxQueue:
+			if n.dev != nil {
+				_ = n.dev.EnqueueRxPacketOwned(frame)
+			}
+		case <-n.done:
+			return
+		}
+	}
+}
+
+func (n *linuxNetworkRuntime) DroppedFrames() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.dropped.Load()
 }
 
 func isLinuxBroadcastMAC(mac net.HardwareAddr) bool {

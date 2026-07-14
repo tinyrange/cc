@@ -35,10 +35,11 @@ type runtimeBackend struct {
 	kernel         *alpine.Manager
 	images         *oci.Store
 	guestInitCache string
+	networkSwitch  *linuxVirtualSwitch
 }
 
 func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
-	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache}
+	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache, networkSwitch: newLinuxVirtualSwitch()}
 }
 
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
@@ -68,7 +69,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +191,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +364,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
 	}
-	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
 		return client.ExecResponse{}, err
 	}

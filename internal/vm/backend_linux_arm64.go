@@ -32,10 +32,11 @@ type runtimeBackend struct {
 	kernel         *alpine.Manager
 	images         *oci.Store
 	guestInitCache string
+	networkSwitch  *linuxVirtualSwitch
 }
 
 func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
-	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache}
+	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache, networkSwitch: newLinuxVirtualSwitch()}
 }
 
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
