@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -2091,13 +2093,13 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 			return true
 		}
 		if len(req.Stdin) > 0 {
-			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
+			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, req.ArchiveLimits, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
 			return true
 		}
 		stdinR, stdinW := io.Pipe()
 		managed := &managedExec{stdin: stdinW, start: time.Now()}
 		active.Add(req.ID, managed)
-		go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, stdinR, func() {
+		go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, req.ArchiveLimits, stdinR, func() {
 			_ = managed.closeStdin()
 			active.Delete(req.ID)
 		})
@@ -2369,12 +2371,17 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 	}
 }
 
-func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, stdin io.ReadCloser, cleanup func()) {
+func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, limits *client.ArchiveLimits, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
-	if err := guestagent.ExtractTarToPath(stdin, rootDir, dst, dstDir); err != nil {
+	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), limits)
+	if err == nil {
+		defer cancel()
+		err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
+	}
+	if err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs extract: "+err.Error()+"\n")
 	}
