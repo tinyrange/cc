@@ -443,13 +443,22 @@ func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 }
 
 func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
+	guestInitCache := t.TempDir()
+	t.Setenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR", guestInitCache)
+	if err := os.MkdirAll(guestInitCache, 0o755); err != nil {
+		t.Fatalf("create stale guest init cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(guestInitCache, "guest-init-linux-"+runtime.GOARCH), []byte("\x7fELFstale-agent"), 0o755); err != nil {
+		t.Fatalf("seed stale guest init cache: %v", err)
+	}
 	env := newRuntimeBootEnv(t)
 	manager := NewManagerWithBackend(env.backend)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
 	defer cancel()
 	const instanceID = "tty-control"
+	guestWorkDir := "/host" + t.TempDir()
 	share := client.ShareMount{
-		Source:   t.TempDir(),
+		Source:   "/",
 		Mount:    "/host",
 		Writable: true,
 		MapOwner: true,
@@ -457,7 +466,7 @@ func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
 		OwnerGID: 1000,
 		Cache:    "strict",
 	}
-	if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+	if _, err := manager.StartBlank(ctx, client.StartInstanceRequest{
 		ID:       instanceID,
 		Image:    env.imageName,
 		Shares:   []client.ShareMount{share},
@@ -482,16 +491,34 @@ if [ -n "$__vmsh_passwd" ]; then
 fi
 unset __vmsh_uid __vmsh_passwd
 stty -echo 2>/dev/null || true
-alias ls >/dev/null 2>&1 || { ls --color=always -C -w ${COLUMNS:-80} >/dev/null 2>&1 && alias ls='ls --color=always -C -w ${COLUMNS:-80}'; } || true
+alias ls >/dev/null 2>&1 || { ls --color=always -C -w ${COLUMNS:-80} >/dev/null 2>&1 && alias ls='ls --color=always -C -w ${COLUMNS:-80}'; } || { ls -G -C >/dev/null 2>&1 && alias ls='ls -G -C'; } || true
+
 __vmsh_control_fd=3
-printf 'ready\t0\t%s\n' "$PWD" >&$__vmsh_control_fd
-IFS= read -r line
-eval "$line"`
+__vmsh_report() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$PWD" >&$__vmsh_control_fd
+}
+__vmsh_run() {
+  stty echo 2>/dev/null || true
+  eval " $1"
+  __vmsh_status=$?
+  stty -echo 2>/dev/null || true
+  __vmsh_report done "$__vmsh_status"
+}
+__vmsh_report ready 0
+while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
 	err := manager.RunStreamIn(ctx, instanceID, client.RunRequest{
-		Image:     env.imageName,
-		Command:   []string{"sh", "-lc", persistentCommand},
-		Env:       []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc", "TERM=xterm-256color", "COLUMNS=80", "LINES=24"},
-		WorkDir:   "/host",
+		Image:   env.imageName,
+		Command: []string{"sh", "-lc", persistentCommand},
+		Env: []string{
+			"HOME=/home/cc",
+			"USER=cc",
+			"LOGNAME=cc",
+			"TERM=dumb",
+			"LS_COLORS=" + os.Getenv("LS_COLORS"),
+			"NO_COLOR=1",
+			"CLICOLOR=1",
+		},
+		WorkDir:   guestWorkDir,
 		User:      "1000:1000",
 		Shares:    []client.ShareMount{share},
 		TTY:       true,
@@ -504,7 +531,7 @@ eval "$line"`
 			output.WriteString(event.Output)
 		case "control":
 			control.WriteString(event.Output)
-			if !sent && strings.Contains(event.Output, "ready\t0\t/host") {
+			if !sent && strings.Contains(event.Output, "ready\t0\t"+guestWorkDir) {
 				sent = true
 				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'done:%s\\n' \"$PWD\" >&3\n")}
 				close(inputs)
@@ -521,7 +548,7 @@ eval "$line"`
 	if !sent || exit == nil || *exit != 0 {
 		t.Fatalf("Linux TTY control fd state: sent=%t exit=%v stdout=%q control=%q", sent, exit, output.String(), control.String())
 	}
-	if got := strings.TrimSpace(control.String()); got != "ready\t0\t/host\ndone:/host" {
+	if got, want := strings.TrimSpace(control.String()), "ready\t0\t"+guestWorkDir+"\ndone:"+guestWorkDir; got != want {
 		t.Fatalf("Linux TTY control fd output = %q", got)
 	}
 }
@@ -1072,8 +1099,12 @@ func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 		}
 	}
 
+	guestInitCache := filepath.Join(cacheRoot, "guestinit")
+	if override := strings.TrimSpace(os.Getenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR")); override != "" {
+		guestInitCache = override
+	}
 	return &runtimeBootEnv{
-		backend:      NewRuntimeBackend(kernelManager, store, filepath.Join(cacheRoot, "guestinit")),
+		backend:      NewRuntimeBackend(kernelManager, store, guestInitCache),
 		images:       store,
 		imageName:    runtimeBootImage,
 		altImageName: runtimeBootAltImage,

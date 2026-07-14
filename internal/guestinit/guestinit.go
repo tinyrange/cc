@@ -2,12 +2,22 @@ package guestinit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 )
+
+var guestInitBuildIdentity struct {
+	sync.Once
+	value string
+	err   error
+}
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 	return BuildForArch(ctx, cacheDir, runtime.GOARCH)
@@ -30,7 +40,11 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create guest init cache: %w", err)
 	}
-	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch)
+	identity, err := currentBuildIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("identify ccvm build: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch+"-"+identity)
 	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
 		return data, nil
 	}
@@ -54,6 +68,29 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 		return nil, err
 	}
 	return bin, nil
+}
+
+func currentBuildIdentity() (string, error) {
+	guestInitBuildIdentity.Do(func() {
+		executable, err := os.Executable()
+		if err != nil {
+			guestInitBuildIdentity.err = err
+			return
+		}
+		file, err := os.Open(executable)
+		if err != nil {
+			guestInitBuildIdentity.err = err
+			return
+		}
+		defer file.Close()
+		hash := sha256.New()
+		if _, err := io.Copy(hash, file); err != nil {
+			guestInitBuildIdentity.err = err
+			return
+		}
+		guestInitBuildIdentity.value = hex.EncodeToString(hash.Sum(nil)[:16])
+	})
+	return guestInitBuildIdentity.value, guestInitBuildIdentity.err
 }
 
 func validateGuestInitPayload(goarch string, payload []byte) error {
