@@ -480,52 +480,83 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 		}
 	}()
 	defer close(ctxDone)
-	sendErr := streamExecInputsToWebSocket(ws, inputs)
+	sendCtx, stopSend := context.WithCancel(ctx)
+	sendErr := streamExecInputsToWebSocket(sendCtx, ws, inputs)
 	err = receiveExecEventsFromWebSocket(ws, onEvent)
+	stopSend()
+	_ = ws.Close()
+	sendErrValue := <-sendErr
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if sendErrValue := currentWebSocketSendError(sendErr); sendErrValue != nil {
+	if sendErrValue != nil {
 		return sendErrValue
 	}
 	return err
 }
 
-func streamExecInputsToWebSocket(ws *websocket.Conn, inputs <-chan ExecInput) <-chan error {
+func streamExecInputsToWebSocket(ctx context.Context, ws *websocket.Conn, inputs <-chan ExecInput) <-chan error {
 	done := make(chan error, 1)
-	if inputs == nil {
-		go func() {
-			done <- websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"})
-		}()
-		return done
-	}
 	go func() {
 		stdinClosed := false
-		for input := range inputs {
+		for {
+			var input ExecInput
+			var ok bool
+			if inputs == nil {
+				input = ExecInput{Kind: "stdin_close"}
+				ok = true
+			} else {
+				select {
+				case <-ctx.Done():
+					done <- nil
+					return
+				case input, ok = <-inputs:
+				}
+			}
+			if !ok {
+				if !stdinClosed {
+					if err := sendExecInputToWebSocket(ctx, ws, ExecInput{Kind: "stdin_close"}); err != nil {
+						done <- err
+						return
+					}
+				}
+				done <- nil
+				return
+			}
 			if input.Kind == "stdin_close" {
 				if stdinClosed {
+					if inputs == nil {
+						done <- nil
+						return
+					}
 					continue
 				}
 				stdinClosed = true
 			} else if input.Kind == "stdin" && stdinClosed {
 				continue
 			}
-			if err := websocket.JSON.Send(ws, input); err != nil {
+			if err := sendExecInputToWebSocket(ctx, ws, input); err != nil {
 				done <- err
-				_ = ws.Close()
+				return
+			}
+			if inputs == nil {
+				done <- nil
 				return
 			}
 		}
-		if !stdinClosed {
-			if err := websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"}); err != nil {
-				done <- err
-				_ = ws.Close()
-				return
-			}
-		}
-		done <- nil
 	}()
 	return done
+}
+
+func sendExecInputToWebSocket(ctx context.Context, ws *websocket.Conn, input ExecInput) error {
+	if err := websocket.JSON.Send(ws, input); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		_ = ws.Close()
+		return err
+	}
+	return nil
 }
 
 func receiveExecEventsFromWebSocket(ws *websocket.Conn, onEvent func(ExecEvent) error) error {
@@ -547,18 +578,6 @@ func receiveExecEventsFromWebSocket(ws *websocket.Conn, onEvent func(ExecEvent) 
 		}
 	}
 	return nil
-}
-
-func currentWebSocketSendError(sendErr <-chan error) error {
-	if sendErr == nil {
-		return nil
-	}
-	select {
-	case err := <-sendErr:
-		return err
-	default:
-		return nil
-	}
 }
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
@@ -634,12 +653,16 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		}
 	}()
 	defer close(ctxDone)
-	sendErr := streamExecInputsToWebSocket(ws, inputs)
+	sendCtx, stopSend := context.WithCancel(ctx)
+	sendErr := streamExecInputsToWebSocket(sendCtx, ws, inputs)
 	err = receiveExecEventsFromWebSocket(ws, onEvent)
+	stopSend()
+	_ = ws.Close()
+	sendErrValue := <-sendErr
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if sendErrValue := currentWebSocketSendError(sendErr); sendErrValue != nil {
+	if sendErrValue != nil {
 		return sendErrValue
 	}
 	return err
