@@ -468,16 +468,23 @@ func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) err
 }
 
 func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOptions) (bool, error) {
-	listenNetwork, listenAddress, cleanup, err := workerControlListenEndpoint(socketPath)
+	listenNetwork, listenAddress, err := workerControlListenEndpoint(socketPath)
 	if err != nil {
 		return false, err
 	}
-	defer cleanup()
 	l, err := net.Listen(listenNetwork, listenAddress)
 	if err != nil {
 		return false, fmt.Errorf("listen worker control socket: %w", err)
 	}
+	if unixListener, ok := l.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
 	defer l.Close()
+	cleanup, err := workerControlSocketCleanup(listenNetwork, listenAddress)
+	if err != nil {
+		return false, fmt.Errorf("capture worker control socket ownership: %w", err)
+	}
+	defer cleanup()
 	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: workerControlDialEndpoint(listenNetwork, l.Addr().String())}); err != nil {
 		return false, fmt.Errorf("write worker startup banner: %w", err)
 	}
@@ -508,16 +515,24 @@ func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOpti
 	return true, serveWorkerControl(codec, srvState, opts)
 }
 
-func workerControlListenEndpoint(address string) (network string, listenAddress string, cleanup func(), err error) {
-	cleanup = func() {}
+func workerControlListenEndpoint(address string) (network string, listenAddress string, err error) {
 	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://"), cleanup, nil
+		return "tcp", strings.TrimPrefix(address, "tcp://"), nil
 	}
 	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
-		return "", "", cleanup, fmt.Errorf("prepare worker control socket dir: %w", err)
+		return "", "", fmt.Errorf("prepare worker control socket dir: %w", err)
 	}
-	_ = os.Remove(address)
-	return "unix", address, func() { _ = os.Remove(address) }, nil
+	if err := prepareWorkerUnixSocket(address); err != nil {
+		return "", "", err
+	}
+	return "unix", address, nil
+}
+
+func workerControlSocketCleanup(network, address string) (func(), error) {
+	if network != "unix" {
+		return func() {}, nil
+	}
+	return ownedWorkerUnixSocketCleanup(address)
 }
 
 func workerControlDialEndpoint(network string, address string) string {

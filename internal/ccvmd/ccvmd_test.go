@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -106,6 +110,141 @@ func TestMuxPprofEnvironmentCombinations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWorkerControlSocketPreparationProtectsExistingPaths(t *testing.T) {
+	t.Run("regular file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "control.sock")
+		if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+			t.Fatalf("write regular file: %v", err)
+		}
+		if _, _, err := workerControlListenEndpoint(path); err == nil {
+			t.Fatal("regular worker path was accepted")
+		}
+		if data, err := os.ReadFile(path); err != nil || string(data) != "keep" {
+			t.Fatalf("regular worker path changed: data=%q err=%v", data, err)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "control.sock")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create directory: %v", err)
+		}
+		if _, _, err := workerControlListenEndpoint(path); err == nil {
+			t.Fatal("directory worker path was accepted")
+		}
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("worker directory changed: info=%v err=%v", info, err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink creation requires additional Windows privileges")
+		}
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+			t.Fatalf("write symlink target: %v", err)
+		}
+		path := filepath.Join(dir, "control.sock")
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatalf("create symlink: %v", err)
+		}
+		if _, _, err := workerControlListenEndpoint(path); err == nil {
+			t.Fatal("symlink worker path was accepted")
+		}
+		if data, err := os.ReadFile(target); err != nil || string(data) != "keep" {
+			t.Fatalf("symlink target changed: data=%q err=%v", data, err)
+		}
+		if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("worker symlink changed: info=%v err=%v", info, err)
+		}
+	})
+}
+
+func TestWorkerControlSocketDetectsLiveAndRecoversStaleEndpoint(t *testing.T) {
+	dir := shortWorkerSocketTempDir(t)
+	livePath := filepath.Join(dir, "live.sock")
+	live := listenUnixWithoutAutomaticUnlink(t, livePath)
+	defer func() {
+		_ = live.Close()
+		_ = os.Remove(livePath)
+	}()
+	if _, _, err := workerControlListenEndpoint(livePath); err == nil {
+		t.Fatal("live worker socket was treated as stale")
+	}
+	if info, err := os.Lstat(livePath); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("live worker socket changed: info=%v err=%v", info, err)
+	}
+
+	stalePath := filepath.Join(dir, "stale.sock")
+	stale := listenUnixWithoutAutomaticUnlink(t, stalePath)
+	if err := stale.Close(); err != nil {
+		t.Fatalf("close stale listener: %v", err)
+	}
+	network, address, err := workerControlListenEndpoint(stalePath)
+	if err != nil {
+		t.Fatalf("recover stale worker socket: %v", err)
+	}
+	if network != "unix" || address != stalePath {
+		t.Fatalf("recovered endpoint = %q %q", network, address)
+	}
+	if _, err := os.Lstat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("stale socket still exists: %v", err)
+	}
+	recovered := listenUnixWithoutAutomaticUnlink(t, stalePath)
+	_ = recovered.Close()
+	_ = os.Remove(stalePath)
+}
+
+func TestWorkerControlSocketCleanupDoesNotRemoveReplacement(t *testing.T) {
+	path := filepath.Join(shortWorkerSocketTempDir(t), "control.sock")
+	listener := listenUnixWithoutAutomaticUnlink(t, path)
+	cleanup, err := workerControlSocketCleanup("unix", path)
+	if err != nil {
+		t.Fatalf("capture socket cleanup: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove owned socket path: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	cleanup()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "replacement" {
+		t.Fatalf("replacement changed by cleanup: data=%q err=%v", data, err)
+	}
+}
+
+func listenUnixWithoutAutomaticUnlink(t *testing.T, path string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on Unix socket: %v", err)
+	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
+	return listener
+}
+
+func shortWorkerSocketTempDir(t *testing.T) string {
+	t.Helper()
+	base := os.TempDir()
+	if runtime.GOOS != "windows" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "ccvmd-")
+	if err != nil {
+		t.Fatalf("create short socket temp directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func TestPersistentWatchdogDoesNotShutdownWhenLeasesEnd(t *testing.T) {
