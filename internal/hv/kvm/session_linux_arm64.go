@@ -37,7 +37,19 @@ type ManagedSession struct {
 	dmesg      bool
 }
 
+type ManagedSessionOptions struct {
+	SnapshotDir     string
+	RestoreSnapshot string
+}
+
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithOptions(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, ManagedSessionOptions{}, onEvent)
+}
+
+func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, onEvent)
+	}
 	stageStart := time.Now()
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
 		return nil, err
@@ -64,6 +76,10 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}()
 
 	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
+	snapshot := newSnapshotTrigger(opts.SnapshotDir, nil)
+	if snapshot != nil {
+		nodes = append(nodes, arm64vm.SnapshotDeviceNode())
+	}
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			nodes = append(nodes, fsdev.DeviceTreeNode())
@@ -88,6 +104,9 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		vsock.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	if snapshot != nil {
+		snapshot.mem = mem
+	}
 
 	stageStart = time.Now()
 	serialOut := vmruntime.NewSerialTranscript()
@@ -97,6 +116,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
+	serialWriter = snapshot.wrapSerialWriter(serialWriter)
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	for _, fsdev := range fsdevs {
@@ -142,7 +162,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, serialOut, snapshot)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()

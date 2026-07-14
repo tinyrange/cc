@@ -14,15 +14,16 @@ import (
 
 var errVGICUnsupported = errors.New("kvm: vgic device unsupported")
 
-func initVGIC(vmfd int) (int, error) {
+func initVGIC(vmfd int) (int, uint32, error) {
 	fd, err := initVGICv3(vmfd)
 	if err == nil {
-		return fd, nil
+		return fd, kvmDevTypeArmVgicV3, nil
 	}
 	if !errors.Is(err, errVGICUnsupported) {
-		return 0, err
+		return 0, 0, err
 	}
-	return initVGICv2(vmfd)
+	fd, err = initVGICv2(vmfd)
+	return fd, kvmDevTypeArmVgicV2, err
 }
 
 func finalizeVGIC(vgicfd int) error {

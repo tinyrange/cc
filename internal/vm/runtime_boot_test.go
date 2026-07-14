@@ -443,8 +443,8 @@ func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 }
 
 func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		t.Skip("linux/amd64 startup snapshots are implemented by the KVM amd64 backend")
+	if runtime.GOOS != "linux" || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
+		t.Skip("KVM startup snapshots are implemented on Linux amd64 and arm64")
 	}
 	env := newRuntimeBootEnv(t)
 	snapshotRoot := t.TempDir()

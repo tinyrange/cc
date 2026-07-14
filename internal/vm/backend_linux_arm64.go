@@ -110,6 +110,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
 	stageStart = time.Now()
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	timing.Since(ctx, "startup.initramfs", stageStart)
@@ -117,7 +120,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
 	stageStart = time.Now()
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSessionWithOptions(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, kvm.ManagedSessionOptions{
+		SnapshotDir: strings.TrimSpace(req.SnapshotDir), RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+	}, onEvent)
 	timing.Since(ctx, "startup.kvm_to_ready", stageStart)
 	if err != nil {
 		return nil, err
@@ -147,17 +152,19 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          req.Image,
-			InitSystem:     req.InitSystem,
-			Kernel:         req.Kernel,
-			Network:        req.Network,
-			KernelModules:  append([]string(nil), req.KernelModules...),
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			NestedVirt:     req.NestedVirt,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
+			ID:              req.ID,
+			Image:           req.Image,
+			InitSystem:      req.InitSystem,
+			Kernel:          req.Kernel,
+			Network:         req.Network,
+			KernelModules:   append([]string(nil), req.KernelModules...),
+			MemoryMB:        req.MemoryMB,
+			CPUs:            req.CPUs,
+			NestedVirt:      req.NestedVirt,
+			Dmesg:           req.Dmesg,
+			TimeoutSeconds:  req.TimeoutSeconds,
+			SnapshotDir:     req.SnapshotDir,
+			RestoreSnapshot: req.RestoreSnapshot,
 		}, onEvent)
 	}
 	if b == nil || b.kernel == nil || b.images == nil {
@@ -206,11 +213,16 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSessionWithOptions(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, kvm.ManagedSessionOptions{
+		SnapshotDir: strings.TrimSpace(req.SnapshotDir), RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}

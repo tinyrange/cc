@@ -51,6 +51,7 @@ type VM struct {
 	vmfd        int
 	vcpufd      int
 	vgicfd      int
+	vgicType    uint32
 	run         []byte
 	mem         []byte
 	extraMem    [][]byte
@@ -68,7 +69,7 @@ func NewVM() (*VM, error) {
 		_ = k.Close()
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
-	vgicfd, err := initVGIC(vmfd)
+	vgicfd, vgicType, err := initVGIC(vmfd)
 	if err != nil {
 		_ = k.CloseVM(vmfd)
 		_ = k.Close()
@@ -111,7 +112,7 @@ func NewVM() (*VM, error) {
 		_ = k.Close()
 		return nil, fmt.Errorf("mmap kvm_run: %w", err)
 	}
-	return &VM{kvm: k, vmfd: vmfd, vcpufd: vcpufd, vgicfd: vgicfd, run: run}, nil
+	return &VM{kvm: k, vmfd: vmfd, vcpufd: vcpufd, vgicfd: vgicfd, vgicType: vgicType, run: run}, nil
 }
 
 func (v *VM) Close() error {
@@ -167,6 +168,22 @@ func (v *VM) MapAnonymousMemory(size uint64, guestPhysAddr uint64) ([]byte, erro
 	v.mem = mem
 	v.memRegion = region
 	return mem, nil
+}
+
+func (v *VM) MapMemory(mem []byte, guestPhysAddr uint64) error {
+	if len(mem) == 0 {
+		return fmt.Errorf("guest memory is empty")
+	}
+	region := kvmUserspaceMemoryRegion{
+		Slot: 0, GuestPhysAddr: guestPhysAddr, MemorySize: uint64(len(mem)),
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
+		return fmt.Errorf("set user memory region: %w", err)
+	}
+	v.mem = mem
+	v.memRegion = region
+	return nil
 }
 
 func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint64) ([]byte, error) {

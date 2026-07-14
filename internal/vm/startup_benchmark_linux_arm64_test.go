@@ -27,6 +27,7 @@ type arm64StartupSample struct {
 
 type arm64StartupReport struct {
 	GOARCH                  string               `json:"goarch"`
+	Mode                    string               `json:"mode"`
 	MemoryMB                uint64               `json:"memory_mb"`
 	Samples                 []arm64StartupSample `json:"samples"`
 	MedianReadyNanos        int64                `json:"median_ready_nanos"`
@@ -49,16 +50,29 @@ func TestKVMARM64StartupBenchmark(t *testing.T) {
 		t.Fatalf("prepare kernel: %v", err)
 	}
 	backend := NewRuntimeBackend(kernelManager, oci.NewStore(filepath.Join(t.TempDir(), "images")), filepath.Join(cacheRoot, "guestinit"))
+	snapshotRoot := t.TempDir()
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	capture, err := backend.StartBlankStream(captureCtx, client.StartInstanceRequest{MemoryMB: 768, CPUs: 1, SnapshotDir: snapshotRoot}, nil)
+	if err != nil {
+		captureCancel()
+		t.Fatalf("capture startup snapshot: %v", err)
+	}
+	if err := capture.Close(); err != nil {
+		captureCancel()
+		t.Fatalf("close snapshot capture: %v", err)
+	}
+	captureCancel()
+	snapshotPath := singleSnapshotPath(t, snapshotRoot, "")
 
 	const samples = 5
-	report := arm64StartupReport{GOARCH: "arm64", MemoryMB: 768, Samples: make([]arm64StartupSample, 0, samples)}
+	report := arm64StartupReport{GOARCH: "arm64", Mode: "snapshot_restore", MemoryMB: 768, Samples: make([]arm64StartupSample, 0, samples)}
 	readyValues := make([]int64, 0, samples)
 	commandValues := make([]int64, 0, samples)
 	for i := 0; i < samples; i++ {
 		recorder := timing.NewRecorder()
 		ctx, cancel := context.WithTimeout(timing.WithRecorder(context.Background(), recorder), runtimeBootTimeout())
 		readyStart := time.Now()
-		inst, err := backend.StartBlankStream(ctx, client.StartInstanceRequest{MemoryMB: report.MemoryMB, CPUs: 1}, nil)
+		inst, err := backend.StartBlankStream(ctx, client.StartInstanceRequest{MemoryMB: report.MemoryMB, CPUs: 1, RestoreSnapshot: snapshotPath}, nil)
 		readyDuration := time.Since(readyStart)
 		if err != nil {
 			cancel()
