@@ -69,7 +69,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	network, err := newLinuxSwitchNetworkRuntimeOn(b.networkSwitch, req.ID, req.Network, amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
 		return nil, err
 	}
