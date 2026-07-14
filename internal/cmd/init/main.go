@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/managed/protocol"
 )
