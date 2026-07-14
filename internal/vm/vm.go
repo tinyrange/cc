@@ -320,7 +320,7 @@ func (m *Manager) StartBlankInstanceStream(
 
 	shares := append([]client.ShareMount(nil), req.Shares...)
 	snapshotStartup := strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != ""
-	startupShares := isBuiltinGuestImage(req.Image) || snapshotStartup
+	startupShares := builtin.IsGuestImage(req.Image) || snapshotStartup
 	if !startupShares {
 		req.Shares = nil
 	}

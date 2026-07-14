@@ -147,10 +147,11 @@ func TestBuildManagedRootFromOpenBSDBaseSetExtractsEtcSet(t *testing.T) {
 		{name: "etc", mode: 0o755, dir: true},
 		{name: "dev", mode: 0o755, dir: true},
 	})
-	root, err := BuildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"))
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTGZ, []byte("#!/bin/sh\n"), machine.NetworkSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeRoot()
 	if got := readRootFile(t, root, "/etc/ssl/cert.pem"); got != "test certificate bundle\n" {
 		t.Fatalf("cert.pem = %q, want etc set certificate bundle", got)
 	}
