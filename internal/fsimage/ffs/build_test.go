@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -174,6 +175,59 @@ func TestBuildFFSLazilyMapsRegularFiles(t *testing.T) {
 	payloadIno := reader.lookupPath("/payload")
 	if got := string(reader.fileData(payloadIno)); got != "lazy payload\n" {
 		t.Fatalf("/payload contents = %q", got)
+	}
+}
+
+func TestBuildFFSTooSmallReturnsCapacityError(t *testing.T) {
+	root := lazyTestDir{entries: map[string]imagefs.Entry{
+		"large": {File: patternTestFile{size: 1 << 20}},
+	}}
+	img, err := Build(context.Background(), root, Options{
+		SizeBytes: ffsDBlkNo*ffsFSize + ffsBSize,
+	})
+	if img != nil {
+		t.Fatal("too-small build published an image")
+	}
+	var capacityErr *CapacityError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("too-small build error = %v, want CapacityError", err)
+	}
+	if capacityErr.RequiredBytes <= capacityErr.AvailableBytes {
+		t.Fatalf("capacity error = %#v", capacityErr)
+	}
+
+	if _, err := Build(context.Background(), root, Options{}); err != nil {
+		t.Fatalf("build after capacity failure: %v", err)
+	}
+}
+
+func TestFFSFragmentAllocatorBoundaries(t *testing.T) {
+	b := &ffsBuilder{
+		fsSize:    ffsFrag * ffsFSize,
+		usedFrags: make([]bool, ffsFrag),
+	}
+	for _, count := range []uint32{0, ffsFrag + 1} {
+		if _, err := b.allocFragRun(count); err == nil {
+			t.Fatalf("allocFragRun(%d) succeeded", count)
+		}
+	}
+	frag, err := b.allocFragRun(ffsFrag)
+	if err != nil {
+		t.Fatalf("allocate exact-capacity block: %v", err)
+	}
+	if frag != 0 {
+		t.Fatalf("exact-capacity block starts at fragment %d, want 0", frag)
+	}
+	if _, err := b.allocFragRun(1); err == nil {
+		t.Fatal("allocation beyond capacity succeeded")
+	} else {
+		var capacityErr *CapacityError
+		if !errors.As(err, &capacityErr) {
+			t.Fatalf("allocation error = %v, want CapacityError", err)
+		}
+		if capacityErr.AvailableBytes != ffsFrag*ffsFSize || capacityErr.RequiredBytes != (ffsFrag+1)*ffsFSize {
+			t.Fatalf("capacity error = %#v", capacityErr)
+		}
 	}
 }
 
