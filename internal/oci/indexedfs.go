@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	intcvmfs "j5.nz/cc/internal/cvmfs"
+	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/linuxabi"
@@ -463,11 +465,15 @@ func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
-	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	tmpPath := dstPath + ".tmp"
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	defer func() {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+	}()
 	buffered := bufio.NewReader(body)
 	var src io.Reader = buffered
 	gzipLayer := strings.Contains(mediaType, "gzip")
@@ -484,10 +490,17 @@ func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 		defer gzr.Close()
 		src = gzr
 	}
-	if _, err := io.Copy(dst, src); err != nil {
+	maxBytes, err := download.FilesystemBudget(dstPath)
+	if err != nil {
+		return fmt.Errorf("determine expanded layer budget: %w", err)
+	}
+	if _, err := download.CopyReader(context.Background(), dst, src, maxBytes); err != nil {
 		return err
 	}
-	return dst.Close()
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, dstPath)
 }
 
 type countingReader struct {

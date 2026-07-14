@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"j5.nz/cc/internal/download"
 	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/managed/rootartifact"
@@ -20,6 +21,7 @@ import (
 
 const bsdKernelMediaType = "application/vnd.tinyrange.bsd.kernel.v1"
 const customKernelFilePrefix = "file:"
+const maxBSDRegistryMetadataBytes int64 = 16 << 20
 
 type bsdOCIManifest struct {
 	Layers []struct {
@@ -171,23 +173,26 @@ func ensureBSDOCIArtifact(ctx context.Context, cacheDir, repo, tag string) (stri
 		return "", nil, fmt.Errorf("decode BSD OCI manifest: %w", err)
 	}
 	var rootDigest, kernelDigest string
+	var rootSize, kernelSize int64
 	for _, layer := range manifest.Layers {
 		if strings.Contains(layer.MediaType, "tar+gzip") {
 			rootDigest = layer.Digest
+			rootSize = layer.Size
 		}
 		if layer.MediaType == bsdKernelMediaType {
 			kernelDigest = layer.Digest
+			kernelSize = layer.Size
 		}
 	}
 	if rootDigest == "" || kernelDigest == "" {
 		return "", nil, fmt.Errorf("BSD OCI manifest missing rootfs or kernel layer")
 	}
 	rootPath := filepath.Join(cacheDir, digestFile(rootDigest)+".tar.gz")
-	if err := ensureRegistryBlob(ctx, repo, rootDigest, rootPath); err != nil {
+	if err := ensureRegistryBlob(ctx, repo, rootDigest, rootSize, rootPath); err != nil {
 		return "", nil, err
 	}
 	kernelPath := filepath.Join(cacheDir, digestFile(kernelDigest)+".kernel")
-	if err := ensureRegistryBlob(ctx, repo, kernelDigest, kernelPath); err != nil {
+	if err := ensureRegistryBlob(ctx, repo, kernelDigest, kernelSize, kernelPath); err != nil {
 		return "", nil, err
 	}
 	kernel, err := os.ReadFile(kernelPath)
@@ -197,7 +202,7 @@ func ensureBSDOCIArtifact(ctx context.Context, cacheDir, repo, tag string) (stri
 	return rootPath, kernel, nil
 }
 
-func ensureRegistryBlob(ctx context.Context, repo, digest, target string) error {
+func ensureRegistryBlob(ctx context.Context, repo, digest string, size int64, target string) error {
 	if st, err := os.Stat(target); err == nil && st.Size() > 0 {
 		return nil
 	}
@@ -206,12 +211,15 @@ func ensureRegistryBlob(ctx context.Context, repo, digest, target string) error 
 		return err
 	}
 	defer resp.Body.Close()
+	if size <= 0 {
+		return fmt.Errorf("registry blob %s has invalid size %d", digest, size)
+	}
 	tmp := target + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, resp.Body)
+	_, copyErr := download.Copy(ctx, out, resp, download.Budget{MaxBytes: size, ExpectedBytes: size, ExpectedSHA256: digest})
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
@@ -234,7 +242,7 @@ func registryGet(ctx context.Context, rawURL, accept string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return download.ReadAll(ctx, resp, download.Budget{MaxBytes: maxBSDRegistryMetadataBytes})
 }
 
 func registryDo(ctx context.Context, rawURL, accept string) (*http.Response, error) {
@@ -268,6 +276,10 @@ func registryDo(ctx context.Context, rawURL, accept string) (*http.Response, err
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("GET %s: %s", rawURL, resp.Status)
+	}
+	if err := download.BoundResponse(resp, 0); err != nil {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("GET %s: %w", rawURL, err)
 	}
 	return resp, nil
 }
@@ -316,7 +328,7 @@ func registryBearerToken(ctx context.Context, header string) (string, error) {
 	var out struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBSDRegistryMetadataBytes)).Decode(&out); err != nil {
 		return "", err
 	}
 	if out.Token == "" {
