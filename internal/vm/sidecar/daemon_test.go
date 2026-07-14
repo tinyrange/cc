@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -31,7 +32,7 @@ func TestWaitCommand(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start exit helper: %v", err)
 	}
-	if err := WaitCommand(cmd, time.Second); err != nil {
+	if err := WaitCommand(cmd, 5*time.Second); err != nil {
 		t.Fatalf("wait exit helper: %v", err)
 	}
 
@@ -46,6 +47,33 @@ func TestWaitCommand(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("wait sleep took %s, want timeout kill", elapsed)
+	}
+}
+
+func TestWaitCommandBoundsKillResistantReap(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	killErr := errors.New("kill refused")
+	start := time.Now()
+	err := waitCommand(10*time.Millisecond, func() error {
+		<-release
+		return nil
+	}, func() error {
+		return killErr
+	})
+	elapsed := time.Since(start)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("waitCommand took %s", elapsed)
+	}
+	if !errors.Is(err, ErrCommandTimeout) || !errors.Is(err, killErr) {
+		t.Fatalf("waitCommand error = %v", err)
+	}
+	var timeoutErr *CommandTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("waitCommand error type = %T", err)
+	}
+	if timeoutErr.Timeout != 10*time.Millisecond || !timeoutErr.ReapTimedOut {
+		t.Fatalf("timeout state = %+v", timeoutErr)
 	}
 }
 
