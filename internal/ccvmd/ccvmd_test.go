@@ -568,6 +568,8 @@ func TestMuxBadRequests(t *testing.T) {
 	}{
 		{name: "bad lease json", method: http.MethodPost, target: "/watchdog/lease", body: []byte("{"), status: http.StatusBadRequest},
 		{name: "overflowing lease timeout", method: http.MethodPost, target: "/watchdog/lease", body: []byte(`{"timeout_seconds":1e100}`), status: http.StatusBadRequest},
+		{name: "trailing lease json", method: http.MethodPost, target: "/watchdog/lease", body: []byte(`{"timeout_seconds":1}{}`), status: http.StatusBadRequest},
+		{name: "unknown lease field", method: http.MethodPost, target: "/watchdog/lease", body: []byte(`{"timeout_seconds":1,"unexpected":true}`), status: http.StatusBadRequest},
 		{name: "bad run json", method: http.MethodPost, target: "/vm/run", body: []byte("{"), status: http.StatusBadRequest},
 		{name: "forward stopped vm", method: http.MethodPost, target: "/vm/forward?id=alpha", body: mustJSON(t, client.PortForward{HostPort: 8080, GuestPort: 80}), status: http.StatusBadRequest},
 	} {
@@ -585,6 +587,27 @@ func TestMuxBadRequests(t *testing.T) {
 				t.Fatalf("empty error response: %s", rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestMuxRejectsRequestBeforeReadingPastBodyLimit(t *testing.T) {
+	watchdog := newWatchdogController(func() {})
+	defer watchdog.Stop()
+	mux := newMux(&server{vms: vm.NewManagerWithHost(nil)}, watchdog, func() {}, ServerOptions{})
+	handler := http.MaxBytesHandler(mux, 8)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/watchdog/lease", bytes.NewReader([]byte(`{"timeout_seconds":1}`))))
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusRequestEntityTooLarge)
+	}
+	var apiErr client.ErrorResponse
+	if err := json.NewDecoder(rr.Body).Decode(&apiErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if apiErr.Error == "" {
+		t.Fatal("oversized request returned an empty structured error")
 	}
 }
 
