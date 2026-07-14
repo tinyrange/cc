@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	vm "j5.nz/cc/internal/ext4image/vmregion"
+	vm "j5.nz/cc/internal/fsimage/vm"
 )
 
 type writerAtFunc func([]byte, int64) (int, error)
