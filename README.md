@@ -265,5 +265,6 @@ plaintext deprecation window before v1.
 - `internal/vm`: runtime backend orchestration
 - `internal/oci`: OCI, SIMG/SIF, and CVMFS image import
 - `internal/cvmfs`: minimal remote CVMFS catalog and file client
+- `docs/design`: accepted plans for cross-cutting runtime features
 - `pyneurodesk`: Python client and shell integration
 - `PLAN.md`: linux/amd64 support plan and milestone notes
