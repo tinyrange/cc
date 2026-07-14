@@ -196,7 +196,8 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 
 func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// This loop always runs in a dedicated goroutine. Leave it locked so the
+	// OS thread terminates with the goroutine instead of remaining parked.
 	vm.SetVCPUTID(unix.Gettid())
 	defer vm.SetVCPUTID(0)
 	cancelDone := make(chan struct{})
