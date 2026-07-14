@@ -198,6 +198,25 @@ func TestRegistryAuthorizeEncodesChallengeParams(t *testing.T) {
 	}
 }
 
+func TestRegistryAuthorizeAcceptsChunkedTokenResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte(`{"token":"chunked"}`))
+	}))
+	defer server.Close()
+
+	reg := &registryContext{client: server.Client()}
+	header := `Bearer realm="` + server.URL + `/token"`
+	if err := reg.authorize(context.Background(), header); err != nil {
+		t.Fatalf("authorize chunked token response: %v", err)
+	}
+	if reg.token != "chunked" {
+		t.Fatalf("token = %q, want chunked", reg.token)
+	}
+}
+
 func alpineFixture(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)

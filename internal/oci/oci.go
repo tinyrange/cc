@@ -1412,11 +1412,12 @@ func (reg *registryContext) authorize(ctx context.Context, header string) error 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("token request failed: %s", resp.Status)
 	}
-	if err := download.BoundResponse(resp, 1<<20); err != nil {
+	data, err := download.ReadAll(ctx, resp, download.Budget{MaxBytes: 1 << 20})
+	if err != nil {
 		return fmt.Errorf("registry token response: %w", err)
 	}
 	var token tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+	if err := json.Unmarshal(data, &token); err != nil {
 		return fmt.Errorf("decode token response: %w", err)
 	}
 	switch {
