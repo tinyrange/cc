@@ -342,6 +342,10 @@ type CapabilitiesResponse struct {
 	SupportsNestedVirt     bool     `json:"supports_nested_virtualization"`
 	RequiresPrivilegedCCX3 bool     `json:"requires_privileged_ccx3"`
 	Notes                  []string `json:"notes,omitempty"`
+	MemoryCapacityMB       uint64   `json:"memory_capacity_mb,omitempty"`
+	MemoryReservedMB       uint64   `json:"memory_reserved_mb,omitempty"`
+	CPUCapacity            int      `json:"cpu_capacity,omitempty"`
+	CPUReserved            int      `json:"cpu_reserved,omitempty"`
 }
 
 type CreateInstanceRequest struct {
