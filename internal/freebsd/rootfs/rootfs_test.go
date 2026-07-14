@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -67,8 +66,9 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != fmt.Sprintf(managedInitScript, "vtnet0", "10.42.0.2", "10.42.0.1") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", data)
+	if !textHasFields(string(data), "/sbin/ifconfig", "vtnet0", "inet", "10.42.0.2", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(string(data), "/sbin/route", "add", "default", "10.42.0.1", "||", "true") {
+		t.Fatalf("init script does not configure the leased network: %q", data)
 	}
 	agentEntry, err := imagefs.LookupPath(root, "/sbin/cc-freebsd-init")
 	if err != nil {

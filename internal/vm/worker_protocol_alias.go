@@ -20,10 +20,10 @@ const (
 	WorkerFrameWait         = sidecarproto.WorkerFrameWait
 	WorkerFrameStatus       = sidecarproto.WorkerFrameStatus
 	WorkerFrameExec         = sidecarproto.WorkerFrameExec
+	WorkerFrameAddShare     = sidecarproto.WorkerFrameAddShare
 	WorkerFrameExecInput    = sidecarproto.WorkerFrameExecInput
 	WorkerFrameCancel       = sidecarproto.WorkerFrameCancel
 	WorkerFrameFlush        = sidecarproto.WorkerFrameFlush
-	WorkerFrameAddShare     = sidecarproto.WorkerFrameAddShare
 	WorkerFrameConsole      = sidecarproto.WorkerFrameConsole
 	WorkerFrameDone         = sidecarproto.WorkerFrameDone
 	WorkerFrameEvent        = sidecarproto.WorkerFrameEvent

@@ -83,7 +83,7 @@ func TestRuntimeBootsTrimmedBSDSourceCachePackageManagers(t *testing.T) {
 func trimmedOpenBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.OpenBSDDefinition("")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir, Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err
@@ -96,7 +96,7 @@ func trimmedOpenBSDDefinition(cacheDir string) builtin.BSDDefinition {
 func trimmedFreeBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.FreeBSDDefinition("")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{CacheDir: cacheDir, Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err
@@ -109,7 +109,7 @@ func trimmedFreeBSDDefinition(cacheDir string) builtin.BSDDefinition {
 func trimmedNetBSDDefinition(cacheDir string) builtin.BSDDefinition {
 	def := builtin.NetBSDDefinition("")
 	def.CacheDir = cacheDir
-	def.BuildArtifact = func(ctx context.Context, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+	def.BuildArtifact = func(ctx context.Context, _, _ string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
 		rt, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Network: network})
 		if err != nil {
 			return rootartifact.Artifact{}, err

@@ -159,7 +159,7 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	network = normalizeFreeBSDNetwork(network)
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
+		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, managedInitDate(), network.Interface, network.GuestIPv4, network.GatewayIPv4))},
 		{Path: "/sbin/cc-freebsd-init", Mode: 0o755, Data: initBin},
 		{Path: "/etc/fstab", Mode: 0o644, Data: []byte("/dev/nda0 / ufs rw 1 1\n")},
 		{Path: "/etc/rc.conf", Mode: 0o644, Data: []byte(fmt.Sprintf("hostname=\"%s\"\nifconfig_%s=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"%s\"\n", network.Hostname, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
@@ -353,11 +353,16 @@ func versionNoDot(version string) string {
 	return strings.ReplaceAll(version, ".", "")
 }
 
+func managedInitDate() string {
+	return time.Now().UTC().Format("200601021504.05")
+}
+
 const managedInitScript = `#!/bin/sh
 /sbin/mount -u -o rw / || :
 /sbin/mount -t devfs devfs /dev || :
 /bin/chmod 1777 /tmp || :
 /bin/chmod 700 /root || :
+/bin/date -u %s >/dev/null 2>&1 || true
 /sbin/ifconfig %s inet %s netmask 255.255.255.0 up || {
 	while :; do /bin/sleep 3600; done
 }

@@ -173,7 +173,7 @@ func buildManagedRootFromBase(root imagefs.Directory, closeRoot func() error, in
 	}
 	overlay := imagefs.NewOverlay(root)
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
-		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))},
+		{Path: "/sbin/init", Mode: 0o755, Data: []byte(fmt.Sprintf(managedInitScript, managedInitDate(), network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4))},
 		{Path: "/sbin/cc-netbsd-init", Mode: 0o755, Data: initBin},
 		{Path: "/etc/fstab", Mode: 0o644, Data: []byte(fmt.Sprintf("/dev/%s / ffs rw 1 1\n", rootDevice))},
 		{Path: "/etc/rc.conf", Mode: 0o644, Data: []byte(fmt.Sprintf("rc_configured=YES\nhostname=\"%s\"\ndefaultroute=\"%s\"\n", network.Hostname, network.GatewayIPv4))},
@@ -439,12 +439,17 @@ func versionNoDot(version string) string {
 	return strings.ReplaceAll(version, ".", "")
 }
 
+func managedInitDate() string {
+	return time.Now().UTC().Format("200601021504.05")
+}
+
 const managedInitScript = `#!/bin/sh
 exec >/dev/console 2>&1
 /sbin/mount -u -o rw / || {
 	echo NETBSD_MANAGED_REMOUNT_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/bin/date -u %s >/dev/null 2>&1 || true
 /sbin/sysctl -w net.inet.ip.dad_count=0 >/dev/null 2>&1 || true
 /sbin/ifconfig %s inet %s netmask 255.255.255.0 up || {
 	echo NETBSD_MANAGED_IFCONFIG_FAILED

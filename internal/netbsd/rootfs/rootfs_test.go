@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -79,8 +78,10 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 		}
 	}
 	initScript := readRootFile(t, root, "/sbin/init")
-	if initScript != fmt.Sprintf(managedInitScript, "vioif0", "10.42.0.2", "10.42.0.1", "02:42:0a:2a:00:01", "10.42.0.1") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
+	if !textHasFields(initScript, "/sbin/ifconfig", "vioif0", "inet", "10.42.0.2", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(initScript, "/usr/sbin/arp", "-s", "10.42.0.1", "02:42:0a:2a:00:01", ">/dev/null", "2>&1", "||", "true") ||
+		!textHasFields(initScript, "/sbin/route", "add", "default", "10.42.0.1", "||", "true") {
+		t.Fatalf("default init script does not configure the leased network: %q", initScript)
 	}
 	fstab := readRootFile(t, root, "/etc/fstab")
 	if !textHasFields(fstab, "/dev/ld0a", "/", "ffs", "rw", "1", "1") {
@@ -108,8 +109,10 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	}
 	defer closeRoot()
 	initScript := readRootFile(t, root, "/sbin/init")
-	if initScript != fmt.Sprintf(managedInitScript, "vioif1", "10.42.0.8", "10.42.0.9", "02:42:0a:2a:00:01", "10.42.0.9") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
+	if !textHasFields(initScript, "/sbin/ifconfig", "vioif1", "inet", "10.42.0.8", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(initScript, "/usr/sbin/arp", "-s", "10.42.0.9", "02:42:0a:2a:00:01", ">/dev/null", "2>&1", "||", "true") ||
+		!textHasFields(initScript, "/sbin/route", "add", "default", "10.42.0.9", "||", "true") {
+		t.Fatalf("init script does not configure the leased network: %q", initScript)
 	}
 	ifconfig := readRootFile(t, root, "/etc/ifconfig.vioif1")
 	if !textHasLine(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {

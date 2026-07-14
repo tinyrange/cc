@@ -1,11 +1,14 @@
 package builtin
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
 	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/rootartifact"
 )
 
 func TestGuestForImageRecognizesBuiltinBSDProfiles(t *testing.T) {
@@ -118,5 +121,31 @@ func TestEffectiveExecEnvAppliesBSDDefaults(t *testing.T) {
 	want = []string{"PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=vt220"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("replacement env = %#v, want %#v", got, want)
+	}
+}
+
+func TestBSDArtifactWithCustomKernel(t *testing.T) {
+	kernelPath := filepath.Join(t.TempDir(), "bsd-kernel")
+	wantKernel := []byte("custom-bsd-kernel")
+	if err := os.WriteFile(kernelPath, wantKernel, 0o644); err != nil {
+		t.Fatalf("write custom kernel: %v", err)
+	}
+	artifact, err := bsdArtifactWithCustomKernel(rootartifact.Artifact{Kernel: []byte("packaged")}, customKernelFilePrefix+kernelPath)
+	if err != nil {
+		t.Fatalf("apply custom kernel: %v", err)
+	}
+	if !bytes.Equal(artifact.Kernel, wantKernel) {
+		t.Fatalf("artifact kernel = %q, want custom kernel", artifact.Kernel)
+	}
+}
+
+func TestBSDArtifactWithDefaultKernelKeepsPackagedKernel(t *testing.T) {
+	packaged := []byte("packaged")
+	artifact, err := bsdArtifactWithCustomKernel(rootartifact.Artifact{Kernel: packaged}, "default")
+	if err != nil {
+		t.Fatalf("apply default kernel: %v", err)
+	}
+	if !bytes.Equal(artifact.Kernel, packaged) {
+		t.Fatalf("artifact kernel = %q, want packaged kernel", artifact.Kernel)
 	}
 }
