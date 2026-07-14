@@ -391,6 +391,8 @@ type InstanceState struct {
 	StartedAt   string `json:"started_at,omitempty"`
 	NetworkIPv4 string `json:"network_ipv4,omitempty"`
 	Error       string `json:"error,omitempty"`
+	ExitedAt    string `json:"exited_at,omitempty"`
+	ExitReason  string `json:"exit_reason,omitempty"`
 }
 
 type ConsoleHistoryResponse struct {
