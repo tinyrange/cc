@@ -898,6 +898,9 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 	m.mu.Lock()
 	memory, cpus := m.resourceUsageLocked()
 	m.mu.Unlock()
+	if m.maxCPUs > 0 && (caps.MaxInstances <= 0 || caps.MaxInstances > m.maxCPUs) {
+		caps.MaxInstances = m.maxCPUs
+	}
 	caps.MemoryCapacityMB, caps.MemoryReservedMB = m.maxMemoryMB, memory
 	caps.CPUCapacity, caps.CPUReserved = m.maxCPUs, cpus
 	return caps

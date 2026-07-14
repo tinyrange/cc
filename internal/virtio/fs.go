@@ -545,12 +545,12 @@ func (f *FS) Close() error {
 
 func resolveVirtioFSKickPoll() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_KICK_POLL"))) {
-	case "", "1", "true", "yes", "on":
+	case "1", "true", "yes", "on":
 		return true
-	case "0", "false", "no", "off":
+	case "", "0", "false", "no", "off":
 		return false
 	default:
-		return true
+		return false
 	}
 }
 
@@ -846,10 +846,9 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 				return err
 			}
 			if f.Async && f.kickPoll && f.driverFeatures&featureRingEventIdx == 0 {
-				if err := f.setRequestQueueNoNotifyLocked(true); err != nil {
-					f.mu.Unlock()
-					return err
-				}
+				// Keep guest kicks enabled while polling. Suppressing them creates
+				// a lost-wakeup window when the poller becomes idle while the guest
+				// is posting a descriptor based on the previous no-notify flag.
 				f.startKickPollerLocked()
 			}
 			f.mu.Unlock()
@@ -1165,6 +1164,19 @@ func (f *FS) runKickPoller(generation uint32) {
 			f.kickPollMisses++
 			if err := f.setRequestQueueNoNotifyLocked(false); err != nil {
 				f.logf("kick-poll clear no-notify: %v", err)
+			}
+			// Publish the notification re-enable before the final queue check.
+			// Without this release/acquire boundary, a guest can observe the old
+			// no-notify flag, post work without kicking, and race past the
+			// poller's final check, leaving the request asleep indefinitely.
+			f.mu.Unlock()
+			runtime.Gosched()
+			f.mu.Lock()
+			if generation != f.configGeneration || !f.kickPoll {
+				f.kickPollActive = false
+				f.mu.Unlock()
+				f.enqueueWorks(allWorks)
+				return
 			}
 			for qidx := fsQueueRequest; qidx < fsQueueRequest+fsRequestQueueCount && qidx < len(f.queues); qidx++ {
 				var workScratch [16]fsWork

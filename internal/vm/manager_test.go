@@ -327,6 +327,17 @@ func TestManagerRejectsInvalidResourcesBeforeHostAllocation(t *testing.T) {
 	}
 }
 
+func TestManagerCapabilitiesDoNotAdvertiseMoreInstancesThanCPUAdmissionAllows(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 64})
+	manager := testManager(host)
+	manager.maxCPUs = 16
+
+	caps := manager.Capabilities()
+	if caps.MaxInstances != 16 || caps.CPUCapacity != 16 {
+		t.Fatalf("capacity = instances %d, CPUs %d, want 16 each", caps.MaxInstances, caps.CPUCapacity)
+	}
+}
+
 func TestManagerAdmissionIncludesInflightStarts(t *testing.T) {
 	base := newFakeHost(VMHostCapabilities{MaxVMs: 4})
 	base.queueInstance(newFakeInstance())
