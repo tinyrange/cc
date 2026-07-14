@@ -442,6 +442,90 @@ func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 	requireGuestOutput(t, output, "line:alpha", "line:beta")
 }
 
+func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	manager := NewManagerWithBackend(env.backend)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	const instanceID = "tty-control"
+	share := client.ShareMount{
+		Source:   t.TempDir(),
+		Mount:    "/host",
+		Writable: true,
+		MapOwner: true,
+		OwnerUID: 1000,
+		OwnerGID: 1000,
+		Cache:    "strict",
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+		ID:       instanceID,
+		Image:    env.imageName,
+		Shares:   []client.ShareMount{share},
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+	}); err != nil {
+		t.Fatalf("start managed Linux TTY instance: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.ShutdownAll(context.Background()) })
+	inputs := make(chan client.ExecInput, 2)
+	var control strings.Builder
+	var output strings.Builder
+	var exit *int
+	sent := false
+	persistentCommand := `__vmsh_uid="$(id -u 2>/dev/null || printf '')"
+__vmsh_passwd="$(awk -F: -v u="$__vmsh_uid" '$3 == u { print $1 ":" $6; exit }' /etc/passwd 2>/dev/null || true)"
+if [ -n "$__vmsh_passwd" ]; then
+  USER="${__vmsh_passwd%%:*}"
+  LOGNAME="$USER"
+  HOME="${__vmsh_passwd#*:}"
+  export USER LOGNAME HOME
+fi
+unset __vmsh_uid __vmsh_passwd
+stty -echo 2>/dev/null || true
+alias ls >/dev/null 2>&1 || { ls --color=always -C -w ${COLUMNS:-80} >/dev/null 2>&1 && alias ls='ls --color=always -C -w ${COLUMNS:-80}'; } || true
+__vmsh_control_fd=3
+printf 'ready\t0\t%s\n' "$PWD" >&$__vmsh_control_fd
+IFS= read -r line
+eval "$line"`
+	err := manager.RunStreamIn(ctx, instanceID, client.RunRequest{
+		Image:     env.imageName,
+		Command:   []string{"sh", "-lc", persistentCommand},
+		Env:       []string{"HOME=/home/cc", "USER=cc", "LOGNAME=cc", "TERM=xterm-256color", "COLUMNS=80", "LINES=24"},
+		WorkDir:   "/host",
+		User:      "1000:1000",
+		Shares:    []client.ShareMount{share},
+		TTY:       true,
+		ControlFD: true,
+		Cols:      80,
+		Rows:      24,
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			output.WriteString(event.Output)
+		case "control":
+			control.WriteString(event.Output)
+			if !sent && strings.Contains(event.Output, "ready\t0\t/host") {
+				sent = true
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'done:%s\\n' \"$PWD\" >&3\n")}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			exit = &code
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Linux TTY control fd exec: %v; stdout=%q control=%q", err, output.String(), control.String())
+	}
+	if !sent || exit == nil || *exit != 0 {
+		t.Fatalf("Linux TTY control fd state: sent=%t exit=%v stdout=%q control=%q", sent, exit, output.String(), control.String())
+	}
+	if got := strings.TrimSpace(control.String()); got != "ready\t0\t/host\ndone:/host" {
+		t.Fatalf("Linux TTY control fd output = %q", got)
+	}
+}
+
 func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
 	if runtime.GOOS != "linux" || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
 		t.Skip("KVM startup snapshots are implemented on Linux amd64 and arm64")

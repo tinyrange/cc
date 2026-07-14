@@ -144,6 +144,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		rootFS: rootFS,
 		fsdevs: fsdevs,
 		dmesg:  req.Dmesg,
+		mounts: mounts.NewState(req.Shares),
 	}, nil
 }
 
