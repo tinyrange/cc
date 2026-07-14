@@ -2,7 +2,9 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -144,6 +146,199 @@ func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
 	close(releaseExec)
 	if err := <-execErr; err != nil {
 		t.Fatalf("ExecStream: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	execReceived := make(chan struct{})
+	controlReceived := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		codec := NewWorkerCodec(conn)
+		defer codec.Close()
+		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+			serverErr <- err
+			return
+		}
+		execFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if execFrame.Type != WorkerFrameExec {
+			serverErr <- fmt.Errorf("first frame type = %q", execFrame.Type)
+			return
+		}
+		close(execReceived)
+		controlFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if controlFrame.Type != WorkerFrameAddShare {
+			serverErr <- fmt.Errorf("second frame type = %q", controlFrame.Type)
+			return
+		}
+		close(controlReceived)
+		cancelFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if cancelFrame.Type != WorkerFrameCancel || cancelFrame.ID != execFrame.ID {
+			serverErr <- fmt.Errorf("cancel frame = %+v", cancelFrame)
+			return
+		}
+		if err := codec.Send(mustWorkerFrame(controlFrame.ID, WorkerFrameDone, map[string]string{"status": "mounted"})); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialWorker: %v", err)
+	}
+	defer worker.Close()
+
+	execCtx, cancelExec := context.WithCancel(t.Context())
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- worker.ExecStream(execCtx, "vm", client.ExecRequest{Command: []string{"sleep"}}, nil, nil)
+	}()
+	select {
+	case <-execReceived:
+	case err := <-serverErr:
+		t.Fatalf("server: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive exec call")
+	}
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- worker.AddShare(t.Context(), "vm", client.ShareMount{Source: "/host", Mount: "/host"})
+	}()
+
+	select {
+	case <-controlReceived:
+	case err := <-serverErr:
+		t.Fatalf("server: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive concurrent control call")
+	}
+	cancelExec()
+
+	select {
+	case err := <-execDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ExecStream error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ExecStream did not return after cancellation")
+	}
+	select {
+	case err := <-controlDone:
+		if err != nil {
+			t.Fatalf("concurrent AddShare: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent AddShare did not complete")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWorkerConnectionFailureReachesAllCalls(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	execReceived := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		codec := NewWorkerCodec(conn)
+		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+			serverErr <- err
+			return
+		}
+		frame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if frame.Type != WorkerFrameExec {
+			serverErr <- fmt.Errorf("first frame type = %q", frame.Type)
+			return
+		}
+		close(execReceived)
+		frame, err = codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if frame.Type != WorkerFrameAddShare {
+			serverErr <- fmt.Errorf("second frame type = %q", frame.Type)
+			return
+		}
+		serverErr <- codec.Close()
+	}()
+
+	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialWorker: %v", err)
+	}
+	defer worker.Close()
+
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- worker.ExecStream(t.Context(), "vm", client.ExecRequest{Command: []string{"sleep"}}, nil, nil)
+	}()
+	select {
+	case <-execReceived:
+	case err := <-serverErr:
+		t.Fatalf("server: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive exec call")
+	}
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- worker.AddShare(t.Context(), "vm", client.ShareMount{Source: "/host", Mount: "/host"})
+	}()
+
+	for name, result := range map[string]<-chan error{
+		"exec":    execDone,
+		"control": controlDone,
+	} {
+		select {
+		case err := <-result:
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("%s error = %v, want connection EOF", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s call did not receive connection failure", name)
+		}
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
