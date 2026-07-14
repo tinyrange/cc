@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -815,6 +816,131 @@ func TestWebSocketRoutesEnforceOriginPolicy(t *testing.T) {
 			_ = conn.Close()
 		})
 	}
+}
+
+func TestBootEventWritersDoNotBlockOtherStreams(t *testing.T) {
+	blockedResponse := &blockingResponseWriter{
+		header:  http.Header{},
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	blocked := newBootEventWriter(blockedResponse)
+	blockedDone := make(chan error, 1)
+	go func() {
+		blockedDone <- blocked.Write(client.BootEvent{Kind: "status", Message: "blocked"})
+	}()
+	select {
+	case <-blockedResponse.started:
+	case <-time.After(time.Second):
+		t.Fatal("first stream did not begin writing")
+	}
+
+	fast := newBootEventWriter(httptest.NewRecorder())
+	fastDone := make(chan error, 1)
+	go func() {
+		fastDone <- fast.Write(client.BootEvent{Kind: "status", Message: "independent"})
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("independent stream write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("independent stream blocked behind another response")
+	}
+	close(blockedResponse.release)
+	if err := <-blockedDone; err != nil {
+		t.Fatalf("blocked stream write: %v", err)
+	}
+}
+
+func TestBootEventWriterSerializesValidNDJSON(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writer := newBootEventWriter(recorder)
+	const eventCount = 100
+	var wg sync.WaitGroup
+	errs := make(chan error, eventCount)
+	for i := 0; i < eventCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- writer.Write(client.BootEvent{Kind: "status", Data: fmt.Sprintf("%d", i)})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("write event: %v", err)
+		}
+	}
+	seen := make(map[string]bool, eventCount)
+	decoder := json.NewDecoder(recorder.Body)
+	for {
+		var event client.BootEvent
+		err := decoder.Decode(&event)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		if event.Kind != "status" || seen[event.Data] {
+			t.Fatalf("event = %+v", event)
+		}
+		seen[event.Data] = true
+	}
+	if len(seen) != eventCount {
+		t.Fatalf("decoded events = %d, want %d", len(seen), eventCount)
+	}
+}
+
+func TestBootEventWriterReturnsDisconnectError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	response := &contextResponseWriter{header: http.Header{}, ctx: ctx}
+	result := make(chan error, 1)
+	go func() {
+		result <- newBootEventWriter(response).Write(client.BootEvent{Kind: "status"})
+	}()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("write error = %v, want disconnect cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("producer did not return after disconnect")
+	}
+}
+
+type blockingResponseWriter struct {
+	header  http.Header
+	started chan struct{}
+	release chan struct{}
+	buf     bytes.Buffer
+}
+
+func (w *blockingResponseWriter) Header() http.Header { return w.header }
+func (w *blockingResponseWriter) WriteHeader(int)     {}
+func (w *blockingResponseWriter) Write(p []byte) (int, error) {
+	select {
+	case w.started <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return w.buf.Write(p)
+}
+
+type contextResponseWriter struct {
+	header http.Header
+	ctx    context.Context
+}
+
+func (w *contextResponseWriter) Header() http.Header { return w.header }
+func (w *contextResponseWriter) WriteHeader(int)     {}
+func (w *contextResponseWriter) Write([]byte) (int, error) {
+	<-w.ctx.Done()
+	return 0, w.ctx.Err()
 }
 
 func jsonBody(t *testing.T, value any) *bytes.Reader {

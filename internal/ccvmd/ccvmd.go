@@ -41,7 +41,6 @@ func isBuiltInBSDImage(name string) bool {
 }
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
-var bootEventWriteMu sync.Mutex
 
 const (
 	defaultVMBootTimeout = 5 * time.Second
@@ -1608,18 +1607,20 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
+		bootEvents := newBootEventWriter(w)
+		defer bootEvents.Close()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
 		var startImage *oci.Image
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if imageName := strings.TrimSpace(req.Image); imageName != "" {
 			if builtInBSDImage {
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
+					bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
 				}
 			} else if _, err := srvState.images.Get(imageName); err != nil {
 				msg := fmt.Sprintf("image %q is not available", imageName)
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: msg})
 					return
 				}
 				writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
@@ -1629,7 +1630,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				if err != nil {
 					msg := fmt.Sprintf("image %q is not available: %s", imageName, err)
 					if wantsBootEventStream(r) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: msg})
 						return
 					}
 					writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
@@ -1637,13 +1638,13 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				}
 				startImage = image
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
+					bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
 				}
 			}
 		}
 		if err := vm.Supports(); err != nil {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, err)
@@ -1651,15 +1652,15 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		}
 		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
@@ -1673,22 +1674,22 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
 		if vm.NeedsAMD64Emulation(startImage) {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
 				_, err := srvState.kernel.ExtractPackageFileWithProgress(
 					bootCtx,
 					"community",
 					"qemu-x86_64",
 					"usr/bin/qemu-x86_64",
 					func(event client.ProgressEvent) {
-						_ = writeBootEvent(w, client.BootEvent{Kind: "status", Message: bootProgressMessage("preparing amd64 emulator", event)})
+						_ = bootEvents.Write(client.BootEvent{Kind: "status", Message: bootProgressMessage("preparing amd64 emulator", event)})
 					},
 				)
 				if err != nil {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 			} else if _, err := vm.PrepareAMD64Emulator(bootCtx, startImage, srvState.kernel.ExtractPackageFile); err != nil {
@@ -1701,22 +1702,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			}
 		}
 		if wantsBootEventStream(r) {
-			var streamMu sync.Mutex
-			streamOpen := true
-			writeStreamEvent := func(event client.BootEvent) error {
-				streamMu.Lock()
-				defer streamMu.Unlock()
-				if !streamOpen {
-					return nil
-				}
-				return writeBootEvent(w, event)
-			}
-			closeStream := func() {
-				streamMu.Lock()
-				streamOpen = false
-				streamMu.Unlock()
-			}
-			defer closeStream()
+			writeStreamEvent := bootEvents.Write
 
 			writeStreamEvent(client.BootEvent{Kind: "status", Message: "starting VM"})
 			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
@@ -1768,12 +1754,14 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
+		bootEvents := newBootEventWriter(w)
+		defer bootEvents.Close()
 		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if !builtInBSDImage {
 			if _, err := srvState.images.Get(req.Image); err != nil {
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
 					return
 				}
 				writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
@@ -1784,11 +1772,11 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			timingLog("POST /vm builtin image lookup took=%s", time.Since(start))
 		}
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
+			bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
 		}
 		if err := vm.Supports(); err != nil {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, err)
@@ -1796,15 +1784,15 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		}
 		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
@@ -1817,22 +1805,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		}
 		timingLog("POST /vm kernel ensure/status took=%s", time.Since(start))
 		if wantsBootEventStream(r) {
-			var streamMu sync.Mutex
-			streamOpen := true
-			writeStreamEvent := func(event client.BootEvent) error {
-				streamMu.Lock()
-				defer streamMu.Unlock()
-				if !streamOpen {
-					return nil
-				}
-				return writeBootEvent(w, event)
-			}
-			closeStream := func() {
-				streamMu.Lock()
-				streamOpen = false
-				streamMu.Unlock()
-			}
-			defer closeStream()
+			writeStreamEvent := bootEvents.Write
 
 			writeStreamEvent(client.BootEvent{Kind: "status", Message: fmt.Sprintf("starting VM for %s", req.Image)})
 			state, err := srvState.vms.StartStream(bootCtx, req, func(event client.BootEvent) error {
@@ -2323,22 +2296,47 @@ func sanitizeExecEventForJSON(event client.ExecEvent) client.ExecEvent {
 	return event
 }
 
-func writeBootEvent(w http.ResponseWriter, event client.BootEvent) (err error) {
-	bootEventWriteMu.Lock()
-	defer bootEventWriteMu.Unlock()
+type bootEventWriter struct {
+	mu   sync.Mutex
+	w    http.ResponseWriter
+	open bool
+}
+
+func newBootEventWriter(w http.ResponseWriter) *bootEventWriter {
+	return &bootEventWriter{w: w, open: true}
+}
+
+func (w *bootEventWriter) Close() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.open = false
+	w.mu.Unlock()
+}
+
+func (w *bootEventWriter) Write(event client.BootEvent) (err error) {
+	if w == nil {
+		return fmt.Errorf("boot event writer is unavailable")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.open {
+		return nil
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("write boot event: %v", recovered)
 		}
 	}()
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.w.Header().Set("Content-Type", "application/x-ndjson")
 	if event.Kind == "" {
 		event.Kind = "status"
 	}
-	if err := json.NewEncoder(w).Encode(event); err != nil {
+	if err := json.NewEncoder(w.w).Encode(event); err != nil {
 		return err
 	}
-	if flusher, ok := w.(http.Flusher); ok {
+	if flusher, ok := w.w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 	return nil
