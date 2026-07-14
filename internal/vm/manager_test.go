@@ -534,6 +534,58 @@ func waitForStopObservers(t *testing.T, manager *Manager, id string, want int) {
 	t.Fatalf("shutdown observers did not reach %d", want)
 }
 
+func TestManagerShutdownCancelsAndRejectsLateStart(t *testing.T) {
+	ctx := context.Background()
+	inst := newFakeInstance()
+	host := &lateStartHost{
+		fakeHost: newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1}),
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		instance: inst,
+	}
+	manager := testManager(host)
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"})
+		startDone <- err
+	}()
+	<-host.started
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownAll(ctx) }()
+	<-host.canceled
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "stopped" {
+		t.Fatalf("state during shutdown = %+v", state)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before canceled start completed: %v", err)
+	default:
+	}
+	close(host.release)
+	if err := <-startDone; !errors.Is(err, ErrManagerClosing) {
+		t.Fatalf("late start error = %v, want ErrManagerClosing", err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inst.done:
+	default:
+		t.Fatal("instance returned after shutdown was not closed")
+	}
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "stopped" {
+		t.Fatalf("state after shutdown = %+v", state)
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); !errors.Is(err, ErrManagerClosing) {
+		t.Fatalf("post-shutdown start error = %v, want ErrManagerClosing", err)
+	}
+	if got := host.calls.Load(); got != 1 {
+		t.Fatalf("backend start calls = %d, want 1", got)
+	}
+}
+
 func TestManagerAssignsNetworkLeasesForBuiltinDefaultNetwork(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -718,6 +770,24 @@ func (h *blockingStartHost) StartStream(ctx context.Context, req client.CreateIn
 		return nil, ctx.Err()
 	}
 	return h.fakeHost.StartStream(ctx, req, onEvent)
+}
+
+type lateStartHost struct {
+	*fakeHost
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	instance Instance
+	calls    atomic.Int32
+}
+
+func (h *lateStartHost) StartStream(ctx context.Context, _ client.CreateInstanceRequest, _ func(client.BootEvent) error) (Instance, error) {
+	h.calls.Add(1)
+	close(h.started)
+	<-ctx.Done()
+	close(h.canceled)
+	<-h.release
+	return h.instance, nil
 }
 
 type fakeRunInCall struct {
