@@ -2,6 +2,7 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -19,14 +20,32 @@ type Client struct {
 	next uint64
 
 	pendingMu sync.Mutex
-	pending   map[uint64]chan workerFrameResult
+	pending   map[uint64]*workerCall
 	closed    bool
 	recvErr   error
 }
 
-type workerFrameResult struct {
-	frame WorkerFrame
-	err   error
+// ErrWorkerCallOverflow reports that a caller stopped consuming frames quickly
+// enough for its bounded delivery queue to fill.
+var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflow")
+
+type workerCall struct {
+	frames chan WorkerFrame
+	done   chan error
+}
+
+func newWorkerCall() *workerCall {
+	return &workerCall{
+		frames: make(chan WorkerFrame, 256),
+		done:   make(chan error, 1),
+	}
+}
+
+func (c *workerCall) finish(err error) {
+	select {
+	case c.done <- err:
+	default:
+	}
 }
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
@@ -48,7 +67,7 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]chan workerFrameResult{}}
+	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]*workerCall{}}
 	frame, err := worker.codec.Receive()
 	if err != nil {
 		_ = conn.Close()
@@ -84,16 +103,24 @@ func (c *Client) receiveLoop() {
 			return
 		}
 		c.pendingMu.Lock()
-		ch := c.pending[frame.ID]
+		call := c.pending[frame.ID]
 		c.pendingMu.Unlock()
-		if ch == nil {
+		if call == nil {
 			continue
 		}
-		ch <- workerFrameResult{frame: frame}
+		select {
+		case call.frames <- frame:
+		default:
+			err := fmt.Errorf("%w for request %d", ErrWorkerCallOverflow, frame.ID)
+			if c.failCall(frame.ID, call, err) {
+				id := frame.ID
+				go func() { _ = c.sendCancel(id) }()
+			}
+		}
 	}
 }
 
-func (c *Client) registerCall(id uint64) (chan workerFrameResult, error) {
+func (c *Client) registerCall(id uint64) (*workerCall, error) {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	if c.closed {
@@ -102,15 +129,27 @@ func (c *Client) registerCall(id uint64) (chan workerFrameResult, error) {
 		}
 		return nil, fmt.Errorf("sidecar worker is closed")
 	}
-	ch := make(chan workerFrameResult, 256)
-	c.pending[id] = ch
-	return ch, nil
+	call := newWorkerCall()
+	c.pending[id] = call
+	return call, nil
 }
 
 func (c *Client) unregisterCall(id uint64) {
 	c.pendingMu.Lock()
 	delete(c.pending, id)
 	c.pendingMu.Unlock()
+}
+
+func (c *Client) failCall(id uint64, call *workerCall, err error) bool {
+	c.pendingMu.Lock()
+	if c.pending[id] != call {
+		c.pendingMu.Unlock()
+		return false
+	}
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+	call.finish(err)
+	return true
 }
 
 func (c *Client) closePending(err error) {
@@ -125,11 +164,10 @@ func (c *Client) closePending(err error) {
 	c.closed = true
 	c.recvErr = err
 	pending := c.pending
-	c.pending = map[uint64]chan workerFrameResult{}
+	c.pending = map[uint64]*workerCall{}
 	c.pendingMu.Unlock()
-	for _, ch := range pending {
-		ch <- workerFrameResult{err: err}
-		close(ch)
+	for _, call := range pending {
+		call.finish(err)
 	}
 }
 
@@ -226,7 +264,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 		ctx = context.Background()
 	}
 	requestID := c.nextID()
-	frames, err := c.registerCall(requestID)
+	call, err := c.registerCall(requestID)
 	if err != nil {
 		return err
 	}
@@ -262,11 +300,10 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	defer close(cancelDone)
 
 	for {
-		result, err := c.nextFrame(ctx, frames)
+		got, err := c.nextFrame(ctx, call)
 		if err != nil {
 			return err
 		}
-		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -300,8 +337,11 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	id := c.nextID()
-	frames, err := c.registerCall(id)
+	call, err := c.registerCall(id)
 	if err != nil {
 		return err
 	}
@@ -326,11 +366,10 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 		return err
 	}
 	for {
-		result, err := c.nextFrame(ctx, frames)
+		got, err := c.nextFrame(ctx, call)
 		if err != nil {
 			return err
 		}
-		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -353,24 +392,25 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	}
 }
 
-func (c *Client) nextFrame(ctx context.Context, frames <-chan workerFrameResult) (workerFrameResult, error) {
+func (c *Client) nextFrame(ctx context.Context, call *workerCall) (WorkerFrame, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	select {
+	case err := <-call.done:
+		return WorkerFrame{}, err
+	default:
+	}
+	select {
 	case <-ctx.Done():
-		return workerFrameResult{}, ctx.Err()
-	case result, ok := <-frames:
-		if !ok {
-			return workerFrameResult{}, fmt.Errorf("sidecar worker is closed")
+		return WorkerFrame{}, ctx.Err()
+	case err := <-call.done:
+		if ctx.Err() != nil {
+			return WorkerFrame{}, ctx.Err()
 		}
-		if result.err != nil {
-			if ctx.Err() != nil {
-				return workerFrameResult{}, ctx.Err()
-			}
-			return workerFrameResult{}, result.err
-		}
-		return result, nil
+		return WorkerFrame{}, err
+	case frame := <-call.frames:
+		return frame, nil
 	}
 }
 
