@@ -117,6 +117,53 @@ func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsInvalidResourcesBeforeHostAllocation(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 4})
+	manager := testManager(host)
+	_, err := manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: ^uint64(0), CPUs: 1})
+	if err == nil {
+		t.Fatal("overflowing memory request was accepted")
+	}
+	if len(host.starts) != 0 {
+		t.Fatalf("host starts = %+v", host.starts)
+	}
+	_, err = manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: 512, BalloonMB: 513, CPUs: 1})
+	if err == nil {
+		t.Fatal("balloon larger than guest memory was accepted")
+	}
+	if len(host.starts) != 0 {
+		t.Fatalf("host starts after balloon rejection = %+v", host.starts)
+	}
+}
+
+func TestManagerAdmissionIncludesInflightStarts(t *testing.T) {
+	base := newFakeHost(VMHostCapabilities{MaxVMs: 4})
+	base.queueInstance(newFakeInstance())
+	host := &blockingStartHost{fakeHost: base, entered: make(chan struct{}), release: make(chan struct{})}
+	manager := testManager(host)
+	manager.maxMemoryMB = 512
+	manager.maxCPUs = 2
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine", MemoryMB: 512, CPUs: 2})
+		firstDone <- err
+	}()
+	<-host.entered
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "alpine", MemoryMB: 512, CPUs: 1}); err == nil {
+		t.Fatal("concurrent start exceeded reserved budget")
+	}
+	if len(base.starts) != 0 {
+		t.Fatalf("host starts before release = %d, want 0", len(base.starts))
+	}
+	close(host.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if len(base.starts) != 1 {
+		t.Fatalf("host starts after release = %d, want 1", len(base.starts))
+	}
+}
+
 func TestManagerBlankSnapshotStartKeepsSharesInStartRequest(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
@@ -377,6 +424,22 @@ type fakeHost struct {
 	hostCapabilitiesN int
 }
 
+type blockingStartHost struct {
+	*fakeHost
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingStartHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	close(h.entered)
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return h.fakeHost.StartStream(ctx, req, onEvent)
+}
+
 type fakeRunInCall struct {
 	inst         Instance
 	runningImage string
@@ -633,6 +696,8 @@ func (i *fakeInstance) VirtioFSStats() []virtio.FSStats {
 
 func testManager(host VMHost) *Manager {
 	manager := NewManagerWithHost(host)
+	manager.maxMemoryMB = 1 << 40
+	manager.maxCPUs = 1 << 20
 	manager.supports = func() error { return nil }
 	manager.capabilities = func() client.CapabilitiesResponse {
 		caps := host.HostCapabilities(context.Background())

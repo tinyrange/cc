@@ -67,6 +67,14 @@ type Manager struct {
 	running       map[string]*Machine
 	starting      map[string]struct{}
 	networkLeases map[string]managerNetworkLease
+	reservations  map[string]resourceReservation
+	maxMemoryMB   uint64
+	maxCPUs       int
+}
+
+type resourceReservation struct {
+	memoryMB uint64
+	cpus     int
 }
 
 type Machine struct {
@@ -97,10 +105,8 @@ func NewManager() *Manager {
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
-	m := &Manager{supports: Supports, capabilities: HostCapabilities}
-	m.host = vmhost.NewInProcess(backend, func() client.CapabilitiesResponse {
-		return m.Capabilities()
-	})
+	m := newManagerBudgets(&Manager{supports: Supports, capabilities: HostCapabilities})
+	m.host = vmhost.NewInProcess(backend, HostCapabilities)
 	return m
 }
 
@@ -108,7 +114,13 @@ func NewManagerWithHost(host VMHost) *Manager {
 	if host == nil {
 		host = vmhost.NewInProcess(vmhost.UnsupportedBackend{}, HostCapabilities)
 	}
-	return &Manager{host: host, supports: Supports, capabilities: HostCapabilities}
+	return newManagerBudgets(&Manager{host: host, supports: Supports, capabilities: HostCapabilities})
+}
+
+func newManagerBudgets(m *Manager) *Manager {
+	m.maxMemoryMB = hostMemoryMB()
+	m.maxCPUs = runtime.NumCPU()
+	return m
 }
 
 func NewManagerWithHosts(hosts ...VMHost) *Manager {
@@ -205,6 +217,9 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if req.Image == "" {
 		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
+	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
+		return client.InstanceState{}, err
+	}
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -226,11 +241,15 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.mu.Unlock()
 		return state, fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(req.MemoryMB, req.CPUs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
 	m.starting[id] = struct{}{}
+	if m.reservations == nil {
+		m.reservations = make(map[string]resourceReservation)
+	}
+	m.reservations[id] = resourceReservation{memoryMB: req.MemoryMB, cpus: req.CPUs}
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
@@ -260,6 +279,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
+	delete(m.reservations, id)
 	m.running[id] = machine
 	m.mu.Unlock()
 
@@ -289,6 +309,9 @@ func (m *Manager) StartBlankInstanceStream(
 ) (client.InstanceState, error) {
 	id = instanceID(id)
 	req.ID = id
+	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
+		return client.InstanceState{}, err
+	}
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -310,11 +333,15 @@ func (m *Manager) StartBlankInstanceStream(
 		m.mu.Unlock()
 		return state, fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(req.MemoryMB, req.CPUs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
 	m.starting[id] = struct{}{}
+	if m.reservations == nil {
+		m.reservations = make(map[string]resourceReservation)
+	}
+	m.reservations[id] = resourceReservation{memoryMB: req.MemoryMB, cpus: req.CPUs}
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
@@ -359,6 +386,7 @@ func (m *Manager) StartBlankInstanceStream(
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
+	delete(m.reservations, id)
 	m.running[id] = machine
 	m.mu.Unlock()
 
@@ -692,10 +720,22 @@ func (m *Manager) Statuses() []client.InstanceState {
 }
 
 func (m *Manager) Capabilities() client.CapabilitiesResponse {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.capabilitiesLocked()
+}
+
+func (m *Manager) capabilitiesLocked() client.CapabilitiesResponse {
+	var caps client.CapabilitiesResponse
 	if m.capabilities == nil {
-		return HostCapabilities()
+		caps = HostCapabilities()
+	} else {
+		caps = m.capabilities()
 	}
-	return m.capabilities()
+	memory, cpus := m.resourceUsageLocked()
+	caps.MemoryCapacityMB, caps.MemoryReservedMB = m.maxMemoryMB, memory
+	caps.CPUCapacity, caps.CPUReserved = m.maxCPUs, cpus
+	return caps
 }
 
 func (m *Manager) statusLocked(id string) client.InstanceState {
@@ -741,10 +781,51 @@ func (m *Manager) watch(machine *Machine) {
 	machine.exitedAt = time.Now().UTC()
 }
 
-func (m *Manager) checkCapacityLocked() error {
+func (m *Manager) checkCapacityLocked(memoryMB uint64, cpus int) error {
 	caps := m.host.HostCapabilities(context.Background())
 	if caps.MaxVMs > 0 && len(m.running)+len(m.starting) >= caps.MaxVMs {
 		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxVMs)
+	}
+	usedMemory, usedCPUs := m.resourceUsageLocked()
+	if m.maxMemoryMB > 0 && (memoryMB > m.maxMemoryMB || usedMemory > m.maxMemoryMB-memoryMB) {
+		return fmt.Errorf("VM memory admission rejected: requested=%d MiB reserved=%d MiB capacity=%d MiB", memoryMB, usedMemory, m.maxMemoryMB)
+	}
+	if m.maxCPUs > 0 && (cpus > m.maxCPUs || usedCPUs > m.maxCPUs-cpus) {
+		return fmt.Errorf("VM CPU admission rejected: requested=%d reserved=%d capacity=%d", cpus, usedCPUs, m.maxCPUs)
+	}
+	return nil
+}
+
+func (m *Manager) resourceUsageLocked() (uint64, int) {
+	var memory uint64
+	var cpus int
+	for _, machine := range m.running {
+		memory += machine.memoryMB
+		cpus += machine.cpus
+	}
+	for _, reservation := range m.reservations {
+		memory += reservation.memoryMB
+		cpus += reservation.cpus
+	}
+	return memory, cpus
+}
+
+func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {
+	if *memoryMB == 0 {
+		*memoryMB = 512
+	}
+	if *cpus == 0 {
+		*cpus = 1
+	}
+	if *cpus < 0 {
+		return fmt.Errorf("cpus must be positive")
+	}
+	maxAllocationMB := uint64(^uint(0)>>1) >> 20
+	if *memoryMB > maxAllocationMB {
+		return fmt.Errorf("memory_mb %d overflows host allocation size", *memoryMB)
+	}
+	if *balloonMB > *memoryMB {
+		return fmt.Errorf("balloon_mb %d exceeds memory_mb %d", *balloonMB, *memoryMB)
 	}
 	return nil
 }
@@ -753,6 +834,7 @@ func (m *Manager) clearStarting(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.starting, id)
+	delete(m.reservations, id)
 }
 
 func (m *Manager) ensureNetworkLeaseLocked(id, image string, cfg *client.NetworkConfig) *client.NetworkConfig {
