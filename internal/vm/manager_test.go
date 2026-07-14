@@ -2,10 +2,12 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
@@ -141,6 +143,38 @@ func TestManagerBlankStartPassesBuiltinGuestSharesToHost(t *testing.T) {
 	if len(inst.shares) != 0 {
 		t.Fatalf("replayed shares = %+v, want none", inst.shares)
 	}
+}
+
+func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 2})
+	crashed := newFakeInstance()
+	crashed.waitErr = errors.New("hypervisor exited")
+	host.queueInstance(crashed)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "alpha", Image: "alpine", MemoryMB: 256, CPUs: 1}); err != nil {
+		t.Fatalf("start crashing instance: %v", err)
+	}
+	_ = crashed.Close()
+	deadline := time.Now().Add(time.Second)
+	var state client.InstanceState
+	for time.Now().Before(deadline) {
+		state = manager.StatusOf("alpha")
+		if state.Status == "crashed" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if state.Status != "crashed" || state.ExitReason != "hypervisor exited" || state.ExitedAt == "" || state.StartedAt == "" {
+		t.Fatalf("crash state = %+v", state)
+	}
+	host.queueInstance(newFakeInstance())
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "alpha", Image: "alpine", MemoryMB: 256, CPUs: 1}); err != nil {
+		t.Fatalf("start replacement instance: %v", err)
+	}
+	if state := manager.StatusOf("alpha"); state.Status != "running" || state.ExitReason != "" || state.ExitedAt != "" {
+		t.Fatalf("replacement state = %+v", state)
+	}
+	_ = manager.ShutdownAll(context.Background())
 }
 
 func TestManagerBlankSnapshotStartKeepsSharesInStartRequest(t *testing.T) {
@@ -565,6 +599,7 @@ type fakeInstance struct {
 	stats          []virtio.FSStats
 	ipv4           string
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
+	waitErr        error
 }
 
 func newFakeInstance() *fakeInstance {
@@ -608,7 +643,7 @@ func (i *fakeInstance) ExecStream(_ context.Context, req client.ExecRequest, _ <
 
 func (i *fakeInstance) Wait() error {
 	<-i.done
-	return nil
+	return i.waitErr
 }
 
 func (i *fakeInstance) Close() error {

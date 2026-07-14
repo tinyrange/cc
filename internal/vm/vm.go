@@ -20,6 +20,7 @@ import (
 )
 
 const DefaultInstanceID = "default"
+const maxExitTombstones = 64
 
 type Backend = vmhost.Backend
 
@@ -67,6 +68,7 @@ type Manager struct {
 	running       map[string]*Machine
 	starting      map[string]struct{}
 	networkLeases map[string]managerNetworkLease
+	exited        map[string]client.InstanceState
 }
 
 type Machine struct {
@@ -230,6 +232,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
+	delete(m.exited, id)
 	m.starting[id] = struct{}{}
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
@@ -314,6 +317,7 @@ func (m *Manager) StartBlankInstanceStream(
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
+	delete(m.exited, id)
 	m.starting[id] = struct{}{}
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
@@ -677,12 +681,24 @@ func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
 func (m *Manager) Statuses() []client.InstanceState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.running) == 0 {
+	if len(m.running) == 0 && len(m.starting) == 0 && len(m.exited) == 0 {
 		return nil
 	}
-	ids := make([]string, 0, len(m.running))
+	ids := make([]string, 0, len(m.running)+len(m.starting)+len(m.exited))
 	for id := range m.running {
 		ids = append(ids, id)
+	}
+	for id := range m.starting {
+		if m.running[id] == nil {
+			ids = append(ids, id)
+		}
+	}
+	for id := range m.exited {
+		if m.running[id] == nil {
+			if _, starting := m.starting[id]; !starting {
+				ids = append(ids, id)
+			}
+		}
 	}
 	sort.Strings(ids)
 	out := make([]client.InstanceState, 0, len(ids))
@@ -706,6 +722,9 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 			if _, ok := m.starting[id]; ok {
 				return client.InstanceState{ID: id, Status: "starting"}
 			}
+		}
+		if state, ok := m.exited[id]; ok {
+			return state
 		}
 		return client.InstanceState{ID: id, Status: "stopped"}
 	}
@@ -740,6 +759,29 @@ func (m *Manager) watch(machine *Machine) {
 	delete(m.networkLeases, machine.id)
 	machine.lastErr = err
 	machine.exitedAt = time.Now().UTC()
+	if m.exited == nil {
+		m.exited = make(map[string]client.InstanceState)
+	}
+	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
+	if err != nil {
+		state.Status = "crashed"
+		state.Error = err.Error()
+		state.ExitReason = err.Error()
+	} else {
+		state.ExitReason = "clean shutdown"
+	}
+	m.exited[machine.id] = state
+	for len(m.exited) > maxExitTombstones {
+		var oldestID string
+		var oldest time.Time
+		for id, candidate := range m.exited {
+			at, _ := time.Parse(time.RFC3339, candidate.ExitedAt)
+			if oldestID == "" || at.Before(oldest) {
+				oldestID, oldest = id, at
+			}
+		}
+		delete(m.exited, oldestID)
+	}
 }
 
 func (m *Manager) checkCapacityLocked() error {
