@@ -1,4 +1,4 @@
-package vmregion
+package vm
 
 import (
 	"fmt"
@@ -31,9 +31,9 @@ func TestRegionArrayReadAt(t *testing.T) {
 				[]byte("!"),
 			}
 
-			regions := make(RegionArray[RawRegion], len(mockData))
-			for i, d := range mockData {
-				regions[i] = RawRegion(d)
+			regions := NewRegionArray[RawRegion]()
+			for _, d := range mockData {
+				regions.Append(RawRegion(d))
 			}
 
 			b := make([]byte, tt.length)
@@ -77,9 +77,9 @@ func TestRegionArrayWriteAt(t *testing.T) {
 				make([]byte, 1), // Placeholder for "!"
 			}
 
-			regions := make(RegionArray[RawRegion], len(mockData))
-			for i, d := range mockData {
-				regions[i] = RawRegion(d)
+			regions := NewRegionArray[RawRegion]()
+			for _, d := range mockData {
+				regions.Append(RawRegion(d))
 			}
 
 			n, err := regions.WriteAt([]byte(tt.data), tt.offset)
@@ -91,7 +91,7 @@ func TestRegionArrayWriteAt(t *testing.T) {
 			}
 
 			for i, wantData := range tt.want {
-				if got := string(regions[i]); got != wantData {
+				if got := string(regions.Get(i)); got != wantData {
 					t.Errorf("Region %d: got `%s`, want `%s` after WriteAt(`%s`, %d)", i, got, wantData, tt.data, tt.offset)
 				}
 			}
@@ -111,9 +111,9 @@ func TestRegionArraySize(t *testing.T) {
 		totalSize += int64(len(d))
 	}
 
-	regions := make(RegionArray[RawRegion], len(mockData))
-	for i, d := range mockData {
-		regions[i] = RawRegion(d)
+	regions := NewRegionArray[RawRegion]()
+	for _, d := range mockData {
+		regions.Append(RawRegion(d))
 	}
 
 	if size := regions.Size(); size != totalSize {

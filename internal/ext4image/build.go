@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/ext4image/ext4"
-	"j5.nz/cc/internal/ext4image/vmregion"
+	"j5.nz/cc/internal/fsimage/vm"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -30,7 +30,7 @@ type Options struct {
 	UUID              ext4.UUID
 }
 
-func Build(ctx context.Context, root imagefs.Directory, opts Options) (*vmregion.VirtualMemory, error) {
+func Build(ctx context.Context, root imagefs.Directory, opts Options) (*vm.VirtualMemory, error) {
 	if root == nil {
 		return nil, fmt.Errorf("root filesystem is required")
 	}
@@ -43,7 +43,7 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*vmregion
 		size = estimateSize(stats, opts.ExtraBytes)
 	}
 	size = roundUp(size, 4096)
-	vm := vmregion.NewVirtualMemory(size, defaultPageSize)
+	vm := vm.NewVirtualMemory(size, defaultPageSize)
 	out, err := ext4.CreateExt4Filesystem(vm, 0, size)
 	if err != nil {
 		return nil, err

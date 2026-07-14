@@ -16,7 +16,7 @@ import (
 
 	"log/slog"
 
-	vm "j5.nz/cc/internal/ext4image/vmregion"
+	vm "j5.nz/cc/internal/fsimage/vm"
 )
 
 const DEFAULT_MODE = goFs.FileMode(0755)
@@ -147,10 +147,10 @@ func (ent DirectoryEntry) recordLength() uint16 {
 func (ent *DirectoryEntry) setRecordLength(recLen uint16) {
 	ent.ent.SetRecLen(recLen)
 
-	ent.PaddedRegion = vm.NewPaddedRegion(&vm.RegionArray[vm.MemoryRegion]{
+	ent.PaddedRegion = vm.NewPaddedRegion(vm.NewRegionArray[vm.MemoryRegion](
 		ent.ent,
 		vm.RawRegion(ent.name),
-	}, int64(recLen))
+	), int64(recLen))
 }
 
 func newDirectoryEntry(target *InodeWrapper, childNode uint32, typ uint8, name string, recLen uint16) *DirectoryEntry {
@@ -165,10 +165,10 @@ func newDirectoryEntry(target *InodeWrapper, childNode uint32, typ uint8, name s
 	ent.ent.SetFileType(typ)
 	ent.ent.SetNameLen(uint8(len(ent.name)))
 
-	ent.PaddedRegion = vm.NewPaddedRegion(&vm.RegionArray[vm.MemoryRegion]{
+	ent.PaddedRegion = vm.NewPaddedRegion(vm.NewRegionArray[vm.MemoryRegion](
 		ent.ent,
 		vm.RawRegion(name),
-	}, int64(recLen))
+	), int64(recLen))
 
 	return ent
 }
@@ -219,11 +219,11 @@ func (d *LinearDirectory) AddEntry(child *InodeWrapper, name string) error {
 
 	var ent *DirectoryEntry
 
-	if len(*block.ents) == 0 {
+	if block.ents.Len() == 0 {
 		ent = newDirectoryEntry(child, uint32(child.num), uint8(typ), name, uint16(blockSize))
-		*block.ents = append(*block.ents, ent)
+		block.ents.Append(ent)
 	} else {
-		lastEnt := (*block.ents)[len(*block.ents)-1]
+		lastEnt := block.ents.Get(block.ents.Len() - 1)
 		currentLen := lastEnt.ent.RecLen()
 
 		requiredLen := roundUpDiv(8+len(name), 4) * 4
@@ -243,7 +243,7 @@ func (d *LinearDirectory) AddEntry(child *InodeWrapper, name string) error {
 
 		ent = newDirectoryEntry(child, uint32(child.num), uint8(typ), name, currentLen-lastRecLen)
 
-		*block.ents = append(*block.ents, ent)
+		block.ents.Append(ent)
 
 		lastEnt.setRecordLength(lastRecLen)
 	}
@@ -258,9 +258,10 @@ func (d LinearDirectory) String() string {
 
 	for _, block := range d.blocks {
 		ret += "\n   Block ["
-		for _, ent := range *block.ents {
+		block.ents.Range(func(_ int, ent *DirectoryEntry) bool {
 			ret += "\n    " + ent.String() + ","
-		}
+			return true
+		})
 		ret += "\n   ]"
 	}
 
@@ -333,7 +334,7 @@ func (d *LinearDirectory) increaseSize() error {
 }
 
 func (dir *LinearDirectory) addBlock(extent Extent) error {
-	block := &LinearDirectoryBlock{ents: &vm.RegionArray[*DirectoryEntry]{}}
+	block := &LinearDirectoryBlock{ents: vm.NewRegionArray[*DirectoryEntry]()}
 
 	// Create a padded region to store the directory data.
 	block.paddedRegion = vm.NewPaddedRegion(
@@ -359,7 +360,7 @@ func mapLinearDirectory(fs *Ext4Filesystem, tree ExtentTree) (*LinearDirectory, 
 		fs:         fs,
 		extentTree: tree,
 		blocks: []*LinearDirectoryBlock{
-			{ents: &vm.RegionArray[*DirectoryEntry]{}},
+			{ents: vm.NewRegionArray[*DirectoryEntry]()},
 		},
 		ents: make(map[string]*DirectoryEntry),
 	}
@@ -414,7 +415,7 @@ func mapLinearDirectory(fs *Ext4Filesystem, tree ExtentTree) (*LinearDirectory, 
 
 		currentOffset += uint64(ent.ent.RecLen())
 
-		*dir.blocks[0].ents = append(*dir.blocks[0].ents, ent)
+		dir.blocks[0].ents.Append(ent)
 	}
 
 	return dir, nil
@@ -555,14 +556,15 @@ func (e *ExtentTree1) AllocateBlocks(blocks int64) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (e ExtentTree1) Extents() ([]Extent, error) {
-	if len(e.indexNodes) != 0 {
+func (e *ExtentTree1) Extents() ([]Extent, error) {
+	if e.indexNodes.Len() != 0 {
 		return nil, fmt.Errorf("extents with index nodes not implemented")
 	}
 
 	var ret []Extent
 
-	for _, leaf := range e.leafNodes {
+	for i := 0; i < e.leafNodes.Len(); i++ {
+		leaf := e.leafNodes.Get(i)
 		ext, err := NewExtent(leaf.Block(), leaf.Start(), leaf.Len())
 		if err != nil {
 			return nil, err
@@ -574,13 +576,14 @@ func (e ExtentTree1) Extents() ([]Extent, error) {
 	return ret, nil
 }
 
-func (e ExtentTree1) String() string {
+func (e *ExtentTree1) String() string {
 	ret := "ExtentTree{"
 
 	ret += "header=" + e.header.String() + " "
 
 	ret += "leafs=["
-	for _, leaf := range e.leafNodes {
+	for i := 0; i < e.leafNodes.Len(); i++ {
+		leaf := e.leafNodes.Get(i)
 		ret += leaf.String()
 	}
 	ret += "] "
@@ -616,10 +619,10 @@ func mapExtentTree(vm *vm.VirtualMemory, base uint64) (*ExtentTree1, error) {
 			}
 			base += uint64(leaf.Size())
 
-			tree.leafNodes = append(tree.leafNodes, leaf)
+			tree.leafNodes.Append(leaf)
 		}
 
-		if len(tree.leafNodes) > 1 {
+		if tree.leafNodes.Len() > 1 {
 			slog.Warn("tree has more than 1 leaf node")
 		}
 	} else {
@@ -654,13 +657,13 @@ func newExtentTree1(fs *Ext4Filesystem, base uint64, blocks int64) (*ExtentTree1
 			leaf.SetLen(extent.Length)
 			leaf.SetStart(extent.StartBlock)
 
-			tree.leafNodes = append(tree.leafNodes, leaf)
+			tree.leafNodes.Append(leaf)
 		}
 
-		tree.arr = &vm.RegionArray[vm.MemoryRegion]{
+		tree.arr = vm.NewRegionArray[vm.MemoryRegion](
 			tree.header,
 			&tree.leafNodes,
-		}
+		)
 
 		// Make a padded region to extend the region to 60 bytes.
 		tree.region = vm.NewPaddedRegion(tree.arr, 60)
