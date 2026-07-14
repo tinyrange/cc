@@ -465,7 +465,11 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	if err != nil {
 		return client.ImageState{}, err
 	}
-	return state, stateErr
+	if stateErr != nil {
+		return state, stateErr
+	}
+	reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+	return state, nil
 }
 
 func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
@@ -538,7 +542,6 @@ func (s *Store) pullRootFSTarDirect(ctx context.Context, name string, spec Sourc
 	if err := s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build); err != nil {
 		return err
 	}
-	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
 }
 
@@ -648,7 +651,6 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err := s.writeMetadata(name, meta); err != nil {
 		return err
 	}
-	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
 }
 

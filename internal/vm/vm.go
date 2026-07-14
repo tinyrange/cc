@@ -467,7 +467,7 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 		pendingStops[id] = stop
 		pending++
 		go func() {
-			results <- managerShutdownResult{id: id, err: waitMachineStop(nil, stop)}
+			results <- managerShutdownResult{id: id, err: waitMachineStop(context.Background(), stop)}
 		}()
 	}
 	starts := make([]*managerStart, 0, len(m.starting))

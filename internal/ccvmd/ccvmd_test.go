@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/vm"
 )
 
@@ -113,6 +114,51 @@ func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	case <-shutdownCalled:
 	case <-time.After(time.Second):
 		t.Fatalf("shutdown callback was not called")
+	}
+}
+
+func TestImagePullStreamCompletesSIMGImport(t *testing.T) {
+	fixture, err := filepath.Abs(filepath.Join("..", "..", "fixtures", "alpine.simg"))
+	if err != nil {
+		t.Fatalf("resolve SIMG fixture: %v", err)
+	}
+	if _, err := os.Stat(fixture); err != nil {
+		t.Fatalf("stat SIMG fixture: %v", err)
+	}
+
+	watchdog := newWatchdogController(func() {})
+	defer watchdog.Stop()
+	handler := newMux(&server{
+		images: oci.NewStore(filepath.Join(t.TempDir(), "images")),
+		vms:    vm.NewManagerWithHost(nil),
+	}, watchdog, func() {}, ServerOptions{})
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	api := client.NewClient(httpServer.URL, nil)
+	var events []client.ProgressEvent
+	if err := api.PullImageStream("alpine-test", client.PullImageRequest{
+		Source:       fixture,
+		Architecture: "amd64",
+	}, func(event client.ProgressEvent) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("stream SIMG import: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("SIMG import produced no progress events")
+	}
+	terminal := events[len(events)-1]
+	if terminal.Status != "downloaded" || terminal.Blob != "" || terminal.Artifact != "alpine-test" {
+		t.Fatalf("terminal progress event = %+v", terminal)
+	}
+	state, err := api.GetImage("alpine-test")
+	if err != nil {
+		t.Fatalf("get imported image: %v", err)
+	}
+	if state.Name != "alpine-test" || state.Status != "downloaded" || state.SourceKind != oci.SourceKindSIMG {
+		t.Fatalf("imported image state = %+v", state)
 	}
 }
 
