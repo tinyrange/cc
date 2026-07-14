@@ -584,11 +584,8 @@ func sidecarEffectiveExecEnv(base, overrides []string, replace bool) []string {
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
 
-func (i *sidecarInstance) addCoordinatorShare(ctx context.Context, share client.ShareMount) error {
+func (i *sidecarInstance) addCoordinatorShare(share client.ShareMount) error {
 	if i == nil || i.rootFS == nil {
-		if i != nil && i.sidecar != nil && i.sidecar.Worker() != nil {
-			return i.sidecar.Worker().AddShare(ctx, i.id, share)
-		}
 		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
 	}
 	mounter, ok := i.rootFS.(virtio.ShareMounter)
@@ -599,7 +596,10 @@ func (i *sidecarInstance) addCoordinatorShare(ctx context.Context, share client.
 }
 
 func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount) error {
-	return i.addCoordinatorShare(ctx, share)
+	if i != nil && i.sidecar != nil {
+		return i.sidecar.Worker().AddShare(ctx, i.id, share)
+	}
+	return i.addCoordinatorShare(share)
 }
 
 func (i *sidecarInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
