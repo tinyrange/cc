@@ -485,6 +485,11 @@ func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOpti
 		return false, fmt.Errorf("capture worker control socket ownership: %w", err)
 	}
 	defer cleanup()
+	if listenNetwork == "unix" {
+		if err := secureWorkerControlSocket(listenAddress); err != nil {
+			return false, fmt.Errorf("secure worker control socket: %w", err)
+		}
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: workerControlDialEndpoint(listenNetwork, l.Addr().String())}); err != nil {
 		return false, fmt.Errorf("write worker startup banner: %w", err)
 	}
@@ -521,6 +526,9 @@ func workerControlListenEndpoint(address string) (network string, listenAddress 
 	}
 	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
 		return "", "", fmt.Errorf("prepare worker control socket dir: %w", err)
+	}
+	if err := validateWorkerControlDirectory(filepath.Dir(address)); err != nil {
+		return "", "", fmt.Errorf("validate worker control socket dir: %w", err)
 	}
 	if err := prepareWorkerUnixSocket(address); err != nil {
 		return "", "", err

@@ -164,6 +164,75 @@ func TestWorkerControlSocketPreparationProtectsExistingPaths(t *testing.T) {
 	})
 }
 
+func TestWorkerControlEndpointPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix ownership and mode semantics are not available on Windows")
+	}
+	t.Run("private parent and socket", func(t *testing.T) {
+		root := shortWorkerSocketTempDir(t)
+		path := filepath.Join(root, "private", "control.sock")
+		network, address, err := workerControlListenEndpoint(path)
+		if err != nil {
+			t.Fatalf("prepare endpoint: %v", err)
+		}
+		parentInfo, err := os.Lstat(filepath.Dir(path))
+		if err != nil {
+			t.Fatalf("stat parent: %v", err)
+		}
+		if parentInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("parent permissions = %04o, want 0700", parentInfo.Mode().Perm())
+		}
+
+		listener, err := net.Listen(network, address)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer listener.Close()
+		if err := secureWorkerControlSocket(path); err != nil {
+			t.Fatalf("secure socket: %v", err)
+		}
+		socketInfo, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("stat socket: %v", err)
+		}
+		if socketInfo.Mode().Perm() != 0o600 || socketInfo.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("socket mode = %v, want owner-only socket", socketInfo.Mode())
+		}
+	})
+
+	t.Run("insecure existing parent", func(t *testing.T) {
+		parent := filepath.Join(shortWorkerSocketTempDir(t), "open")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatalf("create parent: %v", err)
+		}
+		if err := os.Chmod(parent, 0o755); err != nil {
+			t.Fatalf("make parent insecure: %v", err)
+		}
+		path := filepath.Join(parent, "control.sock")
+		if _, _, err := workerControlListenEndpoint(path); err == nil {
+			t.Fatal("insecure worker parent was accepted")
+		}
+		if info, err := os.Stat(parent); err != nil || info.Mode().Perm() != 0o755 {
+			t.Fatalf("insecure parent was modified: info=%v err=%v", info, err)
+		}
+	})
+
+	t.Run("symlink parent", func(t *testing.T) {
+		root := shortWorkerSocketTempDir(t)
+		target := filepath.Join(root, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatalf("create target: %v", err)
+		}
+		parent := filepath.Join(root, "linked")
+		if err := os.Symlink(target, parent); err != nil {
+			t.Fatalf("create parent symlink: %v", err)
+		}
+		if _, _, err := workerControlListenEndpoint(filepath.Join(parent, "control.sock")); err == nil {
+			t.Fatal("symlink worker parent was accepted")
+		}
+	})
+}
+
 func TestWorkerControlSocketDetectsLiveAndRecoversStaleEndpoint(t *testing.T) {
 	dir := shortWorkerSocketTempDir(t)
 	livePath := filepath.Join(dir, "live.sock")
