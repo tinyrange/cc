@@ -18,6 +18,7 @@ import (
 	"j5.nz/cc/internal/kernel/alpine"
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/execplan"
 	kvmhost "j5.nz/cc/internal/vm/host/kvm"
@@ -46,6 +47,8 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	totalStart := time.Now()
+	defer func() { timing.Since(ctx, "startup.total_ready", totalStart) }()
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -55,32 +58,44 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("linux arm64 runtime currently supports only 1 CPU")
 	}
+	stageStart := time.Now()
 	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
+	timing.Since(ctx, "startup.kernel_read", stageStart)
 	if err != nil {
 		return nil, err
 	}
+	stageStart = time.Now()
 	image, err := b.images.Open(req.Image)
+	timing.Since(ctx, "startup.image_open", stageStart)
 	if err != nil {
 		return nil, err
 	}
 	image = withLinuxRuntimeMountDirs(image)
+	stageStart = time.Now()
 	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	timing.Since(ctx, "startup.module_plan", stageStart)
 	if err != nil {
 		return nil, err
 	}
+	stageStart = time.Now()
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	timing.Since(ctx, "startup.emulator_prepare", stageStart)
 	if err != nil {
 		return nil, err
 	}
+	stageStart = time.Now()
 	fsdevs, rootFS, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
 		Image:             image,
 		AMD64EmulatorPath: qemuX8664,
 		Shares:            mounts.ConvertShareMounts(req.Shares),
 	}, nil)
+	timing.Since(ctx, "startup.fs_devices", stageStart)
 	if err != nil {
 		return nil, err
 	}
+	stageStart = time.Now()
 	initBin, err := guestinit.Build(ctx, b.guestInitCache)
+	timing.Since(ctx, "startup.guest_init", stageStart)
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
@@ -95,11 +110,20 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	stageStart = time.Now()
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
+	timing.Since(ctx, "startup.initramfs", stageStart)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	stageStart = time.Now()
+	session, err := kvm.StartManagedSessionWithOptions(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, kvm.ManagedSessionOptions{
+		SnapshotDir: strings.TrimSpace(req.SnapshotDir), RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+	}, onEvent)
+	timing.Since(ctx, "startup.kvm_to_ready", stageStart)
 	if err != nil {
 		return nil, err
 	}
@@ -128,17 +152,19 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
-			ID:             req.ID,
-			Image:          req.Image,
-			InitSystem:     req.InitSystem,
-			Kernel:         req.Kernel,
-			Network:        req.Network,
-			KernelModules:  append([]string(nil), req.KernelModules...),
-			MemoryMB:       req.MemoryMB,
-			CPUs:           req.CPUs,
-			NestedVirt:     req.NestedVirt,
-			Dmesg:          req.Dmesg,
-			TimeoutSeconds: req.TimeoutSeconds,
+			ID:              req.ID,
+			Image:           req.Image,
+			InitSystem:      req.InitSystem,
+			Kernel:          req.Kernel,
+			Network:         req.Network,
+			KernelModules:   append([]string(nil), req.KernelModules...),
+			MemoryMB:        req.MemoryMB,
+			CPUs:            req.CPUs,
+			NestedVirt:      req.NestedVirt,
+			Dmesg:           req.Dmesg,
+			TimeoutSeconds:  req.TimeoutSeconds,
+			SnapshotDir:     req.SnapshotDir,
+			RestoreSnapshot: req.RestoreSnapshot,
 		}, onEvent)
 	}
 	if b == nil || b.kernel == nil || b.images == nil {
@@ -187,11 +213,16 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
+	if strings.TrimSpace(req.SnapshotDir) != "" {
+		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSessionWithOptions(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, kvm.ManagedSessionOptions{
+		SnapshotDir: strings.TrimSpace(req.SnapshotDir), RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+	}, onEvent)
 	if err != nil {
 		return nil, err
 	}

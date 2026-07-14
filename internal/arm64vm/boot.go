@@ -34,6 +34,9 @@ func BootCommandLine(dmesg bool, serialConsole bool) string {
 		"panic=-1",
 		"rdinit=/init",
 	}
+	if !dmesg {
+		args = append(args, "quiet")
+	}
 	if serialConsole {
 		args = append([]string{"console=ttyS0,115200n8"}, args...)
 	}
