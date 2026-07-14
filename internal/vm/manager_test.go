@@ -104,6 +104,107 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	}
 }
 
+func TestManagerStatusProviderDoesNotBlockManagementAndReconcilesShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	providerStarted := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	alpha := newFakeInstance()
+	beta := newFakeInstance()
+	host.queueInstance(alpha)
+	host.queueInstance(beta)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	alpha.networkIPv4 = func() string {
+		close(providerStarted)
+		<-releaseProvider
+		return "10.0.2.15"
+	}
+
+	statusDone := make(chan client.InstanceState, 1)
+	go func() { statusDone <- manager.StatusOf("alpha") }()
+	<-providerStarted
+	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
+		t.Fatalf("unrelated instance status while provider blocked = %+v", state)
+	}
+	if err := manager.ShutdownInstance(ctx, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseProvider)
+	if state := <-statusDone; state.ID != "alpha" || state.Status != "stopped" || state.NetworkIPv4 != "" {
+		t.Fatalf("status after concurrent shutdown = %+v", state)
+	}
+	if err := manager.ShutdownInstance(ctx, "beta"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerVirtioFSProviderDoesNotBlockOtherInstances(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	providerStarted := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	alpha := newFakeInstance()
+	alpha.virtioFSStats = func() []virtio.FSStats {
+		close(providerStarted)
+		<-releaseProvider
+		return []virtio.FSStats{{}}
+	}
+	host.queueInstance(alpha)
+	host.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	statsDone := make(chan []virtio.FSStats, 1)
+	go func() { statsDone <- manager.VirtioFSStats("alpha") }()
+	<-providerStarted
+	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
+		t.Fatalf("unrelated instance status while stats blocked = %+v", state)
+	}
+	close(releaseProvider)
+	if stats := <-statsDone; len(stats) != 1 {
+		t.Fatalf("stats count = %d, want 1", len(stats))
+	}
+}
+
+func TestManagerCapacityProviderDoesNotRunUnderManagerLock(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	host := &blockingCapabilitiesHost{fakeHost: base}
+	base.queueInstance(newFakeInstance())
+	base.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "beta", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	host.started = make(chan struct{})
+	host.release = make(chan struct{})
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "alpha", Image: "alpine"})
+		startDone <- err
+	}()
+	<-host.started
+	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
+		t.Fatalf("instance status while capacity provider blocked = %+v", state)
+	}
+	close(host.release)
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
@@ -790,6 +891,23 @@ func (h *lateStartHost) StartStream(ctx context.Context, _ client.CreateInstance
 	return h.instance, nil
 }
 
+type blockingCapabilitiesHost struct {
+	*fakeHost
+	started chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingCapabilitiesHost) HostCapabilities(ctx context.Context) VMHostCapabilities {
+	if h.started != nil {
+		close(h.started)
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+		}
+	}
+	return h.fakeHost.HostCapabilities(ctx)
+}
+
 type fakeRunInCall struct {
 	inst         Instance
 	runningImage string
@@ -951,6 +1069,8 @@ type fakeInstance struct {
 	snapshots      map[string]imagefs.Directory
 	stats          []virtio.FSStats
 	ipv4           string
+	networkIPv4    func() string
+	virtioFSStats  func() []virtio.FSStats
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
 	waitErr        error
 }
@@ -1068,14 +1188,24 @@ func (i *fakeInstance) SnapshotImage(imageName string) (imagefs.Directory, error
 
 func (i *fakeInstance) NetworkIPv4() string {
 	i.mu.Lock()
-	defer i.mu.Unlock()
-	return i.ipv4
+	fn := i.networkIPv4
+	ipv4 := i.ipv4
+	i.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return ipv4
 }
 
 func (i *fakeInstance) VirtioFSStats() []virtio.FSStats {
 	i.mu.Lock()
-	defer i.mu.Unlock()
-	return append([]virtio.FSStats(nil), i.stats...)
+	fn := i.virtioFSStats
+	stats := append([]virtio.FSStats(nil), i.stats...)
+	i.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return stats
 }
 
 func testManager(host VMHost) *Manager {
