@@ -561,6 +561,86 @@ type workerActiveExec struct {
 	closed bool
 }
 
+type workerOperationRegistry struct {
+	mu      sync.Mutex
+	active  map[uint64]context.CancelFunc
+	vmTails map[string]chan struct{}
+}
+
+func newWorkerOperationRegistry() *workerOperationRegistry {
+	return &workerOperationRegistry{
+		active:  make(map[uint64]context.CancelFunc),
+		vmTails: make(map[string]chan struct{}),
+	}
+}
+
+func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(context.Context)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var previous <-chan struct{}
+	var done chan struct{}
+	r.mu.Lock()
+	r.active[frameID] = cancel
+	if vmID != "" {
+		previous = r.vmTails[vmID]
+		done = make(chan struct{})
+		r.vmTails[vmID] = done
+	}
+	r.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer func() {
+			r.mu.Lock()
+			delete(r.active, frameID)
+			if done != nil {
+				close(done)
+				if r.vmTails[vmID] == done {
+					delete(r.vmTails, vmID)
+				}
+			}
+			r.mu.Unlock()
+		}()
+		if previous != nil {
+			select {
+			case <-previous:
+			case <-ctx.Done():
+				return
+			}
+		}
+		run(ctx)
+	}()
+}
+
+func (r *workerOperationRegistry) cancel(frameID uint64) bool {
+	r.mu.Lock()
+	cancel := r.active[frameID]
+	r.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (r *workerOperationRegistry) close() {
+	r.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(r.active))
+	for _, cancel := range r.active {
+		cancels = append(cancels, cancel)
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func workerVMKey(id string) string {
+	if id == "" {
+		return vm.DefaultInstanceID
+	}
+	return id
+}
+
 func (e *workerActiveExec) closeInputs() {
 	if e == nil || e.inputs == nil {
 		return
@@ -625,7 +705,8 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 	defer cancelConnection()
 	var activeMu sync.Mutex
 	activeExecs := make(map[uint64]*workerActiveExec)
-	activeWaits := make(map[uint64]*workerActiveWait)
+	operations := newWorkerOperationRegistry()
+	defer operations.close()
 
 	for {
 		frame, err := codec.Receive()
@@ -650,14 +731,16 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			state, err := srvState.vms.StartStream(context.Background(), req, func(event client.BootEvent) error {
-				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				state, err := srvState.vms.StartStream(ctx, req, func(event client.BootEvent) error {
+					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+				})
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 			})
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStartBlank:
 			var req client.StartInstanceRequest
 			if !decodeWorkerRequest(codec, frame, &req) {
@@ -672,67 +755,86 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			state, err := srvState.vms.StartBlankStream(context.Background(), req, func(event client.BootEvent) error {
-				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				state, err := srvState.vms.StartBlankStream(ctx, req, func(event client.BootEvent) error {
+					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+				})
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 			})
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStatus:
 			var req vm.WorkerStatusRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			operations.start(frame.ID, "", func(context.Context) {
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			})
 		case vm.WorkerFrameStop:
 			var req vm.WorkerStopRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			if err := srvState.vms.ShutdownInstance(context.Background(), req.ID); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.ShutdownInstance(ctx, req.ID); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			})
 		case vm.WorkerFrameWait:
 			var req vm.WorkerWaitRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			serveWorkerWait(connectionCtx, codec, srvState, frame.ID, req.ID, &activeMu, activeWaits)
+			operations.start(frame.ID, "", func(ctx context.Context) {
+				state, completed := waitForWorkerState(ctx, func() client.InstanceState {
+					return srvState.vms.StatusOf(req.ID)
+				})
+				if completed {
+					_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
+				}
+			})
 		case vm.WorkerFrameFlush:
 			var req vm.WorkerFlushRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			if err := srvState.vms.FlushInstance(context.Background(), req.ID); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.FlushInstance(ctx, req.ID); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+			})
 		case vm.WorkerFrameAddShare:
 			var req vm.WorkerAddShareRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.AddShareTo(ctx, req.ID, req.Share); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
+			})
 		case vm.WorkerFrameConsole:
 			var req vm.WorkerConsoleRequest
 			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+			operations.start(frame.ID, "", func(ctx context.Context) {
+				history, err := srvState.vms.ConsoleHistory(ctx, req.ID)
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+			})
 		case vm.WorkerFrameExec:
 			if err := serveWorkerExec(connectionCtx, codec, srvState, frame, &activeMu, activeExecs); err != nil {
 				_ = sendWorkerRequestError(codec, frame, err)
@@ -760,53 +862,18 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 			if !decodeWorkerRequest(codec, frame, &req) {
 				continue
 			}
+			operations.cancel(frame.ID)
 			activeMu.Lock()
 			exec := activeExecs[frame.ID]
-			wait := activeWaits[frame.ID]
 			activeMu.Unlock()
 			if exec != nil {
 				exec.cancel()
 				exec.closeInputs()
 			}
-			if wait != nil {
-				wait.cancel()
-			}
 		default:
 			_ = sendWorkerError(codec, frame.ID, fmt.Errorf("unsupported worker frame %q", frame.Type))
 		}
 	}
-}
-
-type workerActiveWait struct {
-	cancel context.CancelFunc
-}
-
-func serveWorkerWait(parent context.Context, codec *vm.WorkerCodec, srvState *server, frameID uint64, id string, activeMu *sync.Mutex, activeWaits map[uint64]*workerActiveWait) {
-	ctx, cancel := context.WithCancel(parent)
-	wait := &workerActiveWait{cancel: cancel}
-	activeMu.Lock()
-	if previous := activeWaits[frameID]; previous != nil {
-		previous.cancel()
-	}
-	activeWaits[frameID] = wait
-	activeMu.Unlock()
-
-	go func() {
-		defer cancel()
-		defer func() {
-			activeMu.Lock()
-			if activeWaits[frameID] == wait {
-				delete(activeWaits, frameID)
-			}
-			activeMu.Unlock()
-		}()
-		state, completed := waitForWorkerState(ctx, func() client.InstanceState {
-			return srvState.vms.StatusOf(id)
-		})
-		if completed {
-			_ = sendWorkerPayload(codec, frameID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
-		}
-	}()
 }
 
 func waitForWorkerState(ctx context.Context, status func() client.InstanceState) (client.InstanceState, bool) {
