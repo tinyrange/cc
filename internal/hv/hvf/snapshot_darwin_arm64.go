@@ -766,10 +766,9 @@ func loadSnapshot(path string) (snapshotManifest, []byte, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return snapshotManifest{}, nil, fmt.Errorf("decode snapshot manifest: %w", err)
 	}
-	baseDir := filepath.Dir(manifestPath)
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(baseDir, memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return snapshotManifest{}, nil, err
 	}
 	memFile, err := os.Open(memPath)
 	if err != nil {
