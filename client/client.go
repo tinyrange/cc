@@ -447,6 +447,9 @@ func (c *Client) RunInteractiveStream(req RunRequest, inputs <-chan ExecInput, o
 }
 
 func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	wsURL, err := websocketURL(c.url, "/vm/run/stream")
 	if err != nil {
 		return err
@@ -459,7 +462,7 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
-	ws, err := websocket.DialConfig(cfg)
+	ws, err := dialWebSocketContext(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -467,9 +470,6 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 
 	if err := websocket.JSON.Send(ws, req); err != nil {
 		return err
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	ctxDone := make(chan struct{})
 	go func() {
@@ -601,6 +601,9 @@ func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent fu
 }
 
 func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	wsURL, err := websocketURL(c.url, "/vm/run")
 	if err != nil {
 		return err
@@ -613,7 +616,7 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 	if c.dialer != nil {
 		cfg.Dialer = &net.Dialer{}
 	}
-	ws, err := websocket.DialConfig(cfg)
+	ws, err := dialWebSocketContext(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -621,9 +624,6 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 
 	if err := websocket.JSON.Send(ws, req); err != nil {
 		return err
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	ctxDone := make(chan struct{})
 	go func() {
@@ -643,6 +643,36 @@ func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs 
 		return sendErrValue
 	}
 	return err
+}
+
+// WebSocketDialError identifies the endpoint whose connection or handshake
+// failed. Err retains cancellation and transport errors for errors.Is/As.
+type WebSocketDialError struct {
+	Endpoint string
+	Err      error
+}
+
+func (e *WebSocketDialError) Error() string {
+	return fmt.Sprintf("dial WebSocket %s: %v", e.Endpoint, e.Err)
+}
+
+func (e *WebSocketDialError) Unwrap() error {
+	return e.Err
+}
+
+func dialWebSocketContext(ctx context.Context, cfg *websocket.Config) (*websocket.Conn, error) {
+	ws, err := cfg.DialContext(ctx)
+	if err == nil {
+		return ws, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	endpoint := ""
+	if cfg != nil && cfg.Location != nil {
+		endpoint = cfg.Location.String()
+	}
+	return nil, &WebSocketDialError{Endpoint: endpoint, Err: err}
 }
 
 func (c *Client) applyWebSocketAuth(cfg *websocket.Config) {
