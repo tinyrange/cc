@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -13,19 +16,35 @@ import (
 )
 
 func TestWorkerDialTarget(t *testing.T) {
-	network, address := workerDialTarget("tcp://127.0.0.1:1234")
-	if network != "tcp" || address != "127.0.0.1:1234" {
-		t.Fatalf("tcp target = %q %q", network, address)
+	_, err := workerDialTarget("tcp://127.0.0.1:1234")
+	var securityErr *WorkerSecurityError
+	if !errors.As(err, &securityErr) {
+		t.Fatalf("plaintext TCP error type = %T", err)
 	}
-	network, address = workerDialTarget("/tmp/worker.sock")
-	if network != "unix" || address != "/tmp/worker.sock" {
-		t.Fatalf("unix target = %q %q", network, address)
+	if securityErr.Reason != WorkerSecurityPlaintextTCPRejected {
+		t.Fatalf("plaintext TCP reason = %q", securityErr.Reason)
+	}
+	target, err := workerDialTarget("tls://127.0.0.1:1234")
+	if err != nil {
+		t.Fatalf("TLS target: %v", err)
+	}
+	if target.network != "tcp" || target.address != "127.0.0.1:1234" || !target.secure {
+		t.Fatalf("TLS target = %+v", target)
+	}
+	target, err = workerDialTarget("/tmp/worker.sock")
+	if err != nil {
+		t.Fatalf("Unix target: %v", err)
+	}
+	if target.network != "unix" || target.address != "/tmp/worker.sock" || target.secure {
+		t.Fatalf("Unix target = %+v", target)
 	}
 }
 
 func TestDialWorkerReadsHello(t *testing.T) {
-	addr, done := serveWorkerFrame(t, WorkerFrame{Type: WorkerFrameHello})
-	worker, err := DialWorker(context.Background(), "tcp://"+addr)
+	endpoint, clientConfig, done := serveWorkerFrame(t, func(scope string) WorkerFrame {
+		return mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion, WorkerID: scope})
+	})
+	worker, err := DialWorkerTLS(context.Background(), endpoint, clientConfig)
 	if err != nil {
 		t.Fatalf("DialWorker: %v", err)
 	}
@@ -39,8 +58,10 @@ func TestDialWorkerReadsHello(t *testing.T) {
 }
 
 func TestDialWorkerRejectsNonHello(t *testing.T) {
-	addr, done := serveWorkerFrame(t, WorkerFrame{Type: WorkerFrameError})
-	worker, err := DialWorker(context.Background(), "tcp://"+addr)
+	endpoint, clientConfig, done := serveWorkerFrame(t, func(string) WorkerFrame {
+		return WorkerFrame{Type: WorkerFrameError}
+	})
+	worker, err := DialWorkerTLS(context.Background(), endpoint, clientConfig)
 	if worker != nil {
 		_ = worker.Close()
 	}
@@ -53,59 +74,38 @@ func TestDialWorkerRejectsNonHello(t *testing.T) {
 }
 
 func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-
-	serverErr := make(chan error, 1)
 	releaseExec := make(chan struct{})
 	execReceived := make(chan struct{})
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		codec := NewWorkerCodec(conn)
-		defer codec.Close()
-		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
-			serverErr <- err
-			return
+	endpoint, clientConfig, serverErr := serveWorkerTLS(t, func(codec *WorkerCodec, scope string) error {
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion, WorkerID: scope})); err != nil {
+			return err
 		}
 		execFrame, err := codec.Receive()
 		if err != nil {
-			serverErr <- err
-			return
+			return err
 		}
 		if execFrame.Type != WorkerFrameExec {
-			serverErr <- fmt.Errorf("first frame type = %q", execFrame.Type)
-			return
+			return fmt.Errorf("first frame type = %q", execFrame.Type)
 		}
 		close(execReceived)
 		addShareFrame, err := codec.Receive()
 		if err != nil {
-			serverErr <- err
-			return
+			return err
 		}
 		if addShareFrame.Type != WorkerFrameAddShare {
-			serverErr <- fmt.Errorf("second frame type = %q", addShareFrame.Type)
-			return
+			return fmt.Errorf("second frame type = %q", addShareFrame.Type)
 		}
 		if err := codec.Send(mustWorkerFrame(addShareFrame.ID, WorkerFrameDone, map[string]string{"status": "mounted"})); err != nil {
-			serverErr <- err
-			return
+			return err
 		}
 		<-releaseExec
 		if err := codec.Send(mustWorkerFrame(execFrame.ID, WorkerFrameDone, map[string]string{"status": "done"})); err != nil {
-			serverErr <- err
-			return
+			return err
 		}
-		serverErr <- nil
-	}()
+		return nil
+	})
 
-	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	worker, err := DialWorkerTLS(context.Background(), endpoint, clientConfig)
 	if err != nil {
 		t.Fatalf("DialWorker: %v", err)
 	}
@@ -153,10 +153,7 @@ func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
 }
 
 func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	ln, endpoint := listenWorkerUnix(t)
 	defer ln.Close()
 
 	serverErr := make(chan error, 1)
@@ -170,7 +167,7 @@ func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
 		}
 		codec := NewWorkerCodec(conn)
 		defer codec.Close()
-		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion})); err != nil {
 			serverErr <- err
 			return
 		}
@@ -210,7 +207,7 @@ func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
 		serverErr <- nil
 	}()
 
-	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	worker, err := DialWorker(context.Background(), endpoint)
 	if err != nil {
 		t.Fatalf("DialWorker: %v", err)
 	}
@@ -263,10 +260,7 @@ func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
 }
 
 func TestWorkerConnectionFailureReachesAllCalls(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	ln, endpoint := listenWorkerUnix(t)
 	defer ln.Close()
 
 	execReceived := make(chan struct{})
@@ -278,7 +272,7 @@ func TestWorkerConnectionFailureReachesAllCalls(t *testing.T) {
 			return
 		}
 		codec := NewWorkerCodec(conn)
-		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion})); err != nil {
 			serverErr <- err
 			return
 		}
@@ -304,7 +298,7 @@ func TestWorkerConnectionFailureReachesAllCalls(t *testing.T) {
 		serverErr <- codec.Close()
 	}()
 
-	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	worker, err := DialWorker(context.Background(), endpoint)
 	if err != nil {
 		t.Fatalf("DialWorker: %v", err)
 	}
@@ -345,10 +339,7 @@ func TestWorkerConnectionFailureReachesAllCalls(t *testing.T) {
 }
 
 func TestWorkerCallOverflowDoesNotBlockUnrelatedCall(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	ln, endpoint := listenWorkerUnix(t)
 	defer ln.Close()
 
 	callbackStarted := make(chan struct{})
@@ -363,7 +354,7 @@ func TestWorkerCallOverflowDoesNotBlockUnrelatedCall(t *testing.T) {
 		}
 		codec := NewWorkerCodec(conn)
 		defer codec.Close()
-		if err := codec.Send(WorkerFrame{Type: WorkerFrameHello}); err != nil {
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion})); err != nil {
 			serverErr <- err
 			return
 		}
@@ -419,7 +410,7 @@ func TestWorkerCallOverflowDoesNotBlockUnrelatedCall(t *testing.T) {
 		serverErr <- nil
 	}()
 
-	worker, err := DialWorker(context.Background(), "tcp://"+ln.Addr().String())
+	worker, err := DialWorker(context.Background(), endpoint)
 	if err != nil {
 		t.Fatalf("DialWorker: %v", err)
 	}
@@ -496,8 +487,43 @@ func mustWorkerFrame(id uint64, frameType string, payload any) WorkerFrame {
 	return frame
 }
 
-func serveWorkerFrame(t *testing.T, frame WorkerFrame) (string, <-chan error) {
+func serveWorkerFrame(t *testing.T, frame func(scope string) WorkerFrame) (string, string, <-chan error) {
 	t.Helper()
+	return serveWorkerTLS(t, func(codec *WorkerCodec, scope string) error {
+		return codec.Send(frame(scope))
+	})
+}
+
+func listenWorkerUnix(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	base := ""
+	if runtime.GOOS != "windows" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "cc-sidecar-")
+	if err != nil {
+		t.Fatalf("create worker socket directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "worker.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on worker socket: %v", err)
+	}
+	return ln, path
+}
+
+func serveWorkerTLS(t *testing.T, serve func(*WorkerCodec, string) error) (string, string, <-chan error) {
+	t.Helper()
+	credentials, err := NewEphemeralWorkerSecurity(t.TempDir())
+	if err != nil {
+		t.Fatalf("create worker credentials: %v", err)
+	}
+	t.Cleanup(credentials.Close)
+	security, err := LoadWorkerServerSecurity(credentials.ServerConfigPath)
+	if err != nil {
+		t.Fatalf("load worker server security: %v", err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -510,13 +536,20 @@ func serveWorkerFrame(t *testing.T, frame WorkerFrame) (string, <-chan error) {
 			done <- err
 			return
 		}
-		codec := NewWorkerCodec(conn)
-		if err := codec.Send(frame); err != nil {
-			_ = codec.Close()
+		endpoint := WorkerTLSScheme + ln.Addr().String()
+		authenticated, err := HandshakeWorkerServer(context.Background(), conn, endpoint, security)
+		if err != nil {
+			_ = conn.Close()
 			done <- err
 			return
 		}
-		done <- codec.Close()
+		codec := NewWorkerCodec(authenticated)
+		err = serve(codec, security.Scope)
+		closeErr := codec.Close()
+		if err == nil {
+			err = closeErr
+		}
+		done <- err
 	}()
-	return ln.Addr().String(), done
+	return WorkerTLSScheme + ln.Addr().String(), credentials.ClientConfigPath, done
 }

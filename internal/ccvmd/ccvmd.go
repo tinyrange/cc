@@ -406,6 +406,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
 	worker := fs.Bool("worker", false, "Run as a single-process VM worker")
+	workerTLSConfigPath := fs.String("worker-tls-config", "", "Path to worker-control mutual TLS configuration")
 
 	if err := fs.Parse(args); err != nil {
 		return false, fmt.Errorf("parse ccvm flags: %w", err)
@@ -431,7 +432,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	if *worker {
 		if socketPath := strings.TrimSpace(os.Getenv("CCX3_WORKER_CONTROL_SOCKET")); socketPath != "" {
-			return runWorkerControlSocket(socketPath, srvState, opts)
+			return runWorkerControlSocket(socketPath, *workerTLSConfigPath, srvState, opts)
 		}
 	}
 
@@ -494,10 +495,17 @@ func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) err
 	})
 }
 
-func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOptions) (bool, error) {
-	listenNetwork, listenAddress, err := workerControlListenEndpoint(socketPath)
+func runWorkerControlSocket(socketPath, tlsConfigPath string, srvState *server, opts ServerOptions) (bool, error) {
+	listenNetwork, listenAddress, secure, cleanup, err := workerControlListenEndpoint(socketPath, tlsConfigPath)
 	if err != nil {
 		return false, err
+	}
+	var security *vm.WorkerTransportSecurity
+	if secure {
+		security, err = vm.LoadWorkerServerSecurity(tlsConfigPath)
+		if err != nil {
+			return false, err
+		}
 	}
 	l, err := net.Listen(listenNetwork, listenAddress)
 	if err != nil {
@@ -507,28 +515,48 @@ func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOpti
 		unixListener.SetUnlinkOnClose(false)
 	}
 	defer l.Close()
-	cleanup, err := workerControlSocketCleanup(listenNetwork, listenAddress)
-	if err != nil {
-		return false, fmt.Errorf("capture worker control socket ownership: %w", err)
-	}
-	defer cleanup()
 	if listenNetwork == "unix" {
+		cleanup, err = workerControlSocketCleanup(listenNetwork, listenAddress)
+		if err != nil {
+			return false, fmt.Errorf("capture worker control socket ownership: %w", err)
+		}
 		if err := secureWorkerControlSocket(listenAddress); err != nil {
 			return false, fmt.Errorf("secure worker control socket: %w", err)
 		}
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: workerControlDialEndpoint(listenNetwork, l.Addr().String())}); err != nil {
+	defer cleanup()
+	endpoint := workerControlDialEndpoint(listenNetwork, l.Addr().String(), secure)
+	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: endpoint}); err != nil {
 		return false, fmt.Errorf("write worker startup banner: %w", err)
 	}
-	conn, err := l.Accept()
-	if err != nil {
-		return true, fmt.Errorf("accept worker control connection: %w", err)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return true, fmt.Errorf("accept worker control connection: %w", err)
+		}
+		if secure {
+			authenticated, handshakeErr := vm.HandshakeWorkerServer(context.Background(), conn, endpoint, security)
+			if handshakeErr != nil {
+				_ = conn.Close()
+				continue
+			}
+			conn = authenticated
+		}
+		workerID := "local-sidecar"
+		if security != nil {
+			workerID = security.Scope
+		}
+		err = serveAuthenticatedWorkerControl(conn, workerID, srvState, opts)
+		_ = conn.Close()
+		return true, err
 	}
-	defer conn.Close()
+}
+
+func serveAuthenticatedWorkerControl(conn net.Conn, workerID string, srvState *server, opts ServerOptions) error {
 	codec := vm.NewWorkerCodec(conn)
 	hello, err := vm.NewWorkerFrame(0, vm.WorkerServiceControl, vm.WorkerFrameHello, vm.WorkerHello{
 		Version:  vm.WorkerProtocolVersion,
-		WorkerID: "local-sidecar",
+		WorkerID: workerID,
 		Backend:  "worker",
 		Capabilities: vm.VMHostCapabilities{
 			Backend:       "worker",
@@ -539,28 +567,12 @@ func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOpti
 		},
 	})
 	if err != nil {
-		return true, err
+		return err
 	}
 	if err := codec.Send(hello); err != nil {
-		return true, fmt.Errorf("send worker hello: %w", err)
+		return fmt.Errorf("send worker hello: %w", err)
 	}
-	return true, serveWorkerControl(codec, srvState, opts)
-}
-
-func workerControlListenEndpoint(address string) (network string, listenAddress string, err error) {
-	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://"), nil
-	}
-	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
-		return "", "", fmt.Errorf("prepare worker control socket dir: %w", err)
-	}
-	if err := validateWorkerControlDirectory(filepath.Dir(address)); err != nil {
-		return "", "", fmt.Errorf("validate worker control socket dir: %w", err)
-	}
-	if err := prepareWorkerUnixSocket(address); err != nil {
-		return "", "", err
-	}
-	return "unix", address, nil
+	return serveWorkerControl(codec, srvState, opts)
 }
 
 func workerControlSocketCleanup(network, address string) (func(), error) {
@@ -570,8 +582,51 @@ func workerControlSocketCleanup(network, address string) (func(), error) {
 	return ownedWorkerUnixSocketCleanup(address)
 }
 
-func workerControlDialEndpoint(network string, address string) string {
+func workerControlListenEndpoint(address, tlsConfigPath string) (network string, listenAddress string, secure bool, cleanup func(), err error) {
+	cleanup = func() {}
+	if strings.HasPrefix(address, "tcp://") {
+		return "", "", false, cleanup, &vm.WorkerSecurityError{
+			Endpoint: address,
+			Reason:   vm.WorkerSecurityPlaintextTCPRejected,
+		}
+	}
+	if strings.HasPrefix(address, vm.WorkerTLSScheme) {
+		if strings.TrimSpace(tlsConfigPath) == "" {
+			return "", "", false, cleanup, &vm.WorkerSecurityError{
+				Endpoint: address,
+				Reason:   vm.WorkerSecurityTLSConfigRequired,
+			}
+		}
+		listenAddress = strings.TrimPrefix(address, vm.WorkerTLSScheme)
+		if _, _, err := net.SplitHostPort(listenAddress); err != nil {
+			return "", "", false, cleanup, fmt.Errorf("parse worker TLS endpoint: %w", err)
+		}
+		return "tcp", listenAddress, true, cleanup, nil
+	}
+	if strings.TrimSpace(tlsConfigPath) != "" {
+		return "", "", false, cleanup, &vm.WorkerSecurityError{
+			Endpoint: address,
+			Reason:   vm.WorkerSecurityInvalidTLSConfig,
+			Detail:   "TLS configuration cannot be used with a Unix socket",
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
+		return "", "", false, cleanup, fmt.Errorf("prepare worker control socket dir: %w", err)
+	}
+	if err := validateWorkerControlDirectory(filepath.Dir(address)); err != nil {
+		return "", "", false, cleanup, fmt.Errorf("validate worker control socket dir: %w", err)
+	}
+	if err := prepareWorkerUnixSocket(address); err != nil {
+		return "", "", false, cleanup, err
+	}
+	return "unix", address, false, cleanup, nil
+}
+
+func workerControlDialEndpoint(network string, address string, secure bool) string {
 	if network == "tcp" {
+		if secure {
+			return vm.WorkerTLSScheme + address
+		}
 		return "tcp://" + address
 	}
 	return address

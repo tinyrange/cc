@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -19,6 +20,34 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/vm"
 )
+
+func TestWorkerControlTransportRequiresTLSForTCP(t *testing.T) {
+	_, _, _, _, err := workerControlListenEndpoint("tcp://127.0.0.1:0", "")
+	var securityErr *vm.WorkerSecurityError
+	if !errors.As(err, &securityErr) {
+		t.Fatalf("plaintext TCP error type = %T", err)
+	}
+	if securityErr.Reason != vm.WorkerSecurityPlaintextTCPRejected {
+		t.Fatalf("plaintext TCP reason = %q", securityErr.Reason)
+	}
+
+	_, _, _, _, err = workerControlListenEndpoint("tls://127.0.0.1:0", "")
+	if !errors.As(err, &securityErr) {
+		t.Fatalf("missing TLS config error type = %T", err)
+	}
+	if securityErr.Reason != vm.WorkerSecurityTLSConfigRequired {
+		t.Fatalf("missing TLS config reason = %q", securityErr.Reason)
+	}
+
+	network, address, secure, cleanup, err := workerControlListenEndpoint(filepath.Join(t.TempDir(), "private", "control.sock"), "")
+	if err != nil {
+		t.Fatalf("Unix endpoint: %v", err)
+	}
+	defer cleanup()
+	if network != "unix" || address == "" || secure {
+		t.Fatalf("Unix endpoint = network:%q address:%q secure:%t", network, address, secure)
+	}
+}
 
 func TestMuxHealthStatusWatchdogAndShutdown(t *testing.T) {
 	shutdownCalled := make(chan struct{}, 1)
@@ -118,7 +147,7 @@ func TestWorkerControlSocketPreparationProtectsExistingPaths(t *testing.T) {
 		if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 			t.Fatalf("write regular file: %v", err)
 		}
-		if _, _, err := workerControlListenEndpoint(path); err == nil {
+		if _, _, _, _, err := workerControlListenEndpoint(path, ""); err == nil {
 			t.Fatal("regular worker path was accepted")
 		}
 		if data, err := os.ReadFile(path); err != nil || string(data) != "keep" {
@@ -131,7 +160,7 @@ func TestWorkerControlSocketPreparationProtectsExistingPaths(t *testing.T) {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatalf("create directory: %v", err)
 		}
-		if _, _, err := workerControlListenEndpoint(path); err == nil {
+		if _, _, _, _, err := workerControlListenEndpoint(path, ""); err == nil {
 			t.Fatal("directory worker path was accepted")
 		}
 		if info, err := os.Stat(path); err != nil || !info.IsDir() {
@@ -152,7 +181,7 @@ func TestWorkerControlSocketPreparationProtectsExistingPaths(t *testing.T) {
 		if err := os.Symlink(target, path); err != nil {
 			t.Fatalf("create symlink: %v", err)
 		}
-		if _, _, err := workerControlListenEndpoint(path); err == nil {
+		if _, _, _, _, err := workerControlListenEndpoint(path, ""); err == nil {
 			t.Fatal("symlink worker path was accepted")
 		}
 		if data, err := os.ReadFile(target); err != nil || string(data) != "keep" {
@@ -171,7 +200,7 @@ func TestWorkerControlEndpointPermissions(t *testing.T) {
 	t.Run("private parent and socket", func(t *testing.T) {
 		root := shortWorkerSocketTempDir(t)
 		path := filepath.Join(root, "private", "control.sock")
-		network, address, err := workerControlListenEndpoint(path)
+		network, address, _, _, err := workerControlListenEndpoint(path, "")
 		if err != nil {
 			t.Fatalf("prepare endpoint: %v", err)
 		}
@@ -209,7 +238,7 @@ func TestWorkerControlEndpointPermissions(t *testing.T) {
 			t.Fatalf("make parent insecure: %v", err)
 		}
 		path := filepath.Join(parent, "control.sock")
-		if _, _, err := workerControlListenEndpoint(path); err == nil {
+		if _, _, _, _, err := workerControlListenEndpoint(path, ""); err == nil {
 			t.Fatal("insecure worker parent was accepted")
 		}
 		if info, err := os.Stat(parent); err != nil || info.Mode().Perm() != 0o755 {
@@ -227,7 +256,7 @@ func TestWorkerControlEndpointPermissions(t *testing.T) {
 		if err := os.Symlink(target, parent); err != nil {
 			t.Fatalf("create parent symlink: %v", err)
 		}
-		if _, _, err := workerControlListenEndpoint(filepath.Join(parent, "control.sock")); err == nil {
+		if _, _, _, _, err := workerControlListenEndpoint(filepath.Join(parent, "control.sock"), ""); err == nil {
 			t.Fatal("symlink worker parent was accepted")
 		}
 	})
@@ -241,7 +270,7 @@ func TestWorkerControlSocketDetectsLiveAndRecoversStaleEndpoint(t *testing.T) {
 		_ = live.Close()
 		_ = os.Remove(livePath)
 	}()
-	if _, _, err := workerControlListenEndpoint(livePath); err == nil {
+	if _, _, _, _, err := workerControlListenEndpoint(livePath, ""); err == nil {
 		t.Fatal("live worker socket was treated as stale")
 	}
 	if info, err := os.Lstat(livePath); err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -253,7 +282,7 @@ func TestWorkerControlSocketDetectsLiveAndRecoversStaleEndpoint(t *testing.T) {
 	if err := stale.Close(); err != nil {
 		t.Fatalf("close stale listener: %v", err)
 	}
-	network, address, err := workerControlListenEndpoint(stalePath)
+	network, address, _, _, err := workerControlListenEndpoint(stalePath, "")
 	if err != nil {
 		t.Fatalf("recover stale worker socket: %v", err)
 	}

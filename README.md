@@ -156,6 +156,66 @@ print(nm.run("niimath", "-help"))
 
 See [pyneurodesk/README.md](pyneurodesk/README.md) for Python-specific usage.
 
+## Worker control transport
+
+Sidecar worker control uses an owner-only Unix socket where the platform
+supports it. TCP worker control never permits the old `tcp://` plaintext scheme,
+including on loopback. Use `tls://` with mutually authenticated TLS 1.3 when a
+TCP transport is required. Windows local sidecars create a one-worker ephemeral
+CA and scoped certificates automatically.
+
+A remotely started worker receives a worker-role configuration file:
+
+```json
+{
+  "role": "worker",
+  "certificate_file": "worker.crt",
+  "private_key_file": "worker.key",
+  "peer_ca_file": "coordinator-ca.pem",
+  "scope": "deployment-issued-worker-scope",
+  "handshake_timeout": "20s"
+}
+```
+
+The coordinator uses a separate file and private key:
+
+```json
+{
+  "role": "coordinator",
+  "certificate_file": "coordinator.crt",
+  "private_key_file": "coordinator.key",
+  "peer_ca_file": "worker-ca.pem",
+  "server_name": "worker.tailnet.ts.net",
+  "scope": "deployment-issued-worker-scope",
+  "handshake_timeout": "20s"
+}
+```
+
+Relative paths are resolved beside each owner-only configuration file. Private
+keys must also be owner-only on Unix. Choose `handshake_timeout` from the
+deployment's measured Tailscale latency and authentication path; cc does not
+substitute a universal remote timeout.
+
+Both leaf certificates must carry the matching URI identity
+`urn:cc:worker:<scope>:worker` or
+`urn:cc:worker:<scope>:coordinator`. The role, CA chain, server name, certificate
+lifetime, and scope are all verified before the worker sends its hello frame.
+Tailscale supplies reachability but does not replace these checks.
+
+Start the worker with its existing address setting and the security file:
+
+```sh
+CCX3_WORKER_CONTROL_SOCKET=tls://100.64.0.20:9443 \
+  ccvm -worker -worker-tls-config /secure/worker.json
+```
+
+The server reloads its certificate, key, peer CA, and policy file for each new
+connection. Rotate them with atomic replacement while retaining the same scope;
+changing scope requires a new worker. TLS session resumption is disabled so a
+new connection always reauthenticates. Existing worker connections keep their
+authenticated scope until they close. There is no insecure migration flag or
+plaintext deprecation window before v1.
+
 ## Repository Layout
 
 - `cmd/cc`: user-facing CLI

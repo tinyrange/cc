@@ -49,22 +49,39 @@ func (c *workerCall) finish(err error) {
 }
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
-	var conn net.Conn
-	var err error
-	network, address := workerDialTarget(socketPath)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err = net.Dial(network, address)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+	return dialWorker(ctx, socketPath, nil)
+}
+
+func DialWorkerTLS(ctx context.Context, endpoint, configPath string) (*Client, error) {
+	security, err := LoadWorkerClientSecurity(configPath)
+	if err != nil {
+		return nil, err
+	}
+	return dialWorker(ctx, endpoint, security)
+}
+
+func dialWorker(ctx context.Context, socketPath string, security *WorkerTransportSecurity) (*Client, error) {
+	target, err := workerDialTarget(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if target.secure && security == nil {
+		return nil, &WorkerSecurityError{Endpoint: socketPath, Reason: WorkerSecurityTLSConfigRequired}
+	}
+	if !target.secure && security != nil {
+		return nil, &WorkerSecurityError{Endpoint: socketPath, Reason: WorkerSecurityInvalidTLSConfig, Detail: "TLS configuration was provided for a Unix socket"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, target.network, target.address)
+	if err != nil {
+		return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
+	}
+	if target.secure {
+		conn, err = handshakeWorkerClient(ctx, conn, socketPath, security)
+		if err != nil {
+			return nil, err
 		}
 	}
 	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]*workerCall{}}
@@ -77,15 +94,48 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
 	}
+	var hello WorkerHello
+	if err := frame.DecodePayload(&hello); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("decode sidecar worker hello: %w", err)
+	}
+	if hello.Version != WorkerProtocolVersion {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sidecar worker protocol version %d is not supported", hello.Version)
+	}
+	if target.secure && hello.WorkerID != security.Scope {
+		_ = conn.Close()
+		return nil, &WorkerSecurityError{
+			Endpoint: socketPath,
+			Reason:   WorkerSecurityPeerScopeMismatch,
+			Detail:   "worker hello identity does not match the authenticated certificate scope",
+		}
+	}
 	go worker.receiveLoop()
 	return worker, nil
 }
 
-func workerDialTarget(address string) (string, string) {
+type workerDialEndpoint struct {
+	network string
+	address string
+	secure  bool
+}
+
+func workerDialTarget(address string) (workerDialEndpoint, error) {
 	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://")
+		return workerDialEndpoint{}, &WorkerSecurityError{
+			Endpoint: address,
+			Reason:   WorkerSecurityPlaintextTCPRejected,
+		}
 	}
-	return "unix", address
+	if strings.HasPrefix(address, WorkerTLSScheme) {
+		target := strings.TrimPrefix(address, WorkerTLSScheme)
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return workerDialEndpoint{}, fmt.Errorf("parse worker TLS endpoint: %w", err)
+		}
+		return workerDialEndpoint{network: "tcp", address: target, secure: true}, nil
+	}
+	return workerDialEndpoint{network: "unix", address: address}, nil
 }
 
 func (c *Client) Close() error {
