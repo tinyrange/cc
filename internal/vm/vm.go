@@ -80,21 +80,26 @@ type resourceReservation struct {
 }
 
 type Machine struct {
-	id           string
-	image        string
-	initSystem   string
-	kernel       string
-	memoryMB     uint64
-	balloonMB    uint64
-	cpus         int
-	nestedVirt   bool
-	startedAt    time.Time
-	instance     Instance
-	lastErr      error
-	exitedAt     time.Time
-	shutdownCh   chan struct{}
-	shutdownOnce sync.Once
-	stopping     bool
+	id         string
+	image      string
+	initSystem string
+	kernel     string
+	memoryMB   uint64
+	balloonMB  uint64
+	cpus       int
+	nestedVirt bool
+	startedAt  time.Time
+	instance   Instance
+	lastErr    error
+	exitedAt   time.Time
+	stopping   bool
+	stop       *machineStopOperation
+}
+
+type machineStopOperation struct {
+	done      chan struct{}
+	err       error
+	observers int
 }
 
 type managerNetworkLease struct {
@@ -274,7 +279,6 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
-		shutdownCh: make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -383,7 +387,6 @@ func (m *Manager) StartBlankInstanceStream(
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
-		shutdownCh: make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -408,18 +411,15 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 	m.mu.Lock()
 	results := make(chan managerShutdownResult, len(m.running))
 	pending := 0
+	pendingStops := make(map[string]*machineStopOperation, len(m.running))
 	var errs []error
 	for id, machine := range m.running {
-		if machine.stopping {
-			errs = append(errs, fmt.Errorf("shutdown VM %q: already shutting down", id))
-			continue
-		}
-		machine.stopping = true
-		machine.shutdownOnce.Do(func() {
-			close(machine.shutdownCh)
-		})
+		stop := m.beginMachineStopLocked(machine)
+		pendingStops[id] = stop
 		pending++
-		go m.closeMachineForShutdownAll(id, machine, results)
+		go func() {
+			results <- managerShutdownResult{id: id, err: waitMachineStop(nil, stop)}
+		}()
 	}
 	m.mu.Unlock()
 
@@ -427,6 +427,7 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 		if ctx == nil {
 			result := <-results
 			pending--
+			delete(pendingStops, result.id)
 			if result.err != nil {
 				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
 			}
@@ -435,22 +436,22 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 		select {
 		case result := <-results:
 			pending--
+			delete(pendingStops, result.id)
 			if result.err != nil {
 				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
 			}
 		case <-ctx.Done():
 			errs = append(errs, ctx.Err())
-			for {
+			for id, stop := range pendingStops {
 				select {
-				case result := <-results:
-					pending--
-					if result.err != nil {
-						errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+				case <-stop.done:
+					if stop.err != nil {
+						errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, stop.err))
 					}
 				default:
-					return errors.Join(errs...)
 				}
 			}
+			return errors.Join(errs...)
 		}
 	}
 	if len(errs) > 0 {
@@ -464,23 +465,12 @@ type managerShutdownResult struct {
 	err error
 }
 
-func (m *Manager) closeMachineForShutdownAll(id string, machine *Machine, results chan<- managerShutdownResult) {
-	err := machine.instance.Close()
-	m.mu.Lock()
-	if err == nil {
-		if m.running != nil && m.running[id] == machine {
-			delete(m.running, id)
-		}
-		delete(m.networkLeases, id)
-	} else if m.running != nil && m.running[id] == machine {
-		machine.stopping = false
-	}
-	m.mu.Unlock()
-	results <- managerShutdownResult{id: id, err: err}
-}
-
 func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
-	_ = ctx
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	id = instanceID(id)
 
 	m.mu.Lock()
@@ -489,27 +479,63 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("no VM %q is running", id)
 	}
-	if machine.stopping {
-		m.mu.Unlock()
-		return fmt.Errorf("VM %q is already shutting down", id)
+	stop := m.beginMachineStopLocked(machine)
+	m.mu.Unlock()
+	return waitMachineStop(ctx, stop)
+}
+
+func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation {
+	if machine.stop != nil {
+		select {
+		case <-machine.stop.done:
+			if machine.stop.err == nil {
+				machine.stop.observers++
+				return machine.stop
+			}
+		default:
+			machine.stop.observers++
+			return machine.stop
+		}
 	}
+	stop := &machineStopOperation{done: make(chan struct{}), observers: 1}
+	machine.stop = stop
 	machine.stopping = true
-	machine.shutdownOnce.Do(func() {
-		close(machine.shutdownCh)
-	})
-	m.mu.Unlock()
+	go m.runMachineStop(machine, stop)
+	return stop
+}
 
-	if err := machine.instance.Close(); err != nil {
-		return err
-	}
-
+func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
+	err := machine.instance.Close()
 	m.mu.Lock()
-	if m.running != nil && m.running[id] == machine {
-		delete(m.running, id)
+	stop.err = err
+	if err == nil {
+		if m.running != nil && m.running[machine.id] == machine {
+			delete(m.running, machine.id)
+		}
+		delete(m.networkLeases, machine.id)
+	} else if machine.stop == stop {
+		machine.stopping = false
 	}
-	delete(m.networkLeases, id)
+	close(stop.done)
 	m.mu.Unlock()
-	return nil
+}
+
+func waitMachineStop(ctx context.Context, stop *machineStopOperation) error {
+	if ctx == nil {
+		<-stop.done
+		return stop.err
+	}
+	select {
+	case <-stop.done:
+		return stop.err
+	default:
+	}
+	select {
+	case <-stop.done:
+		return stop.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -614,11 +640,6 @@ func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecReques
 func (m *Manager) instanceIsStopping(id string, machine *Machine) bool {
 	if machine == nil {
 		return false
-	}
-	select {
-	case <-machine.shutdownCh:
-		return true
-	default:
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
