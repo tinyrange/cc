@@ -5,6 +5,7 @@ package kvm
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -25,6 +26,22 @@ type ProbeInfo struct {
 	VMCreateOK   bool
 	VCPUCreateOK bool
 	VCPUInitOK   bool
+}
+
+var processBootstrap struct {
+	once sync.Once
+	kvm  *Bootstrap
+	err  error
+}
+
+// sharedBootstrap keeps the process-wide /dev/kvm descriptor open. A single
+// KVM system descriptor may create any number of VMs; opening one per VM adds
+// a file object and consumes a descriptor without isolating the guests.
+func sharedBootstrap() (*Bootstrap, error) {
+	processBootstrap.once.Do(func() {
+		processBootstrap.kvm, processBootstrap.err = Open()
+	})
+	return processBootstrap.kvm, processBootstrap.err
 }
 
 func Open() (*Bootstrap, error) {

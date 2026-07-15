@@ -101,3 +101,7 @@ type kvmOneReg struct {
 	id   uint64
 	addr uint64
 }
+
+type kvmRegList struct {
+	n uint64
+}

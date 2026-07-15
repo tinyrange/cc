@@ -362,14 +362,21 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarpkg.D
 	if err != nil {
 		return nil, err
 	}
-	controlSocket, err := h.sidecarControlSocketPath()
+	control, err := h.sidecarControlEndpoint()
 	if err != nil {
 		return nil, err
 	}
-	cmd := sidecarpkg.LaunchCommand(exe, h.cacheDir, controlSocket, env, sidecarpkg.LaunchOptions{
-		DisableEnv: sidecarDisableEnv,
-		ControlEnv: sidecarControlEnv,
-		ModeEnv:    sidecarModeEnv,
+	keepControl := false
+	defer func() {
+		if !keepControl {
+			control.Close()
+		}
+	}()
+	cmd := sidecarpkg.LaunchCommand(exe, h.cacheDir, control.address, env, sidecarpkg.LaunchOptions{
+		DisableEnv:    sidecarDisableEnv,
+		ControlEnv:    sidecarControlEnv,
+		ModeEnv:       sidecarModeEnv,
+		TLSConfigPath: control.serverTLSConfig,
 	})
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -395,25 +402,61 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarpkg.D
 		started = false
 		return nil, err
 	}
-	worker, err := sidecarpkg.DialWorker(ctx, hello.Addr)
+	features := sidecarHostFeatures()
+	requirements := sidecarpkg.WorkerRequirements{
+		SupportsFSRPC: features.supportsFSRPC,
+		SupportsL2:    features.supportsL2,
+	}
+	var worker *sidecarpkg.Client
+	if control.clientTLSConfig == "" {
+		worker, err = sidecarpkg.DialWorkerWithRequirements(ctx, hello.Addr, requirements)
+	} else {
+		worker, err = sidecarpkg.DialWorkerTLSWithRequirements(ctx, hello.Addr, control.clientTLSConfig, requirements)
+	}
 	if err != nil {
 		started = false
 		return nil, err
 	}
-	return sidecarpkg.NewDaemon(cmd, worker, stdout, []func(){sidecarControlCleanup(controlSocket)}), nil
+	keepControl = true
+	return sidecarpkg.NewDaemon(cmd, worker, stdout, []func(){control.Close}), nil
 }
 
-func (h *sidecarVMHost) sidecarControlSocketPath() (string, error) {
+type sidecarControlEndpoint struct {
+	address         string
+	serverTLSConfig string
+	clientTLSConfig string
+	cleanup         func()
+}
+
+func (e sidecarControlEndpoint) Close() {
+	if e.cleanup != nil {
+		e.cleanup()
+	}
+}
+
+func (h *sidecarVMHost) sidecarControlEndpoint() (sidecarControlEndpoint, error) {
 	if runtime.GOOS == "windows" {
-		return "tcp://127.0.0.1:0", nil
+		security, err := sidecarpkg.NewEphemeralWorkerSecurity(h.cacheDir)
+		if err != nil {
+			return sidecarControlEndpoint{}, err
+		}
+		return sidecarControlEndpoint{
+			address:         sidecarpkg.WorkerTLSScheme + "127.0.0.1:0",
+			serverTLSConfig: security.ServerConfigPath,
+			clientTLSConfig: security.ClientConfigPath,
+			cleanup:         security.Close,
+		}, nil
 	}
 	socketDir := filepath.Join(h.cacheDir, "_worker-sockets")
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
-		return "", err
+		return sidecarControlEndpoint{}, err
 	}
 	socketPath := filepath.Join(socketDir, fmt.Sprintf("control-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
 	_ = os.Remove(socketPath)
-	return socketPath, nil
+	return sidecarControlEndpoint{
+		address: socketPath,
+		cleanup: sidecarControlCleanup(socketPath),
+	}, nil
 }
 
 func prepareSidecarUnixListener(cacheDir, prefix string) (string, net.Listener, func(), error) {

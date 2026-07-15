@@ -2,9 +2,52 @@ package netstack
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"testing"
+	"time"
 )
+
+func TestTCPConnCloseWriteKeepsReadSideOpen(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	key := tcpFourTuple{
+		srcIP:   [4]byte{10, 42, 0, 2},
+		dstIP:   [4]byte{10, 42, 0, 1},
+		srcPort: 8080,
+		dstPort: 49152,
+	}
+	conn := newTCPConn(h.stack, nil, key, 1, 0xffff, [4]byte{10, 42, 0, 1}, nil)
+	conn.state = tcpStateEstablished
+	h.stack.tcpMu.Lock()
+	h.stack.tcpConns[key] = conn
+	h.stack.tcpMu.Unlock()
+	defer conn.Close()
+
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-h.tcpFrames:
+		if frame.flags&tcpFlagFIN == 0 {
+			t.Fatalf("CloseWrite flags = %#x, want FIN", frame.flags)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseWrite did not send FIN")
+	}
+	if _, err := conn.Write([]byte("late write")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after CloseWrite error = %v, want net.ErrClosed", err)
+	}
+
+	conn.enqueueData([]byte("response"))
+	buf := make([]byte, len("response"))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "response" {
+		t.Fatalf("read after CloseWrite = %q, want response", buf)
+	}
+}
 
 func TestParseTCPOptionsExtractsMSSAndWindowScale(t *testing.T) {
 	options := []byte{

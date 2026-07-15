@@ -26,6 +26,7 @@ import (
 	"github.com/ulikunitz/xz"
 	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
+	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/simg"
@@ -46,6 +47,7 @@ const (
 )
 
 const internalScratchSource = "scratch"
+const maxRegistryMetadataBytes int64 = 16 << 20
 
 type Store struct {
 	root          string
@@ -55,6 +57,14 @@ type Store struct {
 	mu          sync.Mutex
 	downloading map[string]bool
 	lastErr     map[string]error
+	opened      map[string]*Image
+	opening     map[string]*imageOpenCall
+}
+
+type imageOpenCall struct {
+	done  chan struct{}
+	image *Image
+	err   error
 }
 
 type metadata struct {
@@ -226,6 +236,8 @@ func NewStore(root string) *Store {
 		httpClient:  http.DefaultClient,
 		downloading: map[string]bool{},
 		lastErr:     map[string]error{},
+		opened:      map[string]*Image{},
+		opening:     map[string]*imageOpenCall{},
 	}
 }
 
@@ -287,6 +299,7 @@ func (s *Store) Delete(name string) error {
 		return fmt.Errorf("remove image %q: %w", name, err)
 	}
 	delete(s.lastErr, name)
+	delete(s.opened, name)
 	return nil
 }
 
@@ -296,6 +309,33 @@ func (s *Store) Open(name string) (*Image, error) {
 			return nil, err
 		}
 	}
+	s.mu.Lock()
+	if image := s.opened[name]; image != nil {
+		s.mu.Unlock()
+		return cloneImage(image), nil
+	}
+	if call := s.opening[name]; call != nil {
+		s.mu.Unlock()
+		<-call.done
+		return cloneImage(call.image), call.err
+	}
+	call := &imageOpenCall{done: make(chan struct{})}
+	s.opening[name] = call
+	s.mu.Unlock()
+
+	image, err := s.openUncached(name)
+	s.mu.Lock()
+	call.image, call.err = image, err
+	if err == nil && image.SourceKind == SourceKindSIMG {
+		s.opened[name] = image
+	}
+	delete(s.opening, name)
+	close(call.done)
+	s.mu.Unlock()
+	return cloneImage(image), err
+}
+
+func (s *Store) openUncached(name string) (*Image, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		return nil, err
@@ -399,6 +439,23 @@ func (s *Store) Open(name string) (*Image, error) {
 	}, nil
 }
 
+func cloneImage(image *Image) *Image {
+	if image == nil {
+		return nil
+	}
+	clone := *image
+	clone.Config.Env = append([]string(nil), image.Config.Env...)
+	clone.Config.Entrypoint = append([]string(nil), image.Config.Entrypoint...)
+	clone.Config.Cmd = append([]string(nil), image.Config.Cmd...)
+	if image.Config.Labels != nil {
+		clone.Config.Labels = make(map[string]string, len(image.Config.Labels))
+		for key, value := range image.Config.Labels {
+			clone.Config.Labels[key] = value
+		}
+	}
+	return &clone
+}
+
 func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOptions) (client.ImageState, error) {
 	if name == "" {
 		return client.ImageState{}, fmt.Errorf("image name is required")
@@ -422,7 +479,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return s.Get(name)
 	}
-	if state, ok, err := s.existingState(name, spec, opts.Architecture); err != nil {
+	if state, ok, err := s.existingState(ctx, name, spec, opts.Architecture); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
@@ -432,7 +489,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return state, nil
 	}
-	if state, ok, err := s.restoreFromSharedCache(name, spec, opts.Architecture); err != nil {
+	if state, ok, err := s.restoreFromSharedCache(ctx, name, spec, opts.Architecture); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "restored", Artifact: name})
@@ -450,6 +507,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	}
 	s.downloading[name] = true
 	delete(s.lastErr, name)
+	delete(s.opened, name)
 	s.mu.Unlock()
 
 	err = s.pull(ctx, name, spec, opts)
@@ -463,7 +521,11 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	if err != nil {
 		return client.ImageState{}, err
 	}
-	return state, stateErr
+	if stateErr != nil {
+		return state, stateErr
+	}
+	reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+	return state, nil
 }
 
 func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
@@ -477,7 +539,7 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options 
 	sharedName := sharedImageKey(spec, options.Architecture)
 	shared := NewStore(s.sharedRoot())
 	shared.httpClient = s.httpClient
-	if _, ok, err := shared.existingState(sharedName, spec, options.Architecture); err != nil {
+	if _, ok, err := shared.existingState(ctx, sharedName, spec, options.Architecture); err != nil {
 		return err
 	} else if !ok {
 		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
@@ -536,7 +598,6 @@ func (s *Store) pullRootFSTarDirect(ctx context.Context, name string, spec Sourc
 	if err := s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build); err != nil {
 		return err
 	}
-	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
 }
 
@@ -568,10 +629,12 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	}
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
+		Context:    ctx,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
 		OnActivity: s.cvmfsActivity,
 		Mirrors:    options.CVMFSMirrors,
 	}
+	defer func() { cvmfsClient.Context = nil }()
 	normalizedSource := normalizeCVMFSSource(spec.Raw)
 	rootTarget, isDir, err := resolveCVMFSRootTarget(cvmfsClient, normalizedSource)
 	if err != nil {
@@ -644,7 +707,6 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err := s.writeMetadata(name, meta); err != nil {
 		return err
 	}
-	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
 }
 
@@ -766,6 +828,7 @@ func (s *Store) maybePrefetchCVMFSImage(ctx context.Context, name string, spec S
 	}
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
+		Context:    ctx,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
 		OnActivity: s.cvmfsActivity,
 		Mirrors:    options.CVMFSMirrors,
@@ -823,11 +886,14 @@ func (s *Store) fetchSIMG(ctx context.Context, source, destPath string) error {
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("download simg: status %s", resp.Status)
 		}
+		if err := download.BoundResponse(resp, 0); err != nil {
+			return fmt.Errorf("download simg: %w", err)
+		}
 		dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(dst, resp.Body); err != nil {
+		if _, err := download.Copy(ctx, dst, resp, download.Budget{MaxBytes: resp.ContentLength, ExpectedBytes: resp.ContentLength}); err != nil {
 			_ = dst.Close()
 			_ = os.Remove(tmpPath)
 			return err
@@ -873,6 +939,10 @@ func (s *Store) fetchRootFSTar(ctx context.Context, name, source, destPath strin
 			resp.Body.Close()
 			return fmt.Errorf("download rootfs tar: status %s (%s)", resp.Status, strings.TrimSpace(string(body)))
 		}
+		if err := download.BoundResponse(resp, 0); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("download rootfs tar: %w", err)
+		}
 		src = resp.Body
 		if resp.ContentLength > 0 {
 			totalBytes = resp.ContentLength
@@ -893,7 +963,19 @@ func (s *Store) fetchRootFSTar(ctx context.Context, name, source, destPath strin
 		return err
 	}
 	progress := newDownloadProgressReader(src, name, "rootfs", totalBytes, report)
-	if err := writeUncompressedTar(dst, source, progress); err != nil {
+	expandedBudget, err := download.FilesystemBudget(destPath)
+	if err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("determine rootfs expansion budget: %w", err)
+	}
+	budgetedDst, err := download.NewLimitWriter(dst, expandedBudget)
+	if err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := writeUncompressedTar(budgetedDst, source, progress); err != nil {
 		_ = dst.Close()
 		_ = os.Remove(tmpPath)
 		return err
@@ -930,7 +1012,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		return err
 	}
 
-	cfgBlob, err := s.fetchBlob(ctx, reg, imageName, mani.Config.Digest)
+	cfgBlob, err := s.fetchBlob(ctx, reg, imageName, mani.Config)
 	if err != nil {
 		return fmt.Errorf("fetch config blob: %w", err)
 	}
@@ -1027,7 +1109,7 @@ func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, imageDir, tmp
 	return nil
 }
 
-func (s *Store) existingState(name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
+func (s *Store) existingState(ctx context.Context, name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1045,7 +1127,7 @@ func (s *Store) existingState(name string, spec SourceSpec, architecture string)
 		if meta.CVMFSRootHash == "" {
 			return client.ImageState{}, false, nil
 		}
-		currentHash, err := s.currentCVMFSRootHash(spec, meta.CVMFSMirrors)
+		currentHash, err := s.currentCVMFSRootHash(ctx, spec, meta.CVMFSMirrors)
 		if err != nil {
 			return client.ImageState{}, false, err
 		}
@@ -1059,7 +1141,7 @@ func (s *Store) existingState(name string, spec SourceSpec, architecture string)
 	return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) restoreFromSharedCache(name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
+func (s *Store) restoreFromSharedCache(ctx context.Context, name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
 	shared := NewStore(s.sharedRoot())
 	sharedName := sharedImageKey(spec, architecture)
 	meta, err := shared.readMetadata(sharedName)
@@ -1079,7 +1161,7 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec, architectur
 		if meta.CVMFSRootHash == "" {
 			return client.ImageState{}, false, nil
 		}
-		currentHash, err := s.currentCVMFSRootHash(spec, meta.CVMFSMirrors)
+		currentHash, err := s.currentCVMFSRootHash(ctx, spec, meta.CVMFSMirrors)
 		if err != nil {
 			return client.ImageState{}, false, err
 		}
@@ -1096,9 +1178,10 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec, architectur
 	return client.ImageState{Name: name, Source: spec.Raw, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) currentCVMFSRootHash(spec SourceSpec, mirrors []string) (string, error) {
+func (s *Store) currentCVMFSRootHash(ctx context.Context, spec SourceSpec, mirrors []string) (string, error) {
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
+		Context:    ctx,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
 		OnActivity: s.cvmfsActivity,
 		Mirrors:    mirrors,
@@ -1220,21 +1303,13 @@ func resolvedOCISource(registry, imageName, digest string) string {
 	return registry + "/" + imageName + "@" + digest
 }
 
-func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName, digest string) ([]byte, error) {
-	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(digest))
+func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName string, blob descriptor) ([]byte, error) {
+	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(blob.Digest))
 	if data, err := os.ReadFile(blobPath); err == nil {
 		return data, nil
 	}
 
-	body, _, err := s.getJSONBlob(ctx, reg, "/"+imageName+"/blobs/"+digest, nil)
-	if err == nil {
-		if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err == nil {
-			_ = os.WriteFile(blobPath, body, 0o644)
-		}
-		return body, nil
-	}
-
-	data, err := s.getRawBlob(ctx, reg, "/"+imageName+"/blobs/"+digest)
+	data, err := s.getRawBlob(ctx, reg, "/"+imageName+"/blobs/"+blob.Digest, blob)
 	if err != nil {
 		return nil, err
 	}
@@ -1256,7 +1331,33 @@ func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageNa
 		return err
 	}
 	defer resp.Body.Close()
-	return writeLayerTarFromReader(dstPath, layer.MediaType, resp.Body)
+	if layer.Size <= 0 {
+		return fmt.Errorf("layer %s has invalid size %d", layer.Digest, layer.Size)
+	}
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		return err
+	}
+	tmp := blobPath + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := download.Copy(ctx, out, resp, download.Budget{MaxBytes: layer.Size, ExpectedBytes: layer.Size, ExpectedSHA256: layer.Digest})
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		return errors.Join(copyErr, closeErr)
+	}
+	if err := os.Rename(tmp, blobPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	file, err := os.Open(blobPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return writeLayerTarFromReader(dstPath, layer.MediaType, file)
 }
 
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
@@ -1270,25 +1371,31 @@ func (s *Store) getJSONBlobWithDigest(ctx context.Context, reg *registryContext,
 		return nil, "", "", err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := download.ReadAll(ctx, resp, download.Budget{MaxBytes: maxRegistryMetadataBytes})
 	if err != nil {
 		return nil, "", "", fmt.Errorf("read response body: %w", err)
 	}
 	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
+	sum := sha256.Sum256(data)
+	actualDigest := "sha256:" + hex.EncodeToString(sum[:])
 	if digest == "" {
-		sum := sha256.Sum256(data)
-		digest = "sha256:" + hex.EncodeToString(sum[:])
+		digest = actualDigest
+	} else if strings.HasPrefix(digest, "sha256:") && !strings.EqualFold(digest, actualDigest) {
+		return nil, "", "", &download.DigestError{Expected: digest, Actual: actualDigest}
 	}
 	return data, resp.Header.Get("Content-Type"), digest, nil
 }
 
-func (s *Store) getRawBlob(ctx context.Context, reg *registryContext, path string) ([]byte, error) {
+func (s *Store) getRawBlob(ctx context.Context, reg *registryContext, path string, blob descriptor) ([]byte, error) {
 	resp, err := reg.do(ctx, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	if blob.Size <= 0 {
+		return nil, fmt.Errorf("blob %s has invalid size %d", blob.Digest, blob.Size)
+	}
+	data, err := download.ReadAll(ctx, resp, download.Budget{MaxBytes: blob.Size, ExpectedBytes: blob.Size, ExpectedSHA256: blob.Digest})
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
@@ -1321,9 +1428,13 @@ func (reg *registryContext) do(ctx context.Context, path string, accept []string
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			return nil, fmt.Errorf("registry request failed: %s (%s)", resp.Status, strings.TrimSpace(string(body)))
+		}
+		if err := download.BoundResponse(resp, 0); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("registry response: %w", err)
 		}
 		return resp, nil
 	}
@@ -1359,8 +1470,12 @@ func (reg *registryContext) authorize(ctx context.Context, header string) error 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("token request failed: %s", resp.Status)
 	}
+	data, err := download.ReadAll(ctx, resp, download.Budget{MaxBytes: 1 << 20})
+	if err != nil {
+		return fmt.Errorf("registry token response: %w", err)
+	}
 	var token tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+	if err := json.Unmarshal(data, &token); err != nil {
 		return fmt.Errorf("decode token response: %w", err)
 	}
 	switch {

@@ -333,7 +333,7 @@ func setupOpenBSDArm64Registers(vm *VM, plan *openbsdarm64.BootPlan) error {
 
 func runOpenBSDArm64ManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci *Arm64PCIHost, netdev *virtio.Net, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// The caller owns a dedicated goroutine; terminate its vCPU thread when it exits.
 	vm.SetVCPUTID(unix.Gettid())
 	defer vm.SetVCPUTID(0)
 	cancelDone := make(chan struct{})

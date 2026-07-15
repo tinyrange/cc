@@ -5,6 +5,8 @@ package guestagent
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"j5.nz/cc/client"
 )
 
 func TestRootPathCleansRootAndName(t *testing.T) {
@@ -175,6 +179,157 @@ func TestExtractTarToPathConflictSemantics(t *testing.T) {
 			t.Fatalf("dst dir stat = %v info=%v", err, info)
 		}
 	})
+}
+
+func TestExtractTarToPathEnforcesCallerBudgets(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "payload", "0123456789"); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "payload")
+	err := ExtractTarToPathContext(context.Background(), bytes.NewReader(archive.Bytes()), "/", dst, false, &client.ArchiveLimits{
+		MaxEntries:       1,
+		MaxFileBytes:     9,
+		MaxExpandedBytes: 100,
+	})
+	var limitErr *ArchiveLimitError
+	if !errors.As(err, &limitErr) || limitErr.Resource != "file bytes" || limitErr.Limit != 9 || limitErr.Actual != 10 {
+		t.Fatalf("limit error = %#v", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("oversized archive published destination: %v", statErr)
+	}
+}
+
+func TestExtractTarToPathCancellationPreservesExistingFile(t *testing.T) {
+	var archive bytes.Buffer
+	if err := writeSingleFileTar(&archive, "payload", strings.Repeat("x", 4096)); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "payload")
+	if err := os.WriteFile(dst, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer := io.Pipe()
+	wrotePrefix := make(chan struct{})
+	go func() {
+		_, _ = writer.Write(archive.Bytes()[:1024])
+		close(wrotePrefix)
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ExtractTarToPathContext(ctx, reader, "/", dst, false, &client.ArchiveLimits{MaxFileBytes: 4096, MaxExpandedBytes: 4096})
+	}()
+	<-wrotePrefix
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("extraction error = %v, want context cancellation", err)
+	}
+	if got := readTestFile(t, dst); got != "keep" {
+		t.Fatalf("existing file after canceled extraction = %q", got)
+	}
+}
+
+func TestExtractTarToPathRejectsArchiveSymlinkEscape(t *testing.T) {
+	base := t.TempDir()
+	dst := filepath.Join(base, "dst")
+	outside := filepath.Join(base, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatalf("make outside dir: %v", err)
+	}
+	outPath := filepath.Join(outside, "marker")
+	if err := os.WriteFile(outPath, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write outside marker: %v", err)
+	}
+	archive := maliciousSymlinkTar(t, true)
+	err := ExtractTarToPath(bytes.NewReader(archive), "", dst, true)
+	if !errors.Is(err, ErrUnsafeTarExtractionPath) {
+		t.Fatalf("extract error = %v, want unsafe path", err)
+	}
+	if got := readTestFile(t, outPath); got != "unchanged" {
+		t.Fatalf("outside content = %q", got)
+	}
+}
+
+func TestExtractTarToPathRejectsPreexistingSymlinkParent(t *testing.T) {
+	base := t.TempDir()
+	dst := filepath.Join(base, "dst")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(dst, "root"), 0o755); err != nil {
+		t.Fatalf("make destination: %v", err)
+	}
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatalf("make outside dir: %v", err)
+	}
+	outPath := filepath.Join(outside, "marker")
+	if err := os.WriteFile(outPath, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write outside marker: %v", err)
+	}
+	if err := os.Symlink("../../outside", filepath.Join(dst, "root", "link")); err != nil {
+		t.Fatalf("make escaping symlink: %v", err)
+	}
+	archive := maliciousSymlinkTar(t, false)
+	err := ExtractTarToPath(bytes.NewReader(archive), "", dst, true)
+	if !errors.Is(err, ErrUnsafeTarExtractionPath) {
+		t.Fatalf("extract error = %v, want unsafe path", err)
+	}
+	if got := readTestFile(t, outPath); got != "unchanged" {
+		t.Fatalf("outside content = %q", got)
+	}
+}
+
+func TestExtractTarToPathPreservesRegularFileMetadata(t *testing.T) {
+	mtime := time.Unix(1_700_000_000, 0)
+	payload := []byte("payload")
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "file", Typeflag: tar.TypeReg, Mode: 0o750, Size: int64(len(payload)), ModTime: mtime}); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+	dst := t.TempDir()
+	if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "", dst, true); err != nil {
+		t.Fatalf("extract regular file: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dst, "file"))
+	if err != nil {
+		t.Fatalf("stat extracted file: %v", err)
+	}
+	if info.Mode().Perm() != 0o750 || info.ModTime().Unix() != mtime.Unix() {
+		t.Fatalf("file metadata = mode %#o mtime %d", info.Mode().Perm(), info.ModTime().Unix())
+	}
+	if got := readTestFile(t, filepath.Join(dst, "file")); got != string(payload) {
+		t.Fatalf("file content = %q", got)
+	}
+}
+
+func maliciousSymlinkTar(t *testing.T, includeSymlink bool) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if includeSymlink {
+		if err := tw.WriteHeader(&tar.Header{Name: "root/link", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0o777}); err != nil {
+			t.Fatalf("write symlink header: %v", err)
+		}
+	}
+	payload := []byte("overwritten")
+	if err := tw.WriteHeader(&tar.Header{Name: "root/link/marker", Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(payload))}); err != nil {
+		t.Fatalf("write file header: %v", err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatalf("write file payload: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+	return archive.Bytes()
 }
 
 func TestParseSignal(t *testing.T) {

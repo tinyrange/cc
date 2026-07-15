@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -61,6 +61,7 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 		{name: "sbin", mode: 0o755, dir: true},
 		{name: "sbin/init", mode: 0o555, data: []byte("base init\n")},
 		{name: "etc", mode: 0o755, dir: true},
+		{name: "etc/group", mode: 0o644, data: []byte("wheel:*:0:root\noperator:*:5:root")},
 		{name: "dev", mode: 0o755, dir: true},
 		{name: "root", mode: 0o700, dir: true},
 	})
@@ -73,18 +74,46 @@ func TestBuildManagedRootFromNetBSDBaseSet(t *testing.T) {
 	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
 		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
 	}
-	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/sbin/cc-netbsd-init", "/etc/fstab", "/dev/console", "/dev/ld0a"} {
+	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/sbin/cc-netbsd-init", "/etc/fstab", "/dev/console", "/dev/ld0a", "/dev/pts", "/dev/ptmx", "/dev/ptm"} {
 		if _, err := imagefs.LookupPath(root, guestPath); err != nil {
 			t.Fatalf("lookup %s: %v", guestPath, err)
 		}
 	}
 	initScript := readRootFile(t, root, "/sbin/init")
-	if initScript != fmt.Sprintf(managedInitScript, "vioif0", "10.42.0.2", "10.42.0.1", "02:42:0a:2a:00:01", "10.42.0.1") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
+	if !textHasFields(initScript, "/sbin/ifconfig", "vioif0", "inet", "10.42.0.2", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(initScript, "/usr/sbin/arp", "-s", "10.42.0.1", "02:42:0a:2a:00:01", ">/dev/null", "2>&1", "||", "true") ||
+		!textHasFields(initScript, "/sbin/route", "add", "default", "10.42.0.1", "||", "true") ||
+		!textHasFields(initScript, "/sbin/mount_ptyfs", "ptyfs", "/dev/pts", "||", "{") {
+		t.Fatalf("default init script does not configure the leased network: %q", initScript)
 	}
+	if group := readRootFile(t, root, "/etc/group"); !textHasLine(group, "tty:*:4:root") {
+		t.Fatalf("group database does not define NetBSD's tty group: %q", group)
+	} else if !textHasLine(group, "operator:*:5:root") {
+		t.Fatalf("group database did not preserve base groups: %q", group)
+	}
+	assertDevice(t, root, "/dev/ptmx", fs.ModeCharDevice|0o666, rdev(165, 0))
+	assertDevice(t, root, "/dev/ptm", fs.ModeCharDevice|0o666, rdev(165, 1))
 	fstab := readRootFile(t, root, "/etc/fstab")
 	if !textHasFields(fstab, "/dev/ld0a", "/", "ffs", "rw", "1", "1") {
 		t.Fatalf("fstab does not mount ld0a: %q", fstab)
+	}
+}
+
+func assertDevice(t *testing.T, root imagefs.Directory, guestPath string, wantMode fs.FileMode, wantRDev uint32) {
+	t.Helper()
+	entry, err := imagefs.LookupPath(root, guestPath)
+	if err != nil {
+		t.Fatalf("lookup %s: %v", guestPath, err)
+	}
+	if entry.File == nil {
+		t.Fatalf("%s is not a device file", guestPath)
+	}
+	_, gotMode := entry.File.Stat()
+	if gotMode != fs.ModeDevice|wantMode {
+		t.Fatalf("%s mode = %v, want %v", guestPath, gotMode, fs.ModeDevice|wantMode)
+	}
+	if got := entry.File.RDev(); got != wantRDev {
+		t.Fatalf("%s rdev = %d, want %d", guestPath, got, wantRDev)
 	}
 }
 
@@ -108,8 +137,10 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 	}
 	defer closeRoot()
 	initScript := readRootFile(t, root, "/sbin/init")
-	if initScript != fmt.Sprintf(managedInitScript, "vioif1", "10.42.0.8", "10.42.0.9", "02:42:0a:2a:00:01", "10.42.0.9") {
-		t.Fatalf("unexpected /sbin/init overlay: %q", initScript)
+	if !textHasFields(initScript, "/sbin/ifconfig", "vioif1", "inet", "10.42.0.8", "netmask", "255.255.255.0", "up", "||", "{") ||
+		!textHasFields(initScript, "/usr/sbin/arp", "-s", "10.42.0.9", "02:42:0a:2a:00:01", ">/dev/null", "2>&1", "||", "true") ||
+		!textHasFields(initScript, "/sbin/route", "add", "default", "10.42.0.9", "||", "true") {
+		t.Fatalf("init script does not configure the leased network: %q", initScript)
 	}
 	ifconfig := readRootFile(t, root, "/etc/ifconfig.vioif1")
 	if !textHasLine(ifconfig, "inet 10.42.0.8 netmask 255.255.255.0") {

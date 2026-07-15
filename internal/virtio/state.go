@@ -13,20 +13,28 @@ type QueueState struct {
 	NoNotify     bool   `json:"no_notify,omitempty"`
 }
 
+type BalloonPageWord struct {
+	Index uint64 `json:"index"`
+	Bits  uint64 `json:"bits"`
+}
+
 type MMIOState struct {
-	DeviceFeatureSel uint32       `json:"device_feature_sel"`
-	DriverFeatureSel uint32       `json:"driver_feature_sel"`
-	DriverFeatures   uint64       `json:"driver_features"`
-	QueueSel         uint32       `json:"queue_sel"`
-	Status           uint32       `json:"status"`
-	ConfigGeneration uint32       `json:"config_generation"`
-	SharedMemorySel  uint32       `json:"shared_memory_sel,omitempty"`
-	Legacy           bool         `json:"legacy,omitempty"`
-	Queues           []QueueState `json:"queues,omitempty"`
-	BackendPaths     []string     `json:"backend_paths,omitempty"`
-	NumPages         uint32       `json:"num_pages,omitempty"`
-	ActualPages      uint32       `json:"actual_pages,omitempty"`
-	InflatedPages    []uint64     `json:"inflated_pages,omitempty"`
+	DeviceFeatureSel  uint32            `json:"device_feature_sel"`
+	DriverFeatureSel  uint32            `json:"driver_feature_sel"`
+	DriverFeatures    uint64            `json:"driver_features"`
+	QueueSel          uint32            `json:"queue_sel"`
+	Status            uint32            `json:"status"`
+	ConfigGeneration  uint32            `json:"config_generation"`
+	SharedMemorySel   uint32            `json:"shared_memory_sel,omitempty"`
+	Legacy            bool              `json:"legacy,omitempty"`
+	Queues            []QueueState      `json:"queues,omitempty"`
+	BackendPaths      []string          `json:"backend_paths,omitempty"`
+	NumPages          uint32            `json:"num_pages,omitempty"`
+	ActualPages       uint32            `json:"actual_pages,omitempty"`
+	InflatedPageWords []BalloonPageWord `json:"inflated_page_words,omitempty"`
+	// InflatedPages is retained for restoring snapshots written before the
+	// compact bitmap representation was introduced.
+	InflatedPages []uint64 `json:"inflated_pages,omitempty"`
 }
 
 func snapshotQueues(queues []queue) []QueueState {
@@ -146,16 +154,16 @@ func (b *Balloon) SnapshotState() MMIOState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return MMIOState{
-		DeviceFeatureSel: b.deviceFeatureSel,
-		DriverFeatureSel: b.driverFeatureSel,
-		DriverFeatures:   b.driverFeatures,
-		QueueSel:         b.queueSel,
-		Status:           b.status,
-		ConfigGeneration: b.configGeneration,
-		Queues:           snapshotQueues(b.queues[:]),
-		NumPages:         b.numPages,
-		ActualPages:      b.actualPages,
-		InflatedPages:    b.inflatedPagesLocked(),
+		DeviceFeatureSel:  b.deviceFeatureSel,
+		DriverFeatureSel:  b.driverFeatureSel,
+		DriverFeatures:    b.driverFeatures,
+		QueueSel:          b.queueSel,
+		Status:            b.status,
+		ConfigGeneration:  b.configGeneration,
+		Queues:            snapshotQueues(b.queues[:]),
+		NumPages:          b.numPages,
+		ActualPages:       b.actualPages,
+		InflatedPageWords: b.inflatedPageWordsLocked(),
 	}
 }
 
@@ -172,9 +180,16 @@ func (b *Balloon) RestoreState(state MMIOState) error {
 	b.configGeneration = state.ConfigGeneration
 	b.numPages = state.NumPages
 	b.actualPages = state.ActualPages
-	b.inflated = make(map[uint64]struct{}, len(state.InflatedPages))
-	for _, pfn := range state.InflatedPages {
-		b.inflated[pfn] = struct{}{}
+	b.inflated = make(map[uint64]uint64, len(state.InflatedPageWords)+(len(state.InflatedPages)+63)/64)
+	for _, word := range state.InflatedPageWords {
+		if word.Bits != 0 {
+			b.inflated[word.Index] = word.Bits
+		}
+	}
+	if len(state.InflatedPageWords) == 0 {
+		for _, pfn := range state.InflatedPages {
+			b.markInflatedLocked(pfn)
+		}
 	}
 	return restoreQueues(b.queues[:], state.Queues, b.mem)
 }

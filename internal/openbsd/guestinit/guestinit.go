@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	guestbuildid "j5.nz/cc/internal/guestinit/buildid"
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
@@ -27,15 +29,19 @@ func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, er
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create guest init cache: %w", err)
 	}
-	out := filepath.Join(cacheDir, "guest-init-openbsd-"+arch)
-	if data, err := os.ReadFile(out); err == nil && len(data) != 0 {
-		return data, nil
-	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return nil, fmt.Errorf("locate OpenBSD guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
+	identity, err := guestbuildid.Resolve(ctx, moduleRoot, "openbsd", arch, "./internal/cmd/openbsd-init")
+	if err != nil {
+		return nil, fmt.Errorf("identify OpenBSD guest init build: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-openbsd-"+arch+"-"+identity)
+	if data, err := os.ReadFile(out); err == nil && len(data) != 0 {
+		return data, nil
+	}
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/openbsd-init")
 	cmd.Env = append(os.Environ(), "GOOS=openbsd", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot

@@ -220,7 +220,9 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut)
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// This loop always runs in a dedicated goroutine. Leave it locked so the
+	// Go runtime terminates the OS thread when that goroutine exits instead of
+	// retaining one parked thread for every VM that has ever run.
 	vm.SetVCPUTID(0, unix.Gettid())
 	defer vm.SetVCPUTID(0, 0)
 	cancelDone := make(chan struct{})
@@ -250,7 +252,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 				return err
 			}
 		case ExitMMIO:
-			if handled, err := snapshot.handleMMIO(vm, exit.MMIO); err != nil {
+			if handled, err := snapshot.handleMMIO(vm, balloon, exit.MMIO); err != nil {
 				return err
 			} else if handled {
 				break
@@ -285,7 +287,8 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 		go func(index int) {
 			defer wg.Done()
 			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
+			// Terminate this dedicated vCPU thread with its goroutine rather than
+			// returning it to Go's idle thread pool.
 			vm.SetVCPUTID(index, unix.Gettid())
 			var exit Exit
 			for {

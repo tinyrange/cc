@@ -385,8 +385,8 @@ func NewVMWithOptions(ctx context.Context, opts VMOptions) (*VM, error) {
 		start := time.Now()
 		vmCfg := hvVMConfigCreate()
 		timing.Since(ctx, "hvf.new_vm.vm_config_create", start)
-		start = time.Now()
 		if opts.NestedVirt {
+			start = time.Now()
 			if hvVMConfigSetEL2Enabled == nil {
 				osRelease(uintptr(vmCfg))
 				errCh <- fmt.Errorf("enable nested virtualization: EL2 is not available in this Hypervisor.framework")
@@ -406,6 +406,7 @@ func NewVMWithOptions(ctx context.Context, opts VMOptions) (*VM, error) {
 				errCh <- fmt.Errorf("enable nested virtualization: %w", ret)
 				return
 			}
+			timing.Since(ctx, "hvf.new_vm.vm_config_set_el2", start)
 		}
 		start = time.Now()
 		ret := createVMWithRetry(vmCfg)

@@ -9,6 +9,7 @@ import (
 
 type ServerHello struct {
 	Addr      string `json:"addr,omitempty"`
+	Scheme    string `json:"scheme,omitempty"`
 	Kind      string `json:"kind,omitempty"`
 	TokenPath string `json:"token_path,omitempty"`
 	Error     string `json:"error,omitempty"`
@@ -307,14 +308,16 @@ type NetworkConfig struct {
 	HostDNSName              string        `json:"host_dns_name,omitempty"`
 	AllowedServiceProxyPorts []int         `json:"allowed_service_proxy_ports,omitempty"`
 	PortForwards             []PortForward `json:"port_forwards,omitempty"`
+	MaxForwardConnections    int           `json:"max_forward_connections,omitempty"`
 }
 
 type PortForward struct {
-	Protocol  string `json:"protocol,omitempty"`
-	HostAddr  string `json:"host_addr,omitempty"`
-	HostPort  int    `json:"host_port,omitempty"`
-	GuestAddr string `json:"guest_addr,omitempty"`
-	GuestPort int    `json:"guest_port,omitempty"`
+	Protocol       string `json:"protocol,omitempty"`
+	HostAddr       string `json:"host_addr,omitempty"`
+	HostPort       int    `json:"host_port,omitempty"`
+	GuestAddr      string `json:"guest_addr,omitempty"`
+	GuestPort      int    `json:"guest_port,omitempty"`
+	MaxConnections int    `json:"max_connections,omitempty"`
 }
 
 type ServiceProxyPortRequest struct {
@@ -340,6 +343,10 @@ type CapabilitiesResponse struct {
 	SupportsNestedVirt     bool     `json:"supports_nested_virtualization"`
 	RequiresPrivilegedCCX3 bool     `json:"requires_privileged_ccx3"`
 	Notes                  []string `json:"notes,omitempty"`
+	MemoryCapacityMB       uint64   `json:"memory_capacity_mb,omitempty"`
+	MemoryReservedMB       uint64   `json:"memory_reserved_mb,omitempty"`
+	CPUCapacity            int      `json:"cpu_capacity,omitempty"`
+	CPUReserved            int      `json:"cpu_reserved,omitempty"`
 }
 
 type CreateInstanceRequest struct {
@@ -391,6 +398,8 @@ type InstanceState struct {
 	StartedAt   string `json:"started_at,omitempty"`
 	NetworkIPv4 string `json:"network_ipv4,omitempty"`
 	Error       string `json:"error,omitempty"`
+	ExitedAt    string `json:"exited_at,omitempty"`
+	ExitReason  string `json:"exit_reason,omitempty"`
 }
 
 type ConsoleHistoryResponse struct {
@@ -444,23 +453,35 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
-	Kind        string   `json:"kind,omitempty"`
-	ID          string   `json:"id,omitempty"`
-	Image       string   `json:"image,omitempty"`
-	Command     []string `json:"command"`
-	Env         []string `json:"env,omitempty"`
-	RootDir     string   `json:"root_dir,omitempty"`
-	Path        string   `json:"path,omitempty"`
-	Directory   bool     `json:"directory,omitempty"`
-	ReplaceEnv  bool     `json:"replace_env,omitempty"`
-	SkipResolve bool     `json:"skip_resolve,omitempty"`
-	WorkDir     string   `json:"workdir,omitempty"`
-	User        string   `json:"user,omitempty"`
-	Stdin       []byte   `json:"stdin,omitempty"`
-	TTY         bool     `json:"tty,omitempty"`
-	ControlFD   bool     `json:"control_fd,omitempty"`
-	Cols        int      `json:"cols,omitempty"`
-	Rows        int      `json:"rows,omitempty"`
+	Kind          string         `json:"kind,omitempty"`
+	ID            string         `json:"id,omitempty"`
+	Image         string         `json:"image,omitempty"`
+	Command       []string       `json:"command"`
+	Env           []string       `json:"env,omitempty"`
+	RootDir       string         `json:"root_dir,omitempty"`
+	Path          string         `json:"path,omitempty"`
+	Directory     bool           `json:"directory,omitempty"`
+	ReplaceEnv    bool           `json:"replace_env,omitempty"`
+	SkipResolve   bool           `json:"skip_resolve,omitempty"`
+	WorkDir       string         `json:"workdir,omitempty"`
+	User          string         `json:"user,omitempty"`
+	Stdin         []byte         `json:"stdin,omitempty"`
+	TTY           bool           `json:"tty,omitempty"`
+	ControlFD     bool           `json:"control_fd,omitempty"`
+	Cols          int            `json:"cols,omitempty"`
+	Rows          int            `json:"rows,omitempty"`
+	ArchiveLimits *ArchiveLimits `json:"archive_limits,omitempty"`
+}
+
+// ArchiveLimits bounds the expanded work performed by an fs_extract request.
+// Zero fields use limits derived from the destination filesystem's current
+// capacity. TimeoutSeconds is optional because callers are best placed to set
+// a deadline appropriate to the amount of data they are sending.
+type ArchiveLimits struct {
+	MaxEntries       uint64  `json:"max_entries,omitempty"`
+	MaxFileBytes     int64   `json:"max_file_bytes,omitempty"`
+	MaxExpandedBytes int64   `json:"max_expanded_bytes,omitempty"`
+	TimeoutSeconds   float64 `json:"timeout_seconds,omitempty"`
 }
 
 type ExecInput struct {

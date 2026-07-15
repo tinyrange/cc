@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	guestbuildid "j5.nz/cc/internal/guestinit/buildid"
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
@@ -30,15 +32,19 @@ func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) 
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create guest init cache: %w", err)
 	}
-	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch)
-	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
-		return data, nil
-	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return nil, fmt.Errorf("locate guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	identity, err := guestbuildid.Resolve(ctx, moduleRoot, "linux", goarch, "./internal/cmd/init")
+	if err != nil {
+		return nil, fmt.Errorf("identify guest init build: %w", err)
+	}
+	out := filepath.Join(cacheDir, "guest-init-linux-"+goarch+"-"+identity)
+	if data, err := os.ReadFile(out); err == nil && validateGuestInitPayload(goarch, data) == nil {
+		return data, nil
+	}
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./internal/cmd/init")
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot

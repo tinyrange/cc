@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	if err := guestagent.Run(guestagent.Options{Name: "openbsd"}); err != nil {
+	if err := guestagent.Run(guestagent.Options{Name: "openbsd", PTY: guestagent.BSDPTY{}}); err != nil {
 		guestagent.WriteConsole("ccx3-openbsd-init: " + err.Error() + "\n")
 		for {
 			time.Sleep(time.Hour)

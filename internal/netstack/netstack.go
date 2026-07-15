@@ -280,14 +280,17 @@ type NetStack struct {
 	debugAddr     string
 
 	// Simple counters.
-	udpRxPackets atomic.Uint64
-	udpTxPackets atomic.Uint64
-
-	closeOnce sync.Once
+	udpRxPackets     atomic.Uint64
+	udpTxPackets     atomic.Uint64
+	sourceViolations [5]atomic.Uint64
+	closeOnce        sync.Once
 }
 
 // New constructs a NetStack with defaults.
 func New(l *slog.Logger) *NetStack {
+	if l == nil {
+		l = slog.Default()
+	}
 	now := time.Now().UnixNano()
 	stack := &NetStack{
 		log:                 l,
@@ -747,6 +750,12 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 			src.String(), dst.String(), etherType.String(), len(payload), releaseUnsafe)
 	}
 
+	expectedMAC := macFromUint64(macAddr(ns.guestMAC.Load()))
+	if violation := ValidateGuestSource(frame, expectedMAC, net.IP(ns.guestIPv4[:])); violation != SourceValid {
+		ns.recordSourceViolation(violation, src)
+		return nil
+	}
+
 	ns.recordGuestMAC(src)
 
 	// Apply simple L2 filter: accept broadcast, host MAC, and configured guest
@@ -771,6 +780,19 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 	default:
 		tracef("netstack.handleEthernetFrame drop unsupported", "ethertype=%s", etherType.String())
 		return nil
+	}
+}
+
+func (ns *NetStack) recordSourceViolation(violation SourceViolation, sourceMAC net.HardwareAddr) {
+	if violation <= SourceValid || int(violation) >= len(ns.sourceViolations) {
+		return
+	}
+	count := ns.sourceViolations[violation].Add(1)
+	// Log the first violation and powers of two thereafter. Counters preserve
+	// every event while a hostile guest cannot flood logs per packet.
+	if count&(count-1) == 0 {
+		ns.log.Warn("dropping guest frame with invalid source identity",
+			"reason", violation.String(), "source_mac", sourceMAC.String(), "count", count)
 	}
 }
 
@@ -1812,6 +1834,7 @@ type tcpConn struct {
 	readDeadline   time.Time
 	writeDeadline  time.Time
 	closed         bool
+	writeClosed    bool
 
 	// Retransmission support
 	sendBuf     *tcpSendBuffer   // segments awaiting ACK
@@ -2229,11 +2252,14 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		if hdr.flags&tcpFlagFIN != 0 {
 			c.guestSeq++
 			c.state = tcpStateFinWait
+			writeClosed := c.writeClosed
 			c.mu.Unlock()
 			c.enqueueData(nil) // signal EOF to readers
 			// Send ACK immediately for FIN
 			c.sendAckImmediate()
-			c.sendFin()
+			if !writeClosed {
+				c.sendFin()
+			}
 			return nil
 		}
 		c.mu.Unlock()
@@ -2665,7 +2691,7 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 
 		c.mu.Lock()
 		for {
-			if c.closed {
+			if c.closed || c.writeClosed {
 				c.mu.Unlock()
 				return written, net.ErrClosed
 			}
@@ -2923,7 +2949,7 @@ func (c *tcpConn) Close() error {
 		c.mu.Unlock()
 		return nil
 	}
-	needFin := c.state == tcpStateEstablished
+	needFin := c.state == tcpStateEstablished && !c.writeClosed
 	tracef("netstack.tcpConn Close", "needFin=%t", needFin)
 	c.state = tcpStateClosed
 	c.closed = true
@@ -2956,6 +2982,24 @@ func (c *tcpConn) Close() error {
 	c.stack.tcpMu.Lock()
 	delete(c.stack.tcpConns, c.key)
 	c.stack.tcpMu.Unlock()
+	return nil
+}
+
+// CloseWrite sends FIN while leaving the read side available for the peer's
+// response. This is used by bidirectional proxies to preserve TCP half-close.
+func (c *tcpConn) CloseWrite() error {
+	c.mu.Lock()
+	if c.closed || c.writeClosed {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.state != tcpStateEstablished {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.writeClosed = true
+	c.mu.Unlock()
+	c.sendFin()
 	return nil
 }
 
@@ -3782,6 +3826,10 @@ type debugStatus struct {
 	HostMAC                  string   `json:"hostMAC"`
 	ConfiguredMAC            string   `json:"configuredGuestMAC"`
 	ObservedMAC              string   `json:"observedGuestMAC"`
+	SourceMACViolations      uint64   `json:"sourceMACViolations"`
+	SourceARPViolations      uint64   `json:"sourceARPViolations"`
+	SourceIPv4Violations     uint64   `json:"sourceIPv4Violations"`
+	MalformedSourceFrames    uint64   `json:"malformedSourceFrames"`
 }
 
 func (ns *NetStack) collectDebugStatus() debugStatus {
@@ -3821,6 +3869,10 @@ func (ns *NetStack) collectDebugStatus() debugStatus {
 	if mac := macFromUint64(macAddr(ns.observedGuestMAC.Load())); len(mac) == 6 {
 		status.ObservedMAC = mac.String()
 	}
+	status.SourceMACViolations = ns.sourceViolations[SourceMACViolation].Load()
+	status.SourceARPViolations = ns.sourceViolations[SourceARPViolation].Load()
+	status.SourceIPv4Violations = ns.sourceViolations[SourceIPv4Violation].Load()
+	status.MalformedSourceFrames = ns.sourceViolations[SourceMalformed].Load()
 
 	ns.tcpMu.Lock()
 	for port := range ns.tcpListen {

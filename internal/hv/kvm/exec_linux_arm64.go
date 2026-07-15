@@ -4,10 +4,14 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
+
+	"golang.org/x/sys/unix"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/arm64vm"
@@ -187,17 +191,52 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
+	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, serialOut, nil)
+}
+
+func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
+	runtime.LockOSThread()
+	// This loop always runs in a dedicated goroutine. Leave it locked so the
+	// OS thread terminates with the goroutine instead of remaining parked.
+	vm.SetVCPUTID(unix.Gettid())
+	defer vm.SetVCPUTID(0)
+	cancelDone := make(chan struct{})
+	defer close(cancelDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			vm.RequestImmediateExit()
+		case <-cancelDone:
+		}
+	}()
+
 	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := vm.Run(&exit); err != nil {
+		if err := vm.RunInterruptible(&exit); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
 			return fmt.Errorf("run step %d: %w", step, err)
 		}
 		switch exit.Reason {
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, uart, fsdevs, vsock, rng, exit.MMIO); err != nil {
+			handled, err := snapshot.handleMMIO(vm, exit.MMIO)
+			if err != nil {
+				return err
+			}
+			if !handled {
+				err = handleBootMMIO(vm, uart, fsdevs, vsock, rng, exit.MMIO)
+			}
+			if err != nil {
+				return err
+			}
+			if err := snapshot.captureIfPending(vm, fsdevs, vsock, rng); err != nil {
 				return err
 			}
 		case ExitShutdown:

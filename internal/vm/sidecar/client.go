@@ -2,6 +2,7 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -14,42 +15,114 @@ import (
 type Client struct {
 	conn  net.Conn
 	codec *WorkerCodec
+	hello WorkerHello
 
 	idMu sync.Mutex
 	next uint64
 
 	pendingMu sync.Mutex
-	pending   map[uint64]chan workerFrameResult
+	pending   map[uint64]*workerCall
 	closed    bool
 	recvErr   error
 }
 
-type workerFrameResult struct {
-	frame WorkerFrame
-	err   error
+// ErrWorkerCallOverflow reports that a caller stopped consuming frames quickly
+// enough for its bounded delivery queue to fill.
+var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflow")
+
+type workerCall struct {
+	frames chan WorkerFrame
+	done   chan error
 }
 
+type WorkerRequirements struct {
+	SupportsFSRPC bool
+	SupportsL2    bool
+}
+
+type WorkerProtocolVersionError struct {
+	Received  int
+	Supported int
+}
+
+func (e *WorkerProtocolVersionError) Error() string {
+	return fmt.Sprintf("unsupported sidecar worker protocol version %d (supported version: %d)", e.Received, e.Supported)
+}
+
+type MissingWorkerCapabilityError struct {
+	Capability string
+}
+
+func (e *MissingWorkerCapabilityError) Error() string {
+	return fmt.Sprintf("sidecar worker does not support required capability %q", e.Capability)
+}
+
+func newWorkerCall() *workerCall {
+	return &workerCall{
+		frames: make(chan WorkerFrame, 256),
+		done:   make(chan error, 1),
+	}
+}
+
+func (c *workerCall) finish(err error) {
+	select {
+	case c.done <- err:
+	default:
+	}
+}
+
+const (
+	workerConnectTimeout = 5 * time.Second
+	workerRetryDelay     = 10 * time.Millisecond
+	workerHelloTimeout   = 5 * time.Second
+)
+
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
-	var conn net.Conn
-	var err error
-	network, address := workerDialTarget(socketPath)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err = net.Dial(network, address)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+	return dialWorker(ctx, socketPath, nil, WorkerRequirements{})
+}
+
+func DialWorkerWithRequirements(ctx context.Context, socketPath string, requirements WorkerRequirements) (*Client, error) {
+	return dialWorker(ctx, socketPath, nil, requirements)
+}
+
+func DialWorkerTLS(ctx context.Context, endpoint, configPath string) (*Client, error) {
+	return DialWorkerTLSWithRequirements(ctx, endpoint, configPath, WorkerRequirements{})
+}
+
+func DialWorkerTLSWithRequirements(ctx context.Context, endpoint, configPath string, requirements WorkerRequirements) (*Client, error) {
+	security, err := LoadWorkerClientSecurity(configPath)
+	if err != nil {
+		return nil, err
+	}
+	return dialWorker(ctx, endpoint, security, requirements)
+}
+
+func dialWorker(ctx context.Context, socketPath string, security *WorkerTransportSecurity, requirements WorkerRequirements) (*Client, error) {
+	target, err := workerDialTarget(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if target.secure && security == nil {
+		return nil, &WorkerSecurityError{Endpoint: socketPath, Reason: WorkerSecurityTLSConfigRequired}
+	}
+	if !target.secure && security != nil {
+		return nil, &WorkerSecurityError{Endpoint: socketPath, Reason: WorkerSecurityInvalidTLSConfig, Detail: "TLS configuration was provided for a Unix socket"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dialWorkerTargetConnection(ctx, target, workerConnectTimeout, (&net.Dialer{}).DialContext)
+	if err != nil {
+		return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
+	}
+	if target.secure {
+		conn, err = handshakeWorkerClient(ctx, conn, socketPath, security)
+		if err != nil {
+			return nil, err
 		}
 	}
-	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]chan workerFrameResult{}}
-	frame, err := worker.codec.Receive()
+	worker := &Client{conn: conn, codec: NewWorkerCodec(conn), pending: map[uint64]*workerCall{}}
+	frame, err := receiveWorkerHello(ctx, conn, worker.codec, workerHelloTimeout)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read sidecar worker hello: %w", err)
@@ -58,15 +131,131 @@ func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
 	}
+	var hello WorkerHello
+	if err := frame.DecodePayload(&hello); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("decode sidecar worker hello: %w", err)
+	}
+	if err := validateWorkerHello(hello, requirements); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if target.secure && hello.WorkerID != security.Scope {
+		_ = conn.Close()
+		return nil, &WorkerSecurityError{
+			Endpoint: socketPath,
+			Reason:   WorkerSecurityPeerScopeMismatch,
+			Detail:   "worker hello identity does not match the authenticated certificate scope",
+		}
+	}
+	worker.hello = hello
 	go worker.receiveLoop()
 	return worker, nil
 }
 
-func workerDialTarget(address string) (string, string) {
-	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://")
+func validateWorkerHello(hello WorkerHello, requirements WorkerRequirements) error {
+	if hello.Version != WorkerProtocolVersion {
+		return &WorkerProtocolVersionError{Received: hello.Version, Supported: WorkerProtocolVersion}
 	}
-	return "unix", address
+	if requirements.SupportsFSRPC && !hello.Capabilities.SupportsFSRPC {
+		return &MissingWorkerCapabilityError{Capability: "filesystem-rpc"}
+	}
+	if requirements.SupportsL2 && !hello.Capabilities.SupportsL2 {
+		return &MissingWorkerCapabilityError{Capability: "l2-networking"}
+	}
+	return nil
+}
+
+func receiveWorkerHello(ctx context.Context, conn net.Conn, codec *WorkerCodec, timeout time.Duration) (WorkerFrame, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return WorkerFrame{}, err
+	}
+
+	cancelWatchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-cancelWatchDone:
+		}
+	}()
+	frame, err := codec.Receive()
+	close(cancelWatchDone)
+	if clearErr := conn.SetReadDeadline(time.Time{}); err == nil && clearErr != nil {
+		err = clearErr
+	}
+	if ctx.Err() != nil {
+		return WorkerFrame{}, ctx.Err()
+	}
+	return frame, err
+}
+
+type workerDialEndpoint struct {
+	network string
+	address string
+	secure  bool
+}
+
+type workerDialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func dialWorkerConnection(ctx context.Context, socketPath string, timeout time.Duration, dial workerDialContextFunc) (net.Conn, error) {
+	target, err := workerDialTarget(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	return dialWorkerTargetConnection(ctx, target, timeout, dial)
+}
+
+func dialWorkerTargetConnection(ctx context.Context, target workerDialEndpoint, timeout time.Duration, dial workerDialContextFunc) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	retry := time.NewTimer(workerRetryDelay)
+	if !retry.Stop() {
+		<-retry.C
+	}
+	defer retry.Stop()
+	for {
+		conn, err := dial(connectCtx, target.network, target.address)
+		if err == nil {
+			return conn, nil
+		}
+		if connectCtx.Err() != nil {
+			return nil, connectCtx.Err()
+		}
+		retry.Reset(workerRetryDelay)
+		select {
+		case <-connectCtx.Done():
+			return nil, connectCtx.Err()
+		case <-retry.C:
+		}
+	}
+}
+
+func workerDialTarget(address string) (workerDialEndpoint, error) {
+	if strings.HasPrefix(address, "tcp://") {
+		return workerDialEndpoint{}, &WorkerSecurityError{
+			Endpoint: address,
+			Reason:   WorkerSecurityPlaintextTCPRejected,
+		}
+	}
+	if strings.HasPrefix(address, WorkerTLSScheme) {
+		target := strings.TrimPrefix(address, WorkerTLSScheme)
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return workerDialEndpoint{}, fmt.Errorf("parse worker TLS endpoint: %w", err)
+		}
+		return workerDialEndpoint{network: "tcp", address: target, secure: true}, nil
+	}
+	return workerDialEndpoint{network: "unix", address: address}, nil
 }
 
 func (c *Client) Close() error {
@@ -74,6 +263,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	return c.conn.Close()
+}
+
+func (c *Client) Hello() WorkerHello {
+	if c == nil {
+		return WorkerHello{}
+	}
+	return c.hello
 }
 
 func (c *Client) receiveLoop() {
@@ -84,16 +280,24 @@ func (c *Client) receiveLoop() {
 			return
 		}
 		c.pendingMu.Lock()
-		ch := c.pending[frame.ID]
+		call := c.pending[frame.ID]
 		c.pendingMu.Unlock()
-		if ch == nil {
+		if call == nil {
 			continue
 		}
-		ch <- workerFrameResult{frame: frame}
+		select {
+		case call.frames <- frame:
+		default:
+			err := fmt.Errorf("%w for request %d", ErrWorkerCallOverflow, frame.ID)
+			if c.failCall(frame.ID, call, err) {
+				id := frame.ID
+				go func() { _ = c.sendCancel(id) }()
+			}
+		}
 	}
 }
 
-func (c *Client) registerCall(id uint64) (chan workerFrameResult, error) {
+func (c *Client) registerCall(id uint64) (*workerCall, error) {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	if c.closed {
@@ -102,15 +306,27 @@ func (c *Client) registerCall(id uint64) (chan workerFrameResult, error) {
 		}
 		return nil, fmt.Errorf("sidecar worker is closed")
 	}
-	ch := make(chan workerFrameResult, 256)
-	c.pending[id] = ch
-	return ch, nil
+	call := newWorkerCall()
+	c.pending[id] = call
+	return call, nil
 }
 
 func (c *Client) unregisterCall(id uint64) {
 	c.pendingMu.Lock()
 	delete(c.pending, id)
 	c.pendingMu.Unlock()
+}
+
+func (c *Client) failCall(id uint64, call *workerCall, err error) bool {
+	c.pendingMu.Lock()
+	if c.pending[id] != call {
+		c.pendingMu.Unlock()
+		return false
+	}
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+	call.finish(err)
+	return true
 }
 
 func (c *Client) closePending(err error) {
@@ -125,11 +341,10 @@ func (c *Client) closePending(err error) {
 	c.closed = true
 	c.recvErr = err
 	pending := c.pending
-	c.pending = map[uint64]chan workerFrameResult{}
+	c.pending = map[uint64]*workerCall{}
 	c.pendingMu.Unlock()
-	for _, ch := range pending {
-		ch <- workerFrameResult{err: err}
-		close(ch)
+	for _, call := range pending {
+		call.finish(err)
 	}
 }
 
@@ -226,7 +441,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 		ctx = context.Background()
 	}
 	requestID := c.nextID()
-	frames, err := c.registerCall(requestID)
+	call, err := c.registerCall(requestID)
 	if err != nil {
 		return err
 	}
@@ -262,11 +477,10 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	defer close(cancelDone)
 
 	for {
-		result, err := c.nextFrame(ctx, frames)
+		got, err := c.nextFrame(ctx, call)
 		if err != nil {
 			return err
 		}
-		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -300,8 +514,11 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	id := c.nextID()
-	frames, err := c.registerCall(id)
+	call, err := c.registerCall(id)
 	if err != nil {
 		return err
 	}
@@ -326,11 +543,10 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 		return err
 	}
 	for {
-		result, err := c.nextFrame(ctx, frames)
+		got, err := c.nextFrame(ctx, call)
 		if err != nil {
 			return err
 		}
-		got := result.frame
 		switch got.Type {
 		case WorkerFrameError:
 			var workerErr WorkerError
@@ -353,24 +569,25 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	}
 }
 
-func (c *Client) nextFrame(ctx context.Context, frames <-chan workerFrameResult) (workerFrameResult, error) {
+func (c *Client) nextFrame(ctx context.Context, call *workerCall) (WorkerFrame, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	select {
+	case err := <-call.done:
+		return WorkerFrame{}, err
+	default:
+	}
+	select {
 	case <-ctx.Done():
-		return workerFrameResult{}, ctx.Err()
-	case result, ok := <-frames:
-		if !ok {
-			return workerFrameResult{}, fmt.Errorf("sidecar worker is closed")
+		return WorkerFrame{}, ctx.Err()
+	case err := <-call.done:
+		if ctx.Err() != nil {
+			return WorkerFrame{}, ctx.Err()
 		}
-		if result.err != nil {
-			if ctx.Err() != nil {
-				return workerFrameResult{}, ctx.Err()
-			}
-			return workerFrameResult{}, result.err
-		}
-		return result, nil
+		return WorkerFrame{}, err
+	case frame := <-call.frames:
+		return frame, nil
 	}
 }
 

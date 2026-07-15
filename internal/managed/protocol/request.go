@@ -1,5 +1,7 @@
 package protocol
 
+import "j5.nz/cc/client"
+
 const (
 	ReadyMarker         = "__CCX3_READY__"
 	BeginMarkerPrefix   = "__CCX3_BEGIN__:"
@@ -12,21 +14,22 @@ const (
 )
 
 type ManagedExecRequest struct {
-	ID          string   `json:"id"`
-	Command     []string `json:"command"`
-	Env         []string `json:"env,omitempty"`
-	RootDir     string   `json:"root_dir,omitempty"`
-	Path        string   `json:"path,omitempty"`
-	Directory   bool     `json:"directory,omitempty"`
-	ReplaceEnv  bool     `json:"replace_env,omitempty"`
-	SkipResolve bool     `json:"skip_resolve,omitempty"`
-	WorkDir     string   `json:"workdir,omitempty"`
-	User        string   `json:"user,omitempty"`
-	Stdin       []byte   `json:"stdin,omitempty"`
-	TTY         bool     `json:"tty,omitempty"`
-	ControlFD   bool     `json:"control_fd,omitempty"`
-	Kind        string   `json:"kind,omitempty"`
-	Signal      string   `json:"signal,omitempty"`
-	Cols        int      `json:"cols,omitempty"`
-	Rows        int      `json:"rows,omitempty"`
+	ID            string                `json:"id"`
+	Command       []string              `json:"command"`
+	Env           []string              `json:"env,omitempty"`
+	RootDir       string                `json:"root_dir,omitempty"`
+	Path          string                `json:"path,omitempty"`
+	Directory     bool                  `json:"directory,omitempty"`
+	ReplaceEnv    bool                  `json:"replace_env,omitempty"`
+	SkipResolve   bool                  `json:"skip_resolve,omitempty"`
+	WorkDir       string                `json:"workdir,omitempty"`
+	User          string                `json:"user,omitempty"`
+	Stdin         []byte                `json:"stdin,omitempty"`
+	TTY           bool                  `json:"tty,omitempty"`
+	ControlFD     bool                  `json:"control_fd,omitempty"`
+	Kind          string                `json:"kind,omitempty"`
+	Signal        string                `json:"signal,omitempty"`
+	Cols          int                   `json:"cols,omitempty"`
+	Rows          int                   `json:"rows,omitempty"`
+	ArchiveLimits *client.ArchiveLimits `json:"archive_limits,omitempty"`
 }

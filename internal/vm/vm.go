@@ -20,6 +20,9 @@ import (
 )
 
 const DefaultInstanceID = "default"
+const maxExitTombstones = 64
+
+var ErrManagerClosing = errors.New("VM manager is shutting down")
 
 type Backend = vmhost.Backend
 
@@ -65,26 +68,47 @@ type Manager struct {
 	supports      func() error
 	capabilities  func() client.CapabilitiesResponse
 	running       map[string]*Machine
-	starting      map[string]struct{}
+	starting      map[string]*managerStart
 	networkLeases map[string]managerNetworkLease
+	exited        map[string]client.InstanceState
+	reservations  map[string]resourceReservation
+	maxMemoryMB   uint64
+	maxCPUs       int
+	closing       bool
+}
+
+type resourceReservation struct {
+	memoryMB uint64
+	cpus     int
+}
+
+type managerStart struct {
+	cancel     context.CancelFunc
+	done       chan struct{}
+	cleanupErr error
 }
 
 type Machine struct {
-	id           string
-	image        string
-	initSystem   string
-	kernel       string
-	memoryMB     uint64
-	balloonMB    uint64
-	cpus         int
-	nestedVirt   bool
-	startedAt    time.Time
-	instance     Instance
-	lastErr      error
-	exitedAt     time.Time
-	shutdownCh   chan struct{}
-	shutdownOnce sync.Once
-	stopping     bool
+	id         string
+	image      string
+	initSystem string
+	kernel     string
+	memoryMB   uint64
+	balloonMB  uint64
+	cpus       int
+	nestedVirt bool
+	startedAt  time.Time
+	instance   Instance
+	lastErr    error
+	exitedAt   time.Time
+	stopping   bool
+	stop       *machineStopOperation
+}
+
+type machineStopOperation struct {
+	done      chan struct{}
+	err       error
+	observers int
 }
 
 type managerNetworkLease struct {
@@ -97,10 +121,8 @@ func NewManager() *Manager {
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
-	m := &Manager{supports: Supports, capabilities: HostCapabilities}
-	m.host = vmhost.NewInProcess(backend, func() client.CapabilitiesResponse {
-		return m.Capabilities()
-	})
+	m := newManagerBudgets(&Manager{supports: Supports, capabilities: HostCapabilities})
+	m.host = vmhost.NewInProcess(backend, HostCapabilities)
 	return m
 }
 
@@ -108,7 +130,13 @@ func NewManagerWithHost(host VMHost) *Manager {
 	if host == nil {
 		host = vmhost.NewInProcess(vmhost.UnsupportedBackend{}, HostCapabilities)
 	}
-	return &Manager{host: host, supports: Supports, capabilities: HostCapabilities}
+	return newManagerBudgets(&Manager{host: host, supports: Supports, capabilities: HostCapabilities})
+}
+
+func newManagerBudgets(m *Manager) *Manager {
+	m.maxMemoryMB = hostMemoryMB()
+	m.maxCPUs = runtime.NumCPU()
+	return m
 }
 
 func NewManagerWithHosts(hosts ...VMHost) *Manager {
@@ -205,39 +233,53 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if req.Image == "" {
 		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
+	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
+		return client.InstanceState{}, err
+	}
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
+	maxVMs := m.host.HostCapabilities(ctx).MaxVMs
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return client.InstanceState{}, ErrManagerClosing
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	if m.starting == nil {
-		m.starting = make(map[string]struct{})
+		m.starting = make(map[string]*managerStart)
 	}
 	if m.running[id] != nil {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already running", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already running", id)
 	}
 	if _, ok := m.starting[id]; ok {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already starting", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(maxVMs, req.MemoryMB, req.CPUs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
-	m.starting[id] = struct{}{}
+	delete(m.exited, id)
+	if m.reservations == nil {
+		m.reservations = make(map[string]resourceReservation)
+	}
+	m.reservations[id] = resourceReservation{memoryMB: req.MemoryMB, cpus: req.CPUs}
+	startCtx, cancelStart := context.WithCancel(ctx)
+	start := &managerStart{cancel: cancelStart, done: make(chan struct{})}
+	m.starting[id] = start
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
-	inst, err := m.host.StartStream(ctx, req, onEvent)
+	inst, err := m.host.StartStream(startCtx, req, onEvent)
 	if err != nil {
-		m.clearStarting(id)
-		m.releaseNetworkLease(id)
+		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
 
@@ -252,16 +294,30 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
-		shutdownCh: make(chan struct{}),
 	}
 
 	m.mu.Lock()
+	if m.closing || m.starting[id] != start {
+		if m.starting[id] == start {
+			delete(m.starting, id)
+		}
+		delete(m.reservations, id)
+		delete(m.networkLeases, id)
+		m.mu.Unlock()
+		cancelStart()
+		start.cleanupErr = inst.Close()
+		close(start.done)
+		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
+	delete(m.reservations, id)
 	m.running[id] = machine
 	m.mu.Unlock()
+	cancelStart()
+	close(start.done)
 
 	go m.watch(machine)
 
@@ -289,53 +345,67 @@ func (m *Manager) StartBlankInstanceStream(
 ) (client.InstanceState, error) {
 	id = instanceID(id)
 	req.ID = id
+	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
+		return client.InstanceState{}, err
+	}
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
+	maxVMs := m.host.HostCapabilities(ctx).MaxVMs
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return client.InstanceState{}, ErrManagerClosing
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	if m.starting == nil {
-		m.starting = make(map[string]struct{})
+		m.starting = make(map[string]*managerStart)
 	}
 	if m.running[id] != nil {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already running", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already running", id)
 	}
 	if _, ok := m.starting[id]; ok {
-		state := m.statusLocked(id)
+		snapshot := m.statusSnapshotLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("VM %q is already starting", id)
+		return m.resolveStatusSnapshot(snapshot), fmt.Errorf("VM %q is already starting", id)
 	}
-	if err := m.checkCapacityLocked(); err != nil {
+	if err := m.checkCapacityLocked(maxVMs, req.MemoryMB, req.CPUs); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
-	m.starting[id] = struct{}{}
+	delete(m.exited, id)
+	if m.reservations == nil {
+		m.reservations = make(map[string]resourceReservation)
+	}
+	m.reservations[id] = resourceReservation{memoryMB: req.MemoryMB, cpus: req.CPUs}
+	startCtx, cancelStart := context.WithCancel(ctx)
+	start := &managerStart{cancel: cancelStart, done: make(chan struct{})}
+	m.starting[id] = start
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
 	shares := append([]client.ShareMount(nil), req.Shares...)
 	snapshotStartup := strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != ""
-	if !snapshotStartup {
+	startupShares := builtin.IsGuestImage(req.Image) || snapshotStartup
+	if !startupShares {
 		req.Shares = nil
 	}
-	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
+	inst, err := m.host.StartBlankStream(startCtx, req, onEvent)
 	if err != nil {
-		m.clearStarting(id)
-		m.releaseNetworkLease(id)
+		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
-	if !snapshotStartup {
+	if !startupShares {
 		for _, share := range shares {
-			if err := inst.AddShare(ctx, share); err != nil {
-				_ = inst.Close()
-				m.clearStarting(id)
-				m.releaseNetworkLease(id)
-				return client.InstanceState{}, err
+			if err := inst.AddShare(startCtx, share); err != nil {
+				start.cleanupErr = inst.Close()
+				m.finishStart(id, start)
+				return client.InstanceState{}, errors.Join(err, start.cleanupErr)
 			}
 		}
 	}
@@ -351,16 +421,30 @@ func (m *Manager) StartBlankInstanceStream(
 		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
-		shutdownCh: make(chan struct{}),
 	}
 
 	m.mu.Lock()
+	if m.closing || m.starting[id] != start {
+		if m.starting[id] == start {
+			delete(m.starting, id)
+		}
+		delete(m.reservations, id)
+		delete(m.networkLeases, id)
+		m.mu.Unlock()
+		cancelStart()
+		start.cleanupErr = inst.Close()
+		close(start.done)
+		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
+	}
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
 	delete(m.starting, id)
+	delete(m.reservations, id)
 	m.running[id] = machine
 	m.mu.Unlock()
+	cancelStart()
+	close(start.done)
 
 	go m.watch(machine)
 
@@ -372,20 +456,73 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 func (m *Manager) ShutdownAll(ctx context.Context) error {
-	_ = ctx
 	m.mu.Lock()
-	running := m.running
-	m.running = nil
-	m.starting = nil
-	m.mu.Unlock()
-
+	m.closing = true
+	results := make(chan managerShutdownResult, len(m.running))
+	pending := 0
+	pendingStops := make(map[string]*machineStopOperation, len(m.running))
 	var errs []error
-	for id, machine := range running {
-		machine.shutdownOnce.Do(func() {
-			close(machine.shutdownCh)
-		})
-		if err := machine.instance.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, err))
+	for id, machine := range m.running {
+		stop := m.beginMachineStopLocked(machine)
+		pendingStops[id] = stop
+		pending++
+		go func() {
+			results <- managerShutdownResult{id: id, err: waitMachineStop(context.Background(), stop)}
+		}()
+	}
+	starts := make([]*managerStart, 0, len(m.starting))
+	for _, start := range m.starting {
+		starts = append(starts, start)
+	}
+	m.mu.Unlock()
+	for _, start := range starts {
+		start.cancel()
+	}
+
+	for pending > 0 {
+		if ctx == nil {
+			result := <-results
+			pending--
+			delete(pendingStops, result.id)
+			if result.err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+			}
+			continue
+		}
+		select {
+		case result := <-results:
+			pending--
+			delete(pendingStops, result.id)
+			if result.err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VM %q: %w", result.id, result.err))
+			}
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
+			for id, stop := range pendingStops {
+				select {
+				case <-stop.done:
+					if stop.err != nil {
+						errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, stop.err))
+					}
+				default:
+				}
+			}
+			return errors.Join(errs...)
+		}
+	}
+	for _, start := range starts {
+		if ctx == nil {
+			<-start.done
+		} else {
+			select {
+			case <-start.done:
+			case <-ctx.Done():
+				errs = append(errs, ctx.Err())
+				return errors.Join(errs...)
+			}
+		}
+		if start.cleanupErr != nil {
+			errs = append(errs, fmt.Errorf("clean up canceled VM start: %w", start.cleanupErr))
 		}
 	}
 	if len(errs) > 0 {
@@ -394,8 +531,17 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 	return nil
 }
 
+type managerShutdownResult struct {
+	id  string
+	err error
+}
+
 func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
-	_ = ctx
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	id = instanceID(id)
 
 	m.mu.Lock()
@@ -404,27 +550,64 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("no VM %q is running", id)
 	}
-	if machine.stopping {
-		m.mu.Unlock()
-		return fmt.Errorf("VM %q is already shutting down", id)
+	stop := m.beginMachineStopLocked(machine)
+	m.mu.Unlock()
+	return waitMachineStop(ctx, stop)
+}
+
+func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation {
+	if machine.stop != nil {
+		select {
+		case <-machine.stop.done:
+			if machine.stop.err == nil {
+				machine.stop.observers++
+				return machine.stop
+			}
+		default:
+			machine.stop.observers++
+			return machine.stop
+		}
 	}
+	stop := &machineStopOperation{done: make(chan struct{}), observers: 1}
+	machine.stop = stop
 	machine.stopping = true
-	machine.shutdownOnce.Do(func() {
-		close(machine.shutdownCh)
-	})
-	m.mu.Unlock()
+	go m.runMachineStop(machine, stop)
+	return stop
+}
 
-	if err := machine.instance.Close(); err != nil {
-		return err
-	}
-
+func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
+	err := machine.instance.Close()
 	m.mu.Lock()
-	if m.running != nil && m.running[id] == machine {
-		delete(m.running, id)
+	stop.err = err
+	if err == nil {
+		if m.running != nil && m.running[machine.id] == machine {
+			delete(m.running, machine.id)
+		}
+		delete(m.networkLeases, machine.id)
+		m.recordExitLocked(machine, nil)
+	} else if machine.stop == stop {
+		machine.stopping = false
 	}
-	delete(m.networkLeases, id)
+	close(stop.done)
 	m.mu.Unlock()
-	return nil
+}
+
+func waitMachineStop(ctx context.Context, stop *machineStopOperation) error {
+	if ctx == nil {
+		<-stop.done
+		return stop.err
+	}
+	select {
+	case <-stop.done:
+		return stop.err
+	default:
+	}
+	select {
+	case <-stop.done:
+		return stop.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -529,11 +712,6 @@ func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecReques
 func (m *Manager) instanceIsStopping(id string, machine *Machine) bool {
 	if machine == nil {
 		return false
-	}
-	select {
-	case <-machine.shutdownCh:
-		return true
-	default:
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -655,18 +833,20 @@ func (m *Manager) Status() client.InstanceState {
 func (m *Manager) StatusOf(id string) client.InstanceState {
 	id = instanceID(id)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.statusLocked(id)
+	snapshot := m.statusSnapshotLocked(id)
+	m.mu.Unlock()
+	return m.resolveStatusSnapshot(snapshot)
 }
 
 func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
 	id = instanceID(id)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.running == nil || m.running[id] == nil || m.running[id].instance == nil {
+		m.mu.Unlock()
 		return nil
 	}
 	provider, ok := m.running[id].instance.(virtioFSStatsProvider)
+	m.mu.Unlock()
 	if !ok {
 		return nil
 	}
@@ -675,38 +855,79 @@ func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
 
 func (m *Manager) Statuses() []client.InstanceState {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.running) == 0 {
+	if len(m.running) == 0 && len(m.starting) == 0 && len(m.exited) == 0 {
+		m.mu.Unlock()
 		return nil
 	}
-	ids := make([]string, 0, len(m.running))
+	ids := make([]string, 0, len(m.running)+len(m.starting)+len(m.exited))
 	for id := range m.running {
 		ids = append(ids, id)
 	}
+	for id := range m.starting {
+		if m.running[id] == nil {
+			ids = append(ids, id)
+		}
+	}
+	for id := range m.exited {
+		if m.running[id] == nil {
+			if _, starting := m.starting[id]; !starting {
+				ids = append(ids, id)
+			}
+		}
+	}
 	sort.Strings(ids)
-	out := make([]client.InstanceState, 0, len(ids))
+	snapshots := make([]managerStatusSnapshot, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, m.statusLocked(id))
+		snapshots = append(snapshots, m.statusSnapshotLocked(id))
+	}
+	m.mu.Unlock()
+	out := make([]client.InstanceState, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		out = append(out, m.resolveStatusSnapshot(snapshot))
 	}
 	return out
 }
 
 func (m *Manager) Capabilities() client.CapabilitiesResponse {
+	var caps client.CapabilitiesResponse
 	if m.capabilities == nil {
-		return HostCapabilities()
+		caps = HostCapabilities()
+	} else {
+		caps = m.capabilities()
 	}
-	return m.capabilities()
+	m.mu.Lock()
+	memory, cpus := m.resourceUsageLocked()
+	m.mu.Unlock()
+	if m.maxCPUs > 0 && (caps.MaxInstances <= 0 || caps.MaxInstances > m.maxCPUs) {
+		caps.MaxInstances = m.maxCPUs
+	}
+	caps.MemoryCapacityMB, caps.MemoryReservedMB = m.maxMemoryMB, memory
+	caps.CPUCapacity, caps.CPUReserved = m.maxCPUs, cpus
+	return caps
 }
 
-func (m *Manager) statusLocked(id string) client.InstanceState {
+type managerStatusSnapshot struct {
+	id       string
+	machine  *Machine
+	state    client.InstanceState
+	provider networkIPv4Provider
+}
+
+func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	id = instanceID(id)
 	if m.running == nil || m.running[id] == nil {
+		if m.closing {
+			return managerStatusSnapshot{id: id, state: client.InstanceState{ID: id, Status: "stopped"}}
+		}
 		if m.starting != nil {
 			if _, ok := m.starting[id]; ok {
-				return client.InstanceState{ID: id, Status: "starting"}
+				return managerStatusSnapshot{id: id, state: client.InstanceState{ID: id, Status: "starting"}}
 			}
 		}
-		return client.InstanceState{ID: id, Status: "stopped"}
+		if state, ok := m.exited[id]; ok {
+			return managerStatusSnapshot{id: id, state: state}
+		}
+		return managerStatusSnapshot{id: id, state: client.InstanceState{ID: id, Status: "stopped"}}
 	}
 	machine := m.running[id]
 	state := client.InstanceState{
@@ -719,12 +940,27 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		BalloonMB:  machine.balloonMB,
 		CPUs:       machine.cpus,
 		NestedVirt: machine.nestedVirt,
-		StartedAt:  machine.startedAt.Format(time.RFC3339),
+		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
 	}
+	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
-		state.NetworkIPv4 = provider.NetworkIPv4()
+		snapshot.provider = provider
 	}
-	return state
+	return snapshot
+}
+
+func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
+	if snapshot.provider == nil {
+		return snapshot.state
+	}
+	ipv4 := snapshot.provider.NetworkIPv4()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running == nil || m.running[snapshot.id] != snapshot.machine {
+		return m.statusSnapshotLocked(snapshot.id).state
+	}
+	snapshot.state.NetworkIPv4 = ipv4
+	return snapshot.state
 }
 
 func (m *Manager) watch(machine *Machine) {
@@ -733,26 +969,106 @@ func (m *Manager) watch(machine *Machine) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// An explicit stop owns exit publication. Close implementations commonly
+	// cancel their run context, so Wait may report context.Canceled even though
+	// the requested shutdown completed successfully. A failed Close keeps the
+	// machine registered so cleanup can be retried.
+	if machine.stopping || machine.stop != nil && machine.stop.err != nil {
+		return
+	}
 	if m.running != nil && m.running[machine.id] == machine {
 		delete(m.running, machine.id)
 	}
 	delete(m.networkLeases, machine.id)
-	machine.lastErr = err
-	machine.exitedAt = time.Now().UTC()
+	m.recordExitLocked(machine, err)
 }
 
-func (m *Manager) checkCapacityLocked() error {
-	caps := m.host.HostCapabilities(context.Background())
-	if caps.MaxVMs > 0 && len(m.running)+len(m.starting) >= caps.MaxVMs {
-		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxVMs)
+func (m *Manager) recordExitLocked(machine *Machine, err error) {
+	machine.lastErr = err
+	machine.exitedAt = time.Now().UTC()
+	if m.exited == nil {
+		m.exited = make(map[string]client.InstanceState)
+	}
+	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
+	if err != nil {
+		state.Status = "crashed"
+		state.Error = err.Error()
+		state.ExitReason = err.Error()
+	} else {
+		state.ExitReason = "clean shutdown"
+	}
+	m.exited[machine.id] = state
+	for len(m.exited) > maxExitTombstones {
+		var oldestID string
+		var oldest time.Time
+		for id, candidate := range m.exited {
+			at, _ := time.Parse(time.RFC3339, candidate.ExitedAt)
+			if oldestID == "" || at.Before(oldest) {
+				oldestID, oldest = id, at
+			}
+		}
+		delete(m.exited, oldestID)
+	}
+}
+
+func (m *Manager) checkCapacityLocked(maxVMs int, memoryMB uint64, cpus int) error {
+	if maxVMs > 0 && len(m.running)+len(m.starting) >= maxVMs {
+		return fmt.Errorf("maximum running VM instances reached: %d", maxVMs)
+	}
+	usedMemory, usedCPUs := m.resourceUsageLocked()
+	if m.maxMemoryMB > 0 && (memoryMB > m.maxMemoryMB || usedMemory > m.maxMemoryMB-memoryMB) {
+		return fmt.Errorf("VM memory admission rejected: requested=%d MiB reserved=%d MiB capacity=%d MiB", memoryMB, usedMemory, m.maxMemoryMB)
+	}
+	if m.maxCPUs > 0 && (cpus > m.maxCPUs || usedCPUs > m.maxCPUs-cpus) {
+		return fmt.Errorf("VM CPU admission rejected: requested=%d reserved=%d capacity=%d", cpus, usedCPUs, m.maxCPUs)
 	}
 	return nil
 }
 
-func (m *Manager) clearStarting(id string) {
+func (m *Manager) resourceUsageLocked() (uint64, int) {
+	var memory uint64
+	var cpus int
+	for _, machine := range m.running {
+		memory += machine.memoryMB
+		cpus += machine.cpus
+	}
+	for _, reservation := range m.reservations {
+		memory += reservation.memoryMB
+		cpus += reservation.cpus
+	}
+	return memory, cpus
+}
+
+func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {
+	if *memoryMB == 0 {
+		*memoryMB = 512
+	}
+	if *cpus == 0 {
+		*cpus = 1
+	}
+	if *cpus < 0 {
+		return fmt.Errorf("cpus must be positive")
+	}
+	maxAllocationMB := uint64(^uint(0)>>1) >> 20
+	if *memoryMB > maxAllocationMB {
+		return fmt.Errorf("memory_mb %d overflows host allocation size", *memoryMB)
+	}
+	if *balloonMB > *memoryMB {
+		return fmt.Errorf("balloon_mb %d exceeds memory_mb %d", *balloonMB, *memoryMB)
+	}
+	return nil
+}
+
+func (m *Manager) finishStart(id string, start *managerStart) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.starting, id)
+	if m.starting[id] == start {
+		delete(m.starting, id)
+	}
+	delete(m.reservations, id)
+	delete(m.networkLeases, id)
+	m.mu.Unlock()
+	start.cancel()
+	close(start.done)
 }
 
 func (m *Manager) ensureNetworkLeaseLocked(id, image string, cfg *client.NetworkConfig) *client.NetworkConfig {

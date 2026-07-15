@@ -15,6 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  api-contract:
+    name: OpenAPI contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate OpenAPI and route inventory
+        run: go test ./internal/ccvmd -run '^TestOpenAPIContract$' -count=1
+
   go-test:
     name: Go tests (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -50,8 +65,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dosfstools musl-tools
 
+      - name: Run vet
+        if: runner.os != 'Windows'
+        run: go vet ./...
+
+      - name: Run vet (Windows)
+        if: runner.os == 'Windows'
+        # Hyper-V bindings intentionally convert syscall uintptr values at the
+        # audited ABI boundary. Keep every other vet analyzer enabled.
+        run: go vet -unsafeptr=false ./...
+
+      - name: Install Staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+
+      - name: Run correctness static analysis
+        # SA1019 flags archive/tar.TypeRegA compatibility handling; SA6002 is
+        # an allocation advisory. Neither is a correctness failure.
+        run: staticcheck -checks='SA*,-SA1019,-SA6002' ./...
+
       - name: Run tests
         run: go test -short ./... -count=1 -timeout 30m
+
+  race-test:
+    name: Lifecycle and ownership race tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run targeted race tests
+        run: go test -race -short ./internal/ccvmd ./internal/netstack ./internal/virtio ./internal/vm/... -count=1 -timeout 15m
 
   kvm-test:
     name: KVM and rootfs tests (${{ matrix.name }})

@@ -48,6 +48,47 @@ Quick KVM check:
 test -r /dev/kvm -a -w /dev/kvm && echo "KVM is accessible"
 ```
 
+## Remote daemon TLS
+
+The default `ccvm` listener is local-only. Any wildcard, non-loopback IP, or
+hostname other than `localhost` requires mutual TLS and fails before startup
+without it. This applies to health, control, debug, streaming, and WebSocket
+routes; a bearer-token wrapper or firewall rule is not treated as remote
+authentication.
+
+Put the listener configuration in an owner-only JSON file:
+
+```json
+{
+  "certificate_file": "server.crt",
+  "private_key_file": "server.key",
+  "client_ca_file": "clients.pem"
+}
+```
+
+Relative paths are resolved beside the configuration file. On Unix, both the
+configuration and private key must be inaccessible to group and other users.
+Start a remote listener with:
+
+```sh
+ccvm --addr 100.64.0.10:8080 --tls-config /secure/ccvm-tls.json
+```
+
+`ccvm` requires TLS 1.3 and a verified client certificate. Any certificate
+chaining to `client_ca_file` has full daemon API authority, so use a dedicated
+client CA, issue short-lived certificates, and keep its signing key outside the
+daemon host. Tailscale can provide reachability but does not replace this
+application-layer authentication.
+
+The server certificate, private key, and client CA bundle are reloaded for each
+new TLS connection, and TLS session resumption is disabled so new connections
+always reauthenticate. Rotate files with atomic replacement. For CA rotation,
+publish an overlap bundle containing old and new client CAs, rotate clients,
+then remove the old CA. Existing TLS connections keep their authenticated
+state; new connections fail closed if the rotated files are missing or invalid.
+Changing the configured file paths requires a daemon restart. TLS termination
+at a reverse proxy is not accepted by this listener mode.
+
 ## Build
 
 ```sh
@@ -156,6 +197,66 @@ print(nm.run("niimath", "-help"))
 
 See [pyneurodesk/README.md](pyneurodesk/README.md) for Python-specific usage.
 
+## Worker control transport
+
+Sidecar worker control uses an owner-only Unix socket where the platform
+supports it. TCP worker control never permits the old `tcp://` plaintext scheme,
+including on loopback. Use `tls://` with mutually authenticated TLS 1.3 when a
+TCP transport is required. Windows local sidecars create a one-worker ephemeral
+CA and scoped certificates automatically.
+
+A remotely started worker receives a worker-role configuration file:
+
+```json
+{
+  "role": "worker",
+  "certificate_file": "worker.crt",
+  "private_key_file": "worker.key",
+  "peer_ca_file": "coordinator-ca.pem",
+  "scope": "deployment-issued-worker-scope",
+  "handshake_timeout": "20s"
+}
+```
+
+The coordinator uses a separate file and private key:
+
+```json
+{
+  "role": "coordinator",
+  "certificate_file": "coordinator.crt",
+  "private_key_file": "coordinator.key",
+  "peer_ca_file": "worker-ca.pem",
+  "server_name": "worker.tailnet.ts.net",
+  "scope": "deployment-issued-worker-scope",
+  "handshake_timeout": "20s"
+}
+```
+
+Relative paths are resolved beside each owner-only configuration file. Private
+keys must also be owner-only on Unix. Choose `handshake_timeout` from the
+deployment's measured Tailscale latency and authentication path; cc does not
+substitute a universal remote timeout.
+
+Both leaf certificates must carry the matching URI identity
+`urn:cc:worker:<scope>:worker` or
+`urn:cc:worker:<scope>:coordinator`. The role, CA chain, server name, certificate
+lifetime, and scope are all verified before the worker sends its hello frame.
+Tailscale supplies reachability but does not replace these checks.
+
+Start the worker with its existing address setting and the security file:
+
+```sh
+CCX3_WORKER_CONTROL_SOCKET=tls://100.64.0.20:9443 \
+  ccvm -worker -worker-tls-config /secure/worker.json
+```
+
+The server reloads its certificate, key, peer CA, and policy file for each new
+connection. Rotate them with atomic replacement while retaining the same scope;
+changing scope requires a new worker. TLS session resumption is disabled so a
+new connection always reauthenticates. Existing worker connections keep their
+authenticated scope until they close. There is no insecure migration flag or
+plaintext deprecation window before v1.
+
 ## Repository Layout
 
 - `cmd/cc`: user-facing CLI
@@ -164,5 +265,6 @@ See [pyneurodesk/README.md](pyneurodesk/README.md) for Python-specific usage.
 - `internal/vm`: runtime backend orchestration
 - `internal/oci`: OCI, SIMG/SIF, and CVMFS image import
 - `internal/cvmfs`: minimal remote CVMFS catalog and file client
+- `docs/design`: accepted plans for cross-cutting runtime features
 - `pyneurodesk`: Python client and shell integration
 - `PLAN.md`: linux/amd64 support plan and milestone notes

@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -17,11 +18,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -491,6 +494,13 @@ func run() error {
 			if strings.TrimSpace(cfg.InitSystem) != "" {
 				return bootInitSystem(cfg, bootStart)
 			}
+			if len(deferredModules) > 0 {
+				writeStage(bootStart, "loading deferred modules")
+				if err := loadModulePayloads(deferredModules); err != nil {
+					return err
+				}
+				writeStage(bootStart, "deferred modules loaded")
+			}
 			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
 				return fmt.Errorf("trigger snapshot: %w", err)
 			}
@@ -500,13 +510,6 @@ func run() error {
 					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
 				}
 				writeStage(bootStart, "entropy seeded")
-			}
-			if len(deferredModules) > 0 {
-				writeStage(bootStart, "loading deferred modules")
-				if err := loadModulePayloads(deferredModules); err != nil {
-					return err
-				}
-				writeStage(bootStart, "deferred modules loaded")
 			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
@@ -634,7 +637,6 @@ func readStage2Config() ([]byte, error) {
 }
 
 func connectStage2Control(port uint32) (*os.File, error) {
-	var lastErr error
 	start := time.Now()
 	lastLog := start
 	for attempt := 0; ; attempt++ {
@@ -645,7 +647,6 @@ func connectStage2Control(port uint32) (*os.File, error) {
 			}
 			return control, nil
 		}
-		lastErr = err
 		if attempt == 0 {
 			writeKernel("ccx3-init: stage2 waiting for vsock control: " + err.Error())
 			lastLog = time.Now()
@@ -655,7 +656,6 @@ func connectStage2Control(port uint32) (*os.File, error) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil, lastErr
 }
 
 func bootInitSystem(cfg config, bootStart time.Time) error {
@@ -1150,7 +1150,15 @@ func triggerSnapshotMMIO(base uint64) error {
 	if pageOff+8 > len(mapped) {
 		return fmt.Errorf("snapshot mmio offset %#x outside mapped page", pageOff)
 	}
-	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = snapshotMagic
+	trigger := (*uint64)(unsafe.Pointer(&mapped[pageOff]))
+	deadline := time.Now().Add(30 * time.Second)
+	for atomic.LoadUint64(trigger) != snapshotMagic {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait for snapshot readiness: timed out")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	atomic.StoreUint64(trigger, snapshotMagic)
 	writeConsole("__CCX3_SNAPSHOT__\n")
 	return nil
 }
@@ -2091,13 +2099,13 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 			return true
 		}
 		if len(req.Stdin) > 0 {
-			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
+			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, req.ArchiveLimits, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
 			return true
 		}
 		stdinR, stdinW := io.Pipe()
 		managed := &managedExec{stdin: stdinW, start: time.Now()}
 		active.Add(req.ID, managed)
-		go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, stdinR, func() {
+		go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Directory, req.User, req.ArchiveLimits, stdinR, func() {
 			_ = managed.closeStdin()
 			active.Delete(req.ID)
 		})
@@ -2369,12 +2377,17 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 	}
 }
 
-func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, stdin io.ReadCloser, cleanup func()) {
+func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, limits *client.ArchiveLimits, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
-	if err := guestagent.ExtractTarToPath(stdin, rootDir, dst, dstDir); err != nil {
+	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), limits)
+	if err == nil {
+		defer cancel()
+		err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
+	}
+	if err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs extract: "+err.Error()+"\n")
 	}

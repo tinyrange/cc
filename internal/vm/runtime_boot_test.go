@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -313,6 +314,41 @@ func bootManagedBSDRuntimeContract(t *testing.T, tc managedBSDRuntimeBootCase) (
 		t.Fatalf("%s control fd output = %q, want %s", tc.name, controlOutput, expectedControl)
 	}
 
+	inputs := make(chan client.ExecInput, 2)
+	var ttyControl strings.Builder
+	var ttyExit *int
+	resizeSent := false
+	if err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"sh", "-c", "test -t 0 || exit 91; printf 'tty-ready\\n' >&3; IFS= read -r command; eval \"$command\""},
+		TTY:       true,
+		ControlFD: true,
+		Cols:      80,
+		Rows:      24,
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			ttyControl.WriteString(event.Output)
+			if !resizeSent && strings.Contains(ttyControl.String(), "tty-ready\n") {
+				resizeSent = true
+				inputs <- client.ExecInput{Kind: "resize", Cols: 91, Rows: 37}
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("stty size >&3\n")}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			ttyExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("%s runtime TTY exec: %v", tc.name, err)
+	}
+	if !resizeSent || ttyExit == nil || *ttyExit != 0 {
+		t.Fatalf("%s TTY state resize_sent=%t exit=%v control=%q", tc.name, resizeSent, ttyExit, ttyControl.String())
+	}
+	if got, want := strings.TrimSpace(ttyControl.String()), "tty-ready\n37 91"; got != want {
+		t.Fatalf("%s TTY control output = %q, want %q", tc.name, got, want)
+	}
+
 	flusher, ok := inst.(instanceFlushProvider)
 	if !ok {
 		t.Fatalf("%s runtime does not expose flush", tc.name)
@@ -442,9 +478,124 @@ func TestRuntimePersistentLinuxStreamsStdin(t *testing.T) {
 	requireGuestOutput(t, output, "line:alpha", "line:beta")
 }
 
+func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
+	guestInitCache := t.TempDir()
+	t.Setenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR", guestInitCache)
+	if err := os.MkdirAll(guestInitCache, 0o755); err != nil {
+		t.Fatalf("create stale guest init cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(guestInitCache, "guest-init-linux-"+runtime.GOARCH), []byte("\x7fELFstale-agent"), 0o755); err != nil {
+		t.Fatalf("seed stale guest init cache: %v", err)
+	}
+	env := newRuntimeBootEnv(t)
+	manager := NewManagerWithBackend(env.backend)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	const instanceID = "tty-control"
+	guestWorkDir := "/host" + t.TempDir()
+	share := client.ShareMount{
+		Source:   "/",
+		Mount:    "/host",
+		Writable: true,
+		MapOwner: true,
+		OwnerUID: 1000,
+		OwnerGID: 1000,
+		Cache:    "strict",
+	}
+	if _, err := manager.StartBlank(ctx, client.StartInstanceRequest{
+		ID:       instanceID,
+		Image:    env.imageName,
+		Shares:   []client.ShareMount{share},
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+	}); err != nil {
+		t.Fatalf("start managed Linux TTY instance: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.ShutdownAll(context.Background()) })
+	inputs := make(chan client.ExecInput, 2)
+	var control strings.Builder
+	var output strings.Builder
+	var exit *int
+	stage := 0
+	persistentCommand := `__vmsh_uid="$(id -u 2>/dev/null || printf '')"
+__vmsh_passwd="$(awk -F: -v u="$__vmsh_uid" '$3 == u { print $1 ":" $6; exit }' /etc/passwd 2>/dev/null || true)"
+if [ -n "$__vmsh_passwd" ]; then
+  USER="${__vmsh_passwd%%:*}"
+  LOGNAME="$USER"
+  HOME="${__vmsh_passwd#*:}"
+  export USER LOGNAME HOME
+fi
+unset __vmsh_uid __vmsh_passwd
+stty -echo 2>/dev/null || true
+alias ls >/dev/null 2>&1 || { ls --color=always -C -w ${COLUMNS:-80} >/dev/null 2>&1 && alias ls='ls --color=always -C -w ${COLUMNS:-80}'; } || { ls -G -C >/dev/null 2>&1 && alias ls='ls -G -C'; } || true
+
+__vmsh_control_fd=3
+__vmsh_report() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$PWD" >&$__vmsh_control_fd
+}
+__vmsh_run() {
+  stty echo 2>/dev/null || true
+  eval " $1"
+  __vmsh_status=$?
+  stty -echo 2>/dev/null || true
+  __vmsh_report done "$__vmsh_status"
+}
+__vmsh_report ready 0
+while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
+	err := manager.RunStreamIn(ctx, instanceID, client.RunRequest{
+		Image:   env.imageName,
+		Command: []string{"sh", "-lc", persistentCommand},
+		Env: []string{
+			"HOME=/home/cc",
+			"USER=cc",
+			"LOGNAME=cc",
+			"TERM=dumb",
+			"LS_COLORS=" + os.Getenv("LS_COLORS"),
+			"NO_COLOR=1",
+			"CLICOLOR=1",
+		},
+		WorkDir:   guestWorkDir,
+		User:      "1000:1000",
+		Shares:    []client.ShareMount{share},
+		TTY:       true,
+		ControlFD: true,
+		Cols:      120,
+		Rows:      30,
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			output.WriteString(event.Output)
+		case "control":
+			control.WriteString(event.Output)
+			if stage == 0 && strings.Contains(event.Output, "ready\t0\t"+guestWorkDir) {
+				stage = 1
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run \"printf 'first\\n' >&3\"\n")}
+			} else if stage == 1 && strings.Contains(event.Output, "done\t0\t"+guestWorkDir) {
+				stage = 2
+				inputs <- client.ExecInput{Kind: "resize", Cols: 132, Rows: 41}
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("__vmsh_run \"stty size >&3\"\n")}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			exit = &code
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Linux TTY control fd exec: %v; stdout=%q control=%q", err, output.String(), control.String())
+	}
+	if stage != 2 || exit == nil || *exit != 0 {
+		t.Fatalf("Linux TTY control fd state: stage=%d exit=%v stdout=%q control=%q", stage, exit, output.String(), control.String())
+	}
+	if got, want := strings.TrimSpace(control.String()), "ready\t0\t"+guestWorkDir+"\nfirst\ndone\t0\t"+guestWorkDir+"\n41 132\ndone\t0\t"+guestWorkDir; got != want {
+		t.Fatalf("Linux TTY control fd output = %q", got)
+	}
+}
+
 func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		t.Skip("linux/amd64 startup snapshots are implemented by the KVM amd64 backend")
+	if runtime.GOOS != "linux" || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
+		t.Skip("KVM startup snapshots are implemented on Linux amd64 and arm64")
 	}
 	env := newRuntimeBootEnv(t)
 	snapshotRoot := t.TempDir()
@@ -469,6 +620,57 @@ func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
 
 	resp := execInRuntime(t, restored, []string{"sh", "-lc", "set -eu; printf 'restored-startup-snapshot\n'; cat /proc/sys/kernel/ostype"})
 	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
+}
+
+func TestRuntimeSnapshotWaitsForBalloonTarget(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("virtio balloon startup snapshots are implemented on Linux amd64")
+	}
+	env := newRuntimeBootEnv(t)
+	snapshotRoot := t.TempDir()
+
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		SnapshotDir: snapshotRoot,
+		MemoryMB:    256,
+		BalloonMB:   160,
+		CPUs:        1,
+	})
+	captureConsole := runtimeConsoleHistory(inst)
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close snapshot capture instance: %v", err)
+	}
+	snapshotPath := singleSnapshotPath(t, snapshotRoot, captureConsole)
+
+	data, err := os.ReadFile(filepath.Join(snapshotPath, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read snapshot manifest: %v", err)
+	}
+	var manifest struct {
+		Devices map[string]struct {
+			NumPages    uint32 `json:"num_pages"`
+			ActualPages uint32 `json:"actual_pages"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("decode snapshot manifest: %v", err)
+	}
+	balloon, ok := manifest.Devices["balloon"]
+	if !ok || balloon.NumPages == 0 {
+		t.Fatalf("snapshot has no balloon target: %+v", balloon)
+	}
+	if balloon.ActualPages < balloon.NumPages {
+		t.Fatalf("snapshot balloon actual pages = %d, want at least target %d", balloon.ActualPages, balloon.NumPages)
+	}
+
+	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		RestoreSnapshot: snapshotPath,
+		MemoryMB:        256,
+		BalloonMB:       160,
+		CPUs:            1,
+	})
+	defer restored.Close()
+	resp := execInRuntime(t, restored, []string{"sh", "-lc", "printf 'balloon-restored\\n'"})
+	requireGuestOutput(t, resp.Output, "balloon-restored")
 }
 
 func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {
@@ -988,8 +1190,12 @@ func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 		}
 	}
 
+	guestInitCache := filepath.Join(cacheRoot, "guestinit")
+	if override := strings.TrimSpace(os.Getenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR")); override != "" {
+		guestInitCache = override
+	}
 	return &runtimeBootEnv{
-		backend:      NewRuntimeBackend(kernelManager, store, filepath.Join(cacheRoot, "guestinit")),
+		backend:      NewRuntimeBackend(kernelManager, store, guestInitCache),
 		images:       store,
 		imageName:    runtimeBootImage,
 		altImageName: runtimeBootAltImage,

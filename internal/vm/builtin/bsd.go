@@ -20,7 +20,7 @@ type BSDDefinition struct {
 	Hostname      string
 	Interface     string
 	CacheDir      string
-	BuildArtifact func(context.Context, string, machine.NetworkSpec) (rootartifact.Artifact, error)
+	BuildArtifact func(context.Context, string, string, machine.NetworkSpec) (rootartifact.Artifact, error)
 }
 
 func GuestForImage(image string) (managedguest.Profile, bool) {
@@ -43,8 +43,8 @@ func OpenBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Hostname:  "cc-openbsd",
 		Interface: "vio0",
 		CacheDir:  OpenBSDRuntimeCacheDir(guestInitCache),
-		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			return buildOpenBSDArtifact(ctx, cacheDir, arch, network)
+		BuildArtifact: func(ctx context.Context, cacheDir, kernel string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+			return buildOpenBSDArtifact(ctx, cacheDir, arch, kernel, network)
 		},
 	}
 }
@@ -74,8 +74,8 @@ func FreeBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Hostname:  "cc-freebsd",
 		Interface: "vtnet0",
 		CacheDir:  FreeBSDRuntimeCacheDir(guestInitCache),
-		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			return buildFreeBSDArtifact(ctx, cacheDir, arch, network)
+		BuildArtifact: func(ctx context.Context, cacheDir, kernel string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+			return buildFreeBSDArtifact(ctx, cacheDir, arch, kernel, network)
 		},
 	}
 }
@@ -105,8 +105,8 @@ func NetBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 		Hostname:  "cc-netbsd",
 		Interface: "vioif0",
 		CacheDir:  NetBSDRuntimeCacheDir(guestInitCache),
-		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			return buildNetBSDArtifact(ctx, cacheDir, arch, network)
+		BuildArtifact: func(ctx context.Context, cacheDir, kernel string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
+			return buildNetBSDArtifact(ctx, cacheDir, arch, kernel, network)
 		},
 	}
 }

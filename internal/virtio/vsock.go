@@ -279,6 +279,27 @@ func (v *Vsock) Close() error {
 	return nil
 }
 
+// Poke wakes an idle guest without adding a packet to the vsock queues. This
+// lets restored guests make progress during control startup and managed execs
+// without consuming credit or writing another control packet.
+func (v *Vsock) Poke() error {
+	if v == nil {
+		return nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.irq == nil {
+		return nil
+	}
+	if v.interruptStatus != 0 {
+		return v.updateIRQLocked()
+	}
+	if err := v.irq.SetIRQ(v.IRQ, true); err != nil {
+		return err
+	}
+	return v.irq.SetIRQ(v.IRQ, false)
+}
+
 func (v *Vsock) Summary() string {
 	if v == nil {
 		return "virtio-vsock=<nil>"

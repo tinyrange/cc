@@ -1560,9 +1560,6 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			}
 		}
 		if pendingResult != nil && ctx.Err() != nil {
-			if includeTraceOnExit {
-				transcript = transcript + "\n[virtio-fs trace]\n" + fsTrace.String()
-			}
 			return *pendingResult, nil
 		}
 
@@ -1697,7 +1694,9 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 	recorder := timing.FromContext(ctx)
 	if recorder != nil {
 		totalStart := time.Now()
-		defer recorder.Record("hvf.data_abort.total", time.Since(totalStart))
+		defer func() {
+			recorder.Record("hvf.data_abort.total", time.Since(totalStart))
+		}()
 	}
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {

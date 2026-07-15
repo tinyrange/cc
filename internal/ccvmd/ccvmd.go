@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -25,6 +26,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/cachepath"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -39,9 +41,20 @@ func isBuiltInBSDImage(name string) bool {
 }
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
-var bootEventWriteMu sync.Mutex
 
-const defaultVMBootTimeout = 5 * time.Second
+const (
+	defaultVMBootTimeout = 5 * time.Second
+
+	// ccvmd has JSON control requests, not bulk upload request bodies. The
+	// largest legitimate body is inline run stdin, so 64 MiB leaves ample room
+	// while bounding allocations. Streaming stdin is framed into smaller
+	// WebSocket messages.
+	maxHTTPRequestBytes      int64 = 64 << 20
+	maxWebSocketMessageBytes       = 8 << 20
+	serverReadHeaderTimeout        = 10 * time.Second
+	serverRequestReadTimeout       = 30 * time.Second
+	serverIdleTimeout              = 2 * time.Minute
+)
 
 func bootTimeoutFromRequest(seconds float64) time.Duration {
 	if seconds <= 0 {
@@ -82,6 +95,7 @@ type ServerOptions struct {
 	// created it. RunServer never unlinks it: only the publisher can safely
 	// coordinate token generation and discovery-state rotation.
 	TokenPath              string
+	Authentication         *ServerAuthentication
 	Persistent             bool
 	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
@@ -95,6 +109,7 @@ type RuntimeView interface {
 	InstanceStatuses() []client.InstanceState
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
+	AllowServiceProxyPort(context.Context, string, int) error
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -120,18 +135,37 @@ func (s *server) ShutdownInstance(ctx context.Context, id string) error {
 	return s.vms.ShutdownInstance(ctx, id)
 }
 
+func (s *server) AllowServiceProxyPort(ctx context.Context, id string, port int) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.AllowServiceProxyPortTo(ctx, id, port)
+}
+
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
 	deadline    time.Time
-	timer       *time.Timer
+	timer       watchdogTimer
 	active      bool
-	leases      map[string]time.Time
+	leases      map[string]watchdogLease
 	onExpired   func()
 	persistent  bool
+	now         func() time.Time
+	afterFunc   func(time.Duration, func()) watchdogTimer
 	cvmfsEvents uint64
 	cvmfsBytes  int64
 	cvmfsLast   time.Time
+}
+
+type watchdogLease struct {
+	timeout  time.Duration
+	deadline time.Time
+}
+
+type watchdogTimer interface {
+	Stop() bool
+	Reset(time.Duration) bool
 }
 
 type watchdogRequest struct {
@@ -139,7 +173,13 @@ type watchdogRequest struct {
 }
 
 func newWatchdogController(onExpired func()) *watchdogController {
-	return &watchdogController{onExpired: onExpired}
+	return &watchdogController{
+		onExpired: onExpired,
+		now:       time.Now,
+		afterFunc: func(delay time.Duration, fn func()) watchdogTimer {
+			return time.AfterFunc(delay, fn)
+		},
+	}
 }
 
 func newPersistentWatchdogController(onExpired func()) *watchdogController {
@@ -152,13 +192,14 @@ func (w *watchdogController) Create(timeout time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.timeout = timeout
-	w.deadline = time.Now().Add(timeout)
+	now := w.now()
+	w.deadline = now.Add(timeout)
 	w.active = true
 	if w.timer == nil {
-		w.timer = time.AfterFunc(timeout, w.expire)
+		w.timer = w.afterFunc(timeout, w.expire)
 		return
 	}
-	w.resetTimerLocked(time.Now())
+	w.resetTimerLocked(now)
 }
 
 func (w *watchdogController) Feed() bool {
@@ -175,7 +216,7 @@ func (w *watchdogController) RecordCVMFSActivity(bytes int) {
 	defer w.mu.Unlock()
 	w.cvmfsEvents++
 	w.cvmfsBytes += int64(bytes)
-	w.cvmfsLast = time.Now()
+	w.cvmfsLast = w.now()
 }
 
 func (w *watchdogController) ActivityState() client.WatchdogActivityState {
@@ -187,7 +228,7 @@ func (w *watchdogController) ActivityState() client.WatchdogActivityState {
 	}
 	if !w.cvmfsLast.IsZero() {
 		cvmfs.LastActivityUnix = w.cvmfsLast.Unix()
-		cvmfs.SecondsSinceLast = time.Since(w.cvmfsLast).Seconds()
+		cvmfs.SecondsSinceLast = w.now().Sub(w.cvmfsLast).Seconds()
 	}
 	return client.WatchdogActivityState{CVMFS: cvmfs}
 }
@@ -203,25 +244,27 @@ func (w *watchdogController) CreateLease(timeout time.Duration) (string, error) 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.leases == nil {
-		w.leases = map[string]time.Time{}
+		w.leases = map[string]watchdogLease{}
 	}
-	now := time.Now()
-	w.leases[id] = now.Add(timeout)
+	now := w.now()
+	w.leases[id] = watchdogLease{timeout: timeout, deadline: now.Add(timeout)}
 	w.resetTimerLocked(now)
 	return id, nil
 }
 
-func (w *watchdogController) FeedLease(id string, timeout time.Duration) bool {
+func (w *watchdogController) FeedLease(id string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.leases == nil {
 		return false
 	}
-	if _, ok := w.leases[id]; !ok {
+	lease, ok := w.leases[id]
+	if !ok {
 		return false
 	}
-	now := time.Now()
-	w.leases[id] = now.Add(timeout)
+	now := w.now()
+	lease.deadline = now.Add(lease.timeout)
+	w.leases[id] = lease
 	w.resetTimerLocked(now)
 	return true
 }
@@ -246,7 +289,7 @@ func (w *watchdogController) ReleaseLease(id string) bool {
 			onExpired = w.onExpired
 		}
 	} else {
-		w.resetTimerLocked(time.Now())
+		w.resetTimerLocked(w.now())
 	}
 	w.mu.Unlock()
 	if onExpired != nil {
@@ -259,8 +302,9 @@ func (w *watchdogController) feedLocked() bool {
 	if !w.active || w.timer == nil {
 		return false
 	}
-	w.deadline = time.Now().Add(w.timeout)
-	w.resetTimerLocked(time.Now())
+	now := w.now()
+	w.deadline = now.Add(w.timeout)
+	w.resetTimerLocked(now)
 	return true
 }
 
@@ -276,9 +320,9 @@ func (w *watchdogController) Stop() {
 func (w *watchdogController) expire() {
 	var onExpired func()
 	w.mu.Lock()
-	now := time.Now()
-	for id, deadline := range w.leases {
-		if !deadline.After(now) {
+	now := w.now()
+	for id, lease := range w.leases {
+		if !lease.deadline.After(now) {
 			delete(w.leases, id)
 		}
 	}
@@ -310,9 +354,9 @@ func (w *watchdogController) resetTimerLocked(now time.Time) {
 	if w.active && !w.deadline.IsZero() {
 		next = w.deadline
 	}
-	for _, deadline := range w.leases {
-		if next.IsZero() || deadline.Before(next) {
-			next = deadline
+	for _, lease := range w.leases {
+		if next.IsZero() || lease.deadline.Before(next) {
+			next = lease.deadline
 		}
 	}
 	if next.IsZero() {
@@ -326,7 +370,7 @@ func (w *watchdogController) resetTimerLocked(now time.Time) {
 		delay = time.Millisecond
 	}
 	if w.timer == nil {
-		w.timer = time.AfterFunc(delay, w.expire)
+		w.timer = w.afterFunc(delay, w.expire)
 		return
 	}
 	w.timer.Stop()
@@ -361,10 +405,16 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
+	tlsConfigPath := fs.String("tls-config", "", "Path to mutual TLS listener configuration")
 	worker := fs.Bool("worker", false, "Run as a single-process VM worker")
+	workerTLSConfigPath := fs.String("worker-tls-config", "", "Path to worker-control mutual TLS configuration")
 
 	if err := fs.Parse(args); err != nil {
 		return false, fmt.Errorf("parse ccvm flags: %w", err)
+	}
+	authentication, err := resolveServerAuthentication(*addr, *tlsConfigPath, opts.Authentication)
+	if err != nil {
+		return false, err
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
@@ -387,7 +437,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	if *worker {
 		if socketPath := strings.TrimSpace(os.Getenv("CCX3_WORKER_CONTROL_SOCKET")); socketPath != "" {
-			return runWorkerControlSocket(socketPath, srvState, opts)
+			return runWorkerControlSocket(socketPath, *workerTLSConfigPath, srvState, opts)
 		}
 	}
 
@@ -395,9 +445,22 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
+	if listenerAddrRequiresAuthentication(l.Addr()) && authentication == nil {
+		_ = l.Close()
+		return false, &ListenerSecurityError{
+			Address: *addr,
+			Reason:  ListenerSecurityRemoteAuthenticationRequired,
+		}
+	}
+	scheme := "http"
+	if authentication != nil {
+		l = authentication.listener(l)
+		scheme = "https"
+	}
 
 	hello := client.ServerHello{
 		Addr:      l.Addr().String(),
+		Scheme:    scheme,
 		Kind:      opts.Kind,
 		TokenPath: opts.TokenPath,
 	}
@@ -414,13 +477,13 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 
 	var httpServer http.Server
 	shutdown := newServerShutdown(srvState, &httpServer)
-	watchdog := newWatchdogController(shutdown)
+	watchdog := newWatchdogController(shutdown.Shutdown)
 	if opts.Persistent {
-		watchdog = newPersistentWatchdogController(shutdown)
+		watchdog = newPersistentWatchdogController(shutdown.Shutdown)
 	}
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
-	mux := newMux(srvState, watchdog, shutdown, opts)
+	mux := newMux(srvState, watchdog, shutdown.Shutdown, opts)
 	if opts.RegisterHandlers != nil {
 		opts.RegisterHandlers(mux, srvState)
 	}
@@ -429,11 +492,16 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if opts.WrapHandler != nil {
 		handler = opts.WrapHandler(handler)
 	}
-	httpServer = http.Server{Handler: handler}
-	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return true, fmt.Errorf("serve daemon API: %w", err)
+	handler = http.MaxBytesHandler(handler, maxHTTPRequestBytes)
+	httpServer = http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverRequestReadTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
-	return true, nil
+	serveErr := daemonServeError(httpServer.Serve(l))
+	shutdownErr := shutdown.Err()
+	return true, errors.Join(serveErr, shutdownErr)
 }
 
 func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) error {
@@ -444,29 +512,68 @@ func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) err
 	})
 }
 
-func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOptions) (bool, error) {
-	listenNetwork, listenAddress, cleanup, err := workerControlListenEndpoint(socketPath)
+func runWorkerControlSocket(socketPath, tlsConfigPath string, srvState *server, opts ServerOptions) (bool, error) {
+	listenNetwork, listenAddress, secure, cleanup, err := workerControlListenEndpoint(socketPath, tlsConfigPath)
 	if err != nil {
 		return false, err
 	}
-	defer cleanup()
+	var security *vm.WorkerTransportSecurity
+	if secure {
+		security, err = vm.LoadWorkerServerSecurity(tlsConfigPath)
+		if err != nil {
+			return false, err
+		}
+	}
 	l, err := net.Listen(listenNetwork, listenAddress)
 	if err != nil {
 		return false, fmt.Errorf("listen worker control socket: %w", err)
 	}
+	if unixListener, ok := l.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
 	defer l.Close()
-	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: workerControlDialEndpoint(listenNetwork, l.Addr().String())}); err != nil {
+	if listenNetwork == "unix" {
+		cleanup, err = workerControlSocketCleanup(listenNetwork, listenAddress)
+		if err != nil {
+			return false, fmt.Errorf("capture worker control socket ownership: %w", err)
+		}
+		if err := secureWorkerControlSocket(listenAddress); err != nil {
+			return false, fmt.Errorf("secure worker control socket: %w", err)
+		}
+	}
+	defer cleanup()
+	endpoint := workerControlDialEndpoint(listenNetwork, l.Addr().String(), secure)
+	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: endpoint}); err != nil {
 		return false, fmt.Errorf("write worker startup banner: %w", err)
 	}
-	conn, err := l.Accept()
-	if err != nil {
-		return true, fmt.Errorf("accept worker control connection: %w", err)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return true, fmt.Errorf("accept worker control connection: %w", err)
+		}
+		if secure {
+			authenticated, handshakeErr := vm.HandshakeWorkerServer(context.Background(), conn, endpoint, security)
+			if handshakeErr != nil {
+				_ = conn.Close()
+				continue
+			}
+			conn = authenticated
+		}
+		workerID := "local-sidecar"
+		if security != nil {
+			workerID = security.Scope
+		}
+		err = serveAuthenticatedWorkerControl(conn, workerID, srvState, opts)
+		_ = conn.Close()
+		return true, err
 	}
-	defer conn.Close()
+}
+
+func serveAuthenticatedWorkerControl(conn net.Conn, workerID string, srvState *server, opts ServerOptions) error {
 	codec := vm.NewWorkerCodec(conn)
 	hello, err := vm.NewWorkerFrame(0, vm.WorkerServiceControl, vm.WorkerFrameHello, vm.WorkerHello{
 		Version:  vm.WorkerProtocolVersion,
-		WorkerID: "local-sidecar",
+		WorkerID: workerID,
 		Backend:  "worker",
 		Capabilities: vm.VMHostCapabilities{
 			Backend:       "worker",
@@ -477,28 +584,66 @@ func runWorkerControlSocket(socketPath string, srvState *server, opts ServerOpti
 		},
 	})
 	if err != nil {
-		return true, err
+		return err
 	}
 	if err := codec.Send(hello); err != nil {
-		return true, fmt.Errorf("send worker hello: %w", err)
+		return fmt.Errorf("send worker hello: %w", err)
 	}
-	return true, serveWorkerControl(codec, srvState, opts)
+	return serveWorkerControl(codec, srvState, opts)
 }
 
-func workerControlListenEndpoint(address string) (network string, listenAddress string, cleanup func(), err error) {
+func workerControlSocketCleanup(network, address string) (func(), error) {
+	if network != "unix" {
+		return func() {}, nil
+	}
+	return ownedWorkerUnixSocketCleanup(address)
+}
+
+func workerControlListenEndpoint(address, tlsConfigPath string) (network string, listenAddress string, secure bool, cleanup func(), err error) {
 	cleanup = func() {}
 	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://"), cleanup, nil
+		return "", "", false, cleanup, &vm.WorkerSecurityError{
+			Endpoint: address,
+			Reason:   vm.WorkerSecurityPlaintextTCPRejected,
+		}
+	}
+	if strings.HasPrefix(address, vm.WorkerTLSScheme) {
+		if strings.TrimSpace(tlsConfigPath) == "" {
+			return "", "", false, cleanup, &vm.WorkerSecurityError{
+				Endpoint: address,
+				Reason:   vm.WorkerSecurityTLSConfigRequired,
+			}
+		}
+		listenAddress = strings.TrimPrefix(address, vm.WorkerTLSScheme)
+		if _, _, err := net.SplitHostPort(listenAddress); err != nil {
+			return "", "", false, cleanup, fmt.Errorf("parse worker TLS endpoint: %w", err)
+		}
+		return "tcp", listenAddress, true, cleanup, nil
+	}
+	if strings.TrimSpace(tlsConfigPath) != "" {
+		return "", "", false, cleanup, &vm.WorkerSecurityError{
+			Endpoint: address,
+			Reason:   vm.WorkerSecurityInvalidTLSConfig,
+			Detail:   "TLS configuration cannot be used with a Unix socket",
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
-		return "", "", cleanup, fmt.Errorf("prepare worker control socket dir: %w", err)
+		return "", "", false, cleanup, fmt.Errorf("prepare worker control socket dir: %w", err)
 	}
-	_ = os.Remove(address)
-	return "unix", address, func() { _ = os.Remove(address) }, nil
+	if err := validateWorkerControlDirectory(filepath.Dir(address)); err != nil {
+		return "", "", false, cleanup, fmt.Errorf("validate worker control socket dir: %w", err)
+	}
+	if err := prepareWorkerUnixSocket(address); err != nil {
+		return "", "", false, cleanup, err
+	}
+	return "unix", address, false, cleanup, nil
 }
 
-func workerControlDialEndpoint(network string, address string) string {
+func workerControlDialEndpoint(network string, address string, secure bool) string {
 	if network == "tcp" {
+		if secure {
+			return vm.WorkerTLSScheme + address
+		}
 		return "tcp://" + address
 	}
 	return address
@@ -513,6 +658,108 @@ type workerActiveExec struct {
 	cond   *sync.Cond
 	queue  []client.ExecInput
 	closed bool
+}
+
+type workerOperationRegistry struct {
+	mu      sync.Mutex
+	active  map[uint64]context.CancelFunc
+	vmTails map[string]chan struct{}
+}
+
+func newWorkerOperationRegistry() *workerOperationRegistry {
+	return &workerOperationRegistry{
+		active:  make(map[uint64]context.CancelFunc),
+		vmTails: make(map[string]chan struct{}),
+	}
+}
+
+func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(context.Context)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var previous <-chan struct{}
+	var done chan struct{}
+	r.mu.Lock()
+	r.active[frameID] = cancel
+	if vmID != "" {
+		previous = r.vmTails[vmID]
+		done = make(chan struct{})
+		r.vmTails[vmID] = done
+	}
+	r.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer func() {
+			r.mu.Lock()
+			delete(r.active, frameID)
+			if done != nil {
+				close(done)
+				if r.vmTails[vmID] == done {
+					delete(r.vmTails, vmID)
+				}
+			}
+			r.mu.Unlock()
+		}()
+		if previous != nil {
+			select {
+			case <-previous:
+			case <-ctx.Done():
+				return
+			}
+		}
+		run(ctx)
+	}()
+}
+
+func (r *workerOperationRegistry) cancel(frameID uint64) bool {
+	r.mu.Lock()
+	cancel := r.active[frameID]
+	r.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (r *workerOperationRegistry) close() {
+	r.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(r.active))
+	for _, cancel := range r.active {
+		cancels = append(cancels, cancel)
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func workerVMKey(id string) string {
+	if id == "" {
+		return vm.DefaultInstanceID
+	}
+	return id
+}
+
+const (
+	workerExecInputQueueCapacity = 64
+	workerExecStdinQueueLimit    = 56
+	workerExecControlQueueLimit  = workerExecInputQueueCapacity - 1
+)
+
+var (
+	errWorkerExecInputsClosed  = errors.New("worker exec input queue is closed")
+	errWorkerExecInputOverflow = errors.New("worker exec input queue is full")
+)
+
+func newWorkerActiveExec(cancel context.CancelFunc, withInputs bool) *workerActiveExec {
+	exec := &workerActiveExec{cancel: cancel}
+	if withInputs {
+		exec.inputs = make(chan client.ExecInput, 16)
+		exec.done = make(chan struct{})
+		exec.cond = sync.NewCond(&exec.mu)
+		exec.queue = make([]client.ExecInput, 0, workerExecInputQueueCapacity)
+	}
+	return exec
 }
 
 func (e *workerActiveExec) closeInputs() {
@@ -530,21 +777,42 @@ func (e *workerActiveExec) closeInputs() {
 	})
 }
 
-func (e *workerActiveExec) sendInput(input client.ExecInput) bool {
+func (e *workerActiveExec) sendInput(input client.ExecInput) error {
 	if e == nil || e.inputs == nil {
-		return false
+		return errWorkerExecInputsClosed
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return false
+		return errWorkerExecInputsClosed
+	}
+	limit := workerExecControlQueueLimit
+	if input.Kind == "stdin" {
+		limit = workerExecStdinQueueLimit
+	} else if input.Kind == "stdin_close" {
+		limit = workerExecInputQueueCapacity
+	}
+	if len(e.queue) >= limit {
+		return errWorkerExecInputOverflow
 	}
 	if input.Kind == "stdin_close" {
 		e.closed = true
 	}
 	e.queue = append(e.queue, input)
 	e.cond.Signal()
-	return true
+	return nil
+}
+
+func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) error {
+	err := exec.sendInput(input)
+	if !errors.Is(err, errWorkerExecInputOverflow) {
+		return err
+	}
+	if exec.cancel != nil {
+		exec.cancel()
+	}
+	exec.closeInputs()
+	return err
 }
 
 func (e *workerActiveExec) forwardInputs() {
@@ -579,7 +847,8 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 	defer cancelConnection()
 	var activeMu sync.Mutex
 	activeExecs := make(map[uint64]*workerActiveExec)
-	activeWaits := make(map[uint64]*workerActiveWait)
+	operations := newWorkerOperationRegistry()
+	defer operations.close()
 
 	for {
 		frame, err := codec.Receive()
@@ -592,8 +861,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 		switch frame.Type {
 		case vm.WorkerFrameStart:
 			var req client.CreateInstanceRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
+			if !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
 			if opts.NormalizeCreateRequest != nil {
@@ -602,18 +873,22 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			state, err := srvState.vms.StartStream(context.Background(), req, func(event client.BootEvent) error {
-				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				state, err := srvState.vms.StartStream(ctx, req, func(event client.BootEvent) error {
+					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+				})
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 			})
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStartBlank:
 			var req client.StartInstanceRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
+			if !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
 			if opts.NormalizeStartRequest != nil {
@@ -622,66 +897,93 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			state, err := srvState.vms.StartBlankStream(context.Background(), req, func(event client.BootEvent) error {
-				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				state, err := srvState.vms.StartBlankStream(ctx, req, func(event client.BootEvent) error {
+					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+				})
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 			})
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
 		case vm.WorkerFrameStatus:
 			var req vm.WorkerStatusRequest
-			_ = frame.DecodePayload(&req)
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
+			operations.start(frame.ID, "", func(context.Context) {
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			})
 		case vm.WorkerFrameStop:
 			var req vm.WorkerStopRequest
-			_ = frame.DecodePayload(&req)
-			if err := srvState.vms.ShutdownInstance(context.Background(), req.ID); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.ShutdownInstance(ctx, req.ID); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+			})
 		case vm.WorkerFrameWait:
 			var req vm.WorkerWaitRequest
-			_ = frame.DecodePayload(&req)
-			serveWorkerWait(connectionCtx, codec, srvState, frame.ID, req.ID, &activeMu, activeWaits)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
+				continue
+			}
+			operations.start(frame.ID, "", func(ctx context.Context) {
+				state, completed := waitForWorkerState(ctx, func() client.InstanceState {
+					return srvState.vms.StatusOf(req.ID)
+				})
+				if completed {
+					_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
+				}
+			})
 		case vm.WorkerFrameFlush:
 			var req vm.WorkerFlushRequest
-			_ = frame.DecodePayload(&req)
-			if err := srvState.vms.FlushInstance(context.Background(), req.ID); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.FlushInstance(ctx, req.ID); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+			})
 		case vm.WorkerFrameAddShare:
 			var req vm.WorkerAddShareRequest
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			if err := srvState.vms.AddShareTo(context.Background(), req.ID, req.Share); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
-				continue
-			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
+			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+				if err := srvState.vms.AddShareTo(ctx, req.ID, req.Share); err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "mounted"})
+			})
 		case vm.WorkerFrameConsole:
 			var req vm.WorkerConsoleRequest
-			_ = frame.DecodePayload(&req)
-			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
-			if err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) || !validateWorkerInstanceID(codec, frame, req.ID) {
 				continue
 			}
-			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+			operations.start(frame.ID, "", func(ctx context.Context) {
+				history, err := srvState.vms.ConsoleHistory(ctx, req.ID)
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+					return
+				}
+				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+			})
 		case vm.WorkerFrameExec:
 			if err := serveWorkerExec(connectionCtx, codec, srvState, frame, &activeMu, activeExecs); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+				_ = sendWorkerRequestError(codec, frame, err)
 			}
 		case vm.WorkerFrameExecInput:
 			var req vm.WorkerExecInput
-			if err := frame.DecodePayload(&req); err != nil {
-				_ = sendWorkerError(codec, frame.ID, err)
+			if !decodeWorkerRequest(codec, frame, &req) {
 				continue
 			}
 			activeMu.Lock()
@@ -691,60 +993,29 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 				continue
 			}
 			if req.Closed {
-				_ = exec.sendInput(client.ExecInput{Kind: "stdin_close"})
+				_ = enqueueWorkerExecInput(exec, client.ExecInput{Kind: "stdin_close"})
 				continue
 			}
-			if !exec.sendInput(req.Input) {
-				_ = sendWorkerError(codec, frame.ID, fmt.Errorf("worker exec input queue is full"))
+			if err := enqueueWorkerExecInput(exec, req.Input); errors.Is(err, errWorkerExecInputOverflow) {
+				_ = sendWorkerError(codec, frame.ID, err)
 			}
 		case vm.WorkerFrameCancel:
+			var req vm.WorkerCancelRequest
+			if !decodeWorkerRequest(codec, frame, &req) {
+				continue
+			}
+			operations.cancel(frame.ID)
 			activeMu.Lock()
 			exec := activeExecs[frame.ID]
-			wait := activeWaits[frame.ID]
 			activeMu.Unlock()
 			if exec != nil {
 				exec.cancel()
 				exec.closeInputs()
 			}
-			if wait != nil {
-				wait.cancel()
-			}
 		default:
 			_ = sendWorkerError(codec, frame.ID, fmt.Errorf("unsupported worker frame %q", frame.Type))
 		}
 	}
-}
-
-type workerActiveWait struct {
-	cancel context.CancelFunc
-}
-
-func serveWorkerWait(parent context.Context, codec *vm.WorkerCodec, srvState *server, frameID uint64, id string, activeMu *sync.Mutex, activeWaits map[uint64]*workerActiveWait) {
-	ctx, cancel := context.WithCancel(parent)
-	wait := &workerActiveWait{cancel: cancel}
-	activeMu.Lock()
-	if previous := activeWaits[frameID]; previous != nil {
-		previous.cancel()
-	}
-	activeWaits[frameID] = wait
-	activeMu.Unlock()
-
-	go func() {
-		defer cancel()
-		defer func() {
-			activeMu.Lock()
-			if activeWaits[frameID] == wait {
-				delete(activeWaits, frameID)
-			}
-			activeMu.Unlock()
-		}()
-		state, completed := waitForWorkerState(ctx, func() client.InstanceState {
-			return srvState.vms.StatusOf(id)
-		})
-		if completed {
-			_ = sendWorkerPayload(codec, frameID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
-		}
-	}()
 }
 
 func waitForWorkerState(ctx context.Context, status func() client.InstanceState) (client.InstanceState, bool) {
@@ -768,12 +1039,12 @@ func serveWorkerExec(parent context.Context, codec *vm.WorkerCodec, srvState *se
 	if err := frame.DecodePayload(&req); err != nil {
 		return err
 	}
+	if strings.TrimSpace(req.ID) == "" {
+		return fmt.Errorf("worker instance id is required")
+	}
 	ctx, cancel := context.WithCancel(parent)
-	exec := &workerActiveExec{cancel: cancel}
+	exec := newWorkerActiveExec(cancel, req.InputStream)
 	if req.InputStream {
-		exec.inputs = make(chan client.ExecInput, 16)
-		exec.done = make(chan struct{})
-		exec.cond = sync.NewCond(&exec.mu)
 		go exec.forwardInputs()
 	}
 	activeMu.Lock()
@@ -813,30 +1084,133 @@ func sendWorkerError(codec *vm.WorkerCodec, id uint64, err error) error {
 	return sendWorkerPayload(codec, id, vm.WorkerFrameError, vm.WorkerError{Error: err.Error()})
 }
 
-func newServerShutdown(srvState *server, httpServer *http.Server) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if srvState != nil && srvState.vms != nil {
-				_ = srvState.vms.ShutdownAll(ctx)
-			}
-			if httpServer != nil {
-				_ = httpServer.Shutdown(ctx)
-			}
-		})
+func decodeWorkerRequest(codec *vm.WorkerCodec, frame vm.WorkerFrame, dst any) bool {
+	if err := frame.DecodePayload(dst); err != nil {
+		_ = sendWorkerRequestError(codec, frame, fmt.Errorf("decode payload: %w", err))
+		return false
 	}
+	return true
+}
+
+func validateWorkerInstanceID(codec *vm.WorkerCodec, frame vm.WorkerFrame, id string) bool {
+	if strings.TrimSpace(id) != "" {
+		return true
+	}
+	_ = sendWorkerRequestError(codec, frame, fmt.Errorf("worker instance id is required"))
+	return false
+}
+
+func sendWorkerRequestError(codec *vm.WorkerCodec, frame vm.WorkerFrame, err error) error {
+	return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameError, vm.WorkerError{
+		Error:       err.Error(),
+		RequestID:   frame.ID,
+		RequestType: frame.Type,
+	})
+}
+
+type serverShutdown struct {
+	once         sync.Once
+	shutdownVMs  func(context.Context) error
+	shutdownHTTP func(context.Context) error
+	err          error
+}
+
+func newServerShutdown(srvState *server, httpServer *http.Server) *serverShutdown {
+	shutdown := &serverShutdown{}
+	if srvState != nil && srvState.vms != nil {
+		shutdown.shutdownVMs = srvState.vms.ShutdownAll
+	}
+	if httpServer != nil {
+		shutdown.shutdownHTTP = httpServer.Shutdown
+	}
+	return shutdown
+}
+
+func (s *serverShutdown) Shutdown() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		var errs []error
+		if s.shutdownVMs != nil {
+			if err := runShutdownStep(s.shutdownVMs); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown VMs: %w", err))
+			}
+		}
+		if s.shutdownHTTP != nil {
+			if err := runShutdownStep(s.shutdownHTTP); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown HTTP server: %w", err))
+			}
+		}
+		s.err = errors.Join(errs...)
+	})
+}
+
+func (s *serverShutdown) Err() error {
+	if s == nil {
+		return nil
+	}
+	s.Shutdown()
+	return s.err
+}
+
+func runShutdownStep(step func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return step(ctx)
+}
+
+func daemonServeError(err error) error {
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve daemon API: %w", err)
+}
+
+type apiRoute struct {
+	Method string
+	Path   string
+}
+
+type trackedServeMux struct {
+	*http.ServeMux
+	routes []apiRoute
+}
+
+func newTrackedServeMux() *trackedServeMux {
+	return &trackedServeMux{ServeMux: http.NewServeMux()}
+}
+
+func (m *trackedServeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.record(pattern)
+	m.ServeMux.HandleFunc(pattern, handler)
+}
+
+func (m *trackedServeMux) Handle(pattern string, handler http.Handler) {
+	m.record(pattern)
+	m.ServeMux.Handle(pattern, handler)
+}
+
+func (m *trackedServeMux) record(pattern string) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if !ok || strings.HasPrefix(path, "/debug/pprof") {
+		return
+	}
+	m.routes = append(m.routes, apiRoute{Method: method, Path: path})
 }
 
 func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) *http.ServeMux {
-	mux := http.NewServeMux()
+	mux, _ := newMuxWithRoutes(srvState, watchdog, shutdown, opts)
+	return mux
+}
+
+func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown func(), opts ServerOptions) (*http.ServeMux, []apiRoute) {
+	mux := newTrackedServeMux()
 	if pprofEnabled() {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
-		registerPprofHandlers(mux)
+		registerPprofHandlers(mux.ServeMux)
 	}
-
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -912,9 +1286,9 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
-		if timeout <= 0 {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("watchdog lease timeout must be positive"))
+		timeout, err := watchdogLeaseDuration(req.TimeoutSeconds)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		id, err := watchdog.CreateLease(timeout)
@@ -922,7 +1296,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, client.WatchdogLeaseResponse{LeaseID: id, TimeoutSeconds: req.TimeoutSeconds})
+		writeJSON(w, http.StatusOK, client.WatchdogLeaseResponse{LeaseID: id, TimeoutSeconds: timeout.Seconds()})
 	})
 
 	mux.HandleFunc("POST /watchdog/lease/feed", func(w http.ResponseWriter, r *http.Request) {
@@ -935,11 +1309,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		if !watchdog.FeedLease(req.LeaseID, timeout) {
+		if !watchdog.FeedLease(req.LeaseID) {
 			writeError(w, http.StatusConflict, fmt.Errorf("watchdog lease is not active"))
 			return
 		}
@@ -1176,6 +1546,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.Context = r.Context()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		cvmfsClient.Mirrors = req.Mirrors
 		if watchdog != nil {
@@ -1215,6 +1586,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.Context = r.Context()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		cvmfsClient.Mirrors = req.Mirrors
 		if watchdog != nil {
@@ -1317,18 +1689,20 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
+		bootEvents := newBootEventWriter(w)
+		defer bootEvents.Close()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
 		var startImage *oci.Image
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if imageName := strings.TrimSpace(req.Image); imageName != "" {
 			if builtInBSDImage {
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
+					bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
 				}
 			} else if _, err := srvState.images.Get(imageName); err != nil {
 				msg := fmt.Sprintf("image %q is not available", imageName)
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: msg})
 					return
 				}
 				writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
@@ -1338,7 +1712,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 				if err != nil {
 					msg := fmt.Sprintf("image %q is not available: %s", imageName, err)
 					if wantsBootEventStream(r) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: msg})
 						return
 					}
 					writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
@@ -1346,13 +1720,13 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 				}
 				startImage = image
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
+					bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
 				}
 			}
 		}
 		if err := vm.Supports(); err != nil {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, err)
@@ -1360,15 +1734,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
@@ -1382,22 +1756,22 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
 		if vm.NeedsAMD64Emulation(startImage) {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
 				_, err := srvState.kernel.ExtractPackageFileWithProgress(
 					bootCtx,
 					"community",
 					"qemu-x86_64",
 					"usr/bin/qemu-x86_64",
 					func(event client.ProgressEvent) {
-						_ = writeBootEvent(w, client.BootEvent{Kind: "status", Message: bootProgressMessage("preparing amd64 emulator", event)})
+						_ = bootEvents.Write(client.BootEvent{Kind: "status", Message: bootProgressMessage("preparing amd64 emulator", event)})
 					},
 				)
 				if err != nil {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 			} else if _, err := vm.PrepareAMD64Emulator(bootCtx, startImage, srvState.kernel.ExtractPackageFile); err != nil {
@@ -1410,22 +1784,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			}
 		}
 		if wantsBootEventStream(r) {
-			var streamMu sync.Mutex
-			streamOpen := true
-			writeStreamEvent := func(event client.BootEvent) error {
-				streamMu.Lock()
-				defer streamMu.Unlock()
-				if !streamOpen {
-					return nil
-				}
-				return writeBootEvent(w, event)
-			}
-			closeStream := func() {
-				streamMu.Lock()
-				streamOpen = false
-				streamMu.Unlock()
-			}
-			defer closeStream()
+			writeStreamEvent := bootEvents.Write
 
 			writeStreamEvent(client.BootEvent{Kind: "status", Message: "starting VM"})
 			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
@@ -1477,12 +1836,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
+		bootEvents := newBootEventWriter(w)
+		defer bootEvents.Close()
 		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if !builtInBSDImage {
 			if _, err := srvState.images.Get(req.Image); err != nil {
 				if wantsBootEventStream(r) {
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
 					return
 				}
 				writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
@@ -1493,11 +1854,11 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			timingLog("POST /vm builtin image lookup took=%s", time.Since(start))
 		}
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
+			bootEvents.Write(client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
 		}
 		if err := vm.Supports(); err != nil {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, err)
@@ -1505,15 +1866,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
-				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+				bootEvents.Write(client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						bootEvents.Write(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
-					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
@@ -1526,22 +1887,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		timingLog("POST /vm kernel ensure/status took=%s", time.Since(start))
 		if wantsBootEventStream(r) {
-			var streamMu sync.Mutex
-			streamOpen := true
-			writeStreamEvent := func(event client.BootEvent) error {
-				streamMu.Lock()
-				defer streamMu.Unlock()
-				if !streamOpen {
-					return nil
-				}
-				return writeBootEvent(w, event)
-			}
-			closeStream := func() {
-				streamMu.Lock()
-				streamOpen = false
-				streamMu.Unlock()
-			}
-			defer closeStream()
+			writeStreamEvent := bootEvents.Write
 
 			writeStreamEvent(client.BootEvent{Kind: "status", Message: fmt.Sprintf("starting VM for %s", req.Image)})
 			state, err := srvState.vms.StartStream(bootCtx, req, func(event client.BootEvent) error {
@@ -1664,17 +2010,21 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 		}
 		writeJSON(w, http.StatusOK, resp)
 	})
-	mux.Handle("/vm/run", websocket.Server{
-		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+	mux.Handle("GET /vm/run", websocket.Server{
+		Handshake: validateWebSocketOrigin,
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			serveRunWebSocket(ws, func(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				return srvState.vms.Stream(ctx, req, inputs, onEvent)
 			})
 		},
 	})
-	mux.Handle("/vm/run/stream", websocket.Server{
-		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+	mux.Handle("GET /vm/run/stream", websocket.Server{
+		Handshake: validateWebSocketOrigin,
 		Handler: func(ws *websocket.Conn) {
+			ws.MaxPayloadBytes = maxWebSocketMessageBytes
+			_ = ws.SetDeadline(time.Time{})
 			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
@@ -1691,7 +2041,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func(), opt
 			})
 		},
 	})
-	return mux
+	return mux.ServeMux, append([]apiRoute(nil), mux.routes...)
 }
 
 func pprofEnabled() bool {
@@ -1701,14 +2051,14 @@ func pprofEnabled() bool {
 
 func resolveCacheDir(arg string) (string, error) {
 	if arg != "" {
-		return arg, os.MkdirAll(arg, 0o755)
+		return arg, cachepath.EnsurePrivateRoot(arg)
 	}
 	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache dir: %w", err)
 	}
 	dir := filepath.Join(userCacheDir, "ccx3")
-	return dir, os.MkdirAll(dir, 0o755)
+	return dir, cachepath.EnsurePrivateRoot(dir)
 }
 
 func registerPprofHandlers(mux *http.ServeMux) {
@@ -1725,6 +2075,83 @@ func registerPprofHandlers(mux *http.ServeMux) {
 	mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 }
 
+func watchdogLeaseDuration(seconds float64) (time.Duration, error) {
+	if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, fmt.Errorf("watchdog lease timeout must be a finite positive duration")
+	}
+	nanoseconds := seconds * float64(time.Second)
+	if nanoseconds >= float64(uint64(1)<<63) {
+		return 0, fmt.Errorf("watchdog lease timeout is too large")
+	}
+	timeout := time.Duration(nanoseconds)
+	if timeout <= 0 {
+		return 0, fmt.Errorf("watchdog lease timeout is below timer resolution")
+	}
+	return timeout, nil
+}
+
+type websocketOriginError struct {
+	Origin string
+	Host   string
+}
+
+func (e *websocketOriginError) Error() string {
+	return fmt.Sprintf("websocket origin %q does not match request host %q", e.Origin, e.Host)
+}
+
+func validateWebSocketOrigin(_ *websocket.Config, r *http.Request) error {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return nil
+	}
+	if len(origins) != 1 {
+		return &websocketOriginError{Origin: strings.Join(origins, ", "), Host: r.Host}
+	}
+	origin, err := url.Parse(origins[0])
+	if err != nil || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	expectedScheme := "http"
+	if r.TLS != nil {
+		expectedScheme = "https"
+	}
+	if !strings.EqualFold(origin.Scheme, expectedScheme) {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	originAuthority, err := canonicalWebSocketAuthority(origin.Host, expectedScheme)
+	if err != nil {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	hostAuthority, err := canonicalWebSocketAuthority(r.Host, expectedScheme)
+	if err != nil || originAuthority != hostAuthority {
+		return &websocketOriginError{Origin: origins[0], Host: r.Host}
+	}
+	return nil
+}
+
+func canonicalWebSocketAuthority(authority, scheme string) (string, error) {
+	parsed, err := url.Parse("//" + authority)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" {
+		return "", fmt.Errorf("invalid authority")
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := parsed.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
 func sharedRuntimeRoot() string {
 	if root := strings.TrimSpace(os.Getenv("CCX3_RUNTIME_SHARED_CACHE_DIR")); root != "" {
 		return root
@@ -1737,21 +2164,34 @@ func sharedRuntimeRoot() string {
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
-	if r.Body == nil {
-		return fmt.Errorf("request body is required")
-	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		return fmt.Errorf("decode request body: %w", err)
-	}
-	return nil
+	return decodeJSON(r, dst, true)
 }
 
 func decodeOptionalJSON(r *http.Request, dst any) error {
+	return decodeJSON(r, dst, false)
+}
+
+func decodeJSON(r *http.Request, dst any, required bool) error {
 	if r.Body == nil || r.ContentLength == 0 {
+		if required {
+			return fmt.Errorf("request body is required")
+		}
 		return nil
 	}
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		if !required && errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("decode request body: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("decode request body: multiple JSON values")
+		}
+		return fmt.Errorf("decode request body: trailing data: %w", err)
 	}
 	return nil
 }
@@ -1938,22 +2378,47 @@ func sanitizeExecEventForJSON(event client.ExecEvent) client.ExecEvent {
 	return event
 }
 
-func writeBootEvent(w http.ResponseWriter, event client.BootEvent) (err error) {
-	bootEventWriteMu.Lock()
-	defer bootEventWriteMu.Unlock()
+type bootEventWriter struct {
+	mu   sync.Mutex
+	w    http.ResponseWriter
+	open bool
+}
+
+func newBootEventWriter(w http.ResponseWriter) *bootEventWriter {
+	return &bootEventWriter{w: w, open: true}
+}
+
+func (w *bootEventWriter) Close() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.open = false
+	w.mu.Unlock()
+}
+
+func (w *bootEventWriter) Write(event client.BootEvent) (err error) {
+	if w == nil {
+		return fmt.Errorf("boot event writer is unavailable")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.open {
+		return nil
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("write boot event: %v", recovered)
 		}
 	}()
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.w.Header().Set("Content-Type", "application/x-ndjson")
 	if event.Kind == "" {
 		event.Kind = "status"
 	}
-	if err := json.NewEncoder(w).Encode(event); err != nil {
+	if err := json.NewEncoder(w.w).Encode(event); err != nil {
 		return err
 	}
-	if flusher, ok := w.(http.Flusher); ok {
+	if flusher, ok := w.w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 	return nil
@@ -2005,6 +2470,10 @@ func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		status = http.StatusRequestEntityTooLarge
+	}
 	writeJSON(w, status, client.ErrorResponse{Error: err.Error()})
 }
 

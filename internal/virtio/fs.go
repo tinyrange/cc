@@ -341,7 +341,7 @@ type FS struct {
 	closed           chan struct{}
 	workerWG         sync.WaitGroup
 	kickPollWG       sync.WaitGroup
-	workCh           chan fsWork
+	workCh           chan *fsWork
 	nextWorkSeq      []uint64
 	nextCompleteSeq  []uint64
 	completions      map[fsCompletionKey]fsCompletion
@@ -357,6 +357,7 @@ const fuseStatsSlots = 64
 const fsStageCount = 4
 const fsInlineRespDescs = 32
 const fsPooledReqSize = 4096
+const fsWorkQueueDepth = 128
 
 const (
 	fsStageQueueHarvest = iota
@@ -489,8 +490,11 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		entryTTL:       entryTTL,
 		attrTTL:        attrTTL,
 		closed:         make(chan struct{}),
-		workCh:         make(chan fsWork, 1024),
-		completions:    make(map[fsCompletionKey]fsCompletion),
+		// A virtqueue can expose at most 128 heads in one notification. Queue
+		// pointers so an idle device does not reserve the large inline descriptor
+		// array in every fsWork slot.
+		workCh:      make(chan *fsWork, fsWorkQueueDepth),
+		completions: make(map[fsCompletionKey]fsCompletion),
 	}
 	fs.resetQueueStateLocked()
 	if fs.backend == nil {
@@ -545,12 +549,12 @@ func (f *FS) Close() error {
 
 func resolveVirtioFSKickPoll() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_KICK_POLL"))) {
-	case "", "1", "true", "yes", "on":
+	case "1", "true", "yes", "on":
 		return true
-	case "0", "false", "no", "off":
+	case "", "0", "false", "no", "off":
 		return false
 	default:
-		return true
+		return false
 	}
 }
 
@@ -601,10 +605,10 @@ func resolveVirtioFSAsync() bool {
 
 func resolveVirtioFSWorkerCount() int {
 	const maxWorkers = 64
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 1 {
-		workers = 1
-	}
+	// One worker per device preserves concurrency between VMs without retaining
+	// GOMAXPROCS-sized worker sets for every mostly idle guest. Workloads that
+	// benefit from parallel requests within one guest can raise this explicitly.
+	workers := 1
 	if value := strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WORKERS")); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil {
 			workers = parsed
@@ -846,10 +850,9 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 				return err
 			}
 			if f.Async && f.kickPoll && f.driverFeatures&featureRingEventIdx == 0 {
-				if err := f.setRequestQueueNoNotifyLocked(true); err != nil {
-					f.mu.Unlock()
-					return err
-				}
+				// Keep guest kicks enabled while polling. Suppressing them creates
+				// a lost-wakeup window when the poller becomes idle while the guest
+				// is posting a descriptor based on the previous no-notify flag.
 				f.startKickPollerLocked()
 			}
 			f.mu.Unlock()
@@ -1100,7 +1103,9 @@ func (f *FS) enqueueWorks(works []fsWork) {
 		return
 	}
 	f.workerOnce.Do(f.startWorkers)
-	for _, work := range works {
+	for i := range works {
+		work := new(fsWork)
+		*work = works[i]
 		select {
 		case <-f.closed:
 			putFSReqBuffer(work.req, work.pooledReq)
@@ -1165,6 +1170,19 @@ func (f *FS) runKickPoller(generation uint32) {
 			f.kickPollMisses++
 			if err := f.setRequestQueueNoNotifyLocked(false); err != nil {
 				f.logf("kick-poll clear no-notify: %v", err)
+			}
+			// Publish the notification re-enable before the final queue check.
+			// Without this release/acquire boundary, a guest can observe the old
+			// no-notify flag, post work without kicking, and race past the
+			// poller's final check, leaving the request asleep indefinitely.
+			f.mu.Unlock()
+			runtime.Gosched()
+			f.mu.Lock()
+			if generation != f.configGeneration || !f.kickPoll {
+				f.kickPollActive = false
+				f.mu.Unlock()
+				f.enqueueWorks(allWorks)
+				return
 			}
 			for qidx := fsQueueRequest; qidx < fsQueueRequest+fsRequestQueueCount && qidx < len(f.queues); qidx++ {
 				var workScratch [16]fsWork
@@ -1249,7 +1267,7 @@ func (f *FS) startWorkers() {
 func (f *FS) runWorker() {
 	defer f.workerWG.Done()
 	for {
-		var work fsWork
+		var work *fsWork
 		select {
 		case <-f.closed:
 			return
@@ -1269,7 +1287,7 @@ func (f *FS) runWorker() {
 			return
 		default:
 		}
-		if err := f.completeWork(work, reply, err); err != nil {
+		if err := f.completeWork(*work, reply, err); err != nil {
 			f.logf("async-complete-error q=%d head=%d: %v", work.qidx, work.head, err)
 		}
 	}

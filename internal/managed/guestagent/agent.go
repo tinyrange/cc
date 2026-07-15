@@ -6,11 +6,13 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/protocol"
 )
 
@@ -597,7 +600,14 @@ func runExtract(opts Options, control io.Writer, req request, r io.ReadCloser, c
 	proto := DefaultProtocol()
 	proto.WriteBegin(control, req.ID)
 	code := 0
-	if err := extractTarToPath(r, req.RootDir, req.Path, req.Directory); err != nil {
+	ctx, cancel, err := ArchiveContext(context.Background(), req.ArchiveLimits)
+	if err != nil {
+		writeErr(opts, control, req.ID, err)
+		proto.WriteExit(control, req.ID, 1)
+		return
+	}
+	defer cancel()
+	if err := extractTarToPath(ctx, r, req.RootDir, req.Path, req.Directory, req.ArchiveLimits); err != nil {
 		writeErr(opts, control, req.ID, err)
 		code = 1
 	}
@@ -694,22 +704,87 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 	})
 }
 
-func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
-	return ExtractTarToPath(r, rootDir, dst, dstDir)
+func extractTarToPath(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, limits *client.ArchiveLimits) error {
+	return ExtractTarToPathContext(ctx, r, rootDir, dst, dstDir, limits)
 }
 
+var ErrUnsafeTarExtractionPath = errors.New("unsafe tar extraction path")
+
 func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
+	return ExtractTarToPathContext(context.Background(), r, rootDir, dst, dstDir, nil)
+}
+
+type ArchiveLimitError struct {
+	Resource string
+	Limit    uint64
+	Actual   uint64
+}
+
+func (e *ArchiveLimitError) Error() string {
+	return fmt.Sprintf("archive %s limit exceeded: limit=%d actual=%d", e.Resource, e.Limit, e.Actual)
+}
+
+func ArchiveContext(parent context.Context, limits *client.ArchiveLimits) (context.Context, context.CancelFunc, error) {
+	if limits == nil || limits.TimeoutSeconds == 0 {
+		return parent, func() {}, nil
+	}
+	if limits.TimeoutSeconds < 0 || math.IsNaN(limits.TimeoutSeconds) || math.IsInf(limits.TimeoutSeconds, 0) {
+		return nil, nil, fmt.Errorf("archive timeout must be finite and positive")
+	}
+	d := time.Duration(limits.TimeoutSeconds * float64(time.Second))
+	if d <= 0 {
+		return nil, nil, fmt.Errorf("archive timeout is below timer resolution")
+	}
+	ctx, cancel := context.WithTimeout(parent, d)
+	return ctx, cancel, nil
+}
+
+func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, requested *client.ArchiveLimits) error {
 	if strings.TrimSpace(dst) == "" {
 		return fmt.Errorf("destination path is required")
 	}
 	dst = rootPath(rootDir, dst)
-	if info, err := os.Stat(dst); err == nil && info.IsDir() {
-		dstDir = true
+	limits, err := resolveArchiveLimits(dst, requested)
+	if err != nil {
+		return err
+	}
+	stopClose := make(chan struct{})
+	if closer, ok := r.(io.Closer); ok && ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = closer.Close()
+			case <-stopClose:
+			}
+		}()
+		defer close(stopClose)
+	}
+	if info, err := os.Lstat(dst); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: destination is a symlink: %s", ErrUnsafeTarExtractionPath, dst)
+		}
+		if info.IsDir() {
+			dstDir = true
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	extractionRoot := filepath.Dir(dst)
+	if dstDir {
+		extractionRoot = dst
+	}
+	if err := os.MkdirAll(extractionRoot, 0o755); err != nil {
+		return err
 	}
 	tr := tar.NewReader(r)
 	sawEntry := false
 	var dirs []tarDirMtime
+	var entries uint64
+	var expanded uint64
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			if !sawEntry {
@@ -721,25 +796,46 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 			return err
 		}
 		sawEntry = true
+		entries++
+		if entries > limits.MaxEntries {
+			return &ArchiveLimitError{Resource: "entry count", Limit: limits.MaxEntries, Actual: entries}
+		}
+		if header.Size < 0 {
+			return fmt.Errorf("archive entry %q has negative size", header.Name)
+		}
+		entryBytes := uint64(header.Size)
+		if entryBytes > limits.MaxFileBytes {
+			return &ArchiveLimitError{Resource: "file bytes", Limit: limits.MaxFileBytes, Actual: entryBytes}
+		}
+		if entryBytes > limits.MaxExpandedBytes-expanded {
+			return &ArchiveLimitError{Resource: "expanded bytes", Limit: limits.MaxExpandedBytes, Actual: expanded + entryBytes}
+		}
+		expanded += entryBytes
 		target, err := tarTarget(dst, dstDir, header.Name)
 		if err != nil {
 			return err
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+				return err
+			}
 			if err := ensureTarTargetCompatible(target, true); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+			if err := os.Mkdir(target, os.FileMode(header.Mode).Perm()); err != nil && !os.IsExist(err) {
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
-			if err := ensureTarTargetCompatible(target, false); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := validateTarSymlinkTarget(extractionRoot, target, header.Linkname); err != nil {
+				return err
+			}
+			if err := ensureTarTargetCompatible(target, false); err != nil {
 				return err
 			}
 			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
@@ -749,33 +845,100 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+				return err
+			}
 			if err := ensureTarTargetCompatible(target, false); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			file, err := os.CreateTemp(filepath.Dir(target), ".cc-extract-*")
 			if err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(file, tr)
+			tmpName := file.Name()
+			_, copyErr := io.Copy(file, contextReader{ctx: ctx, r: tr})
 			closeErr := file.Close()
 			if copyErr != nil {
+				_ = os.Remove(tmpName)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				return copyErr
 			}
 			if closeErr != nil {
+				_ = os.Remove(tmpName)
 				return closeErr
 			}
 			perm := os.FileMode(header.Mode).Perm()
-			if err := os.Chmod(target, perm); err != nil {
+			if err := os.Chmod(tmpName, perm); err != nil {
+				_ = os.Remove(tmpName)
 				return err
 			}
-			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+			if err := os.Chtimes(tmpName, header.ModTime, header.ModTime); err != nil {
+				_ = os.Remove(tmpName)
+				return err
+			}
+			if err := os.Rename(tmpName, target); err != nil {
+				_ = os.Remove(tmpName)
 				return err
 			}
 		}
 	}
+}
+
+type resolvedArchiveLimits struct {
+	MaxEntries       uint64
+	MaxFileBytes     uint64
+	MaxExpandedBytes uint64
+}
+
+func resolveArchiveLimits(dst string, requested *client.ArchiveLimits) (resolvedArchiveLimits, error) {
+	probe := dst
+	for {
+		if _, err := os.Stat(probe); err == nil {
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	available, entries, err := archiveFilesystemCapacity(probe)
+	if err != nil {
+		return resolvedArchiveLimits{}, fmt.Errorf("inspect archive destination capacity: %w", err)
+	}
+	if entries == 0 {
+		entries = ^uint64(0)
+	}
+	limits := resolvedArchiveLimits{MaxEntries: entries, MaxFileBytes: available, MaxExpandedBytes: available}
+	if requested != nil {
+		if requested.MaxEntries > 0 {
+			limits.MaxEntries = requested.MaxEntries
+		}
+		if requested.MaxFileBytes < 0 || requested.MaxExpandedBytes < 0 {
+			return resolvedArchiveLimits{}, fmt.Errorf("archive byte limits cannot be negative")
+		}
+		if requested.MaxFileBytes > 0 {
+			limits.MaxFileBytes = uint64(requested.MaxFileBytes)
+		}
+		if requested.MaxExpandedBytes > 0 {
+			limits.MaxExpandedBytes = uint64(requested.MaxExpandedBytes)
+		}
+	}
+	return limits, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 func ensureTarTargetCompatible(target string, incomingDir bool) error {
@@ -786,6 +949,9 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	if err != nil {
 		return err
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: target is a symlink: %s", ErrUnsafeTarExtractionPath, target)
+	}
 	existingDir := info.IsDir()
 	switch {
 	case incomingDir && !existingDir:
@@ -795,6 +961,49 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	default:
 		return nil
 	}
+}
+
+func ensureTarParents(root, parent string) error {
+	rel, err := filepath.Rel(root, parent)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: target parent escapes destination: %s", ErrUnsafeTarExtractionPath, parent)
+	}
+	if rel == "." {
+		return nil
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: target parent is a symlink: %s", ErrUnsafeTarExtractionPath, current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("tar target parent is not a directory: %s", current)
+		}
+	}
+	return nil
+}
+
+func validateTarSymlinkTarget(root, target, linkname string) error {
+	if filepath.IsAbs(linkname) {
+		return fmt.Errorf("%w: absolute symlink target %q", ErrUnsafeTarExtractionPath, linkname)
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(target), filepath.FromSlash(linkname)))
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: symlink target escapes destination: %q", ErrUnsafeTarExtractionPath, linkname)
+	}
+	return nil
 }
 
 func tarTarget(dst string, dstDir bool, name string) (string, error) {

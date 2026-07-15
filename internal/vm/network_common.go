@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"j5.nz/cc/client"
@@ -18,19 +20,36 @@ import (
 )
 
 const defaultGatewayMAC = "02:42:0a:2a:00:01"
+const defaultForwardConnections = 32
+const defaultTotalForwardConnections = 128
+
+type PortForwardRuntimeStats struct {
+	Active   int64
+	Rejected uint64
+	Limit    int
+}
 
 type networkRuntime struct {
-	id        string
-	ip        net.IP
-	mac       net.HardwareAddr
-	stack     *netstack.NetStack
-	iface     *netstack.NetworkInterface
-	dev       *virtio.Net
-	txHook    func([]byte)
-	mu        sync.Mutex
-	listeners []net.Listener
-	forwards  map[string]client.PortForward
-	wg        sync.WaitGroup
+	id              string
+	ip              net.IP
+	mac             net.HardwareAddr
+	stack           *netstack.NetStack
+	iface           *netstack.NetworkInterface
+	dev             *virtio.Net
+	txHook          func([]byte)
+	mu              sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	closing         bool
+	listeners       []net.Listener
+	active          map[net.Conn]struct{}
+	forwards        map[string]client.PortForward
+	wg              sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+	forwardSlots    chan struct{}
+	forwardActive   atomic.Int64
+	forwardRejected atomic.Uint64
 }
 
 type netstackVirtioBackend struct {
@@ -53,6 +72,10 @@ type networkDeviceConfig struct {
 func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error) {
 	if cfg.Config == nil || !cfg.Config.Enabled {
 		return nil, nil
+	}
+	totalForwardLimit := cfg.Config.MaxForwardConnections
+	if totalForwardLimit <= 0 {
+		totalForwardLimit = defaultTotalForwardConnections
 	}
 	if cfg.IP == nil {
 		if ip := net.ParseIP(strings.TrimSpace(cfg.Config.GuestIPv4)).To4(); ip != nil {
@@ -118,13 +141,15 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 	}
 
 	runtime := &networkRuntime{
-		id:     cfg.ID,
-		ip:     cfg.IP,
-		mac:    cfg.MAC,
-		stack:  stack,
-		iface:  iface,
-		txHook: cfg.TXHook,
+		id:           cfg.ID,
+		ip:           cfg.IP,
+		mac:          cfg.MAC,
+		stack:        stack,
+		iface:        iface,
+		txHook:       cfg.TXHook,
+		forwardSlots: make(chan struct{}, totalForwardLimit),
 	}
+	runtime.ctx, runtime.cancel = context.WithCancel(context.Background())
 	dev := virtio.NewNet(cfg.Base, cfg.Size, cfg.IRQ, cfg.MAC, &netstackVirtioBackend{runtime: runtime})
 	dev.CompleteTXChecksum = false
 	runtime.dev = dev
@@ -172,13 +197,34 @@ func (n *networkRuntime) Close() error {
 	if n == nil {
 		return nil
 	}
+	n.closeOnce.Do(func() {
+		n.closeErr = n.close()
+	})
+	return n.closeErr
+}
+
+func (n *networkRuntime) close() error {
 	var err error
 	n.mu.Lock()
+	n.closing = true
 	listeners := append([]net.Listener(nil), n.listeners...)
 	n.listeners = nil
+	connections := make([]net.Conn, 0, len(n.active))
+	for conn := range n.active {
+		connections = append(connections, conn)
+	}
+	cancel := n.cancel
 	n.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	for _, ln := range listeners {
 		if closeErr := ln.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	for _, conn := range connections {
+		if closeErr := conn.Close(); closeErr != nil && err == nil && !errors.Is(closeErr, net.ErrClosed) {
 			err = closeErr
 		}
 	}
@@ -252,6 +298,10 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 	key := strings.Join([]string{protocol, hostAddr, strconv.Itoa(forward.HostPort), guestAddr, strconv.Itoa(forward.GuestPort)}, "\x00")
 
 	n.mu.Lock()
+	if n.closing {
+		n.mu.Unlock()
+		return net.ErrClosed
+	}
 	if existing, ok := n.forwards[key]; ok {
 		n.mu.Unlock()
 		if existing == forward {
@@ -266,6 +316,11 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 		return fmt.Errorf("listen port forward %s:%d: %w", hostAddr, forward.HostPort, err)
 	}
 	n.mu.Lock()
+	if n.closing {
+		n.mu.Unlock()
+		_ = ln.Close()
+		return net.ErrClosed
+	}
 	if n.forwards == nil {
 		n.forwards = make(map[string]client.PortForward)
 	}
@@ -273,7 +328,11 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 	n.listeners = append(n.listeners, ln)
 	n.wg.Add(1)
 	n.mu.Unlock()
-	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)))
+	limit := forward.MaxConnections
+	if limit <= 0 {
+		limit = defaultForwardConnections
+	}
+	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)), make(chan struct{}, limit))
 	return nil
 }
 
@@ -288,38 +347,144 @@ func (n *networkRuntime) AllowServiceProxyPort(port int) error {
 	return nil
 }
 
-func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string) {
+func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string, slots chan struct{}) {
 	defer n.wg.Done()
 	for {
 		hostConn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		n.wg.Add(1)
-		go n.handlePortForwardConn(hostConn, guestAddress)
+		if !tryAcquireForwardSlot(slots) {
+			n.forwardRejected.Add(1)
+			_ = hostConn.Close()
+			continue
+		}
+		if !tryAcquireForwardSlot(n.forwardSlots) {
+			releaseForwardSlot(slots)
+			n.forwardRejected.Add(1)
+			_ = hostConn.Close()
+			continue
+		}
+		if !n.registerPortForwardConn(hostConn) {
+			releaseForwardSlot(slots)
+			releaseForwardSlot(n.forwardSlots)
+			_ = hostConn.Close()
+			return
+		}
+		n.forwardActive.Add(1)
+		go func() {
+			defer releaseForwardSlot(slots)
+			defer releaseForwardSlot(n.forwardSlots)
+			defer n.forwardActive.Add(-1)
+			n.handlePortForwardConn(hostConn, guestAddress)
+		}()
 	}
+}
+
+func tryAcquireForwardSlot(slots chan struct{}) bool {
+	if slots == nil {
+		return false
+	}
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+func releaseForwardSlot(slots chan struct{}) {
+	if slots == nil {
+		return
+	}
+	select {
+	case <-slots:
+	default:
+	}
+}
+
+func (n *networkRuntime) PortForwardStats() PortForwardRuntimeStats {
+	if n == nil {
+		return PortForwardRuntimeStats{}
+	}
+	return PortForwardRuntimeStats{Active: n.forwardActive.Load(), Rejected: n.forwardRejected.Load(), Limit: cap(n.forwardSlots)}
 }
 
 func (n *networkRuntime) handlePortForwardConn(hostConn net.Conn, guestAddress string) {
 	defer n.wg.Done()
+	defer n.unregisterPortForwardConn(hostConn)
 	defer hostConn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	baseCtx := n.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
 	defer cancel()
 	guestConn, err := n.stack.DialInternalContext(ctx, "tcp", guestAddress)
 	if err != nil {
 		return
 	}
+	if !n.registerActiveConn(guestConn) {
+		_ = guestConn.Close()
+		return
+	}
+	defer n.unregisterPortForwardConn(guestConn)
 	defer guestConn.Close()
 
+	proxyPortForward(hostConn, guestConn)
+}
+
+func (n *networkRuntime) registerPortForwardConn(conn net.Conn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closing {
+		return false
+	}
+	if n.active == nil {
+		n.active = make(map[net.Conn]struct{})
+	}
+	n.active[conn] = struct{}{}
+	n.wg.Add(1)
+	return true
+}
+
+func (n *networkRuntime) registerActiveConn(conn net.Conn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closing {
+		return false
+	}
+	if n.active == nil {
+		n.active = make(map[net.Conn]struct{})
+	}
+	n.active[conn] = struct{}{}
+	return true
+}
+
+func (n *networkRuntime) unregisterPortForwardConn(conn net.Conn) {
+	n.mu.Lock()
+	delete(n.active, conn)
+	n.mu.Unlock()
+}
+
+func proxyPortForward(hostConn, guestConn net.Conn) {
 	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(guestConn, hostConn)
+	copyDirection := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
+				err = closeWriter.CloseWrite()
+			} else {
+				err = dst.Close()
+			}
+		}
 		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(hostConn, guestConn)
-		errCh <- err
-	}()
+	}
+	go copyDirection(guestConn, hostConn)
+	go copyDirection(hostConn, guestConn)
+	if err := <-errCh; err != nil {
+		_ = hostConn.Close()
+		_ = guestConn.Close()
+	}
 	<-errCh
 }

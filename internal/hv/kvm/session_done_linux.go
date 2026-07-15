@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 type sessionDone struct {
@@ -85,6 +86,14 @@ func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predi
 	case <-s.done.done():
 		return "", sessionExitError(s.done.result())
 	case <-ctx.Done():
+		// The transcript result and the caller deadline can become ready in the
+		// same scheduler turn. Give bytes already delivered by the guest one
+		// final bounded parse instead of randomly choosing a false timeout.
+		finalCtx, cancelFinal := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancelFinal()
+		if segment, err := s.transcript.WaitFor(finalCtx, start, predicate); err == nil {
+			return segment, nil
+		}
 		return "", ctx.Err()
 	}
 }

@@ -1,11 +1,38 @@
 package sidecar
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 	"sync"
 	"time"
 )
+
+const CommandReapTimeout = 100 * time.Millisecond
+
+var ErrCommandTimeout = errors.New("command did not exit before timeout")
+
+type CommandTimeoutError struct {
+	Timeout      time.Duration
+	KillErr      error
+	WaitErr      error
+	ReapTimedOut bool
+}
+
+func (e *CommandTimeoutError) Error() string {
+	if e.ReapTimedOut {
+		return fmt.Sprintf("command timed out after %s and did not exit within %s after kill", e.Timeout, CommandReapTimeout)
+	}
+	if e.KillErr != nil {
+		return fmt.Sprintf("command timed out after %s; kill failed: %v", e.Timeout, e.KillErr)
+	}
+	return fmt.Sprintf("command timed out after %s; wait after kill: %v", e.Timeout, e.WaitErr)
+}
+
+func (e *CommandTimeoutError) Unwrap() error {
+	return errors.Join(ErrCommandTimeout, e.KillErr, e.WaitErr)
+}
 
 type Daemon struct {
 	cmd      *exec.Cmd
@@ -56,18 +83,34 @@ func WaitCommand(cmd *exec.Cmd, timeout time.Duration) error {
 	if cmd == nil {
 		return nil
 	}
+	return waitCommand(timeout, cmd.Wait, func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return cmd.Process.Kill()
+	})
+}
+
+func waitCommand(timeout time.Duration, wait func() error, kill func() error) error {
 	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()
+		done <- wait()
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(timeout):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		return <-done
+	case <-timer.C:
+	}
+	killErr := kill()
+	reapTimer := time.NewTimer(CommandReapTimeout)
+	defer reapTimer.Stop()
+	select {
+	case waitErr := <-done:
+		return &CommandTimeoutError{Timeout: timeout, KillErr: killErr, WaitErr: waitErr}
+	case <-reapTimer.C:
+		return &CommandTimeoutError{Timeout: timeout, KillErr: killErr, ReapTimedOut: true}
 	}
 }
 

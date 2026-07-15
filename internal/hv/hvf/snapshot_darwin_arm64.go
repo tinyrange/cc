@@ -19,6 +19,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/arm64vm"
+	"j5.nz/cc/internal/hv/snapshotstore"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
@@ -476,10 +477,12 @@ func (s *snapshotTrigger) capture(vm *VM, vcpuIndex int, value uint64) error {
 		timingLog("snapshot trigger captured vcpu=%d value=%#x without file dump", vcpuIndex, value)
 		return nil
 	}
-	outDir := filepath.Join(s.dir, "snapshot-"+time.Now().UTC().Format("20060102T150405.000000000Z"))
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("create snapshot dir: %w", err)
+	capture, err := snapshotstore.Begin(s.dir)
+	if err != nil {
+		return err
 	}
+	defer capture.Abort()
+	outDir := capture.Dir()
 	if err := os.WriteFile(filepath.Join(outDir, "memory.bin"), s.mem, 0o600); err != nil {
 		return fmt.Errorf("write snapshot memory: %w", err)
 	}
@@ -503,7 +506,6 @@ func (s *snapshotTrigger) capture(vm *VM, vcpuIndex int, value uint64) error {
 	manifest.GICICC = snapshotGICICC(vm, vcpuIndex)
 	manifest.Devices = snapshotDeviceStates(s.devices)
 	manifest.MMIOWrites = s.mmio.snapshot()
-	var err error
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal snapshot manifest: %w", err)
@@ -511,7 +513,11 @@ func (s *snapshotTrigger) capture(vm *VM, vcpuIndex int, value uint64) error {
 	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), data, 0o644); err != nil {
 		return fmt.Errorf("write snapshot manifest: %w", err)
 	}
-	timingLog("snapshot trigger wrote %s", outDir)
+	final, err := capture.Publish("memory.bin", "manifest.json")
+	if err != nil {
+		return err
+	}
+	timingLog("snapshot trigger wrote %s", final)
 	return nil
 }
 
@@ -760,10 +766,9 @@ func loadSnapshot(path string) (snapshotManifest, []byte, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return snapshotManifest{}, nil, fmt.Errorf("decode snapshot manifest: %w", err)
 	}
-	baseDir := filepath.Dir(manifestPath)
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(baseDir, memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return snapshotManifest{}, nil, err
 	}
 	memFile, err := os.Open(memPath)
 	if err != nil {

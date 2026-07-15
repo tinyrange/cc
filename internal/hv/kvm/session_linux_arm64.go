@@ -10,12 +10,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/fdt"
 	managedagent "j5.nz/cc/internal/managed/agent"
 	"j5.nz/cc/internal/serial"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -35,7 +37,20 @@ type ManagedSession struct {
 	dmesg      bool
 }
 
+type ManagedSessionOptions struct {
+	SnapshotDir     string
+	RestoreSnapshot string
+}
+
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithOptions(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, ManagedSessionOptions{}, onEvent)
+}
+
+func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
+		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, onEvent)
+	}
+	stageStart := time.Now()
 	if err := emitManagedBootStatus(onEvent, "starting VM"); err != nil {
 		return nil, err
 	}
@@ -61,26 +76,39 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}()
 
 	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
+	snapshot := newSnapshotTrigger(opts.SnapshotDir, nil)
+	if snapshot != nil {
+		nodes = append(nodes, arm64vm.SnapshotDeviceNode())
+	}
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			nodes = append(nodes, fsdev.DeviceTreeNode())
 		}
 	}
+	timing.Since(ctx, "startup.kvm.host_devices", stageStart)
 
+	stageStart = time.Now()
 	vm, err := NewVM()
+	timing.Since(ctx, "startup.kvm.vm_create", stageStart)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
 		return nil, err
 	}
+	stageStart = time.Now()
 	mem, err := vm.MapAnonymousMemory(arm64vm.MemorySizeBytes(memoryMB), arm64vm.MemoryBase)
+	timing.Since(ctx, "startup.kvm.memory_map", stageStart)
 	if err != nil {
 		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
 		vsock.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	if snapshot != nil {
+		snapshot.mem = mem
+	}
 
+	stageStart = time.Now()
 	serialOut := vmruntime.NewSerialTranscript()
 	var serialWriter io.Writer = serialOut
 	var bootWriter *vmruntime.BootEventWriter
@@ -88,6 +116,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
+	serialWriter = snapshot.wrapSerialWriter(serialWriter)
 	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	for _, fsdev := range fsdevs {
@@ -97,13 +126,19 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}
 	vsock.Attach(vm, vm)
 	rng.Attach(vm, vm)
+	timing.Since(ctx, "startup.kvm.device_attach", stageStart)
 
+	stageStart = time.Now()
 	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   memoryMB,
 		GICVersion: arm64vm.GICVersionV2,
 		Dmesg:      dmesg,
 		ExtraNodes: nodes,
+		RecordTime: func(name string, duration time.Duration) {
+			timing.Record(ctx, "startup.kvm.boot_prepare."+name, duration)
+		},
 	})
+	timing.Since(ctx, "startup.kvm.boot_prepare", stageStart)
 	if err != nil {
 		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
@@ -123,10 +158,11 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		return nil, err
 	}
 
+	stageStart = time.Now()
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, serialOut, snapshot)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
@@ -161,7 +197,9 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		}
 		return nil, transcriptError(ctx.Err(), serialOut.String(), controlTranscript.String())
 	}
+	timing.Since(ctx, "startup.kvm.vcpu_to_control", stageStart)
 
+	stageStart = time.Now()
 	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
 		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
 	}); err != nil {
@@ -174,6 +212,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		}
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}
+	timing.Since(ctx, "startup.kvm.control_to_ready", stageStart)
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		cancel()
 		_ = control.Close()
@@ -223,6 +262,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	if err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
+	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
+	defer stopKeepalive()
 	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok

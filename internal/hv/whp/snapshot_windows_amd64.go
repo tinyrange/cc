@@ -16,6 +16,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/hv/snapshotstore"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -159,10 +160,12 @@ func (s *snapshotTrigger) capture(vm *VM, platform *bootPlatform, value uint64) 
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return nil
 	}
-	outDir := filepath.Join(s.dir, "snapshot-"+time.Now().UTC().Format("20060102T150405.000000000Z"))
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("create snapshot dir: %w", err)
+	capture, err := snapshotstore.Begin(s.dir)
+	if err != nil {
+		return err
 	}
+	defer capture.Abort()
+	outDir := capture.Dir()
 	if err := os.WriteFile(filepath.Join(outDir, "memory.bin"), s.mem, 0o600); err != nil {
 		return fmt.Errorf("write snapshot memory: %w", err)
 	}
@@ -196,7 +199,8 @@ func (s *snapshotTrigger) capture(vm *VM, platform *bootPlatform, value uint64) 
 	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), data, 0o644); err != nil {
 		return fmt.Errorf("write snapshot manifest: %w", err)
 	}
-	return nil
+	_, err = capture.Publish("memory.bin", "manifest.json")
+	return err
 }
 
 func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -420,9 +424,9 @@ func loadWHPSnapshot(path string) (whpSnapshotManifest, string, error) {
 	if manifest.Format != "ccx3-whp-snapshot-v0" {
 		return whpSnapshotManifest{}, "", fmt.Errorf("unsupported WHP snapshot format %q", manifest.Format)
 	}
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(filepath.Dir(manifestPath), memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return whpSnapshotManifest{}, "", err
 	}
 	info, err := os.Stat(memPath)
 	if err != nil {

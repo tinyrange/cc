@@ -27,10 +27,10 @@ const (
 	WorkerFrameWait         = "wait"
 	WorkerFrameStatus       = "status"
 	WorkerFrameExec         = "exec"
+	WorkerFrameAddShare     = "add_share"
 	WorkerFrameExecInput    = "exec_input"
 	WorkerFrameCancel       = "cancel"
 	WorkerFrameFlush        = "flush"
-	WorkerFrameAddShare     = "add_share"
 	WorkerFrameConsole      = "console"
 	WorkerFrameDone         = "done"
 	WorkerFrameEvent        = "event"
@@ -118,7 +118,9 @@ type WorkerCancelRequest struct {
 }
 
 type WorkerError struct {
-	Error string `json:"error"`
+	Error       string `json:"error"`
+	RequestID   uint64 `json:"request_id,omitempty"`
+	RequestType string `json:"request_type,omitempty"`
 }
 
 func (r WorkerStartRequest) Validate() error {

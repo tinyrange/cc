@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/hv/snapshotstore"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -92,6 +93,20 @@ type kvmSnapshotVCPU struct {
 	XCRS      kvmXCRS       `json:"xcrs"`
 }
 
+type kvmSnapshotCacheKey struct {
+	path    string
+	size    int64
+	modTime int64
+}
+
+type cachedKVMSnapshot struct {
+	manifest kvmSnapshotManifest
+	memPath  string
+}
+
+var kvmSnapshotCache sync.Map
+var kvmSnapshotCacheMu sync.Mutex
+
 func newSnapshotTrigger(dir string, mem []byte) *snapshotTrigger {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -109,7 +124,7 @@ func (s *snapshotTrigger) contains(addr uint64, size int) bool {
 	return s != nil && size > 0 && addr >= s.base && addr+uint64(size) <= s.base+s.size
 }
 
-func (s *snapshotTrigger) handleMMIO(vm *VM, mmio MMIOExit) (bool, error) {
+func (s *snapshotTrigger) handleMMIO(vm *VM, balloon *virtio.Balloon, mmio MMIOExit) (bool, error) {
 	if !s.contains(mmio.Addr, int(mmio.Len)) {
 		return false, nil
 	}
@@ -117,7 +132,11 @@ func (s *snapshotTrigger) handleMMIO(vm *VM, mmio MMIOExit) (bool, error) {
 		s.markWrite(mmioValue(mmio))
 		return true, nil
 	}
-	vm.CompleteMMIORead(snapshotTriggerMagic, mmio.Len)
+	var ready uint64 = snapshotTriggerMagic
+	if balloon != nil && !balloon.AtTarget() {
+		ready = 0
+	}
+	vm.CompleteMMIORead(ready, mmio.Len)
 	return true, nil
 }
 
@@ -198,10 +217,12 @@ func (s *snapshotTrigger) capture(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vso
 	if vm == nil || len(vm.vcpus) != 1 {
 		return fmt.Errorf("KVM startup snapshots require exactly one vCPU")
 	}
-	outDir := filepath.Join(s.dir, "snapshot-"+time.Now().UTC().Format("20060102T150405.000000000Z"))
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("create snapshot dir: %w", err)
+	capture, err := snapshotstore.Begin(s.dir)
+	if err != nil {
+		return err
 	}
+	defer capture.Abort()
+	outDir := capture.Dir()
 	if err := writeSparseFile(filepath.Join(outDir, "memory.bin"), s.mem, 0o600); err != nil {
 		return fmt.Errorf("write snapshot memory: %w", err)
 	}
@@ -246,7 +267,8 @@ func (s *snapshotTrigger) capture(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vso
 	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), data, 0o644); err != nil {
 		return fmt.Errorf("write snapshot manifest: %w", err)
 	}
-	return nil
+	_, err = capture.Publish("memory.bin", "manifest.json")
+	return err
 }
 
 func writeSparseFile(path string, data []byte, perm os.FileMode) error {
@@ -348,6 +370,11 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
+	// A restored guest may block with the control interrupt already pending.
+	// Keep pulsing the IRQ until both the control connection and ready marker
+	// have arrived, just as managed exec does for later command traffic.
+	stopRestoreKeepalive := startVsockKeepalive(ctx, vsock, execKeepalive)
+	defer stopRestoreKeepalive()
 
 	var control virtio.VsockConn
 	select {
@@ -401,6 +428,16 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 			_ = bootWriter.Close()
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if err := adviseSnapshotMemoryMergeable(vm.mem); err != nil {
+		cancel()
+		_ = control.Close()
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()
@@ -505,6 +542,21 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
 		manifestPath = filepath.Join(path, "manifest.json")
 	}
+	manifestInfo, err := os.Stat(manifestPath)
+	if err != nil {
+		return kvmSnapshotManifest{}, "", fmt.Errorf("stat snapshot manifest: %w", err)
+	}
+	cacheKey := kvmSnapshotCacheKey{path: manifestPath, size: manifestInfo.Size(), modTime: manifestInfo.ModTime().UnixNano()}
+	if cached, ok := kvmSnapshotCache.Load(cacheKey); ok {
+		snapshot := cached.(cachedKVMSnapshot)
+		return snapshot.manifest, snapshot.memPath, nil
+	}
+	kvmSnapshotCacheMu.Lock()
+	defer kvmSnapshotCacheMu.Unlock()
+	if cached, ok := kvmSnapshotCache.Load(cacheKey); ok {
+		snapshot := cached.(cachedKVMSnapshot)
+		return snapshot.manifest, snapshot.memPath, nil
+	}
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("read snapshot manifest: %w", err)
@@ -516,9 +568,9 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if manifest.Format != "ccx3-kvm-snapshot-v0" {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("unsupported KVM snapshot format %q", manifest.Format)
 	}
-	memPath := manifest.MemoryFile
-	if !filepath.IsAbs(memPath) {
-		memPath = filepath.Join(filepath.Dir(manifestPath), memPath)
+	memPath, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, manifest.MemoryFile)
+	if err != nil {
+		return kvmSnapshotManifest{}, "", err
 	}
 	info, err := os.Stat(memPath)
 	if err != nil {
@@ -530,6 +582,7 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if manifest.MemorySize != 0 && uint64(info.Size()) != manifest.MemorySize {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("snapshot memory size = %d, want %d", info.Size(), manifest.MemorySize)
 	}
+	kvmSnapshotCache.Store(cacheKey, cachedKVMSnapshot{manifest: manifest, memPath: memPath})
 	return manifest, memPath, nil
 }
 

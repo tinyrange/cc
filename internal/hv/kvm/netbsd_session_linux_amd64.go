@@ -122,7 +122,7 @@ func normalizeNetBSDManagedConfig(cfg NetBSDManagedConfig) (NetBSDManagedConfig,
 
 func runNetBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci *PCIBus, serialOut *vmruntime.SerialTranscript) error {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// The caller owns a dedicated goroutine; terminate its vCPU thread when it exits.
 	vm.SetVCPUTID(0, unix.Gettid())
 	defer vm.SetVCPUTID(0, 0)
 	cancelDone := make(chan struct{})

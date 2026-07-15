@@ -16,11 +16,13 @@ const (
 	kvmRun                 = 0xae80
 	kvmGetOneReg           = 0x4010aeab
 	kvmSetOneReg           = 0x4010aeac
+	kvmGetRegList          = 0xc008aeb0
 	kvmArmVCPUInit         = 0x4020aeae
 	kvmArmPrefTarget       = 0x8020aeaf
 	kvmIRQLine             = 0x4008ae61
 	kvmCreateDevice        = 0xc00caee0
 	kvmSetDeviceAttr       = 0x4018aee1
+	kvmGetDeviceAttr       = 0x4018aee2
 	kvmEnableCap           = 0x4068aea3
 )
 
@@ -31,9 +33,13 @@ const (
 	kvmDevTypeArmVgicV2 = 5
 	kvmDevTypeArmVgicV3 = 7
 
-	kvmDevArmVgicGrpAddr   = 0
-	kvmDevArmVgicGrpNrIrqs = 3
-	kvmDevArmVgicGrpCtrl   = 4
+	kvmDevArmVgicGrpAddr       = 0
+	kvmDevArmVgicGrpDistRegs   = 1
+	kvmDevArmVgicGrpCPURegs    = 2
+	kvmDevArmVgicGrpNrIrqs     = 3
+	kvmDevArmVgicGrpCtrl       = 4
+	kvmDevArmVgicGrpRedistRegs = 5
+	kvmDevArmVgicGrpCPUSysRegs = 6
 
 	kvmDevArmVgicCtrlInit = 0
 
@@ -127,6 +133,28 @@ func createDevice(fd int, dev *kvmCreateDeviceArgs) error {
 func setDeviceAttr(fd int, attr *kvmDeviceAttr) error {
 	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmSetDeviceAttr), uintptr(unsafe.Pointer(attr)))
 	return err
+}
+
+func getDeviceAttr(fd int, attr *kvmDeviceAttr) error {
+	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmGetDeviceAttr), uintptr(unsafe.Pointer(attr)))
+	return err
+}
+
+func getRegList(vcpuFd int) ([]uint64, error) {
+	header := kvmRegList{}
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetRegList), uintptr(unsafe.Pointer(&header)))
+	if err != nil && err != unix.E2BIG {
+		return nil, err
+	}
+	if header.n == 0 {
+		return nil, nil
+	}
+	buf := make([]uint64, header.n+1)
+	buf[0] = header.n
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetRegList), uintptr(unsafe.Pointer(&buf[0]))); err != nil {
+		return nil, err
+	}
+	return buf[1:], nil
 }
 
 func irqLevel(vmFd int, irqLine uint32, level bool) error {

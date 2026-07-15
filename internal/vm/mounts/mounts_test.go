@@ -253,6 +253,27 @@ func TestManagedMountStateAddShareTracksDuplicates(t *testing.T) {
 	}
 }
 
+func TestManagedMountStateIncludesStartupShares(t *testing.T) {
+	share := client.ShareMount{Source: "/host/data", Mount: "/data", Writable: true, Cache: "auto"}
+	state := NewState([]client.ShareMount{share})
+	root := &recordingShareMounter{}
+	builds := 0
+	build := func(share client.ShareMount) (virtio.ShareMount, error) {
+		builds++
+		return virtio.ShareMount{GuestPath: share.Mount}, nil
+	}
+
+	if err := state.AddShare(root, share, "shares", build); err != nil {
+		t.Fatalf("repeat startup share: %v", err)
+	}
+	if builds != 0 || len(root.shares) != 0 {
+		t.Fatalf("repeat startup share builds/mounts = %d/%d, want 0/0", builds, len(root.shares))
+	}
+	if err := state.AddShare(root, client.ShareMount{Source: "/other", Mount: "/data"}, "shares", build); err == nil {
+		t.Fatal("conflicting startup share unexpectedly succeeded")
+	}
+}
+
 func TestAddRuntimeShareMountValidatesInputs(t *testing.T) {
 	var mu sync.Mutex
 	shares := map[string]client.ShareMount{}
