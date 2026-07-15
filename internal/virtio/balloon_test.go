@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"reflect"
 	"testing"
 )
 
@@ -9,6 +10,22 @@ type testBalloonMemory struct {
 	testGuestMemory
 	reclaimed []uint64
 	reused    []uint64
+}
+
+type testRangeBalloonMemory struct {
+	testBalloonMemory
+	reclaimedRanges [][2]uint64
+	reusedRanges    [][2]uint64
+}
+
+func (m *testRangeBalloonMemory) ReclaimGuestPages(ipa, size uint64) error {
+	m.reclaimedRanges = append(m.reclaimedRanges, [2]uint64{ipa, size})
+	return nil
+}
+
+func (m *testRangeBalloonMemory) ReuseGuestPages(ipa, size uint64) error {
+	m.reusedRanges = append(m.reusedRanges, [2]uint64{ipa, size})
+	return nil
 }
 
 func (m *testBalloonMemory) ReclaimGuestPage(ipa uint64) error {
@@ -95,6 +112,70 @@ func TestBalloonEmptyQueueNotifyDoesNotInterrupt(t *testing.T) {
 	}
 	if got, err := dev.Read(regInterruptStatus, 4); err != nil || got != 0 {
 		t.Fatalf("interrupt status = %#x, %v; want 0, nil", got, err)
+	}
+}
+
+func TestBalloonCoalescesContiguousPageReclaims(t *testing.T) {
+	mem := &testRangeBalloonMemory{testBalloonMemory: testBalloonMemory{testGuestMemory: make(testGuestMemory, 0x20000)}}
+	dev := NewBalloon(0, 0x1000, 12)
+	dev.Attach(mem, &testIRQ{})
+	configureBalloonQueue(t, dev, balloonQueueInflate, 8, 0x1000, 0x2000, 0x3000)
+
+	writeBalloonPFNChain(mem.testGuestMemory, 0x1000, 0x2000, 0x8000, 0, []uint32{3, 4, 5, 9, 10})
+	if err := dev.Write(regQueueNotify, 4, balloonQueueInflate); err != nil {
+		t.Fatalf("notify inflate: %v", err)
+	}
+	want := [][2]uint64{{3 * balloonPageSize, 3 * balloonPageSize}, {9 * balloonPageSize, 2 * balloonPageSize}}
+	if len(mem.reclaimedRanges) != len(want) {
+		t.Fatalf("reclaimed ranges = %v, want %v", mem.reclaimedRanges, want)
+	}
+	for i := range want {
+		if mem.reclaimedRanges[i] != want[i] {
+			t.Fatalf("reclaimed ranges = %v, want %v", mem.reclaimedRanges, want)
+		}
+	}
+}
+
+func TestBalloonAtTargetTracksGuestAcknowledgement(t *testing.T) {
+	dev := NewBalloon(0, 0x1000, 12)
+	if !dev.AtTarget() {
+		t.Fatal("zero-sized balloon should start at its target")
+	}
+	if err := dev.SetTargetPages(100); err != nil {
+		t.Fatalf("set target: %v", err)
+	}
+	if dev.AtTarget() {
+		t.Fatal("balloon unexpectedly at an unacknowledged target")
+	}
+	dev.mu.Lock()
+	dev.actualPages = 100
+	dev.mu.Unlock()
+	if !dev.AtTarget() {
+		t.Fatal("balloon should be at its acknowledged target")
+	}
+}
+
+func TestBalloonSnapshotRoundTripsCompactInflatedPages(t *testing.T) {
+	mem := &testBalloonMemory{testGuestMemory: make(testGuestMemory, 0x20000)}
+	dev := NewBalloon(0, 0x1000, 12)
+	dev.Attach(mem, &testIRQ{})
+	configureBalloonQueue(t, dev, balloonQueueInflate, 8, 0x1000, 0x2000, 0x3000)
+	writeBalloonPFNChain(mem.testGuestMemory, 0x1000, 0x2000, 0x8000, 0, []uint32{3, 5, 65})
+	if err := dev.Write(regQueueNotify, 4, balloonQueueInflate); err != nil {
+		t.Fatalf("notify inflate: %v", err)
+	}
+
+	state := dev.SnapshotState()
+	if len(state.InflatedPages) != 0 || len(state.InflatedPageWords) != 2 {
+		t.Fatalf("inflated state uses pages=%v words=%v, want two compact words", state.InflatedPages, state.InflatedPageWords)
+	}
+	restored := NewBalloon(0, 0x1000, 12)
+	restored.Attach(make(testGuestMemory, 0x20000), &testIRQ{})
+	if err := restored.RestoreState(state); err != nil {
+		t.Fatalf("restore state: %v", err)
+	}
+	if got := restored.SnapshotState().InflatedPageWords; !reflect.DeepEqual(got, state.InflatedPageWords) {
+		t.Fatalf("restored inflated words = %v, want %v", got, state.InflatedPageWords)
 	}
 }
 

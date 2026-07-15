@@ -341,7 +341,7 @@ type FS struct {
 	closed           chan struct{}
 	workerWG         sync.WaitGroup
 	kickPollWG       sync.WaitGroup
-	workCh           chan fsWork
+	workCh           chan *fsWork
 	nextWorkSeq      []uint64
 	nextCompleteSeq  []uint64
 	completions      map[fsCompletionKey]fsCompletion
@@ -357,6 +357,7 @@ const fuseStatsSlots = 64
 const fsStageCount = 4
 const fsInlineRespDescs = 32
 const fsPooledReqSize = 4096
+const fsWorkQueueDepth = 128
 
 const (
 	fsStageQueueHarvest = iota
@@ -489,8 +490,11 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		entryTTL:       entryTTL,
 		attrTTL:        attrTTL,
 		closed:         make(chan struct{}),
-		workCh:         make(chan fsWork, 1024),
-		completions:    make(map[fsCompletionKey]fsCompletion),
+		// A virtqueue can expose at most 128 heads in one notification. Queue
+		// pointers so an idle device does not reserve the large inline descriptor
+		// array in every fsWork slot.
+		workCh:      make(chan *fsWork, fsWorkQueueDepth),
+		completions: make(map[fsCompletionKey]fsCompletion),
 	}
 	fs.resetQueueStateLocked()
 	if fs.backend == nil {
@@ -601,10 +605,10 @@ func resolveVirtioFSAsync() bool {
 
 func resolveVirtioFSWorkerCount() int {
 	const maxWorkers = 64
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 1 {
-		workers = 1
-	}
+	// One worker per device preserves concurrency between VMs without retaining
+	// GOMAXPROCS-sized worker sets for every mostly idle guest. Workloads that
+	// benefit from parallel requests within one guest can raise this explicitly.
+	workers := 1
 	if value := strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WORKERS")); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil {
 			workers = parsed
@@ -1099,7 +1103,9 @@ func (f *FS) enqueueWorks(works []fsWork) {
 		return
 	}
 	f.workerOnce.Do(f.startWorkers)
-	for _, work := range works {
+	for i := range works {
+		work := new(fsWork)
+		*work = works[i]
 		select {
 		case <-f.closed:
 			putFSReqBuffer(work.req, work.pooledReq)
@@ -1261,7 +1267,7 @@ func (f *FS) startWorkers() {
 func (f *FS) runWorker() {
 	defer f.workerWG.Done()
 	for {
-		var work fsWork
+		var work *fsWork
 		select {
 		case <-f.closed:
 			return
@@ -1281,7 +1287,7 @@ func (f *FS) runWorker() {
 			return
 		default:
 		}
-		if err := f.completeWork(work, reply, err); err != nil {
+		if err := f.completeWork(*work, reply, err); err != nil {
 			f.logf("async-complete-error q=%d head=%d: %v", work.qidx, work.head, err)
 		}
 	}

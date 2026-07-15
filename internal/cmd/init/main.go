@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -493,6 +494,13 @@ func run() error {
 			if strings.TrimSpace(cfg.InitSystem) != "" {
 				return bootInitSystem(cfg, bootStart)
 			}
+			if len(deferredModules) > 0 {
+				writeStage(bootStart, "loading deferred modules")
+				if err := loadModulePayloads(deferredModules); err != nil {
+					return err
+				}
+				writeStage(bootStart, "deferred modules loaded")
+			}
 			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
 				return fmt.Errorf("trigger snapshot: %w", err)
 			}
@@ -502,13 +510,6 @@ func run() error {
 					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
 				}
 				writeStage(bootStart, "entropy seeded")
-			}
-			if len(deferredModules) > 0 {
-				writeStage(bootStart, "loading deferred modules")
-				if err := loadModulePayloads(deferredModules); err != nil {
-					return err
-				}
-				writeStage(bootStart, "deferred modules loaded")
 			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
@@ -1149,7 +1150,15 @@ func triggerSnapshotMMIO(base uint64) error {
 	if pageOff+8 > len(mapped) {
 		return fmt.Errorf("snapshot mmio offset %#x outside mapped page", pageOff)
 	}
-	*(*uint64)(unsafe.Pointer(&mapped[pageOff])) = snapshotMagic
+	trigger := (*uint64)(unsafe.Pointer(&mapped[pageOff]))
+	deadline := time.Now().Add(30 * time.Second)
+	for atomic.LoadUint64(trigger) != snapshotMagic {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait for snapshot readiness: timed out")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	atomic.StoreUint64(trigger, snapshotMagic)
 	writeConsole("__CCX3_SNAPSHOT__\n")
 	return nil
 }

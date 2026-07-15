@@ -57,6 +57,14 @@ type Store struct {
 	mu          sync.Mutex
 	downloading map[string]bool
 	lastErr     map[string]error
+	opened      map[string]*Image
+	opening     map[string]*imageOpenCall
+}
+
+type imageOpenCall struct {
+	done  chan struct{}
+	image *Image
+	err   error
 }
 
 type metadata struct {
@@ -228,6 +236,8 @@ func NewStore(root string) *Store {
 		httpClient:  http.DefaultClient,
 		downloading: map[string]bool{},
 		lastErr:     map[string]error{},
+		opened:      map[string]*Image{},
+		opening:     map[string]*imageOpenCall{},
 	}
 }
 
@@ -289,6 +299,7 @@ func (s *Store) Delete(name string) error {
 		return fmt.Errorf("remove image %q: %w", name, err)
 	}
 	delete(s.lastErr, name)
+	delete(s.opened, name)
 	return nil
 }
 
@@ -298,6 +309,33 @@ func (s *Store) Open(name string) (*Image, error) {
 			return nil, err
 		}
 	}
+	s.mu.Lock()
+	if image := s.opened[name]; image != nil {
+		s.mu.Unlock()
+		return cloneImage(image), nil
+	}
+	if call := s.opening[name]; call != nil {
+		s.mu.Unlock()
+		<-call.done
+		return cloneImage(call.image), call.err
+	}
+	call := &imageOpenCall{done: make(chan struct{})}
+	s.opening[name] = call
+	s.mu.Unlock()
+
+	image, err := s.openUncached(name)
+	s.mu.Lock()
+	call.image, call.err = image, err
+	if err == nil && image.SourceKind == SourceKindSIMG {
+		s.opened[name] = image
+	}
+	delete(s.opening, name)
+	close(call.done)
+	s.mu.Unlock()
+	return cloneImage(image), err
+}
+
+func (s *Store) openUncached(name string) (*Image, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		return nil, err
@@ -401,6 +439,23 @@ func (s *Store) Open(name string) (*Image, error) {
 	}, nil
 }
 
+func cloneImage(image *Image) *Image {
+	if image == nil {
+		return nil
+	}
+	clone := *image
+	clone.Config.Env = append([]string(nil), image.Config.Env...)
+	clone.Config.Entrypoint = append([]string(nil), image.Config.Entrypoint...)
+	clone.Config.Cmd = append([]string(nil), image.Config.Cmd...)
+	if image.Config.Labels != nil {
+		clone.Config.Labels = make(map[string]string, len(image.Config.Labels))
+		for key, value := range image.Config.Labels {
+			clone.Config.Labels[key] = value
+		}
+	}
+	return &clone
+}
+
 func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOptions) (client.ImageState, error) {
 	if name == "" {
 		return client.ImageState{}, fmt.Errorf("image name is required")
@@ -452,6 +507,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	}
 	s.downloading[name] = true
 	delete(s.lastErr, name)
+	delete(s.opened, name)
 	s.mu.Unlock()
 
 	err = s.pull(ctx, name, spec, opts)

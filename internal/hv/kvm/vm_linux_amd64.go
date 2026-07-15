@@ -5,6 +5,8 @@ package kvm
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -79,24 +81,21 @@ func NewVMWithCPUs(cpus int) (*VM, error) {
 	if cpus <= 0 {
 		cpus = 1
 	}
-	k, err := Open()
+	k, err := sharedBootstrap()
 	if err != nil {
 		return nil, err
 	}
 	vmfd, err := k.CreateVM()
 	if err != nil {
-		_ = k.Close()
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
 	if err := k.InitVM(vmfd); err != nil {
 		_ = k.CloseVM(vmfd)
-		_ = k.Close()
 		return nil, fmt.Errorf("init vm: %w", err)
 	}
 	mmapSize, err := k.VcpuMmapSize()
 	if err != nil {
 		_ = k.CloseVM(vmfd)
-		_ = k.Close()
 		return nil, fmt.Errorf("get kvm_run mmap size: %w", err)
 	}
 	vm := &VM{kvm: k, vmfd: vmfd}
@@ -166,7 +165,6 @@ func (v *VM) Close() error {
 	v.regions = nil
 	if v.kvm != nil {
 		_ = v.kvm.CloseVM(v.vmfd)
-		_ = v.kvm.Close()
 		v.kvm = nil
 	}
 	return nil
@@ -567,28 +565,131 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 }
 
 func (v *VM) ReclaimGuestPage(ipa uint64) error {
-	return v.madviseGuestPage(ipa, unix.MADV_DONTNEED)
+	return v.ReclaimGuestPages(ipa, 4096)
 }
 
 func (v *VM) ReuseGuestPage(ipa uint64) error {
 	return nil
 }
 
-func (v *VM) madviseGuestPage(ipa uint64, advice int) error {
+func (v *VM) ReclaimGuestPages(ipa, size uint64) error {
+	return v.madviseGuestRange(ipa, size, unix.MADV_DONTNEED)
+}
+
+func (v *VM) ReuseGuestPages(ipa, size uint64) error {
+	return nil
+}
+
+func (v *VM) ReclaimGuestPageRanges(ranges [][2]uint64) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	iovecs, err := v.guestRangeIOVectors(ranges)
+	if err != nil {
+		return err
+	}
+	if err := processMadviseSelf(iovecs, unix.MADV_DONTNEED); err == nil {
+		return nil
+	}
+	for _, iovec := range iovecs {
+		region := unsafe.Slice(iovec.Base, int(iovec.Len))
+		if err := unix.Madvise(region, unix.MADV_DONTNEED); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (v *VM) ReuseGuestPageRanges(ranges [][2]uint64) error {
+	return nil
+}
+
+func (v *VM) guestRangeIOVectors(ranges [][2]uint64) ([]unix.Iovec, error) {
+	iovecs := make([]unix.Iovec, 0, len(ranges))
+	for _, pageRange := range ranges {
+		ipa, size := pageRange[0], pageRange[1]
+		if ipa%4096 != 0 || size%4096 != 0 {
+			return nil, fmt.Errorf("guest memory range %#x+%#x is not page aligned", ipa, size)
+		}
+		for size != 0 {
+			region, off, ok := v.findMemoryRegion(ipa)
+			if !ok {
+				return nil, fmt.Errorf("guest memory range at %#x: unmapped", ipa)
+			}
+			chunk := min(size, uint64(len(region))-off)
+			if chunk == 0 {
+				return nil, fmt.Errorf("guest memory range at %#x has invalid size %#x", ipa, chunk)
+			}
+			iovec := unix.Iovec{Base: &region[off]}
+			iovec.SetLen(int(chunk))
+			iovecs = append(iovecs, iovec)
+			ipa += chunk
+			size -= chunk
+		}
+	}
+	return iovecs, nil
+}
+
+var selfProcessMadvise = struct {
+	sync.Once
+	fd  int
+	err error
+}{fd: -1}
+
+func processMadviseSelf(iovecs []unix.Iovec, advice int) error {
+	if len(iovecs) == 0 {
+		return nil
+	}
+	selfProcessMadvise.Do(func() {
+		selfProcessMadvise.fd, selfProcessMadvise.err = unix.PidfdOpen(os.Getpid(), 0)
+	})
+	if selfProcessMadvise.err != nil {
+		return selfProcessMadvise.err
+	}
+	want := uint64(0)
+	for i := range iovecs {
+		want += iovecs[i].Len
+	}
+	advised, _, errno := unix.Syscall6(unix.SYS_PROCESS_MADVISE,
+		uintptr(selfProcessMadvise.fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)), uintptr(advice), 0, 0)
+	runtime.KeepAlive(iovecs)
+	if errno != 0 {
+		return errno
+	}
+	if uint64(advised) != want {
+		return fmt.Errorf("process_madvise advised %d bytes, want %d", advised, want)
+	}
+	return nil
+}
+
+func (v *VM) madviseGuestRange(ipa, size uint64, advice int) error {
 	if v == nil {
 		return fmt.Errorf("vm is nil")
 	}
 	const pageSize = 4096
-	if ipa%pageSize != 0 {
-		return fmt.Errorf("guest page %#x is not page aligned", ipa)
+	if ipa%pageSize != 0 || size%pageSize != 0 {
+		return fmt.Errorf("guest memory range %#x+%#x is not page aligned", ipa, size)
 	}
 	v.lifecycleMu.RLock()
 	defer v.lifecycleMu.RUnlock()
-	region, off, ok := v.findMemoryRegion(ipa)
-	if !ok || off+pageSize > uint64(len(region)) {
-		return fmt.Errorf("guest page %#x: unmapped", ipa)
+	for size != 0 {
+		region, off, ok := v.findMemoryRegion(ipa)
+		if !ok {
+			return fmt.Errorf("guest memory range at %#x: unmapped", ipa)
+		}
+		chunk := min(size, uint64(len(region))-off)
+		if chunk == 0 {
+			return fmt.Errorf("guest memory range at %#x has invalid size %#x", ipa, chunk)
+		}
+		if err := unix.Madvise(region[off:off+chunk], advice); err != nil {
+			return err
+		}
+		ipa += chunk
+		size -= chunk
 	}
-	return unix.Madvise(region[off:off+pageSize], advice)
+	return nil
 }
 
 func (v *VM) copyFromGuest(addr uint64, out []byte) error {

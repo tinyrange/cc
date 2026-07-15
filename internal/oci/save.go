@@ -91,6 +91,9 @@ func (s *Store) SaveRootFS(ctx context.Context, name string, root imagefs.Direct
 	if err := os.Rename(tmpDir, imageDir); err != nil {
 		return client.ImageState{}, fmt.Errorf("activate saved image: %w", err)
 	}
+	s.mu.Lock()
+	delete(s.opened, name)
+	s.mu.Unlock()
 	return client.ImageState{Name: name, Source: source, SourceKind: SourceKindSaved, Status: "downloaded"}, nil
 }
 

@@ -11,12 +11,14 @@ import (
 	"j5.nz/cc/client"
 	managedagent "j5.nz/cc/internal/managed/agent"
 	managedsession "j5.nz/cc/internal/managed/session"
+	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
 
 const (
 	execTerminateGrace = 500 * time.Millisecond
 	execKillWait       = 2 * time.Second
+	execKeepalive      = time.Second
 )
 
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -28,6 +30,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	if err := s.sendExecStart(id, req); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
+	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
+	defer stopKeepalive()
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
 	} else if len(req.Stdin) == 0 && !req.TTY {
@@ -36,6 +40,37 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 		}
 	}
 	return s.streamExecEvents(ctx, start, id, onEvent)
+}
+
+// startExecKeepalive gives a blocked restored vCPU a periodic interrupt while
+// an exec is outstanding. It does not consume vsock credit or write control
+// bytes, either of which could block behind the command it is trying to wake.
+func (s *ManagedSession) startExecKeepalive(ctx context.Context, interval time.Duration) context.CancelFunc {
+	if s == nil {
+		_, cancel := context.WithCancel(ctx)
+		return cancel
+	}
+	return startVsockKeepalive(ctx, s.vsock, interval)
+}
+
+func startVsockKeepalive(ctx context.Context, vsock *virtio.Vsock, interval time.Duration) context.CancelFunc {
+	keepaliveCtx, cancel := context.WithCancel(ctx)
+	if vsock == nil || interval <= 0 {
+		return cancel
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveCtx.Done():
+				return
+			case <-ticker.C:
+				_ = vsock.Poke()
+			}
+		}
+	}()
+	return cancel
 }
 
 func (s *ManagedSession) nextExecID() string {

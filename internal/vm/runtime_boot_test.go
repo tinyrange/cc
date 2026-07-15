@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -619,6 +620,57 @@ func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
 
 	resp := execInRuntime(t, restored, []string{"sh", "-lc", "set -eu; printf 'restored-startup-snapshot\n'; cat /proc/sys/kernel/ostype"})
 	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
+}
+
+func TestRuntimeSnapshotWaitsForBalloonTarget(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("virtio balloon startup snapshots are implemented on Linux amd64")
+	}
+	env := newRuntimeBootEnv(t)
+	snapshotRoot := t.TempDir()
+
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		SnapshotDir: snapshotRoot,
+		MemoryMB:    256,
+		BalloonMB:   160,
+		CPUs:        1,
+	})
+	captureConsole := runtimeConsoleHistory(inst)
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close snapshot capture instance: %v", err)
+	}
+	snapshotPath := singleSnapshotPath(t, snapshotRoot, captureConsole)
+
+	data, err := os.ReadFile(filepath.Join(snapshotPath, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read snapshot manifest: %v", err)
+	}
+	var manifest struct {
+		Devices map[string]struct {
+			NumPages    uint32 `json:"num_pages"`
+			ActualPages uint32 `json:"actual_pages"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("decode snapshot manifest: %v", err)
+	}
+	balloon, ok := manifest.Devices["balloon"]
+	if !ok || balloon.NumPages == 0 {
+		t.Fatalf("snapshot has no balloon target: %+v", balloon)
+	}
+	if balloon.ActualPages < balloon.NumPages {
+		t.Fatalf("snapshot balloon actual pages = %d, want at least target %d", balloon.ActualPages, balloon.NumPages)
+	}
+
+	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		RestoreSnapshot: snapshotPath,
+		MemoryMB:        256,
+		BalloonMB:       160,
+		CPUs:            1,
+	})
+	defer restored.Close()
+	resp := execInRuntime(t, restored, []string{"sh", "-lc", "printf 'balloon-restored\\n'"})
+	requireGuestOutput(t, resp.Output, "balloon-restored")
 }
 
 func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {

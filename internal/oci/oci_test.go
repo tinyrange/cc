@@ -45,6 +45,41 @@ func TestStorePullSIMGFixtureAndOpenPreservesMetadata(t *testing.T) {
 	}
 }
 
+func TestStoreOpenSharesImmutableSIMGTree(t *testing.T) {
+	t.Setenv(sharedCacheEnv, filepath.Join(t.TempDir(), "shared"))
+	store := NewStore(filepath.Join(t.TempDir(), "store"))
+	if _, err := store.Pull(context.Background(), "alpine", alpineFixture(t)); err != nil {
+		t.Fatalf("pull fixture: %v", err)
+	}
+
+	const count = 16
+	images := make(chan *Image, count)
+	errs := make(chan error, count)
+	for range count {
+		go func() {
+			image, err := store.Open("alpine")
+			images <- image
+			errs <- err
+		}()
+	}
+	opened := make([]*Image, 0, count)
+	for range count {
+		if err := <-errs; err != nil {
+			t.Fatalf("open image: %v", err)
+		}
+		opened = append(opened, <-images)
+	}
+	for _, image := range opened[1:] {
+		if image.RootFS != opened[0].RootFS {
+			t.Fatal("concurrent opens rebuilt the immutable SIMG tree")
+		}
+	}
+	opened[0].Config.Env = append(opened[0].Config.Env, "ONLY_FIRST=1")
+	if len(opened[0].Config.Env) == len(opened[1].Config.Env) {
+		t.Fatal("open images share mutable runtime configuration")
+	}
+}
+
 func TestStorePullRestoresSIMGFromSharedCache(t *testing.T) {
 	shared := filepath.Join(t.TempDir(), "shared")
 	t.Setenv(sharedCacheEnv, shared)

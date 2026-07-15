@@ -22,6 +22,16 @@ type PageReclaimer interface {
 	ReuseGuestPage(ipa uint64) error
 }
 
+type PageRangeReclaimer interface {
+	ReclaimGuestPages(ipa, size uint64) error
+	ReuseGuestPages(ipa, size uint64) error
+}
+
+type PageVectorReclaimer interface {
+	ReclaimGuestPageRanges(ranges [][2]uint64) error
+	ReuseGuestPageRanges(ranges [][2]uint64) error
+}
+
 type Balloon struct {
 	Base uint64
 	Size uint64
@@ -41,8 +51,11 @@ type Balloon struct {
 	configGeneration uint32
 	numPages         uint32
 	actualPages      uint32
-	inflated         map[uint64]struct{}
-	queues           [2]queue
+	// Each entry tracks 64 guest PFNs. Linux normally inflates long contiguous
+	// runs, so this uses a fraction of the memory of one map entry per 4 KiB
+	// guest page while still accepting sparse PFNs.
+	inflated map[uint64]uint64
+	queues   [2]queue
 }
 
 func NewBalloon(base, size uint64, irq uint32) *Balloon {
@@ -92,6 +105,15 @@ func (b *Balloon) SetTargetPages(pages uint32) error {
 	b.configGeneration++
 	b.interruptStatus |= intConfig
 	return b.updateIRQLocked()
+}
+
+// AtTarget reports whether the guest driver has acknowledged the requested
+// balloon size. Snapshot callers use this to avoid making every restored VM
+// repeat inflation work that the source VM can perform once.
+func (b *Balloon) AtTarget() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.actualPages >= b.numPages
 }
 
 func (b *Balloon) Read(addr uint64, size int) (uint64, error) {
@@ -283,24 +305,67 @@ func (b *Balloon) processPFNsLocked(qidx int, addr uint64, length uint32) error 
 	if err != nil {
 		return err
 	}
+	pfns := make([]uint64, 0, len(buf)/4)
 	for off := 0; off < len(buf); off += 4 {
 		pfn := uint64(binary.LittleEndian.Uint32(buf[off : off+4]))
-		ipa := pfn * balloonPageSize
+		pfns = append(pfns, pfn)
 		switch qidx {
 		case balloonQueueInflate:
-			b.inflated[pfn] = struct{}{}
-			if b.reclaimer != nil {
-				if err := b.reclaimer.ReclaimGuestPage(ipa); err != nil {
-					return err
-				}
-			}
+			b.markInflatedLocked(pfn)
 		case balloonQueueDeflate:
-			delete(b.inflated, pfn)
-			if b.reclaimer != nil {
-				if err := b.reclaimer.ReuseGuestPage(ipa); err != nil {
+			b.markDeflatedLocked(pfn)
+		}
+	}
+	return b.reclaimPFNsLocked(qidx, pfns)
+}
+
+func (b *Balloon) reclaimPFNsLocked(qidx int, pfns []uint64) error {
+	if b.reclaimer == nil || len(pfns) == 0 {
+		return nil
+	}
+	ranges := make([][2]uint64, 0, len(pfns))
+	start := pfns[0]
+	previous := start
+	for _, pfn := range pfns[1:] {
+		if pfn == previous+1 {
+			previous = pfn
+			continue
+		}
+		ranges = append(ranges, [2]uint64{start * balloonPageSize, (previous - start + 1) * balloonPageSize})
+		start = pfn
+		previous = pfn
+	}
+	ranges = append(ranges, [2]uint64{start * balloonPageSize, (previous - start + 1) * balloonPageSize})
+	if vector, ok := b.reclaimer.(PageVectorReclaimer); ok {
+		if qidx == balloonQueueInflate {
+			return vector.ReclaimGuestPageRanges(ranges)
+		}
+		return vector.ReuseGuestPageRanges(ranges)
+	}
+	if reclaimer, ok := b.reclaimer.(PageRangeReclaimer); ok {
+		for _, pageRange := range ranges {
+			if qidx == balloonQueueInflate {
+				if err := reclaimer.ReclaimGuestPages(pageRange[0], pageRange[1]); err != nil {
 					return err
 				}
+				continue
 			}
+			if err := reclaimer.ReuseGuestPages(pageRange[0], pageRange[1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, pfn := range pfns {
+		ipa := pfn * balloonPageSize
+		if qidx == balloonQueueInflate {
+			if err := b.reclaimer.ReclaimGuestPage(ipa); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := b.reclaimer.ReuseGuestPage(ipa); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -358,7 +423,7 @@ func (b *Balloon) resetLocked() {
 	b.irqHigh = false
 	b.configGeneration++
 	b.actualPages = 0
-	b.inflated = make(map[uint64]struct{})
+	b.inflated = make(map[uint64]uint64)
 	b.queues = [2]queue{}
 }
 
@@ -385,13 +450,28 @@ func (b *Balloon) writeActualLocked(offset uint64, size int, value uint64) {
 	b.actualPages = binary.LittleEndian.Uint32(cfg[4:8])
 }
 
-func (b *Balloon) inflatedPagesLocked() []uint64 {
-	pages := make([]uint64, 0, len(b.inflated))
-	for pfn := range b.inflated {
-		pages = append(pages, pfn)
+func (b *Balloon) inflatedPageWordsLocked() []BalloonPageWord {
+	words := make([]BalloonPageWord, 0, len(b.inflated))
+	for index, bits := range b.inflated {
+		words = append(words, BalloonPageWord{Index: index, Bits: bits})
 	}
-	sort.Slice(pages, func(i, j int) bool { return pages[i] < pages[j] })
-	return pages
+	sort.Slice(words, func(i, j int) bool { return words[i].Index < words[j].Index })
+	return words
+}
+
+func (b *Balloon) markInflatedLocked(pfn uint64) {
+	word := pfn / 64
+	b.inflated[word] |= uint64(1) << (pfn % 64)
+}
+
+func (b *Balloon) markDeflatedLocked(pfn uint64) {
+	word := pfn / 64
+	bits := b.inflated[word] &^ (uint64(1) << (pfn % 64))
+	if bits == 0 {
+		delete(b.inflated, word)
+		return
+	}
+	b.inflated[word] = bits
 }
 
 type queueAddrField int

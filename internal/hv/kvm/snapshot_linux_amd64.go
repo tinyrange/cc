@@ -93,6 +93,20 @@ type kvmSnapshotVCPU struct {
 	XCRS      kvmXCRS       `json:"xcrs"`
 }
 
+type kvmSnapshotCacheKey struct {
+	path    string
+	size    int64
+	modTime int64
+}
+
+type cachedKVMSnapshot struct {
+	manifest kvmSnapshotManifest
+	memPath  string
+}
+
+var kvmSnapshotCache sync.Map
+var kvmSnapshotCacheMu sync.Mutex
+
 func newSnapshotTrigger(dir string, mem []byte) *snapshotTrigger {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -110,7 +124,7 @@ func (s *snapshotTrigger) contains(addr uint64, size int) bool {
 	return s != nil && size > 0 && addr >= s.base && addr+uint64(size) <= s.base+s.size
 }
 
-func (s *snapshotTrigger) handleMMIO(vm *VM, mmio MMIOExit) (bool, error) {
+func (s *snapshotTrigger) handleMMIO(vm *VM, balloon *virtio.Balloon, mmio MMIOExit) (bool, error) {
 	if !s.contains(mmio.Addr, int(mmio.Len)) {
 		return false, nil
 	}
@@ -118,7 +132,11 @@ func (s *snapshotTrigger) handleMMIO(vm *VM, mmio MMIOExit) (bool, error) {
 		s.markWrite(mmioValue(mmio))
 		return true, nil
 	}
-	vm.CompleteMMIORead(snapshotTriggerMagic, mmio.Len)
+	var ready uint64 = snapshotTriggerMagic
+	if balloon != nil && !balloon.AtTarget() {
+		ready = 0
+	}
+	vm.CompleteMMIORead(ready, mmio.Len)
 	return true, nil
 }
 
@@ -352,6 +370,11 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
+	// A restored guest may block with the control interrupt already pending.
+	// Keep pulsing the IRQ until both the control connection and ready marker
+	// have arrived, just as managed exec does for later command traffic.
+	stopRestoreKeepalive := startVsockKeepalive(ctx, vsock, execKeepalive)
+	defer stopRestoreKeepalive()
 
 	var control virtio.VsockConn
 	select {
@@ -405,6 +428,16 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 			_ = bootWriter.Close()
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if err := adviseSnapshotMemoryMergeable(vm.mem); err != nil {
+		cancel()
+		_ = control.Close()
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()
@@ -509,6 +542,21 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
 		manifestPath = filepath.Join(path, "manifest.json")
 	}
+	manifestInfo, err := os.Stat(manifestPath)
+	if err != nil {
+		return kvmSnapshotManifest{}, "", fmt.Errorf("stat snapshot manifest: %w", err)
+	}
+	cacheKey := kvmSnapshotCacheKey{path: manifestPath, size: manifestInfo.Size(), modTime: manifestInfo.ModTime().UnixNano()}
+	if cached, ok := kvmSnapshotCache.Load(cacheKey); ok {
+		snapshot := cached.(cachedKVMSnapshot)
+		return snapshot.manifest, snapshot.memPath, nil
+	}
+	kvmSnapshotCacheMu.Lock()
+	defer kvmSnapshotCacheMu.Unlock()
+	if cached, ok := kvmSnapshotCache.Load(cacheKey); ok {
+		snapshot := cached.(cachedKVMSnapshot)
+		return snapshot.manifest, snapshot.memPath, nil
+	}
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("read snapshot manifest: %w", err)
@@ -534,6 +582,7 @@ func loadKVMSnapshot(path string) (kvmSnapshotManifest, string, error) {
 	if manifest.MemorySize != 0 && uint64(info.Size()) != manifest.MemorySize {
 		return kvmSnapshotManifest{}, "", fmt.Errorf("snapshot memory size = %d, want %d", info.Size(), manifest.MemorySize)
 	}
+	kvmSnapshotCache.Store(cacheKey, cachedKVMSnapshot{manifest: manifest, memPath: memPath})
 	return manifest, memPath, nil
 }
 

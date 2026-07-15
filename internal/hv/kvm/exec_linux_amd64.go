@@ -252,7 +252,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 				return err
 			}
 		case ExitMMIO:
-			if handled, err := snapshot.handleMMIO(vm, exit.MMIO); err != nil {
+			if handled, err := snapshot.handleMMIO(vm, balloon, exit.MMIO); err != nil {
 				return err
 			} else if handled {
 				break

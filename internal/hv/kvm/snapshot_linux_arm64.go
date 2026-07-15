@@ -452,7 +452,11 @@ func mmapArm64SnapshotMemory(path string, size uint64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
+	mem, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
+	if err != nil {
+		return nil, err
+	}
+	return mem, nil
 }
 
 func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -553,6 +557,8 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
+	stopRestoreKeepalive := startVsockKeepalive(ctx, vsock, execKeepalive)
+	defer stopRestoreKeepalive()
 	var control virtio.VsockConn
 	select {
 	case err := <-acceptErrCh:
@@ -578,6 +584,10 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		cancel()
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if err := adviseSnapshotMemoryMergeable(vm.mem); err != nil {
+		cancel()
+		return nil, err
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()
