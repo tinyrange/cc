@@ -130,7 +130,7 @@ jobs:
             test_run: ^(TestBootNetBSD|TestNetBSD)
           - name: vm-runtime
             packages: ./internal/vm
-            test_run: ^TestRuntime(BootsLinux|OneShot|RejectsInvalidRequests|BootsPersistentLinux|Persistent|Isolated)
+            test_run: ^TestRuntime(BootsLinux|OneShot|RejectsInvalidRequests|BootsPersistentLinux|RestoresPersistentLinuxFromStartupSnapshot|Snapshot|Persistent|Isolated)
           - name: rootfs-support
             packages: ./internal/fsimage/ffs ./internal/netbsd/rootfs ./internal/openbsd/rootfs
             test_run: .

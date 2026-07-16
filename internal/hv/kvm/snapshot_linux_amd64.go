@@ -327,13 +327,6 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	}
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	balloon := virtio.NewBalloon(amd64vm.BalloonBase, amd64vm.BalloonSize, amd64vm.BalloonIRQ)
-	if targetPages := balloonTargetPages(balloonMB); targetPages != 0 {
-		if err := balloon.SetTargetPages(targetPages); err != nil {
-			_ = listener.Close()
-			vsock.Close()
-			return nil, fmt.Errorf("set balloon target: %w", err)
-		}
-	}
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -355,6 +348,15 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	}
 	vm, uart, rng, serialOut, err := restoreManagedVMFromSnapshot(manifest, memPath, memoryMB, dmesg, fsdevs, vsock, balloon, netdev, serialWriter)
 	if err != nil {
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, err
+	}
+	if err := retargetRestoredBalloon(balloon, balloonTargetPages(balloonMB)); err != nil {
+		closeVMWithFS(vm, fsdevs)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -807,6 +809,16 @@ func restoreKVMDeviceStates(states map[string]virtio.MMIOState, fsdevs []*virtio
 		if err := fsdev.RestoreState(state); err != nil {
 			return fmt.Errorf("restore fs device %#x state: %w", fsdev.Base, err)
 		}
+	}
+	return nil
+}
+
+func retargetRestoredBalloon(balloon *virtio.Balloon, target uint32) error {
+	if balloon == nil {
+		return nil
+	}
+	if err := balloon.SetTargetPages(target); err != nil {
+		return fmt.Errorf("retarget restored balloon: %w", err)
 	}
 	return nil
 }

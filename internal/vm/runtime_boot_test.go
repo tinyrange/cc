@@ -622,9 +622,9 @@ func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
 }
 
-func TestRuntimeSnapshotWaitsForBalloonTarget(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		t.Skip("virtio balloon startup snapshots are implemented on Linux amd64")
+func TestRuntimeSnapshotAppliesCurrentBalloonTarget(t *testing.T) {
+	if !((runtime.GOOS == "linux" && runtime.GOARCH == "amd64") || (runtime.GOOS == "darwin" && runtime.GOARCH == "arm64")) {
+		t.Skip("virtio balloon startup snapshots are implemented on Linux amd64 and Darwin arm64")
 	}
 	env := newRuntimeBootEnv(t)
 	snapshotRoot := t.TempDir()
@@ -665,12 +665,30 @@ func TestRuntimeSnapshotWaitsForBalloonTarget(t *testing.T) {
 	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
 		RestoreSnapshot: snapshotPath,
 		MemoryMB:        256,
-		BalloonMB:       160,
+		BalloonMB:       64,
 		CPUs:            1,
 	})
 	defer restored.Close()
-	resp := execInRuntime(t, restored, []string{"sh", "-lc", "printf 'balloon-restored\\n'"})
-	requireGuestOutput(t, resp.Output, "balloon-restored")
+	resp := execInRuntime(t, restored, []string{"sh", "-lc", `
+for attempt in $(seq 1 100); do
+	memory_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	if test "$memory_kb" -ge 143360; then
+		printf 'balloon-retargeted:%s\n' "$memory_kb"
+		exit 0
+	fi
+	sleep 0.02
+done
+printf 'balloon target was not applied; MemTotal=' >&2
+awk '/^MemTotal:/ { print $2 " kB" }' /proc/meminfo >&2
+exit 1
+`})
+	var memoryKB uint64
+	if _, err := fmt.Sscanf(strings.TrimSpace(resp.Output), "balloon-retargeted:%d", &memoryKB); err != nil {
+		t.Fatalf("parse restored guest memory from %q: %v", resp.Output, err)
+	}
+	if memoryKB < 143360 {
+		t.Fatalf("restored guest memory = %d kB, want at least 143360 kB after applying the current balloon target", memoryKB)
+	}
 }
 
 func TestRuntimePersistentRejectsRuntimeMountConflicts(t *testing.T) {
@@ -1183,9 +1201,14 @@ func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 	}
 
 	store := oci.NewStore(filepath.Join(t.TempDir(), "images"))
-	fixture := filepath.Join(root, "fixtures", "alpine.simg")
+	architecture := runtime.GOARCH
+	fixtureName := "alpine.simg"
+	if architecture == "arm64" {
+		fixtureName = "alpine-arm64.simg"
+	}
+	fixture := filepath.Join(root, "fixtures", fixtureName)
 	for _, name := range []string{runtimeBootImage, runtimeBootAltImage} {
-		if _, err := store.Pull(ctx, name, fixture, oci.PullOptions{Architecture: "amd64"}); err != nil {
+		if _, err := store.Pull(ctx, name, fixture, oci.PullOptions{Architecture: architecture}); err != nil {
 			t.Fatalf("import Alpine SIMG fixture as %s: %v", name, err)
 		}
 	}
