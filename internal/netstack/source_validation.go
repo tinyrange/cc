@@ -13,6 +13,7 @@ const (
 	SourceMACViolation
 	SourceARPViolation
 	SourceIPv4Violation
+	SourceUnsupportedProtocol
 )
 
 func (v SourceViolation) String() string {
@@ -25,6 +26,8 @@ func (v SourceViolation) String() string {
 		return "arp"
 	case SourceIPv4Violation:
 		return "ipv4"
+	case SourceUnsupportedProtocol:
+		return "unsupported"
 	default:
 		return "valid"
 	}
@@ -46,8 +49,8 @@ func ValidateGuestSource(frame []byte, expectedMAC net.HardwareAddr, expectedIPv
 		return validateARPSource(frame[ethernetHeaderLen:], expectedMAC, expectedIPv4.To4())
 	case uint16(etherTypeIPv4):
 		return validateIPv4Source(frame[ethernetHeaderLen:], expectedIPv4.To4())
-	case 0x86dd: // IPv6 has no assigned identity in the IPv4-only guest lease.
-		return SourceIPv4Violation
+	case 0x86dd: // The IPv4-only network drops ordinary guest IPv6 control traffic quietly.
+		return SourceUnsupportedProtocol
 	default:
 		return SourceValid
 	}

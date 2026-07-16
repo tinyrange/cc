@@ -454,7 +454,7 @@ type darwinSidecarSwitch struct {
 	mu               sync.Mutex
 	leases           map[string]darwinSidecarLease
 	endpoints        map[string]darwinSidecarEndpoint
-	sourceViolations [5]uint64
+	sourceViolations [6]uint64
 }
 
 type darwinSidecarLease struct {
@@ -541,7 +541,9 @@ func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
 		return
 	}
 	if violation := netstack.ValidateGuestSource(frame, source.mac, source.ip); violation != netstack.SourceValid {
-		s.recordSourceViolation(sourceID, violation)
+		if violation != netstack.SourceUnsupportedProtocol {
+			s.recordSourceViolation(sourceID, violation)
+		}
 		return
 	}
 	dst := append(net.HardwareAddr(nil), frame[0:6]...)

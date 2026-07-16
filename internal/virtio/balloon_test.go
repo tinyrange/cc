@@ -42,6 +42,9 @@ func TestBalloonTargetRaisesConfigInterrupt(t *testing.T) {
 	irq := &testIRQ{}
 	dev := NewBalloon(0, 0x1000, 12)
 	dev.Attach(make(testGuestMemory, 0x10000), irq)
+	if err := dev.Write(regStatus, 4, balloonDriverOK); err != nil {
+		t.Fatalf("mark driver ready: %v", err)
+	}
 
 	if err := dev.SetTargetPages(16); err != nil {
 		t.Fatalf("SetTargetPages: %v", err)
@@ -60,6 +63,32 @@ func TestBalloonTargetRaisesConfigInterrupt(t *testing.T) {
 	}
 	if irq.level {
 		t.Fatalf("config ack left IRQ asserted")
+	}
+}
+
+func TestBalloonTargetBeforeDriverReadyDefersConfigInterrupt(t *testing.T) {
+	irq := &testIRQ{}
+	dev := NewBalloon(0, 0x1000, 12)
+	dev.Attach(make(testGuestMemory, 0x10000), irq)
+
+	if err := dev.SetTargetPages(16); err != nil {
+		t.Fatalf("set initial target: %v", err)
+	}
+	if irq.level {
+		t.Fatal("initial target asserted IRQ before the guest driver was ready")
+	}
+	if got, err := dev.Read(regInterruptStatus, 4); err != nil || got != 0 {
+		t.Fatalf("interrupt status = %#x, %v; want 0 before driver readiness", got, err)
+	}
+	if got, err := dev.Read(regConfig, 4); err != nil || got != 16 {
+		t.Fatalf("target pages = %d, %v; want 16, nil", got, err)
+	}
+
+	if err := dev.Write(regStatus, 4, balloonDriverOK); err != nil {
+		t.Fatalf("mark driver ready: %v", err)
+	}
+	if !irq.level {
+		t.Fatal("driver readiness did not publish the pending balloon target")
 	}
 }
 

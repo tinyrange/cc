@@ -282,7 +282,7 @@ type NetStack struct {
 	// Simple counters.
 	udpRxPackets     atomic.Uint64
 	udpTxPackets     atomic.Uint64
-	sourceViolations [5]atomic.Uint64
+	sourceViolations [6]atomic.Uint64
 	closeOnce        sync.Once
 }
 
@@ -752,7 +752,9 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 
 	expectedMAC := macFromUint64(macAddr(ns.guestMAC.Load()))
 	if violation := ValidateGuestSource(frame, expectedMAC, net.IP(ns.guestIPv4[:])); violation != SourceValid {
-		ns.recordSourceViolation(violation, src)
+		if violation != SourceUnsupportedProtocol {
+			ns.recordSourceViolation(violation, src)
+		}
 		return nil
 	}
 
