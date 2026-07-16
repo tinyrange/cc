@@ -12,8 +12,11 @@
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
 /internal/freebsd/guestinit/guest-init-freebsd-arm64
+/internal/freebsd/guestinit/guest-init-freebsd-amd64
 /internal/netbsd/guestinit/guest-init-netbsd-arm64
+/internal/netbsd/guestinit/guest-init-netbsd-amd64
 /internal/openbsd/guestinit/guest-init-openbsd-arm64
+/internal/openbsd/guestinit/guest-init-openbsd-amd64
 /tools/__pycache__
 /tools/*.pyc
 /tools/*.pyo

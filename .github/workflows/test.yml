@@ -27,6 +27,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Build guest init payloads
+        run: go run ./internal/cmd/build-guestinit
+
       - name: Validate OpenAPI and route inventory
         run: go test ./internal/ccvmd -run '^TestOpenAPIContract$' -count=1
 
@@ -57,6 +60,9 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Build guest init payloads
+        run: go run ./internal/cmd/build-guestinit
 
       - name: Install Linux test tools
         if: runner.os == 'Linux'
@@ -98,6 +104,9 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Build guest init payloads
+        run: go run ./internal/cmd/build-guestinit
 
       - name: Run targeted race tests
         run: go test -race -short ./internal/ccvmd ./internal/netstack ./internal/virtio ./internal/vm/... -count=1 -timeout 15m
@@ -156,17 +165,7 @@ jobs:
             cc-runtime-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build guest init payloads
-        run: |
-          set -euo pipefail
-          start=$SECONDS
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
-          for goarch in arm64 amd64; do
-            for bsd in openbsd freebsd netbsd; do
-              CGO_ENABLED=0 GOOS="$bsd" GOARCH="$goarch" go build -trimpath -o "internal/${bsd}/guestinit/guest-init-${bsd}-${goarch}" "./internal/cmd/${bsd}-init"
-            done
-          done
-          echo "guest init payload build took $((SECONDS - start))s"
+        run: go run ./internal/cmd/build-guestinit
 
       - name: Run KVM/rootfs test shard
         env:
@@ -189,5 +188,5 @@ jobs:
           if [ "$TEST_RUN" != "." ]; then
             run_args=(-run "$TEST_RUN")
           fi
-          go test -tags embed_guestinit -p 1 "${run_args[@]}" ${TEST_PACKAGES} -count=1 -timeout 40m
+          go test -p 1 "${run_args[@]}" ${TEST_PACKAGES} -count=1 -timeout 40m
           echo "KVM/rootfs shard '${{ matrix.name }}' took $((SECONDS - start))s"
