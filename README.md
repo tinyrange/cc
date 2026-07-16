@@ -94,6 +94,7 @@ at a reverse proxy is not accepted by this listener mode.
 ```sh
 git clone https://github.com/tinyrange/cc.git
 cd cc
+go run ./internal/cmd/build-guestinit
 go build ./cmd/cc
 go build ./cmd/ccvm
 ```
@@ -102,6 +103,7 @@ For a throwaway local build:
 
 ```sh
 tmp="$(mktemp -d)"
+go run ./internal/cmd/build-guestinit
 go build -o "$tmp/cc" ./cmd/cc
 go build -o "$tmp/ccvm" ./cmd/ccvm
 ```
