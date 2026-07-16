@@ -188,7 +188,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 	timingLog("hvf.restore device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 	start = time.Now()
 	if len(manifest.Devices) > 0 {
-		if err := restoreDeviceStates(manifest.Devices, console, rng, balloon, fsdevs, vsock, netdev); err != nil {
+		if err := restoreDeviceStates(manifest.Devices, console, rng, balloon, balloonTargetPages(req.BalloonMB), fsdevs, vsock, netdev); err != nil {
 			_ = listener.Close()
 			vm.Close()
 			return nil, err
@@ -455,7 +455,7 @@ func (s *snapshotTrigger) contains(addr uint64, size int) bool {
 
 func (s *snapshotTrigger) handleDataAbort(vm *VM, vcpuIndex int, info DataAbortInfo, value uint64) error {
 	if !info.Write {
-		if err := writeAbortValue(vm, vcpuIndex, info, snapshotTriggerMagic); err != nil {
+		if err := writeAbortValue(vm, vcpuIndex, info, s.readyValue()); err != nil {
 			return err
 		}
 		return vm.AdvanceProgramCounterForVCPU(vcpuIndex)
@@ -470,6 +470,13 @@ func (s *snapshotTrigger) handleDataAbort(vm *VM, vcpuIndex int, info DataAbortI
 		timingLog("snapshot trigger capture failed: %v", s.err)
 	}
 	return nil
+}
+
+func (s *snapshotTrigger) readyValue() uint64 {
+	if s != nil && s.devices.balloon != nil && !s.devices.balloon.AtTarget() {
+		return 0
+	}
+	return snapshotTriggerMagic
 }
 
 func (s *snapshotTrigger) capture(vm *VM, vcpuIndex int, value uint64) error {
@@ -704,7 +711,7 @@ func snapshotDeviceStates(devices snapshotDevices) map[string]virtio.MMIOState {
 	return out
 }
 
-func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
+func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, balloonTarget uint32, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net) error {
 	if state, ok := states["console"]; ok && console != nil {
 		if err := console.RestoreState(state); err != nil {
 			return fmt.Errorf("restore console state: %w", err)
@@ -718,6 +725,11 @@ func restoreDeviceStates(states map[string]virtio.MMIOState, console *virtio.Con
 	if state, ok := states["balloon"]; ok && balloon != nil {
 		if err := balloon.RestoreState(state); err != nil {
 			return fmt.Errorf("restore balloon state: %w", err)
+		}
+	}
+	if balloon != nil {
+		if err := balloon.SetTargetPages(balloonTarget); err != nil {
+			return fmt.Errorf("retarget restored balloon: %w", err)
 		}
 	}
 	if state, ok := states["vsock"]; ok && vsock != nil {
@@ -797,12 +809,6 @@ func validateSnapshotRequest(manifest snapshotManifest, req ContainerRunRequest)
 		want := arm64vm.MemorySizeBytes(req.MemoryMB)
 		if manifest.MemorySize != 0 && manifest.MemorySize != want {
 			return fmt.Errorf("snapshot memory size = %d, want %d for %d MB VM", manifest.MemorySize, want, req.MemoryMB)
-		}
-	}
-	if state, ok := manifest.Devices["balloon"]; ok {
-		want := balloonTargetPages(req.BalloonMB)
-		if state.NumPages != want {
-			return fmt.Errorf("snapshot balloon target pages = %d, want %d", state.NumPages, want)
 		}
 	}
 	return nil
