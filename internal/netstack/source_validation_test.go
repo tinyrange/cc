@@ -18,7 +18,7 @@ func TestValidateGuestSource(t *testing.T) {
 		{name: "assigned IPv4", frame: sourceValidationIPv4Frame(mac, ip, 1, 0, 0), want: SourceValid},
 		{name: "spoofed Ethernet source", frame: sourceValidationIPv4Frame(net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0, 3}, ip, 1, 0, 0), want: SourceMACViolation},
 		{name: "spoofed IPv4 source", frame: sourceValidationIPv4Frame(mac, net.IPv4(10, 42, 0, 3), 1, 0, 0), want: SourceIPv4Violation},
-		{name: "unassigned IPv6", frame: sourceValidationEtherTypeFrame(mac, 0x86dd), want: SourceIPv4Violation},
+		{name: "unsupported IPv6", frame: sourceValidationEtherTypeFrame(mac, 0x86dd), want: SourceUnsupportedProtocol},
 		{name: "DHCP discovery", frame: sourceValidationIPv4Frame(mac, net.IPv4zero, byte(udpProtocolNumber), 68, 67), want: SourceValid},
 		{name: "non-DHCP unspecified IPv4", frame: sourceValidationIPv4Frame(mac, net.IPv4zero, byte(udpProtocolNumber), 1234, 67), want: SourceIPv4Violation},
 		{name: "assigned ARP", frame: sourceValidationARPFrame(mac, ip, net.IPv4(10, 42, 0, 1)), want: SourceValid},

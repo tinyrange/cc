@@ -73,6 +73,22 @@ func TestDarwinSidecarSwitchDropsSpoofedSources(t *testing.T) {
 	if got := switcher.sourceViolationCount(netstack.SourceMACViolation); got != 1 {
 		t.Fatalf("MAC violation count = %d, want 1", got)
 	}
+
+	switcher.Forward("a", darwinSidecarEtherTypeFrame(macB, macA, 0x86dd))
+	if received != 1 {
+		t.Fatalf("unsupported IPv6 frame reached target: deliveries = %d", received)
+	}
+	if got := switcher.sourceViolationCount(netstack.SourceUnsupportedProtocol); got != 0 {
+		t.Fatalf("ordinary unsupported frame violation count = %d, want 0", got)
+	}
+}
+
+func darwinSidecarEtherTypeFrame(destinationMAC, sourceMAC net.HardwareAddr, etherType uint16) []byte {
+	frame := make([]byte, 14)
+	copy(frame[0:6], destinationMAC)
+	copy(frame[6:12], sourceMAC)
+	binary.BigEndian.PutUint16(frame[12:14], etherType)
+	return frame
 }
 
 func darwinSidecarIPv4Frame(destinationMAC, sourceMAC net.HardwareAddr, sourceIP net.IP) []byte {

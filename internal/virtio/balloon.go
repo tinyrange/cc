@@ -15,6 +15,7 @@ const (
 	balloonQueueInflate = 0
 	balloonQueueDeflate = 1
 	balloonPageSize     = 4096
+	balloonDriverOK     = 0x4
 )
 
 type PageReclaimer interface {
@@ -103,6 +104,9 @@ func (b *Balloon) SetTargetPages(pages uint32) error {
 	}
 	b.numPages = pages
 	b.configGeneration++
+	if b.status&balloonDriverOK == 0 {
+		return nil
+	}
 	b.interruptStatus |= intConfig
 	return b.updateIRQLocked()
 }
@@ -225,9 +229,13 @@ func (b *Balloon) Write(addr uint64, size int, value uint64) error {
 		b.interruptStatus &^= uint32(value)
 		return b.updateIRQLocked()
 	case regStatus:
+		wasReady := b.status&balloonDriverOK != 0
 		b.status = uint32(value)
 		if b.status == 0 {
 			b.resetLocked()
+		} else if !wasReady && b.status&balloonDriverOK != 0 && b.actualPages != b.numPages {
+			b.interruptStatus |= intConfig
+			return b.updateIRQLocked()
 		}
 	case regQueueNotify:
 		if int(value) == balloonQueueInflate || int(value) == balloonQueueDeflate {
