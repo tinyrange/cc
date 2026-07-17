@@ -27,6 +27,27 @@ func TestRootPathCleansRootAndName(t *testing.T) {
 	}
 }
 
+func TestExecCommandUsesRequestPATH(t *testing.T) {
+	binDir := t.TempDir()
+	command := filepath.Join(binDir, "guest-command")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s' \"$RESULT\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	cmd := execCommand(request{
+		Command: []string{"guest-command"},
+		Env:     []string{"PATH=" + binDir, "RESULT=request-environment"},
+	})
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run command from request PATH: %v", err)
+	}
+	if string(output) != "request-environment" {
+		t.Fatalf("command output = %q", output)
+	}
+}
+
 func TestTarTargetRejectsTraversal(t *testing.T) {
 	if _, err := tarTarget("/tmp/out", true, "../escape"); err == nil {
 		t.Fatalf("tarTarget traversal error = %v", err)

@@ -415,13 +415,7 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	defer cleanup()
 	proto := DefaultProtocol()
 	proto.WriteBegin(control, req.ID)
-	cmd := exec.Command(req.Command[0], req.Command[1:]...)
-	if req.WorkDir != "" {
-		cmd.Dir = rootPath(req.RootDir, req.WorkDir)
-	}
-	if len(req.Env) != 0 {
-		cmd.Env = req.Env
-	}
+	cmd := execCommand(req)
 	var controlR, controlW *os.File
 	if req.ControlFD {
 		var err error
@@ -553,6 +547,49 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		}
 	}
 	proto.WriteExit(control, req.ID, code)
+}
+
+func execCommand(req request) *exec.Cmd {
+	name := req.Command[0]
+	cmd := exec.Command(name, req.Command[1:]...)
+	if !strings.ContainsRune(name, filepath.Separator) {
+		if pathValue, ok := environmentValue(req.Env, "PATH"); ok {
+			path, err := lookPath(name, pathValue)
+			cmd.Path = path
+			cmd.Err = err
+		}
+	}
+	if req.WorkDir != "" {
+		cmd.Dir = rootPath(req.RootDir, req.WorkDir)
+	}
+	if len(req.Env) != 0 {
+		cmd.Env = req.Env
+	}
+	return cmd
+}
+
+func environmentValue(env []string, name string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		key, value, ok := strings.Cut(env[i], "=")
+		if ok && key == name {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func lookPath(name, pathValue string) (string, error) {
+	for _, dir := range filepath.SplitList(pathValue) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s", exec.ErrNotFound, name)
 }
 
 func runSync(control io.Writer, id string) {
