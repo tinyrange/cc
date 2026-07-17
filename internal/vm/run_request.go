@@ -48,18 +48,3 @@ func runningVMExecRequest(req client.RunRequest) client.ExecRequest {
 func mergeImageRunEnv(base, overrides []string, _ bool) []string {
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
-
-func withLinuxDefaultEnv(env []string) []string {
-	out := vmruntime.WithDefaultEnv(env)
-	if !vmruntime.HasEnvKey(out, "UV_USE_IO_URING") {
-		// Ubuntu 24.04's Node 18/libuv io_uring path can lose completion
-		// notification after a read from a virtiofs root. Keep libuv on its
-		// thread-pool path by default; callers can explicitly opt back in.
-		out = append(out, "UV_USE_IO_URING=0")
-	}
-	return out
-}
-
-func mergeLinuxImageRunEnv(base, overrides []string, _ bool) []string {
-	return withLinuxDefaultEnv(vmruntime.MergeEnv(base, overrides))
-}

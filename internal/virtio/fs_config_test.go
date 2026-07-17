@@ -65,3 +65,18 @@ func TestVirtioFSPokeRaisesVringIRQ(t *testing.T) {
 		t.Fatalf("vring IRQ was not raised: high=%t status=%#x", fs.irqHigh, fs.interruptStatus)
 	}
 }
+
+func TestVirtioFSPollReportsUnsupportedWithoutNotifications(t *testing.T) {
+	const unique = 42
+	req := make([]byte, fuseInHeaderSize+32)
+	binary.LittleEndian.PutUint32(req[4:8], fusePoll)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+
+	reply, err := (&FS{}).dispatchFUSE(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.unique != unique || reply.errno != -linuxENOSYS || len(reply.extra) != 0 {
+		t.Fatalf("POLL reply = unique %d errno %d extra %x", reply.unique, reply.errno, reply.extra)
+	}
+}

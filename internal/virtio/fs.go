@@ -2029,7 +2029,12 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fusePoll:
-		return reply(0, make([]byte, 8)), nil
+		// Regular files are always ready for I/O and this device has no
+		// FUSE_NOTIFY_POLL implementation. ENOSYS makes the kernel remember
+		// that poll is unsupported and use its default regular-file mask.
+		// Returning an empty mask instead registers a waiter that can never be
+		// notified, which stalls io_uring reads indefinitely.
+		return reply(-linuxENOSYS, nil), nil
 	case fuseLseek:
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs LSEEK too short")

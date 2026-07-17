@@ -159,11 +159,7 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 	rxHook := cfg.RXHook
 	if rxHook == nil {
 		rxHook = func(frame []byte) error {
-			copied := append([]byte(nil), frame...)
-			go func() {
-				_ = dev.EnqueueRxPacketOwned(copied)
-			}()
-			return nil
+			return dev.EnqueueRxPacket(frame)
 		}
 	}
 	iface.AttachVirtioBackend(func(frame []byte) error {

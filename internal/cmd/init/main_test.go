@@ -17,7 +17,7 @@ import (
 	"j5.nz/cc/internal/managed/guestagent"
 )
 
-func TestConfigurePackageManagersPreservesAptTransportDefaults(t *testing.T) {
+func TestConfigurePackageManagersDoesNotDisableAptPipelining(t *testing.T) {
 	root := t.TempDir()
 	aptPath := filepath.Join(root, "usr", "bin", "apt")
 	configPath := filepath.Join(root, "etc", "apt", "apt.conf.d", "99ccvm-netstack")
@@ -30,11 +30,7 @@ func TestConfigurePackageManagersPreservesAptTransportDefaults(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	stale := strings.Join([]string{
-		`Acquire::Queue-Mode "access";`,
-		`Acquire::http::Pipeline-Depth "0";`,
-	}, "\n")
-	if err := os.WriteFile(configPath, []byte(stale), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte(`Acquire::http::Pipeline-Depth "0";`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,8 +55,8 @@ func TestConfigurePackageManagersPreservesAptTransportDefaults(t *testing.T) {
 	if _, ok := config["Acquire::https::Pipeline-Depth"]; ok {
 		t.Fatalf("HTTPS pipelining was overridden: %q", config["Acquire::https::Pipeline-Depth"])
 	}
-	if _, ok := config["Acquire::Queue-Mode"]; ok {
-		t.Fatalf("queue mode was overridden: %q", config["Acquire::Queue-Mode"])
+	if config["Acquire::Queue-Mode"] != "access" {
+		t.Fatalf("queue mode = %q, want access", config["Acquire::Queue-Mode"])
 	}
 }
 

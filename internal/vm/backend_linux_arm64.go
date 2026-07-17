@@ -109,7 +109,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if qemuX8664 != "" {
 		initCfg.EmulatorTag = vmruntime.EmulatorTag
 	}
-	initCfg.Env = withLinuxDefaultEnv(image.Config.Env)
+	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
@@ -133,7 +133,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			osName:         "Linux",
 			session:        session,
 			root:           image.RootFS,
-			baseEnv:        withLinuxDefaultEnv(image.Config.Env),
+			baseEnv:        vmruntime.WithDefaultEnv(image.Config.Env),
 			workDir:        workDir,
 			caps:           linuxARM64Capabilities(),
 			env:            linuxEffectiveExecEnv,
@@ -213,7 +213,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if qemuX8664 != "" {
 		initCfg.EmulatorTag = vmruntime.EmulatorTag
 	}
-	initCfg.Env = withLinuxDefaultEnv(nil)
+	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
@@ -232,7 +232,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		managedInstance: &managedInstance{
 			osName:         "Linux",
 			session:        session,
-			baseEnv:        withLinuxDefaultEnv(nil),
+			baseEnv:        vmruntime.WithDefaultEnv(nil),
 			workDir:        "/",
 			caps:           linuxARM64Capabilities(),
 			env:            linuxEffectiveExecEnv,
@@ -252,7 +252,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		}
 		inst.root = image.RootFS
 		inst.defaultRootDir = mountPath
-		inst.baseEnv = withLinuxDefaultEnv(image.Config.Env)
+		inst.baseEnv = vmruntime.WithDefaultEnv(image.Config.Env)
 		if image.Config.WorkingDir != "" {
 			inst.workDir = image.Config.WorkingDir
 		}
@@ -471,7 +471,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		Root:           image.RootFS,
 		BaseEnv:        image.Config.Env,
 		DefaultWorkDir: image.Config.WorkingDir,
-		Env:            mergeLinuxImageRunEnv,
+		Env:            mergeImageRunEnv,
 	})
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -516,7 +516,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		Root:           image.RootFS,
 		BaseEnv:        image.Config.Env,
 		DefaultWorkDir: image.Config.WorkingDir,
-		Env:            mergeLinuxImageRunEnv,
+		Env:            mergeImageRunEnv,
 	})
 	if err != nil {
 		return err
@@ -767,9 +767,9 @@ func blankLinuxRuntimeRootFS() imagefs.Directory {
 
 func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
 	if replace {
-		return withLinuxDefaultEnv(overrides)
+		return vmruntime.WithDefaultEnv(overrides)
 	}
-	return withLinuxDefaultEnv(vmruntime.MergeEnv(base, overrides))
+	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
 
 func linuxResolveExecUser(user string) (string, error) {
