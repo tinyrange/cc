@@ -524,6 +524,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()

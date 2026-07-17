@@ -2415,13 +2415,23 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 
 func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, limits *client.ArchiveLimits, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
+	defer stdin.Close()
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
 	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), limits)
 	if err == nil {
 		defer cancel()
-		err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
+		var owner *guestagent.ArchiveOwnership
+		credential, credentialErr := guestagent.CredentialForUserInRoot(rootDir, user)
+		if credentialErr != nil {
+			err = credentialErr
+		} else if credential != nil {
+			owner = &guestagent.ArchiveOwnership{UID: int(credential.Uid), GID: int(credential.Gid)}
+		}
+		if err == nil {
+			err = guestagent.ExtractTarToPathContextWithOwnership(ctx, stdin, rootDir, dst, dstDir, limits, owner)
+		}
 	}
 	if err != nil {
 		exitCode = 1
@@ -2821,13 +2831,13 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			reporter.Exit(126)
 			return
 		}
-		if err := guestagent.EnsureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
-			writeKernel("ccx3-init: ensure workdir: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
-			reporter.Exit(126)
-			return
-		}
 		env = guestagent.EnvironmentForCredential(rootDir, env, execCred)
+	}
+	if err := guestagent.EnsureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
+		writeKernel("ccx3-init: ensure workdir: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
+		reporter.Exit(126)
+		return
 	}
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
@@ -3050,6 +3060,9 @@ func configurePackageManagers(rootDir string) error {
 		`Acquire::Queue-Mode "access";`,
 		`Acquire::http::Pipeline-Depth "0";`,
 		`Acquire::https::Pipeline-Depth "0";`,
+		`Acquire::Languages "none";`,
+		`Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";`,
+		`Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";`,
 		"",
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(aptDir, "99ccvm-netstack"), []byte(conf), 0o644); err != nil {

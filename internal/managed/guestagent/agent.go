@@ -714,6 +714,14 @@ func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 	return ExtractTarToPathContext(context.Background(), r, rootDir, dst, dstDir, nil)
 }
 
+// ArchiveOwnership applies one caller-selected guest identity to every entry
+// published by an archive extraction. Tar header ownership is intentionally
+// ignored because archives can cross trust and VM boundaries.
+type ArchiveOwnership struct {
+	UID int
+	GID int
+}
+
 type ArchiveLimitError struct {
 	Resource string
 	Limit    uint64
@@ -740,6 +748,10 @@ func ArchiveContext(parent context.Context, limits *client.ArchiveLimits) (conte
 }
 
 func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, requested *client.ArchiveLimits) error {
+	return ExtractTarToPathContextWithOwnership(ctx, r, rootDir, dst, dstDir, requested, nil)
+}
+
+func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, requested *client.ArchiveLimits, owner *ArchiveOwnership) error {
 	if strings.TrimSpace(dst) == "" {
 		return fmt.Errorf("destination path is required")
 	}
@@ -759,7 +771,9 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		}()
 		defer close(stopClose)
 	}
+	dstExisted := false
 	if info, err := os.Lstat(dst); err == nil {
+		dstExisted = true
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: destination is a symlink: %s", ErrUnsafeTarExtractionPath, dst)
 		}
@@ -775,6 +789,11 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 	}
 	if err := os.MkdirAll(extractionRoot, 0o755); err != nil {
 		return err
+	}
+	if dstDir && !dstExisted {
+		if err := applyArchiveOwnership(extractionRoot, false, owner); err != nil {
+			return err
+		}
 	}
 	tr := tar.NewReader(r)
 	sawEntry := false
@@ -817,7 +836,7 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := ensureTarTargetCompatible(target, true); err != nil {
@@ -827,9 +846,12 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
+			if err := applyArchiveOwnership(target, false, owner); err != nil {
+				return err
+			}
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := validateTarSymlinkTarget(extractionRoot, target, header.Linkname); err != nil {
@@ -844,8 +866,11 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
+			if err := applyArchiveOwnership(target, true, owner); err != nil {
+				return err
+			}
 		case tar.TypeReg, tar.TypeRegA:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := ensureTarTargetCompatible(target, false); err != nil {
@@ -869,6 +894,10 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				_ = os.Remove(tmpName)
 				return closeErr
 			}
+			if err := applyArchiveOwnership(tmpName, false, owner); err != nil {
+				_ = os.Remove(tmpName)
+				return err
+			}
 			perm := os.FileMode(header.Mode).Perm()
 			if err := os.Chmod(tmpName, perm); err != nil {
 				_ = os.Remove(tmpName)
@@ -884,6 +913,16 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 			}
 		}
 	}
+}
+
+func applyArchiveOwnership(target string, symlink bool, owner *ArchiveOwnership) error {
+	if owner == nil {
+		return nil
+	}
+	if symlink {
+		return os.Lchown(target, owner.UID, owner.GID)
+	}
+	return os.Chown(target, owner.UID, owner.GID)
 }
 
 type resolvedArchiveLimits struct {
@@ -963,7 +1002,7 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	}
 }
 
-func ensureTarParents(root, parent string) error {
+func ensureTarParents(root, parent string, owner *ArchiveOwnership) error {
 	rel, err := filepath.Rel(root, parent)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("%w: target parent escapes destination: %s", ErrUnsafeTarExtractionPath, parent)
@@ -977,6 +1016,9 @@ func ensureTarParents(root, parent string) error {
 		info, err := os.Lstat(current)
 		if os.IsNotExist(err) {
 			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+			if err := applyArchiveOwnership(current, false, owner); err != nil {
 				return err
 			}
 			continue

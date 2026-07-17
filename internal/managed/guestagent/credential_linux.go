@@ -220,6 +220,9 @@ func ensureCredentialDirectory(rootDir, dir string, cred *syscall.Credential) er
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", path, err)
 	}
+	if cred == nil {
+		return nil
+	}
 	if err := os.Chown(path, int(cred.Uid), int(cred.Gid)); err != nil {
 		return fmt.Errorf("chown %s: %w", path, err)
 	}

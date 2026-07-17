@@ -36,6 +36,7 @@ const (
 	fsCfgNumQueueOff       = fsCfgTagSize
 	fsCfgTotalSize         = fsCfgTagSize + 4
 	fsInterruptVring       = 0x1
+	fsAvailNoInterrupt     = 0x1
 	virtioStatusFeaturesOK = 0x8
 	featureRingEventIdx    = uint64(1) << 29
 	fuseInHeaderSize       = 40
@@ -367,18 +368,17 @@ const (
 )
 
 type fsWork struct {
-	qidx              int
-	head              uint16
-	seq               uint64
-	generation        uint32
-	unique            uint64
-	opcode            uint32
-	req               []byte
-	pooledReq         bool
-	suppressInterrupt bool
-	respCount         int
-	respDescs         [fsInlineRespDescs]fsDesc
-	respExtra         []fsDesc
+	qidx       int
+	head       uint16
+	seq        uint64
+	generation uint32
+	unique     uint64
+	opcode     uint32
+	req        []byte
+	pooledReq  bool
+	respCount  int
+	respDescs  [fsInlineRespDescs]fsDesc
+	respExtra  []fsDesc
 }
 
 type fsCompletionKey struct {
@@ -938,11 +938,10 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 	}
 
 	for {
-		availFlags, availIdx, err := f.readAvailHeaderLocked(q)
+		_, availIdx, err := f.readAvailHeaderLocked(q)
 		if err != nil {
 			return nil, err
 		}
-		suppressInterrupt := availFlags&1 != 0
 		for q.lastAvailIdx != availIdx {
 			slot := q.lastAvailIdx % q.size
 			head, err := f.readAvailRingEntryLocked(q, slot)
@@ -952,7 +951,7 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 			if f.Log != nil {
 				f.logf("queue-notify q=%d head=%d", qidx, head)
 			}
-			work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
+			work, err := f.prepareRequestLocked(qidx, q, head)
 			if err != nil {
 				return nil, err
 			}
@@ -1037,14 +1036,14 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 	return uint32(reply.Len()), true, nil
 }
 
-func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInterrupt bool) (fsWork, error) {
+func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16) (fsWork, error) {
 	var prepareStart time.Time
 	if f.RecordTiming != nil {
 		prepareStart = time.Now()
 	}
 	seq := f.nextWorkSeq[qidx]
 	f.nextWorkSeq[qidx]++
-	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration, suppressInterrupt: suppressInterrupt}
+	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration}
 	var descScratch [8]fsDesc
 	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
 	if err != nil {
@@ -1328,7 +1327,6 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 		q := &f.queues[qidx]
 		oldUsedIdx := q.usedIdx
 		wroteCompletion := false
-		interruptSuppressed := true
 		for index < len(completions) && completions[index].work.qidx == qidx {
 			completion := completions[index]
 			index++
@@ -1345,18 +1343,13 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 				return err
 			}
 			wroteCompletion = true
-			if !completion.work.suppressInterrupt {
-				interruptSuppressed = false
-			}
 		}
 		if !wroteCompletion || !f.isCompletingQueue(qidx) {
 			continue
 		}
-		shouldInterrupt := false
-		if f.driverFeatures&featureRingEventIdx != 0 {
-			shouldInterrupt = f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0)
-		} else {
-			shouldInterrupt = !interruptSuppressed
+		shouldInterrupt, err := f.shouldInterruptCompletionLocked(q, oldUsedIdx)
+		if err != nil {
+			return err
 		}
 		if shouldInterrupt {
 			f.interruptStatus |= fsInterruptVring
@@ -1400,8 +1393,12 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
 	if err := f.writeCompletionUsedLocked(q, work, reply); err != nil {
 		return err
 	}
-	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
-		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0) {
+	if f.isCompletingQueue(work.qidx) {
+		shouldInterrupt, err := f.shouldInterruptCompletionLocked(q, oldUsedIdx)
+		if err != nil {
+			return err
+		}
+		if !shouldInterrupt {
 			return nil
 		}
 		f.interruptStatus |= fsInterruptVring
@@ -1412,6 +1409,17 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
 		return f.updateIRQLocked()
 	}
 	return nil
+}
+
+func (f *FS) shouldInterruptCompletionLocked(q *queue, oldUsedIdx uint16) (bool, error) {
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		return f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0), nil
+	}
+	flags, _, err := f.readAvailHeaderLocked(q)
+	if err != nil {
+		return false, err
+	}
+	return flags&fsAvailNoInterrupt == 0, nil
 }
 
 func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply fsReply) error {
@@ -2624,6 +2632,29 @@ func (f *FS) IRQAsserted() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.interruptStatus != 0 || f.irqHigh
+}
+
+// Poke asks the guest driver to rescan completed filesystem requests. It is a
+// recovery path for a guest that went to sleep across an interrupt-suppression
+// transition after the host had already published a used-ring entry.
+func (f *FS) Poke() error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.irq == nil {
+		return nil
+	}
+	f.interruptStatus |= fsInterruptVring
+	if f.irqHigh {
+		if err := f.irq.SetIRQ(f.IRQ, false); err != nil {
+			return err
+		}
+		f.irqHigh = false
+		f.irqTransitions++
+	}
+	return f.updateIRQLocked()
 }
 
 func (f *FS) Summary() string {

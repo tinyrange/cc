@@ -291,13 +291,20 @@ func (v *Vsock) Poke() error {
 	if v.irq == nil {
 		return nil
 	}
-	if v.interruptStatus != 0 {
-		return v.updateIRQLocked()
+	// Report an actual vring interrupt so the guest driver rescans completed
+	// receive buffers. A bare line pulse with interruptStatus clear is handled
+	// as a spurious interrupt and cannot recover a missed queue wakeup.
+	v.interruptStatus |= vsockInterruptVring
+	// Reasserting an already-high level does not produce a new wakeup on every
+	// hypervisor. Pulse it low first while retaining the pending device status.
+	if v.irqHigh {
+		if err := v.irq.SetIRQ(v.IRQ, false); err != nil {
+			return err
+		}
+		v.irqHigh = false
+		v.irqTransitions++
 	}
-	if err := v.irq.SetIRQ(v.IRQ, true); err != nil {
-		return err
-	}
-	return v.irq.SetIRQ(v.IRQ, false)
+	return v.updateIRQLocked()
 }
 
 func (v *Vsock) Summary() string {

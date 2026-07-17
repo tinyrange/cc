@@ -593,5 +593,5 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		cancel()
 		return nil, err
 	}
-	return &ManagedSession{cancel: cancel, done: done, control: control, listener: listener, vsock: vsock, bootWriter: bootWriter, transcript: controlTranscript, serialOut: serialOut, cleanup: func() { _ = vm.CancelRun() }, dmesg: dmesg}, nil
+	return &ManagedSession{cancel: cancel, done: done, control: control, listener: listener, vsock: vsock, fsdevs: fsdevs, bootWriter: bootWriter, transcript: controlTranscript, serialOut: serialOut, cleanup: func() { _ = vm.CancelRun() }, dmesg: dmesg}, nil
 }

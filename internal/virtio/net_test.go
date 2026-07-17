@@ -21,6 +21,15 @@ type testNetChecksumBackend struct {
 	needsChecksum bool
 }
 
+type lifecycleTestNetMemory struct {
+	testGuestMemory
+	detach func()
+}
+
+func (m *lifecycleTestNetMemory) RegisterGuestMemoryDetach(detach func()) {
+	m.detach = detach
+}
+
 func (b *testNetChecksumBackend) NeedsTXChecksum([]byte) bool {
 	return b.needsChecksum
 }
@@ -260,6 +269,32 @@ func TestNetLegacyRXWritesTenByteHeader(t *testing.T) {
 	}
 	if !bytes.Equal(mem[0x3000+netHeaderLen:0x3000+netHeaderLen+uint64(len(packet))], packet) {
 		t.Fatalf("packet payload was not written after ten-byte header")
+	}
+}
+
+func TestNetGuestMemoryLifecycleDetachesRXBeforeUnmap(t *testing.T) {
+	mem := &lifecycleTestNetMemory{testGuestMemory: make(testGuestMemory, 0x20000)}
+	dev := NewNet(0, 0x1000, 11, nil, nil)
+	dev.DisableMergeRX = true
+	dev.Attach(mem, &testIRQ{})
+
+	if err := dev.WriteLegacy(14, 2, netQueueRX); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.WriteLegacy(8, 4, 0x10); err != nil {
+		t.Fatal(err)
+	}
+	if mem.detach == nil {
+		t.Fatal("guest memory did not receive a detach callback")
+	}
+
+	mem.detach()
+	mem.testGuestMemory = nil // Models the hypervisor unmapping guest RAM.
+	if err := dev.EnqueueRxPacketOwned([]byte{1, 2, 3}); err != nil {
+		t.Fatalf("enqueue after guest teardown: %v", err)
+	}
+	if len(dev.pendingRx) != 0 {
+		t.Fatalf("packets retained after guest teardown: %d", len(dev.pendingRx))
 	}
 }
 

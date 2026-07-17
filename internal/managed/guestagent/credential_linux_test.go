@@ -69,6 +69,20 @@ func TestEnsureCredentialWorkDirCreatesHomeSubdirectory(t *testing.T) {
 	}
 }
 
+func TestEnsureCredentialWorkDirCreatesRootCommandDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := EnsureCredentialWorkDir(root, "/home/cc", nil); err != nil {
+		t.Fatalf("ensure root workdir: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(root, "home", "cc"))
+	if err != nil {
+		t.Fatalf("stat root workdir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("root workdir is not a directory")
+	}
+}
+
 func TestCredentialForUser(t *testing.T) {
 	root, err := CredentialForUser("root")
 	if err != nil || root != nil {

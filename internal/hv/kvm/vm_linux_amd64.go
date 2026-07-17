@@ -50,14 +50,16 @@ type MMIOExit struct {
 }
 
 type VM struct {
-	lifecycleMu sync.RWMutex
-	kvm         *Bootstrap
-	vmfd        int
-	vcpufd      int
-	vcpus       []*VCPU
-	mem         []byte
-	lowMemLimit uint64
-	regions     []memoryMapping
+	lifecycleMu   sync.RWMutex
+	kvm           *Bootstrap
+	vmfd          int
+	vcpufd        int
+	vcpus         []*VCPU
+	mem           []byte
+	lowMemLimit   uint64
+	regions       []memoryMapping
+	memoryDetach  []func()
+	memoryClosing bool
 }
 
 type VCPU struct {
@@ -137,6 +139,20 @@ func (v *VM) Close() error {
 		return nil
 	}
 	v.lifecycleMu.Lock()
+	if v.memoryClosing {
+		v.lifecycleMu.Unlock()
+		return nil
+	}
+	v.memoryClosing = true
+	detaches := v.memoryDetach
+	v.memoryDetach = nil
+	v.lifecycleMu.Unlock()
+	for _, detach := range detaches {
+		if detach != nil {
+			detach()
+		}
+	}
+	v.lifecycleMu.Lock()
 	defer v.lifecycleMu.Unlock()
 	for _, vcpu := range v.vcpus {
 		if vcpu == nil {
@@ -168,6 +184,23 @@ func (v *VM) Close() error {
 		v.kvm = nil
 	}
 	return nil
+}
+
+// RegisterGuestMemoryDetach registers work that must finish before guest
+// memory is unmapped. Devices with asynchronous host-side workers use this to
+// stop dereferencing cached virtqueue slices during VM teardown.
+func (v *VM) RegisterGuestMemoryDetach(detach func()) {
+	if v == nil || detach == nil {
+		return
+	}
+	v.lifecycleMu.Lock()
+	if v.kvm == nil || v.memoryClosing {
+		v.lifecycleMu.Unlock()
+		detach()
+		return
+	}
+	v.memoryDetach = append(v.memoryDetach, detach)
+	v.lifecycleMu.Unlock()
 }
 
 func (v *VM) MapAnonymousMemory(size uint64, guestPhysAddr uint64) ([]byte, error) {

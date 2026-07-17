@@ -28,6 +28,7 @@ type ManagedSession struct {
 	control    io.ReadWriteCloser
 	listener   io.Closer
 	vsock      *virtio.Vsock
+	fsdevs     []*virtio.FS
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
@@ -240,6 +241,7 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()

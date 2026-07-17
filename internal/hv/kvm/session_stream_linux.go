@@ -18,7 +18,7 @@ import (
 const (
 	execTerminateGrace = 500 * time.Millisecond
 	execKillWait       = 2 * time.Second
-	execKeepalive      = time.Second
+	execKeepalive      = 100 * time.Millisecond
 )
 
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -50,12 +50,21 @@ func (s *ManagedSession) startExecKeepalive(ctx context.Context, interval time.D
 		_, cancel := context.WithCancel(ctx)
 		return cancel
 	}
-	return startVsockKeepalive(ctx, s.vsock, interval)
+	return startVirtioKeepalive(ctx, interval, func() {
+		_ = s.vsock.Poke()
+		for _, fsdev := range s.fsdevs {
+			_ = fsdev.Poke()
+		}
+	})
 }
 
 func startVsockKeepalive(ctx context.Context, vsock *virtio.Vsock, interval time.Duration) context.CancelFunc {
+	return startVirtioKeepalive(ctx, interval, func() { _ = vsock.Poke() })
+}
+
+func startVirtioKeepalive(ctx context.Context, interval time.Duration, poke func()) context.CancelFunc {
 	keepaliveCtx, cancel := context.WithCancel(ctx)
-	if vsock == nil || interval <= 0 {
+	if poke == nil || interval <= 0 {
 		return cancel
 	}
 	go func() {
@@ -66,7 +75,7 @@ func startVsockKeepalive(ctx context.Context, vsock *virtio.Vsock, interval time
 			case <-keepaliveCtx.Done():
 				return
 			case <-ticker.C:
-				_ = vsock.Poke()
+				poke()
 			}
 		}
 	}()

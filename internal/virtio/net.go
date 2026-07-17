@@ -93,6 +93,10 @@ type NetTXChecksumPolicy interface {
 	NeedsTXChecksum(packet []byte) bool
 }
 
+type guestMemoryDetachRegistrar interface {
+	RegisterGuestMemoryDetach(func())
+}
+
 type Net struct {
 	Base         uint64
 	Size         uint64
@@ -129,6 +133,7 @@ type Net struct {
 	asyncTXRunning     bool
 	asyncTXAgain       bool
 	asyncTXErr         error
+	detached           bool
 }
 
 type netTXPacket struct {
@@ -154,9 +159,28 @@ func NewNet(base, size uint64, irq uint32, mac net.HardwareAddr, backend NetBack
 
 func (n *Net) Attach(mem GuestMemory, irq IRQController) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.mem = mem
 	n.irq = irq
+	n.detached = false
+	n.mu.Unlock()
+	if registrar, ok := mem.(guestMemoryDetachRegistrar); ok {
+		registrar.RegisterGuestMemoryDetach(n.Detach)
+	}
+}
+
+// Detach prevents any in-flight or future packet work from accessing guest
+// memory. Hypervisor backends call it before unmapping the memory registered
+// with KVM.
+func (n *Net) Detach() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.mem = nil
+	n.irq = nil
+	n.detached = true
+	n.pendingRx = nil
+	for index := range n.queues {
+		n.queues[index].clearCache()
+	}
 }
 
 func (n *Net) Contains(addr uint64, size int) bool {
@@ -539,6 +563,9 @@ func (n *Net) EnqueueRxPacketOwned(packet []byte) error {
 func (n *Net) enqueueRxPacket(packet []byte, owned bool) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.detached {
+		return nil
+	}
 	if len(n.pendingRx) == 0 {
 		delivered, err := n.processOneRXPacketLocked(packet)
 		if err != nil {
