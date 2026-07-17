@@ -47,6 +47,41 @@ func TestCommandNeedsSystemdReady(t *testing.T) {
 	}
 }
 
+func TestReapOrphanedChildrenPreservesManagedExitStatus(t *testing.T) {
+	managed := exec.Command("sh", "-c", "exit 7")
+	if err := startManagedExecProcess(managed, nil); err != nil {
+		t.Fatal(err)
+	}
+	orphan := exec.Command("sh", "-c", "exit 0")
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForZombie := func(pid int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			state, ppid, ok := procProcessState(filepath.Join("/proc", itoa(pid), "stat"))
+			if ok && state == 'Z' && ppid == os.Getpid() {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("process %d did not become a child zombie", pid)
+	}
+	waitForZombie(managed.Process.Pid)
+	waitForZombie(orphan.Process.Pid)
+
+	reapOrphanedChildren(os.Getpid())
+	result := waitManagedExecProcess(managed, time.Now())
+	if result.ExitErr != nil || result.ExitCode != 7 {
+		t.Fatalf("managed wait = exit %d, err %v", result.ExitCode, result.ExitErr)
+	}
+	if _, err := orphan.Process.Wait(); !errors.Is(err, syscall.ECHILD) {
+		t.Fatalf("orphan wait error = %v, want already reaped child", err)
+	}
+}
+
 func TestSystemdCommandGate(t *testing.T) {
 	nonSystemd := newSystemdCommandGate("")
 	if wait := nonSystemd.WaitForCommand([]string{"systemctl", "status"}); wait != nil {
@@ -179,6 +214,24 @@ func TestManagedExecCommandDirect(t *testing.T) {
 	}
 	if cmd.WaitDelay != 2*time.Second {
 		t.Fatalf("wait delay = %s", cmd.WaitDelay)
+	}
+}
+
+func TestManagedExecCommandUsesRequestPATH(t *testing.T) {
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "installed-after-boot")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write executable: %v", err)
+	}
+	cmd, pivot := managedExecCommand([]string{"installed-after-boot", "arg"}, []string{"PATH=" + dir}, "", "", nil, false)
+	if pivot {
+		t.Fatal("direct command unexpectedly used pivot")
+	}
+	if cmd.Path != executable {
+		t.Fatalf("executable path = %q, want %q", cmd.Path, executable)
+	}
+	if !reflect.DeepEqual(cmd.Args, []string{"installed-after-boot", "arg"}) {
+		t.Fatalf("args = %#v", cmd.Args)
 	}
 }
 
@@ -609,6 +662,17 @@ func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	}
 	if got := managedExecFirstOutputTimingPhase(true); got != managedExecTimingFirstStderr {
 		t.Fatalf("stderr first phase = %q", got)
+	}
+}
+
+func TestManagedExecStartFailureUsesShellExitConventions(t *testing.T) {
+	code, message := managedExecStartFailure(&os.PathError{Op: "fork/exec", Path: "missing", Err: syscall.ENOENT}, []string{"missing"}, "", "/")
+	if code != 127 || message != "missing: executable not found\n" {
+		t.Fatalf("missing executable result = (%d, %q)", code, message)
+	}
+	code, message = managedExecStartFailure(&os.PathError{Op: "fork/exec", Path: "/bin/private", Err: syscall.EACCES}, []string{"/bin/private"}, "", "/")
+	if code != 126 || message != "/bin/private: permission denied\n" {
+		t.Fatalf("permission result = (%d, %q)", code, message)
 	}
 }
 

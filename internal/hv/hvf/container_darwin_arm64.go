@@ -249,13 +249,27 @@ func validateGuestUser(user string) error {
 		return nil
 	}
 	uidPart, gidPart, hasGID := strings.Cut(user, ":")
-	if uidPart == "" || !isUint32String(uidPart) {
-		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	if !validGuestUserComponent(uidPart) {
+		return fmt.Errorf("user must be a name or numeric uid, optionally followed by :group or :gid")
 	}
-	if hasGID && (gidPart == "" || !isUint32String(gidPart)) {
-		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	if hasGID && (!validGuestUserComponent(gidPart) || strings.Contains(gidPart, ":")) {
+		return fmt.Errorf("user must be a name or numeric uid, optionally followed by :group or :gid")
 	}
 	return nil
+}
+
+func validGuestUserComponent(value string) bool {
+	if value == "" || strings.ContainsAny(value, ":\r\n\x00") {
+		return false
+	}
+	numeric := true
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			numeric = false
+			break
+		}
+	}
+	return !numeric || isUint32String(value)
 }
 
 func isUint32String(value string) bool {
@@ -493,6 +507,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return hasManagedExecBegin(text, id)
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec begin", err)
 	}
 	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
@@ -500,6 +517,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return hasManagedExecFirstByte(text, id)
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec first byte", err)
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
@@ -508,6 +528,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec result", err)
 	}
 	timingLog("session.Exec waitForResult took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(segment))

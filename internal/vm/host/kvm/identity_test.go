@@ -18,6 +18,10 @@ func TestResolveRuntimeExecUser(t *testing.T) {
 		{name: "uid gid zero", user: "0:0", want: "0:0"},
 		{name: "uid only", user: "1234", want: "1234:1234"},
 		{name: "uid gid", user: "1234:5678", want: "1234:5678"},
+		{name: "name only", user: "nobody", want: "nobody"},
+		{name: "name and group", user: "nobody:nogroup", want: "nobody:nogroup"},
+		{name: "uid and group", user: "65534:nogroup", want: "65534:nogroup"},
+		{name: "name and gid", user: "nobody:65534", want: "nobody:65534"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,8 +50,9 @@ func TestResolveRuntimeExecUserRejectsInvalidUsers(t *testing.T) {
 	users := []string{
 		":1",
 		"1:",
-		"daemon",
-		"1:daemon",
+		"user:group:extra",
+		"4294967296",
+		"1:4294967296",
 	}
 	for _, user := range users {
 		t.Run(user, func(t *testing.T) {

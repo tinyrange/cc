@@ -21,7 +21,6 @@ const (
 	netFeatureCSUM          = uint64(1) << 0
 	vringAvailNoInterrupt   = 1
 	netFeatureMAC           = uint64(1) << 5
-	netFeatureHostTSO4      = uint64(1) << 11
 	netFeatureStatus        = uint64(1) << 16
 	netFeatureMergeRX       = uint64(1) << 15
 	netHdrFlagNeedsChecksum = 1
@@ -85,6 +84,13 @@ var netTXPacketBatchPool = sync.Pool{
 
 type NetBackend interface {
 	HandleTxPacket(packet []byte) error
+}
+
+// NetTXChecksumPolicy lets a backend request checksum completion for packets
+// that leave a checksum-trusting local path. The packet does not include the
+// virtio header and is only valid for the duration of the call.
+type NetTXChecksumPolicy interface {
+	NeedsTXChecksum(packet []byte) bool
 }
 
 type Net struct {
@@ -665,14 +671,20 @@ func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 		}
 		releaseData := data
 		if len(data) >= headerLen {
-			if n.CompleteTXChecksum {
+			packet := data[headerLen:]
+			completeChecksum := n.CompleteTXChecksum
+			if !completeChecksum {
+				if policy, ok := n.backend.(NetTXChecksumPolicy); ok {
+					completeChecksum = policy.NeedsTXChecksum(packet)
+				}
+			}
+			if completeChecksum {
 				if err := fixTXChecksum(data, headerLen); err != nil {
 					releaseNetPacketBuffer(releaseData)
 					releaseNetTXPackets(packets)
 					return nil, err
 				}
 			}
-			packet := data[headerLen:]
 			if n.backend != nil {
 				if len(packets) == cap(packets) {
 					releaseNetPacketBuffer(releaseData)
@@ -1045,7 +1057,7 @@ func (n *Net) legacyFeaturesLocked() uint64 {
 }
 
 func (n *Net) deviceFeaturesLocked() uint64 {
-	features := featureVersion1 | netFeatureCSUM | netFeatureMAC | netFeatureHostTSO4 | netFeatureStatus
+	features := featureVersion1 | netFeatureCSUM | netFeatureMAC | netFeatureStatus
 	if !n.DisableMergeRX {
 		features |= netFeatureMergeRX
 	}
@@ -1090,7 +1102,6 @@ func fixTXChecksum(frame []byte, headerLen int) error {
 	if csumStart < 0 || csumStart >= len(packet) || csumStart+csumOffset+2 > len(packet) {
 		return fmt.Errorf("virtio-net checksum range out of packet: start=%d offset=%d len=%d", csumStart, csumOffset, len(packet))
 	}
-	binary.LittleEndian.PutUint16(packet[csumStart+csumOffset:csumStart+csumOffset+2], 0)
 	sum := internetChecksum(packet[csumStart:])
 	binary.BigEndian.PutUint16(packet[csumStart+csumOffset:csumStart+csumOffset+2], sum)
 	return nil

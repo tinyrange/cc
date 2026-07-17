@@ -674,7 +674,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 			return err
 		}
 	}
-	err := machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	err := machine.instance.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	if err != nil && m.instanceIsStopping(id, machine) {
 		return stoppedVMError(id)
 	}

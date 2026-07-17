@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,10 @@ var consoleFD = 2
 var kmsgFD = -1
 var protocolMu sync.Mutex
 var setTimeOfDay = unix.Settimeofday
+var managedChildren = struct {
+	sync.Mutex
+	pids map[int]struct{}
+}{pids: make(map[int]struct{})}
 
 type config struct {
 	Command            []string `json:"command"`
@@ -941,10 +946,20 @@ func parseUint32(value string) (uint32, error) {
 }
 
 func lookPathForExec(file string) (string, error) {
+	return lookPathForExecEnv(file, os.Environ())
+}
+
+func lookPathForExecEnv(file string, env []string) (string, error) {
 	if strings.Contains(file, "/") {
 		return file, nil
 	}
-	pathEnv := os.Getenv("PATH")
+	pathEnv := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathEnv = strings.TrimPrefix(entry, "PATH=")
+			break
+		}
+	}
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
@@ -1823,6 +1838,21 @@ func appendStat(buf *strings.Builder, label, path string) {
 	buf.WriteString("\n")
 }
 
+func managedExecStartFailure(err error, argv []string, rootDir, workDir string) (int, string) {
+	command := "command"
+	if len(argv) > 0 && strings.TrimSpace(argv[0]) != "" {
+		command = argv[0]
+	}
+	switch {
+	case errors.Is(err, exec.ErrNotFound), errors.Is(err, os.ErrNotExist):
+		return 127, command + ": executable not found\n"
+	case errors.Is(err, os.ErrPermission):
+		return 126, command + ": permission denied\n"
+	default:
+		return 126, "ccx3-init: exec error: " + err.Error() + "\n" + collectExecDiagnostics(rootDir, argv, workDir)
+	}
+}
+
 func collectExecDiagnostics(rootDir string, argv []string, workDir string) string {
 	var buf strings.Builder
 	if rootDir != "" {
@@ -2034,6 +2064,16 @@ func execCommand(cfg config) error {
 }
 
 func execCommandGo(argv []string, env []string, workDir string, user string) (int, *guestagent.ExecUsage, error) {
+	cred, err := guestagent.CredentialForUser(user)
+	if err != nil {
+		return 0, nil, err
+	}
+	if cred != nil {
+		if err := guestagent.EnsureCredentialUser("", cred); err != nil {
+			return 0, nil, err
+		}
+		env = guestagent.EnvironmentForCredential("", env, cred)
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	start := time.Now()
 	cmd.Env = env
@@ -2044,16 +2084,11 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	cmd.Stdin = console
 	cmd.Stdout = console
 	cmd.Stderr = console
-	if cred, err := guestagent.CredentialForUser(user); err != nil {
-		return 0, nil, err
-	} else if cred != nil {
-		if err := guestagent.EnsureCredentialUser("", cred); err != nil {
-			return 0, nil, err
-		}
+	if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
-	err := cmd.Run()
+	err = cmd.Run()
 	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(start))
 	if err == nil {
 		return 0, usage, nil
@@ -2177,6 +2212,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	reader := bufio.NewReader(control)
 	active := guestagent.NewActiveExecSet()
 	systemdGate := newSystemdCommandGate(cfg.InitSystem)
+	startOrphanReaper()
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -2405,7 +2441,7 @@ func runFSMkdirRequest(cfg config, control io.Writer, id, rootDir, dir, user str
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
-	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(rootDir, target, user); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
 	}
@@ -2430,7 +2466,7 @@ func runFSWriteRequest(cfg config, control io.Writer, id, rootDir, dst, user str
 	} else if err := writeStreamToPath(stdin, target, 0o644); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
-	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(rootDir, target, user); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
 	}
@@ -2475,7 +2511,12 @@ func managedExecCommand(argv []string, env []string, rootDir string, workDir str
 	if useExecPivot {
 		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, cred, argv)...)...)
 	} else {
-		cmd = exec.Command(argv[0], argv[1:]...)
+		executable, err := lookPathForExecEnv(argv[0], env)
+		if err != nil {
+			executable = argv[0]
+		}
+		cmd = exec.Command(executable, argv[1:]...)
+		cmd.Args[0] = argv[0]
 		if workDir != "" {
 			cmd.Dir = workDir
 		}
@@ -2526,7 +2567,14 @@ func managedExecExitCode(waitErr error, state *os.ProcessState) (int, error) {
 }
 
 func startManagedExecProcess(cmd *exec.Cmd, controlW **os.File) error {
+	// Keep registration atomic with Start so the PID 1 orphan reaper cannot
+	// consume a short-lived managed command before os.Process.Wait observes it.
+	managedChildren.Lock()
 	err := cmd.Start()
+	if err == nil {
+		managedChildren.pids[cmd.Process.Pid] = struct{}{}
+	}
+	managedChildren.Unlock()
 	if controlW != nil && *controlW != nil {
 		_ = (*controlW).Close()
 		*controlW = nil
@@ -2544,6 +2592,9 @@ type managedExecWaitResult struct {
 
 func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitResult {
 	state, waitErr := cmd.Process.Wait()
+	managedChildren.Lock()
+	delete(managedChildren.pids, cmd.Process.Pid)
+	managedChildren.Unlock()
 	cmd.ProcessState = state
 	usage := guestagent.UsageFromProcessState(state, time.Since(execStart))
 	exitCode, exitErr := managedExecExitCode(waitErr, state)
@@ -2558,6 +2609,67 @@ func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitR
 		ExitCode:     exitCode,
 		ExitErr:      exitErr,
 	}
+}
+
+func startOrphanReaper() {
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			reapOrphanedChildren(os.Getpid())
+		}
+	}()
+}
+
+// reapOrphanedChildren prevents descendants left behind by canceled command
+// trees from accumulating as zombies under ccx3-init. Managed direct children
+// remain owned by os.Process.Wait so their structured exit status is preserved.
+func reapOrphanedChildren(parentPID int) {
+	managedChildren.Lock()
+	defer managedChildren.Unlock()
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		pid64, err := strconv.ParseInt(entry.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+		pid := int(pid64)
+		if _, tracked := managedChildren.pids[pid]; tracked {
+			continue
+		}
+		state, ppid, ok := procProcessState(filepath.Join("/proc", entry.Name(), "stat"))
+		if !ok || state != 'Z' || ppid != parentPID {
+			continue
+		}
+		var status syscall.WaitStatus
+		_, _ = syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+	}
+}
+
+func procProcessState(path string) (byte, int, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	// The comm field is parenthesized and may itself contain spaces. State and
+	// parent PID are the first two fields after its final closing parenthesis.
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return 0, 0, false
+	}
+	fields := bytes.Fields(data[end+1:])
+	if len(fields) < 2 || len(fields[0]) != 1 {
+		return 0, 0, false
+	}
+	ppid, err := strconv.Atoi(string(fields[1]))
+	if err != nil {
+		return 0, 0, false
+	}
+	return fields[0][0], ppid, true
 }
 
 func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
@@ -2695,7 +2807,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		rootMounts = mounts
 		defer teardownExecRoot(rootMounts)
 	}
-	execCred, err := guestagent.CredentialForUser(user)
+	execCred, err := guestagent.CredentialForUserInRoot(rootDir, user)
 	if err != nil {
 		writeKernel("ccx3-init: resolve user: " + err.Error())
 		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
@@ -2715,6 +2827,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			reporter.Exit(126)
 			return
 		}
+		env = guestagent.EnvironmentForCredential(rootDir, env, execCred)
 	}
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
@@ -2859,9 +2972,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			_ = stderrR.Close()
 		}
 		waitManagedExecStreams(done, cap(done))
+		exitCode, message := managedExecStartFailure(startErr, argv, rootDir, workDir)
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
-		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics(rootDir, argv, workDir))
-		reporter.Exit(126)
+		writeExecStderr(cfg, control, id, message)
+		reporter.Exit(exitCode)
 		return
 	}
 	reporter.Timing(managedExecTimingStarted)

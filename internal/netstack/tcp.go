@@ -458,9 +458,11 @@ type tcpCongestionControl struct {
 // Initial congestion window per RFC 5681.
 const initialCwndSegments = 10
 
-// fastRetransmitThreshold is the number of duplicate ACKs to trigger fast retransmit.
-// Lowered from standard 3 for virtual networks with small receive windows.
-const fastRetransmitThreshold = 2
+// fastRetransmitThreshold is the standard number of duplicate ACKs required
+// before fast retransmit. A lower threshold treated ordinary delayed/window
+// update ACK patterns from Linux guests as loss, repeatedly collapsing the
+// virtual-link congestion window during large pipelined HTTP transfers.
+const fastRetransmitThreshold = 3
 
 // newTCPCongestionControl creates a congestion controller.
 func newTCPCongestionControl(mss uint16) *tcpCongestionControl {

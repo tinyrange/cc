@@ -287,7 +287,7 @@ func (b *runtimeBackend) RunInInstance(
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, runExecRequest(req))
+		return inst.Exec(ctx, runningVMExecRequest(req))
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
@@ -338,7 +338,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return err
 		}
-		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+		return inst.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {

@@ -2338,6 +2338,9 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
 	err := manager.RunStream(ctx, req, nil, func(event client.ExecEvent) error {
 		event = sanitizeExecEventForJSON(event)
 		if err := enc.Encode(event); err != nil {

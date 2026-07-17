@@ -2126,8 +2126,15 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			if c.sendCond != nil {
 				c.sendCond.Broadcast()
 			}
-		} else if hdr.ack == c.sendAcked && c.sendBuf != nil && c.sendBuf.len() > 0 {
-			// Duplicate ACK - same ACK value with no new data
+		} else if hdr.ack == c.sendAcked &&
+			c.sendBuf != nil && c.sendBuf.len() > 0 &&
+			len(hdr.payload) == 0 &&
+			hdr.flags&(tcpFlagSYN|tcpFlagFIN|tcpFlagRST) == 0 &&
+			hdr.window == oldWnd {
+			// A duplicate ACK carries no data or control flags and does not
+			// update the receive window. Counting request data or window updates
+			// as loss signals repeatedly collapsed the congestion window during
+			// pipelined HTTP transfers from Linux guests.
 			c.dupAcks++
 			if c.congCtrl != nil && c.congCtrl.onDupAck() {
 				// 3 duplicate ACKs - trigger fast retransmit
@@ -2240,12 +2247,29 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				contiguous = c.oooRecvBuf.collectContiguous(&c.guestSeq)
 			}
 
+			peerClosed := hdr.flags&tcpFlagFIN != 0
+			writeClosed := c.writeClosed
+			if peerClosed {
+				// FIN consumes one sequence number after the segment payload. A
+				// peer is allowed to combine its final bytes and FIN in one
+				// segment, so process both before returning to the network loop.
+				c.guestSeq++
+				c.state = tcpStateFinWait
+			}
 			c.mu.Unlock()
 
 			// Deliver all data to application
 			c.enqueueData(data)
 			for _, seg := range contiguous {
 				c.enqueueData(seg)
+			}
+			if peerClosed {
+				c.enqueueData(nil) // signal EOF after the final payload
+				c.sendAckImmediate()
+				if !writeClosed {
+					c.sendFin()
+				}
+				return nil
 			}
 			// Send ACK immediately (delayed ACK can cause deadlock with Nagle)
 			c.sendAck()
@@ -2697,18 +2721,18 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 				c.mu.Unlock()
 				return written, net.ErrClosed
 			}
-			// Send-side flow control: don't send more than min(cwnd, peerWnd).
-			// Apply window scaling if negotiated.
+			// The host-side socket already performs congestion control for the
+			// real network path. This connection is the lossless virtual hop from
+			// that socket to the guest, so applying a second Reno window here can
+			// throttle bulk transfers to a fraction of the host connection's
+			// throughput. Respect the guest's advertised receive window; the
+			// retransmit queue still handles any lost virtual frames.
 			inFlight := c.hostSeq - c.sendAcked
 			peerWnd := uint32(c.peerWnd)
 			if c.wndScaleOK {
 				peerWnd = peerWnd << c.peerWndScale
 			}
-			// Use effective window (min of congestion window and peer window)
 			wnd := peerWnd
-			if c.congCtrl != nil {
-				wnd = c.congCtrl.effectiveWindow(peerWnd)
-			}
 			// Debug: log when blocked on window
 			if wnd == 0 || inFlight >= wnd {
 				tracef("netstack.tcpConn Write blocked", "wnd=%d inFlight=%d peerWnd=%d key=%v", wnd, inFlight, peerWnd, c.key)
@@ -2781,19 +2805,41 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 				payload:  retainPayload(chunk),
 				sentAt:   time.Now(),
 			}
-			// Wait for space if buffer is full
+			// Wait for space if buffer is full.
 			for !c.sendBuf.append(seg) {
 				c.mu.Lock()
+				ackedThrough := c.sendAcked
 				if c.closed {
 					c.mu.Unlock()
 					return written, net.ErrClosed
 				}
+				c.mu.Unlock()
+				// An ACK can arrive synchronously from the virtio backend before
+				// the segment is appended above. Reconcile the queue before
+				// waiting so an already-acknowledged segment cannot consume send
+				// buffer capacity forever.
+				c.sendBuf.ack(ackedThrough)
+				if c.sendBuf.append(seg) {
+					break
+				}
+				c.mu.Lock()
 				c.sendCond.Wait()
 				c.mu.Unlock()
 			}
 
+			// sendTCPPacket may synchronously re-enter handleSegment and advance
+			// sendAcked before append runs. Remove any such segment now; without
+			// this reconciliation, pipelined protocols can eventually fill the
+			// retransmit queue with data the guest has already acknowledged.
+			c.mu.Lock()
+			ackedThrough := c.sendAcked
+			c.mu.Unlock()
+			c.sendBuf.ack(ackedThrough)
+
 			// Start retransmit timer if not already running
-			c.startRetxTimer()
+			if c.sendBuf.len() > 0 {
+				c.startRetxTimer()
+			}
 		}
 
 		written += len(chunk)
@@ -4044,12 +4090,23 @@ func tracef(event string, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, event+": "+format+"\n", args...)
 }
 
-// proxyConns bridges bytes between a and b until one side closes.
+// proxyConns bridges bytes between a and b, preserving TCP half-close in both
+// directions. In particular, an origin server closing its response stream must
+// deliver FIN to the guest without discarding a request that is still in flight.
 func proxyConns(a, b net.Conn, bufSize int) error {
 	copyOne := func(dst, src net.Conn) error {
 		buf := getProxyCopyBuffer(bufSize)
 		defer releaseProxyCopyBuffer(buf)
 		_, err := io.CopyBuffer(dst, src, buf)
+		if err == nil {
+			if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
+				err = closeWriter.CloseWrite()
+			} else {
+				// Some net.Conn implementations do not support half-close. Close
+				// them to ensure the opposite copy goroutine can terminate.
+				err = dst.Close()
+			}
+		}
 		return err
 	}
 
@@ -4057,12 +4114,17 @@ func proxyConns(a, b net.Conn, bufSize int) error {
 	go func() { errCh <- copyOne(a, b) }()
 	go func() { errCh <- copyOne(b, a) }()
 
-	// When either direction ends, close both sides to stop the other goroutine.
+	// A clean EOF only closes that direction. Wait for the peer to finish the
+	// other half so response bytes are not truncated. An actual copy error still
+	// aborts both sides promptly.
 	err := <-errCh
+	if err != nil {
+		_ = a.Close()
+		_ = b.Close()
+	}
+	err2 := <-errCh
 	_ = a.Close()
 	_ = b.Close()
-
-	err2 := <-errCh
 	if err == nil {
 		err = err2
 	}

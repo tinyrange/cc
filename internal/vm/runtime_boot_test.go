@@ -389,7 +389,7 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				Image:    env.imageName,
 				MemoryMB: env.memoryMB,
 				CPUs:     1,
-				User:     "daemon",
+				User:     "daemon:",
 				Command:  []string{"sh", "-lc", "true"},
 			},
 		},
@@ -402,6 +402,25 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				t.Fatalf("invalid request unexpectedly succeeded: %+v", resp)
 			}
 		})
+	}
+}
+
+func TestRuntimeRunsAsNamedGuestUser(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		User:     "daemon",
+		Command:  []string{"sh", "-lc", `test "$(id -un)" = daemon`},
+	})
+	if err != nil {
+		t.Fatalf("run as named guest user: %v", err)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("run as named guest user exit code = %d, output = %q", resp.ExitCode, resp.Output)
 	}
 }
 

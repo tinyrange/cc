@@ -72,8 +72,8 @@ func newLinuxSwitchNetworkRuntimeOn(switchNet *linuxVirtualSwitch, id string, cf
 		Base:   base,
 		Size:   size,
 		IRQ:    irq,
-		TXHook: func(packet []byte) {
-			switchNet.Forward(runtime, packet)
+		TXHook: func(packet []byte) bool {
+			return switchNet.Forward(runtime, packet)
 		},
 		Cleanup: func() {
 			switchNet.Unregister(lease.id)
@@ -236,41 +236,41 @@ func (s *linuxVirtualSwitch) Unregister(id string) {
 	s.mu.Unlock()
 }
 
-func (s *linuxVirtualSwitch) Forward(source *linuxNetworkRuntime, frame []byte) {
+func (s *linuxVirtualSwitch) Forward(source *linuxNetworkRuntime, frame []byte) bool {
 	if s == nil || source == nil || len(frame) < 14 {
-		return
+		return false
 	}
 	dst := append(net.HardwareAddr(nil), frame[0:6]...)
 	src := append(net.HardwareAddr(nil), frame[6:12]...)
 	ethType := binary.BigEndian.Uint16(frame[12:14])
 	if ethType == 0x0806 {
-		s.forwardARP(source, frame)
-		return
+		return s.forwardARP(source, frame)
 	}
 	if isLinuxBroadcastMAC(dst) || isLinuxMulticastMAC(dst) {
 		s.forwardToAll(source.id, frame)
-		return
+		return false
 	}
 	if bytesEqualMAC(dst, src) {
-		return
+		return false
 	}
-	s.forwardToMAC(source.id, dst, frame)
+	return s.forwardToMAC(source.id, dst, frame)
 }
 
-func (s *linuxVirtualSwitch) forwardARP(source *linuxNetworkRuntime, frame []byte) {
+func (s *linuxVirtualSwitch) forwardARP(source *linuxNetworkRuntime, frame []byte) bool {
 	if len(frame) < 42 {
-		return
+		return false
 	}
 	targetIP := net.IP(frame[38:42]).To4()
 	if targetIP == nil {
-		return
+		return false
 	}
 	target := s.endpointByIP(source.id, targetIP)
 	if target == nil {
 		s.forwardToAll(source.id, frame)
-		return
+		return false
 	}
 	target.enqueueSwitchFrame(frame)
+	return true
 }
 
 func (s *linuxVirtualSwitch) endpointByIP(sourceID string, ip net.IP) *linuxNetworkRuntime {
@@ -287,7 +287,7 @@ func (s *linuxVirtualSwitch) endpointByIP(sourceID string, ip net.IP) *linuxNetw
 	return nil
 }
 
-func (s *linuxVirtualSwitch) forwardToMAC(sourceID string, mac net.HardwareAddr, frame []byte) {
+func (s *linuxVirtualSwitch) forwardToMAC(sourceID string, mac net.HardwareAddr, frame []byte) bool {
 	s.mu.Lock()
 	var target *linuxNetworkRuntime
 	for id, endpoint := range s.endpoints {
@@ -302,7 +302,9 @@ func (s *linuxVirtualSwitch) forwardToMAC(sourceID string, mac net.HardwareAddr,
 	s.mu.Unlock()
 	if target != nil {
 		target.enqueueSwitchFrame(frame)
+		return true
 	}
+	return false
 }
 
 func (s *linuxVirtualSwitch) forwardToAll(sourceID string, frame []byte) {

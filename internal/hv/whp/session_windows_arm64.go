@@ -250,6 +250,9 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
 	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
@@ -289,6 +292,12 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
+		OnCallbackFail: func() {
+			s.terminateExecAndWait(id, start)
+		},
+		OnContextDone: func() {
+			s.terminateExecAndWait(id, start)
+		},
 		Wait: func(context.Context) error {
 			select {
 			case vmErr := <-s.doneCh:
@@ -311,6 +320,29 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed stream %s done duration=%s err=%v\n", id, time.Since(startTime).Round(time.Millisecond), err)
 	}
 	return err
+}
+
+func (s *ManagedSession) terminateExecAndWait(id string, start int) {
+	if msg, ok := managedagent.InputRequest(id, client.ExecInput{Kind: "signal", Signal: "TERM"}); ok {
+		_ = s.sendExecMessage(msg)
+	}
+	if s.waitForExecExit(id, start, execTerminateGrace) {
+		return
+	}
+	if msg, ok := managedagent.InputRequest(id, client.ExecInput{Kind: "signal", Signal: "KILL"}); ok {
+		_ = s.sendExecMessage(msg)
+	}
+	_ = s.waitForExecExit(id, start, execKillWait)
+}
+
+func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	return err == nil
 }
 
 func (s *ManagedSession) Flush(ctx context.Context) error {

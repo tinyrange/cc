@@ -242,7 +242,7 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecRequest{}, err
 		}
-		return runExecRequest(req), nil
+		return runningVMExecRequest(req), nil
 	}
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err

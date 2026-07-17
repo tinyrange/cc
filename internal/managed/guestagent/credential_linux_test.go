@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -83,6 +85,81 @@ func TestCredentialForUser(t *testing.T) {
 		t.Fatalf("CredentialForUser accepted empty gid")
 	}
 	if _, err := CredentialForUser("not-a-uid"); err == nil {
-		t.Fatalf("CredentialForUser accepted non-numeric uid")
+		t.Fatalf("CredentialForUser accepted an unknown user")
 	}
+}
+
+func TestCredentialForUserResolvesGuestAccountNames(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	passwd := "root:x:0:0:root:/root:/bin/sh\n" +
+		"nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n"
+	if err := os.WriteFile(filepath.Join(root, "etc", "passwd"), []byte(passwd), 0o644); err != nil {
+		t.Fatalf("write passwd: %v", err)
+	}
+	group := "root:x:0:\n" +
+		"dialout:x:20:nobody\n" +
+		"diagnostics:x:27:nobody\n" +
+		"nogroup:x:65534:\n"
+	if err := os.WriteFile(filepath.Join(root, "etc", "group"), []byte(group), 0o644); err != nil {
+		t.Fatalf("write group: %v", err)
+	}
+
+	cred, err := CredentialForUserInRoot(root, "nobody")
+	if err != nil {
+		t.Fatalf("resolve nobody: %v", err)
+	}
+	if cred == nil || cred.Uid != 65534 || cred.Gid != 65534 || !equalUint32s(cred.Groups, []uint32{20, 27}) {
+		t.Fatalf("nobody credential = %+v, want uid/gid 65534 with supplementary groups 20,27", cred)
+	}
+
+	cred, err = CredentialForUserInRoot(root, "nobody:diagnostics")
+	if err != nil {
+		t.Fatalf("resolve nobody:diagnostics: %v", err)
+	}
+	if cred == nil || cred.Uid != 65534 || cred.Gid != 27 || !equalUint32s(cred.Groups, []uint32{20}) {
+		t.Fatalf("overridden credential = %+v, want uid 65534, gid 27, supplementary group 20", cred)
+	}
+}
+
+func TestEnvironmentForCredentialReplacesRootDefaults(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "passwd"), []byte("node:x:1000:1000:Node:/home/node:/bin/sh\n"), 0o644); err != nil {
+		t.Fatalf("write passwd: %v", err)
+	}
+	cred := &syscall.Credential{Uid: 1000, Gid: 1000}
+	env := EnvironmentForCredential(root, []string{"PATH=/bin", "HOME=/root", "USER=root", "CUSTOM=1"}, cred)
+	want := map[string]string{"PATH": "/bin", "HOME": "/home/node", "USER": "node", "LOGNAME": "node", "CUSTOM": "1"}
+	got := make(map[string]string)
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			got[key] = value
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("identity environment = %#v, want %#v", got, want)
+	}
+
+	env = EnvironmentForCredential(root, []string{"HOME=/workspace", "USER=builder", "LOGNAME=builder"}, cred)
+	if !reflect.DeepEqual(env, []string{"HOME=/workspace", "USER=builder", "LOGNAME=builder"}) {
+		t.Fatalf("explicit identity environment was replaced: %#v", env)
+	}
+}
+
+func equalUint32s(got, want []uint32) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

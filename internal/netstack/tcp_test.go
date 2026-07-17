@@ -49,6 +49,236 @@ func TestTCPConnCloseWriteKeepsReadSideOpen(t *testing.T) {
 	}
 }
 
+func TestTCPConnDeliversPayloadBeforeFIN(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	key := tcpFourTuple{
+		srcIP:   [4]byte{10, 42, 0, 2},
+		dstIP:   [4]byte{10, 42, 0, 1},
+		srcPort: 8080,
+		dstPort: 49152,
+	}
+	conn := newTCPConn(h.stack, nil, key, 100, 0xffff, key.dstIP, nil)
+	conn.state = tcpStateEstablished
+	initialSeq := conn.guestSeq
+	h.stack.tcpMu.Lock()
+	h.stack.tcpConns[key] = conn
+	h.stack.tcpMu.Unlock()
+	defer conn.Close()
+
+	if err := conn.handleSegment(ipv4Header{}, tcpHeader{
+		seq:     initialSeq,
+		ack:     conn.sendAcked,
+		flags:   tcpFlagACK | tcpFlagFIN,
+		window:  0xffff,
+		payload: []byte("final"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "final" {
+		t.Fatalf("read = %q, want final payload followed by EOF", got)
+	}
+	if conn.guestSeq != initialSeq+6 {
+		t.Fatalf("next receive sequence = %d, want payload and FIN consumed", conn.guestSeq)
+	}
+}
+
+func TestProxyConnsPreservesHalfCloseResponse(t *testing.T) {
+	proxyA, peerA := tcpConnPair(t)
+	proxyB, peerB := tcpConnPair(t)
+	defer peerA.Close()
+	defer peerB.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for _, conn := range []*net.TCPConn{proxyA, peerA, proxyB, peerB} {
+		if err := conn.SetDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	proxyDone := make(chan error, 1)
+	go func() { proxyDone <- proxyConns(proxyA, proxyB, 4096) }()
+
+	if _, err := peerA.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if err := peerA.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := io.ReadAll(peerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(request) != "request" {
+		t.Fatalf("proxied request = %q", request)
+	}
+
+	if _, err := peerB.Write([]byte("response after request EOF")); err != nil {
+		t.Fatal(err)
+	}
+	if err := peerB.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(peerA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "response after request EOF" {
+		t.Fatalf("proxied response = %q", response)
+	}
+	if err := <-proxyDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan *net.TCPConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+	peer, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case conn := <-accepted:
+		return conn, peer
+	case err := <-acceptErr:
+		peer.Close()
+		t.Fatal(err)
+	}
+	return nil, nil
+}
+
+func TestTCPWriteReconcilesACKDeliveredInlineByBackend(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	key := tcpFourTuple{
+		srcIP:   [4]byte{10, 42, 0, 2},
+		dstIP:   [4]byte{203, 0, 113, 10},
+		srcPort: 49152,
+		dstPort: 80,
+	}
+	conn := newTCPConn(h.stack, nil, key, 1000, 0xffff, key.dstIP, nil)
+	conn.state = tcpStateEstablished
+	h.stack.tcpMu.Lock()
+	h.stack.tcpConns[key] = conn
+	h.stack.tcpMu.Unlock()
+	defer conn.Close()
+
+	h.nic.AttachVirtioBackend(func(frame []byte) error {
+		if len(frame) < ethernetHeaderLen+ipv4HeaderLen+tcpHeaderLen {
+			return nil
+		}
+		ip := frame[ethernetHeaderLen:]
+		ipHeaderLen := int(ip[0]&0x0f) * 4
+		tcp := ip[ipHeaderLen:]
+		tcpHeaderBytes := int(tcp[12]>>4) * 4
+		ack := binary.BigEndian.Uint32(tcp[4:8]) + uint32(len(tcp)-tcpHeaderBytes)
+		return conn.handleSegment(ipv4Header{}, tcpHeader{
+			seq: conn.guestSeq, ack: ack, flags: tcpFlagACK, window: 0xffff,
+		})
+	})
+
+	if _, err := conn.Write([]byte("pipelined response")); err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.sendBuf.len(); got != 0 {
+		t.Fatalf("retransmit queue retained %d already-acknowledged segment(s)", got)
+	}
+}
+
+func TestTCPConnDoesNotTreatRequestDataAsDuplicateACKs(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	key := tcpFourTuple{
+		srcIP:   [4]byte{10, 42, 0, 2},
+		dstIP:   [4]byte{203, 0, 113, 10},
+		srcPort: 49152,
+		dstPort: 80,
+	}
+	conn := newTCPConn(h.stack, nil, key, 1000, 0xffff, key.dstIP, nil)
+	conn.state = tcpStateEstablished
+	if ok := conn.sendBuf.append(tcpSendSegment{
+		seqStart: conn.sendAcked,
+		seqEnd:   conn.sendAcked + 8,
+		payload:  retainPayload([]byte("response")),
+		sentAt:   time.Now(),
+	}); !ok {
+		t.Fatal("could not seed retransmit queue")
+	}
+	conn.hostSeq += 8
+	defer conn.Close()
+
+	for range fastRetransmitThreshold {
+		payload := []byte("next request")
+		if err := conn.handleSegment(ipv4Header{}, tcpHeader{
+			seq:     conn.guestSeq,
+			ack:     conn.sendAcked,
+			flags:   tcpFlagACK | tcpFlagPSH,
+			window:  conn.peerWnd,
+			payload: payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case got := <-conn.recvBuf:
+			releasePayload(got)
+		case <-time.After(time.Second):
+			t.Fatal("request payload was not delivered")
+		}
+	}
+
+	if got := conn.congCtrl.dupAcks; got != 0 {
+		t.Fatalf("payload-bearing ACKs counted as %d duplicate ACKs", got)
+	}
+}
+
+func TestTCPConnVirtualLinkUsesGuestReceiveWindow(t *testing.T) {
+	h := newBenchmarkHarness(t)
+	key := tcpFourTuple{
+		srcIP:   [4]byte{10, 42, 0, 2},
+		dstIP:   [4]byte{203, 0, 113, 10},
+		srcPort: 49152,
+		dstPort: 80,
+	}
+	conn := newTCPConn(h.stack, nil, key, 1000, 0xffff, key.dstIP, nil)
+	conn.state = tcpStateEstablished
+	defer conn.Close()
+
+	// This is larger than the initial Reno congestion window but smaller than
+	// the guest's advertised receive window. The virtual hop must not add a
+	// second congestion bottleneck in front of the real host TCP connection.
+	payload := make([]byte, 32*1024)
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write stalled at the virtual-link congestion window")
+	}
+}
+
 func TestParseTCPOptionsExtractsMSSAndWindowScale(t *testing.T) {
 	options := []byte{
 		tcpOptNOP,

@@ -335,8 +335,8 @@ func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.Network
 		Config: cfg,
 		IP:     lease.ip,
 		MAC:    lease.mac,
-		TXHook: func(packet []byte) {
-			defaultDarwinSidecarSwitch.Forward(lease.id, packet)
+		TXHook: func(packet []byte) bool {
+			return defaultDarwinSidecarSwitch.Forward(lease.id, packet)
 		},
 		RXHook: func(frame []byte) error {
 			codecMu.Lock()
@@ -385,8 +385,11 @@ func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.Network
 			if packet.Kind != virtio.NetPacketTX {
 				return nil
 			}
-			defaultDarwinSidecarSwitch.Forward(lease.id, packet.Frame)
+			handled := defaultDarwinSidecarSwitch.Forward(lease.id, packet.Frame)
 			if mode == "bridge" {
+				return nil
+			}
+			if handled {
 				return nil
 			}
 			if runtime == nil {
@@ -534,17 +537,17 @@ func (s *darwinSidecarSwitch) Unregister(id string) {
 	s.mu.Unlock()
 }
 
-func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
+func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) bool {
 	source, ok := s.sourceEndpoint(sourceID)
 	if !ok {
 		s.recordSourceViolation(sourceID, netstack.SourceMalformed)
-		return
+		return true
 	}
 	if violation := netstack.ValidateGuestSource(frame, source.mac, source.ip); violation != netstack.SourceValid {
 		if violation != netstack.SourceUnsupportedProtocol {
 			s.recordSourceViolation(sourceID, violation)
 		}
-		return
+		return true
 	}
 	dst := append(net.HardwareAddr(nil), frame[0:6]...)
 	if binary.BigEndian.Uint16(frame[12:14]) == 0x0806 && len(frame) >= 42 {
@@ -552,17 +555,19 @@ func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
 		if targetIP != nil {
 			if target := s.endpointByIP(sourceID, targetIP); target.rx != nil {
 				target.rx(frame)
-				return
+				return true
 			}
 		}
 	}
 	if isDarwinSidecarBroadcastMAC(dst) || isDarwinSidecarMulticastMAC(dst) {
 		s.forwardToAll(sourceID, frame)
-		return
+		return false
 	}
 	if target := s.endpointByMAC(sourceID, dst); target.rx != nil {
 		target.rx(frame)
+		return true
 	}
+	return false
 }
 
 func (s *darwinSidecarSwitch) sourceEndpoint(id string) (darwinSidecarEndpoint, bool) {
