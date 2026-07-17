@@ -132,10 +132,10 @@ func querySnapshotMemoryPage(address uintptr) (int32, error) {
 	if err := load(); err != nil {
 		return 0, err
 	}
-	if machVMPageQuery == nil || machTaskSelf == 0 {
+	if machVMPageQuery == nil || taskSelfTrap == nil {
 		return 0, fmt.Errorf("Mach page query unavailable")
 	}
-	task := *(*uint32)(unsafe.Pointer(machTaskSelf))
+	task := taskSelfTrap()
 	var disposition int32
 	var refCount int32
 	if result := machVMPageQuery(task, uint64(address), &disposition, &refCount); result != 0 {

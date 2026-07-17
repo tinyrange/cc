@@ -214,7 +214,7 @@ var (
 	hvGICGetRedistributorBaseAlignment func(alignment *uintptr) Return
 	hvGICCreate                        func(config GICConfig) Return
 	machVMPageQuery                    func(targetMap uint32, offset uint64, disposition *int32, refCount *int32) int32
-	machTaskSelf                       uintptr
+	taskSelfTrap                       func() uint32
 
 	osRelease func(obj uintptr)
 )
@@ -271,7 +271,7 @@ func load() error {
 		registerOptionalLibFunc(&hvGICGetRedistributorBaseAlignment, hvLib, "hv_gic_get_redistributor_base_alignment")
 		registerOptionalLibFunc(&hvGICCreate, hvLib, "hv_gic_create")
 		registerOptionalLibFunc(&machVMPageQuery, sysLib, "mach_vm_page_query")
-		machTaskSelf, _ = purego.Dlsym(sysLib, "mach_task_self_")
+		registerOptionalLibFunc(&taskSelfTrap, sysLib, "task_self_trap")
 
 		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
 	})
