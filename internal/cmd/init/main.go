@@ -3056,13 +3056,11 @@ func configurePackageManagers(rootDir string) error {
 	if err := os.MkdirAll(aptDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", aptDir, err)
 	}
-	// Queue all HTTP work through one access-method worker so archive and
-	// security downloads cannot leave each other's connections idle. Do not
-	// disable apt's default HTTP pipelining: the old Pipeline-Depth=0 override
-	// made full Ubuntu updates slow enough to hit the archive's five-second
-	// keep-alive timeout, after which Ubuntu 24.04's apt worker crashed.
+	// Keep apt's transport defaults. Serializing all HTTP work with Queue-Mode
+	// "access", or disabling pipelining, leaves otherwise complete responses
+	// idle long enough for Ubuntu's archive to close them and apt 2.8 to reject
+	// the fetch. Limiting optional indexes is independent of transport policy.
 	conf := strings.Join([]string{
-		`Acquire::Queue-Mode "access";`,
 		`Acquire::Languages "none";`,
 		`Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";`,
 		`Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";`,
