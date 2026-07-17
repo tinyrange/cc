@@ -17,13 +17,13 @@ import (
 
 func TestWriteSparseSnapshotMemoryPreservesDataAndHoles(t *testing.T) {
 	pageSize := os.Getpagesize()
-	memory, err := syscall.Mmap(-1, 0, pageSize*16, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	memory, err := syscall.Mmap(-1, 0, 16<<20, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
 	if err != nil {
 		t.Fatalf("mmap guest memory: %v", err)
 	}
 	defer syscall.Munmap(memory)
 	copy(memory[pageSize:pageSize+4], "left")
-	copy(memory[pageSize*12:pageSize*12+5], "right")
+	copy(memory[12<<20:(12<<20)+5], "right")
 
 	path := filepath.Join(t.TempDir(), "memory.bin")
 	if err := writeSparseSnapshotMemory(path, memory, 0o600); err != nil {
@@ -33,10 +33,9 @@ func TestWriteSparseSnapshotMemoryPreservesDataAndHoles(t *testing.T) {
 }
 
 func TestWriteSparseSnapshotMemoryFallsBackWhenPageQueryFails(t *testing.T) {
-	pageSize := os.Getpagesize()
-	memory := make([]byte, pageSize*8)
-	copy(memory[pageSize*2:], "first")
-	copy(memory[pageSize*6:], "second")
+	memory := make([]byte, 8<<20)
+	copy(memory[2<<20:], "first")
+	copy(memory[6<<20:], "second")
 	queries := 0
 	query := func(uintptr) (int32, error) {
 		queries++
