@@ -94,7 +94,11 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 		return nil, err
 	}
 	timing.Since(ctx, "hvf.restore.load_snapshot", start)
-	timingLog("hvf.restore load snapshot took=%s size=%d", time.Since(start), len(mem))
+	if allocated, err := snapshotMemoryAllocatedBytes(snapshotMemoryPath(snapshotPath, manifest.MemoryFile)); err == nil {
+		timingLog("hvf.restore load snapshot took=%s logical=%d allocated=%d", time.Since(start), len(mem), allocated)
+	} else {
+		timingLog("hvf.restore load snapshot took=%s logical=%d", time.Since(start), len(mem))
+	}
 	if req.CPUs <= 0 {
 		req.CPUs = 1
 	}
@@ -467,7 +471,7 @@ func (s *snapshotTrigger) handleDataAbort(vm *VM, vcpuIndex int, info DataAbortI
 		s.err = s.capture(vm, vcpuIndex, value)
 	})
 	if s.err != nil {
-		timingLog("snapshot trigger capture failed: %v", s.err)
+		fmt.Fprintf(os.Stderr, "ccx3: startup snapshot capture failed: %v\n", s.err)
 	}
 	return nil
 }
@@ -490,8 +494,15 @@ func (s *snapshotTrigger) capture(vm *VM, vcpuIndex int, value uint64) error {
 	}
 	defer capture.Abort()
 	outDir := capture.Dir()
-	if err := os.WriteFile(filepath.Join(outDir, "memory.bin"), s.mem, 0o600); err != nil {
+	memoryPath := filepath.Join(outDir, "memory.bin")
+	memoryStarted := time.Now()
+	if err := writeSparseSnapshotMemory(memoryPath, s.mem, 0o600); err != nil {
 		return fmt.Errorf("write snapshot memory: %w", err)
+	}
+	if allocated, err := snapshotMemoryAllocatedBytes(memoryPath); err == nil {
+		timingLog("hvf.snapshot memory capture took=%s logical=%d allocated=%d", time.Since(memoryStarted), len(s.mem), allocated)
+	} else {
+		timingLog("hvf.snapshot memory capture took=%s logical=%d", time.Since(memoryStarted), len(s.mem))
 	}
 	manifest := snapshotManifest{
 		Format:       "ccx3-hvf-snapshot-v0",
@@ -802,6 +813,18 @@ func loadSnapshot(path string) (snapshotManifest, []byte, error) {
 		return snapshotManifest{}, nil, fmt.Errorf("mmap snapshot memory: %w", err)
 	}
 	return manifest, mem, nil
+}
+
+func snapshotMemoryPath(snapshotPath, memoryFile string) string {
+	manifestPath := strings.TrimSpace(snapshotPath)
+	if info, err := os.Stat(manifestPath); err == nil && info.IsDir() {
+		manifestPath = filepath.Join(manifestPath, "manifest.json")
+	}
+	path, err := vmruntime.ResolveSnapshotMemoryPath(manifestPath, memoryFile)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func validateSnapshotRequest(manifest snapshotManifest, req ContainerRunRequest) error {
