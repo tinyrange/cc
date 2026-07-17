@@ -70,8 +70,42 @@ func assertSparseSnapshotMemory(t *testing.T, path string, want []byte) {
 		t.Fatalf("snapshot stat has type %T", info.Sys())
 	}
 	if allocated := stat.Blocks * 512; allocated >= info.Size() {
+		if !filesystemReportsSparseAllocation(t, filepath.Dir(path), info.Size()) {
+			t.Logf("filesystem reports dense allocation for sparse probe; skipping physical allocation assertion")
+			return
+		}
 		t.Fatalf("allocated snapshot bytes = %d, logical bytes = %d", allocated, info.Size())
 	}
+}
+
+func filesystemReportsSparseAllocation(t *testing.T, dir string, size int64) bool {
+	t.Helper()
+	path := filepath.Join(dir, "sparse-allocation-probe.bin")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("create sparse allocation probe: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if _, err := file.WriteAt([]byte{1}, 0); err != nil {
+		_ = file.Close()
+		t.Fatalf("write sparse allocation probe: %v", err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		t.Fatalf("truncate sparse allocation probe: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close sparse allocation probe: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat sparse allocation probe: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("sparse allocation probe stat has type %T", info.Sys())
+	}
+	return stat.Blocks*512 < info.Size()
 }
 
 func BenchmarkWriteSparseSnapshotMemory(b *testing.B) {
