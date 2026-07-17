@@ -3,12 +3,107 @@
 package hvf
 
 import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
+
+func TestWriteSparseSnapshotMemoryPreservesDataAndHoles(t *testing.T) {
+	pageSize := os.Getpagesize()
+	memory, err := syscall.Mmap(-1, 0, pageSize*16, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("mmap guest memory: %v", err)
+	}
+	defer syscall.Munmap(memory)
+	copy(memory[pageSize:pageSize+4], "left")
+	copy(memory[pageSize*12:pageSize*12+5], "right")
+
+	path := filepath.Join(t.TempDir(), "memory.bin")
+	if err := writeSparseSnapshotMemory(path, memory, 0o600); err != nil {
+		t.Fatalf("write sparse snapshot memory: %v", err)
+	}
+	assertSparseSnapshotMemory(t, path, memory)
+}
+
+func TestWriteSparseSnapshotMemoryFallsBackWhenPageQueryFails(t *testing.T) {
+	pageSize := os.Getpagesize()
+	memory := make([]byte, pageSize*8)
+	copy(memory[pageSize*2:], "first")
+	copy(memory[pageSize*6:], "second")
+	queries := 0
+	query := func(uintptr) (int32, error) {
+		queries++
+		return 0, fmt.Errorf("page query unavailable")
+	}
+
+	path := filepath.Join(t.TempDir(), "memory.bin")
+	if err := writeSparseSnapshotMemoryWithQuery(path, memory, 0o600, query); err != nil {
+		t.Fatalf("write fallback sparse snapshot memory: %v", err)
+	}
+	if queries != 1 {
+		t.Fatalf("page queries = %d, want 1 before fallback", queries)
+	}
+	assertSparseSnapshotMemory(t, path, memory)
+}
+
+func assertSparseSnapshotMemory(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot memory: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("restored memory differs from captured memory")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat snapshot memory: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("snapshot stat has type %T", info.Sys())
+	}
+	if allocated := stat.Blocks * 512; allocated >= info.Size() {
+		t.Fatalf("allocated snapshot bytes = %d, logical bytes = %d", allocated, info.Size())
+	}
+}
+
+func BenchmarkWriteSparseSnapshotMemory(b *testing.B) {
+	for _, size := range []int{512 << 20, 12 << 30} {
+		b.Run(fmt.Sprintf("%dMiB", size>>20), func(b *testing.B) {
+			memory, err := syscall.Mmap(-1, 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+			if err != nil {
+				b.Fatalf("mmap guest memory: %v", err)
+			}
+			defer syscall.Munmap(memory)
+			for offset := 0; offset < 64<<20; offset += os.Getpagesize() {
+				memory[offset] = 1
+			}
+			path := filepath.Join(b.TempDir(), "memory.bin")
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for range b.N {
+				if err := writeSparseSnapshotMemory(path, memory, 0o600); err != nil {
+					b.Fatalf("write sparse snapshot memory: %v", err)
+				}
+			}
+			b.StopTimer()
+			info, err := os.Stat(path)
+			if err != nil {
+				b.Fatalf("stat snapshot memory: %v", err)
+			}
+			stat := info.Sys().(*syscall.Stat_t)
+			b.ReportMetric(float64(stat.Blocks*512)/(1<<20), "allocated-MiB")
+		})
+	}
+}
 
 func TestValidateSnapshotRequestRequiresMatchingMemory(t *testing.T) {
 	manifest := snapshotManifest{
