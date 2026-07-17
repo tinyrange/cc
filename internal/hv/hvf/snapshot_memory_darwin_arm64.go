@@ -50,13 +50,16 @@ func writeSnapshotMemoryRanges(path string, data []byte, perm os.FileMode, range
 			_ = file.Close()
 		}
 	}()
+	// Establish the logical length before writing populated ranges. On APFS,
+	// extending the file with a write beyond EOF can allocate the intervening
+	// range, while writes into a pre-truncated sparse file preserve its holes.
+	if err := file.Truncate(int64(len(data))); err != nil {
+		return err
+	}
 	for _, span := range ranges {
 		if _, err := file.WriteAt(data[span.start:span.end], int64(span.start)); err != nil {
 			return err
 		}
-	}
-	if err := file.Truncate(int64(len(data))); err != nil {
-		return err
 	}
 	if err := file.Close(); err != nil {
 		return err

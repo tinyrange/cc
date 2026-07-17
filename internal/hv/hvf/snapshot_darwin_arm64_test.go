@@ -86,13 +86,13 @@ func filesystemReportsSparseAllocation(t *testing.T, dir string, size int64) boo
 		t.Fatalf("create sparse allocation probe: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
-	if _, err := file.WriteAt([]byte{1}, 0); err != nil {
-		_ = file.Close()
-		t.Fatalf("write sparse allocation probe: %v", err)
-	}
 	if err := file.Truncate(size); err != nil {
 		_ = file.Close()
 		t.Fatalf("truncate sparse allocation probe: %v", err)
+	}
+	if _, err := file.WriteAt([]byte{1}, 0); err != nil {
+		_ = file.Close()
+		t.Fatalf("write sparse allocation probe: %v", err)
 	}
 	if err := file.Close(); err != nil {
 		t.Fatalf("close sparse allocation probe: %v", err)
