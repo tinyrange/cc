@@ -3,7 +3,9 @@
 package kvm
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
@@ -277,33 +280,96 @@ func writeSparseFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	defer file.Close()
-	const chunkSize = 4096
-	for off := 0; off < len(data); {
-		end := off + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		chunk := data[off:end]
-		if !allZero(chunk) {
-			if _, err := file.WriteAt(chunk, int64(off)); err != nil {
-				return err
-			}
-		}
-		off = end
-	}
 	if err := file.Truncate(int64(len(data))); err != nil {
+		return err
+	}
+	pageSize := unix.Getpagesize()
+	resident, ok := residentSnapshotPages(data, pageSize)
+	if !ok {
+		resident = nil
+	}
+	if err := writePopulatedSnapshotPages(file, data, resident, pageSize); err != nil {
 		return err
 	}
 	return file.Close()
 }
 
-func allZero(data []byte) bool {
-	for _, b := range data {
-		if b != 0 {
-			return false
+// residentSnapshotPages identifies anonymous guest-memory pages that currently
+// have backing storage. Non-resident, non-swapped pages in the guest's private
+// anonymous mapping have never been populated (or were reclaimed by the
+// balloon) and will read as zero, so snapshot capture can avoid faulting and
+// scanning the entire configured address space.
+func residentSnapshotPages(data []byte, pageSize int) ([]bool, bool) {
+	if len(data) == 0 {
+		return nil, true
+	}
+	base := uintptr(unsafe.Pointer(&data[0]))
+	if pageSize <= 0 || base%uintptr(pageSize) != 0 {
+		return nil, false
+	}
+	file, err := os.Open("/proc/self/pagemap")
+	if err != nil {
+		return nil, false
+	}
+	defer file.Close()
+
+	pageCount := (len(data) + pageSize - 1) / pageSize
+	resident := make([]bool, pageCount)
+	const entriesPerRead = 32 * 1024
+	entries := make([]byte, entriesPerRead*8)
+	firstVirtualPage := base / uintptr(pageSize)
+	for first := 0; first < pageCount; first += entriesPerRead {
+		count := min(entriesPerRead, pageCount-first)
+		buf := entries[:count*8]
+		offset := int64(firstVirtualPage+uintptr(first)) * 8
+		n, err := file.ReadAt(buf, offset)
+		if n != len(buf) || (err != nil && err != io.EOF) {
+			return nil, false
+		}
+		for i := 0; i < count; i++ {
+			entry := binary.LittleEndian.Uint64(buf[i*8:])
+			const presentOrSwapped = uint64(3) << 62
+			resident[first+i] = entry&presentOrSwapped != 0
 		}
 	}
-	return true
+	return resident, true
+}
+
+func writePopulatedSnapshotPages(file *os.File, data []byte, resident []bool, pageSize int) error {
+	runStart := -1
+	flush := func(end int) error {
+		if runStart < 0 {
+			return nil
+		}
+		_, err := file.WriteAt(data[runStart:end], int64(runStart))
+		runStart = -1
+		return err
+	}
+	for off, page := 0, 0; off < len(data); off, page = off+pageSize, page+1 {
+		end := min(off+pageSize, len(data))
+		if resident != nil && !resident[page] {
+			if err := flush(off); err != nil {
+				return err
+			}
+			continue
+		}
+		if allZero(data[off:end]) {
+			if err := flush(off); err != nil {
+				return err
+			}
+			continue
+		}
+		if runStart < 0 {
+			runStart = off
+		}
+	}
+	return flush(len(data))
+}
+
+var zeroSnapshotPage = make([]byte, unix.Getpagesize())
+
+func allZero(data []byte) bool {
+	return len(data) <= len(zeroSnapshotPage) && bytes.Equal(data, zeroSnapshotPage[:len(data)])
 }
 
 func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, memoryMB uint64, balloonMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
