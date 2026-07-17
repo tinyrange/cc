@@ -213,6 +213,8 @@ var (
 	hvGICGetDistributorBaseAlignment   func(alignment *uintptr) Return
 	hvGICGetRedistributorBaseAlignment func(alignment *uintptr) Return
 	hvGICCreate                        func(config GICConfig) Return
+	machVMPageQuery                    func(targetMap uint32, offset uint64, disposition *int32, refCount *int32) int32
+	taskSelfTrap                       func() uint32
 
 	osRelease func(obj uintptr)
 )
@@ -268,6 +270,8 @@ func load() error {
 		registerOptionalLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
 		registerOptionalLibFunc(&hvGICGetRedistributorBaseAlignment, hvLib, "hv_gic_get_redistributor_base_alignment")
 		registerOptionalLibFunc(&hvGICCreate, hvLib, "hv_gic_create")
+		registerOptionalLibFunc(&machVMPageQuery, sysLib, "mach_vm_page_query")
+		registerOptionalLibFunc(&taskSelfTrap, sysLib, "task_self_trap")
 
 		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
 	})

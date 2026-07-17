@@ -612,9 +612,11 @@ while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
 	}
 }
 
-func TestRuntimeRestoresPersistentLinuxFromStartupSnapshot(t *testing.T) {
-	if runtime.GOOS != "linux" || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
-		t.Skip("KVM startup snapshots are implemented on Linux amd64 and arm64")
+func TestRuntimeRestoresPersistentFromStartupSnapshot(t *testing.T) {
+	supported := (runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")) ||
+		(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64")
+	if !supported {
+		t.Skip("startup snapshots are implemented on Linux amd64/arm64 and Darwin arm64")
 	}
 	env := newRuntimeBootEnv(t)
 	snapshotRoot := t.TempDir()
