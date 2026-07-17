@@ -9,12 +9,56 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"j5.nz/cc/internal/managed/guestagent"
 )
+
+func TestConfigurePackageManagersDoesNotDisableAptPipelining(t *testing.T) {
+	root := t.TempDir()
+	aptPath := filepath.Join(root, "usr", "bin", "apt")
+	configPath := filepath.Join(root, "etc", "apt", "apt.conf.d", "99ccvm-netstack")
+	if err := os.MkdirAll(filepath.Dir(aptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aptPath, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`Acquire::http::Pipeline-Depth "0";`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := configurePackageManagers(root); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		config[fields[0]] = strings.Trim(fields[1], `";`)
+	}
+	if _, ok := config["Acquire::http::Pipeline-Depth"]; ok {
+		t.Fatalf("HTTP pipelining was overridden: %q", config["Acquire::http::Pipeline-Depth"])
+	}
+	if _, ok := config["Acquire::https::Pipeline-Depth"]; ok {
+		t.Fatalf("HTTPS pipelining was overridden: %q", config["Acquire::https::Pipeline-Depth"])
+	}
+	if config["Acquire::Queue-Mode"] != "access" {
+		t.Fatalf("queue mode = %q, want access", config["Acquire::Queue-Mode"])
+	}
+}
 
 func TestCommandNeedsSystemdReady(t *testing.T) {
 	tests := []struct {

@@ -3056,10 +3056,13 @@ func configurePackageManagers(rootDir string) error {
 	if err := os.MkdirAll(aptDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", aptDir, err)
 	}
+	// Queue all HTTP work through one access-method worker so archive and
+	// security downloads cannot leave each other's connections idle. Do not
+	// disable apt's default HTTP pipelining: the old Pipeline-Depth=0 override
+	// made full Ubuntu updates slow enough to hit the archive's five-second
+	// keep-alive timeout, after which Ubuntu 24.04's apt worker crashed.
 	conf := strings.Join([]string{
 		`Acquire::Queue-Mode "access";`,
-		`Acquire::http::Pipeline-Depth "0";`,
-		`Acquire::https::Pipeline-Depth "0";`,
 		`Acquire::Languages "none";`,
 		`Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";`,
 		`Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";`,
