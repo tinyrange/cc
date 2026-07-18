@@ -1022,6 +1022,12 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			if err := os.Link(source, target); err != nil {
 				return err
 			}
+			// Some FUSE clients retain the pre-link attributes for an inode even
+			// when LINK returns the updated entry. A no-op setattr makes the new
+			// link count visible without changing archive metadata.
+			if err := os.Chmod(source, sourceInfo.Mode().Perm()); err != nil {
+				return err
+			}
 		}
 	}
 }

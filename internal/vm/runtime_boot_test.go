@@ -131,7 +131,7 @@ func TestRuntimeArchiveControlsInitializeUserHomeAndPreserveHardLinks(t *testing
 		Kind: "fs_extract", Path: "/home/cc/copied-links", Directory: true, Stdin: archive, User: "1000:1000",
 	}, 0)
 	verified := execInRuntimeRequest(t, inst, client.ExecRequest{
-		Command: []string{"sh", "-lc", "set -eu; a=$(stat -c %i /home/cc/copied-links/links/first); b=$(stat -c %i /home/cc/copied-links/links/second); test \"$a\" = \"$b\"; printf change >/home/cc/copied-links/links/first; test \"$(cat /home/cc/copied-links/links/second)\" = change"},
+		Command: []string{"sh", "-lc", "set -eu; a=$(stat -c %i /home/cc/copied-links/links/first); b=$(stat -c %i /home/cc/copied-links/links/second); test \"$a\" = \"$b\"; test \"$(stat -c %h /home/cc/copied-links/links/first)\" -eq 2; printf change >/home/cc/copied-links/links/first; test \"$(cat /home/cc/copied-links/links/second)\" = change"},
 		User:    "1000:1000",
 	})
 	if verified.ExitCode != 0 {
