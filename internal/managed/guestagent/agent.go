@@ -171,11 +171,13 @@ func (p Protocol) WriteTiming(w io.Writer, id, phase string, start time.Time) {
 type request = protocol.ManagedExecRequest
 
 type managedExec struct {
-	mu      sync.Mutex
+	stdinMu sync.Mutex
 	stdin   io.WriteCloser
-	process *os.Process
-	pty     *os.File
-	ptyImpl PTY
+
+	processMu sync.Mutex
+	process   *os.Process
+	pty       *os.File
+	ptyImpl   PTY
 }
 
 func Run(opts Options) error {
@@ -327,8 +329,8 @@ func commandLoop(opts Options, control net.Conn) error {
 }
 
 func (m *managedExec) write(data []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
 	if m.stdin == nil {
 		return fmt.Errorf("stdin is closed")
 	}
@@ -337,8 +339,8 @@ func (m *managedExec) write(data []byte) error {
 }
 
 func (m *managedExec) close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
 	if m.stdin == nil {
 		return nil
 	}
@@ -348,20 +350,20 @@ func (m *managedExec) close() error {
 }
 
 func (m *managedExec) setProcess(p *os.Process) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	m.process = p
 }
 
 func (m *managedExec) setPTY(pty *os.File) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	m.pty = pty
 }
 
 func (m *managedExec) resize(cols, rows int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	if m.ptyImpl == nil {
 		return nil
 	}
@@ -395,8 +397,8 @@ func (m *managedExec) signal(name string) error {
 	if err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	if m.process == nil {
 		return fmt.Errorf("process is not started")
 	}
@@ -764,8 +766,7 @@ func archiveHardlinkKey(info os.FileInfo) (string, bool) {
 	}
 	dev, devOK := archiveStatField(value.FieldByName("Dev"))
 	ino, inoOK := archiveStatField(value.FieldByName("Ino"))
-	nlink, nlinkOK := archiveStatField(value.FieldByName("Nlink"))
-	if !devOK || !inoOK || !nlinkOK || nlink < 2 {
+	if !devOK || !inoOK || ino == 0 {
 		return "", false
 	}
 	return fmt.Sprintf("%d:%d", dev, ino), true

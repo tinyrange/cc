@@ -168,8 +168,18 @@ func TestImageFSHardlinkReportsSameInode(t *testing.T) {
 	if aAttr.Ino != bAttr.Ino || aAttrAfter.Ino != bAttrAfter.Ino {
 		t.Fatalf("hardlink inodes before=(%d,%d) after=(%d,%d), want same", aAttr.Ino, bAttr.Ino, aAttrAfter.Ino, bAttrAfter.Ino)
 	}
+	if aID != bID {
+		t.Fatalf("hardlink node IDs = %d and %d, want one FUSE inode", aID, bID)
+	}
 	if aAttrAfter.NLink != 2 || bAttrAfter.NLink != 2 {
 		t.Fatalf("hardlink nlink a=%d b=%d, want 2", aAttrAfter.NLink, bAttrAfter.NLink)
+	}
+	if errno := fsys.(fsUnlinkBackend).Unlink(1, "a"); errno != 0 {
+		t.Fatalf("unlink first hardlink errno = %d", errno)
+	}
+	remainingID, remainingAttr, errno := fsys.Lookup(1, "b")
+	if errno != 0 || remainingID != bID || remainingAttr.NLink != 1 {
+		t.Fatalf("remaining hardlink = node %d nlink %d errno %d, want node %d nlink 1", remainingID, remainingAttr.NLink, errno, bID)
 	}
 }
 

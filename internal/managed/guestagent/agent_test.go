@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -143,6 +144,66 @@ func TestWriteAndExtractTarPreservesHardLink(t *testing.T) {
 		t.Fatal("extracted files do not share an inode")
 	}
 }
+
+func TestArchiveHardlinkIdentityDoesNotDependOnReportedLinkCount(t *testing.T) {
+	info := fakeArchiveFileInfo{sys: struct {
+		Dev   uint64
+		Ino   uint64
+		Nlink uint64
+	}{Dev: 7, Ino: 42, Nlink: 1}}
+	if key, ok := archiveHardlinkKey(info); !ok || key != "7:42" {
+		t.Fatalf("archiveHardlinkKey = %q, %v; want 7:42, true", key, ok)
+	}
+}
+
+func TestManagedExecSignalIsNotBlockedByStdinBackpressure(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	unblock := make(chan struct{})
+	managed := &managedExec{stdin: blockingWriteCloser{unblock: unblock}, process: cmd.Process}
+	writeStarted := make(chan struct{})
+	go func() {
+		close(writeStarted)
+		_ = managed.write([]byte("pending input"))
+	}()
+	<-writeStarted
+
+	signaled := make(chan error, 1)
+	go func() { signaled <- managed.signal("KILL") }()
+	select {
+	case err := <-signaled:
+		if err != nil {
+			t.Fatalf("signal: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(unblock)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("signal waited behind a blocked stdin write")
+	}
+	close(unblock)
+	_ = cmd.Wait()
+}
+
+type fakeArchiveFileInfo struct{ sys any }
+
+func (fakeArchiveFileInfo) Name() string       { return "file" }
+func (fakeArchiveFileInfo) Size() int64        { return 0 }
+func (fakeArchiveFileInfo) Mode() os.FileMode  { return 0o644 }
+func (fakeArchiveFileInfo) ModTime() time.Time { return time.Time{} }
+func (fakeArchiveFileInfo) IsDir() bool        { return false }
+func (f fakeArchiveFileInfo) Sys() any         { return f.sys }
+
+type blockingWriteCloser struct{ unblock <-chan struct{} }
+
+func (w blockingWriteCloser) Write(p []byte) (int, error) {
+	<-w.unblock
+	return len(p), nil
+}
+func (blockingWriteCloser) Close() error { return nil }
 
 func TestExtractTarToPathConflictSemantics(t *testing.T) {
 	t.Run("file over file overwrites", func(t *testing.T) {

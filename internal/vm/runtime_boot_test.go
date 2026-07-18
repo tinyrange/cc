@@ -62,6 +62,83 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
 }
 
+func TestRuntimeCancelsInteractiveShellWithBlockedForegroundCommand(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "cancel-interactive-shell", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	inputs := make(chan client.ExecInput, 1)
+	inputs <- client.ExecInput{Kind: "stdin", Data: []byte("trap '' TERM INT\nprintf 'ready\\n'\nsleep 60\n")}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- inst.ExecStream(ctx, client.ExecRequest{Command: []string{"/bin/sh"}}, inputs, func(event client.ExecEvent) error {
+			if event.Kind == "stdout" && strings.Contains(event.Output, "ready") {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(runtimeExecTimeout()):
+		cancel()
+		t.Fatal("interactive shell did not start its foreground command")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("interactive shell cancellation = %v, want context canceled", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("interactive shell cancellation did not terminate and reap the foreground command")
+	}
+}
+
+func TestRuntimeArchiveControlsInitializeUserHomeAndPreserveHardLinks(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-user-home", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind:      "fs_extract",
+		Path:      "/home/cc/first-copy",
+		Directory: true,
+		Stdin:     tarPayload(t, map[string]string{"payload.txt": "first-copy"}),
+		User:      "1000:1000",
+	}, 0)
+	first := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; test \"$(stat -c %u:%g /home/cc)\" = 1000:1000; cat /home/cc/first-copy/payload.txt"},
+		User:    "1000:1000",
+	})
+	requireGuestOutput(t, first.Output, "first-copy")
+
+	created := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; mkdir -p /home/cc/links; printf linked >/home/cc/links/first; ln /home/cc/links/first /home/cc/links/second"},
+		User:    "1000:1000",
+	})
+	if created.ExitCode != 0 {
+		t.Fatalf("create guest hard links exited with %d: %s", created.ExitCode, created.Output)
+	}
+	archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/home/cc/links", User: "1000:1000"}, 0)
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/home/cc/copied-links", Directory: true, Stdin: archive, User: "1000:1000",
+	}, 0)
+	verified := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; a=$(stat -c %i /home/cc/copied-links/links/first); b=$(stat -c %i /home/cc/copied-links/links/second); test \"$a\" = \"$b\"; printf change >/home/cc/copied-links/links/first; test \"$(cat /home/cc/copied-links/links/second)\" = change"},
+		User:    "1000:1000",
+	})
+	if verified.ExitCode != 0 {
+		t.Fatalf("copied hard-link topology check exited with %d: %s", verified.ExitCode, verified.Output)
+	}
+}
+
 func TestRuntimeBootsLinuxWithVirtioBalloon(t *testing.T) {
 	if runtime.GOOS != "darwin" && !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
 		t.Skip("virtio balloon support is implemented by the Darwin arm64 and Linux amd64 backends")

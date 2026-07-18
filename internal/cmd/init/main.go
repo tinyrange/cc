@@ -40,6 +40,8 @@ const execPivotMode = "--ccx3-exec-pivot"
 const archiveMode = "--ccx3-fs-archive"
 const extractMode = "--ccx3-fs-extract"
 
+var credentialSetupMu sync.Mutex
+
 const (
 	managedExecTimingRecv            = "recv"
 	managedExecTimingGuestReadyBegin = "guest_ready_begin"
@@ -2091,7 +2093,10 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 		return 0, nil, err
 	}
 	if cred != nil {
-		if err := guestagent.EnsureCredentialUser("", cred); err != nil {
+		credentialSetupMu.Lock()
+		err := guestagent.EnsureCredentialUser("", cred)
+		credentialSetupMu.Unlock()
+		if err != nil {
 			return 0, nil, err
 		}
 		env = guestagent.EnvironmentForCredential("", env, cred)
@@ -2534,6 +2539,17 @@ func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string,
 		if credentialErr != nil {
 			err = credentialErr
 		} else if credential != nil {
+			credentialSetupMu.Lock()
+			userErr := guestagent.EnsureCredentialUser(rootDir, credential)
+			if userErr == nil {
+				userErr = guestagent.EnsureCredentialArchiveHome(rootDir, dst, credential)
+			}
+			credentialSetupMu.Unlock()
+			if userErr != nil {
+				err = userErr
+			}
+		}
+		if err == nil && credential != nil {
 			request, marshalErr := json.Marshal(extractHelperRequest{RootDir: rootDir, Path: dst, IsDir: dstDir, Limits: limits})
 			if marshalErr != nil {
 				err = marshalErr
@@ -2944,7 +2960,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		return
 	}
 	if execCred != nil {
-		if err := guestagent.EnsureCredentialUser(rootDir, execCred); err != nil {
+		credentialSetupMu.Lock()
+		err := guestagent.EnsureCredentialUser(rootDir, execCred)
+		credentialSetupMu.Unlock()
+		if err != nil {
 			writeKernel("ccx3-init: ensure user: " + err.Error())
 			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
 			reporter.Exit(126)

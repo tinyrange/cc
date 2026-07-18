@@ -93,6 +93,37 @@ func EnsureCredentialWorkDir(rootDir, workDir string, cred *syscall.Credential) 
 	return ensureCredentialDirectory(rootDir, workDir, cred)
 }
 
+// EnsureCredentialArchiveHome provisions only a missing top-level directory
+// below /home for an archive destination. Existing paths are left untouched so
+// an archive request cannot acquire access by changing their ownership.
+func EnsureCredentialArchiveHome(rootDir, destination string, cred *syscall.Credential) error {
+	if cred == nil || cred.Uid == 0 {
+		return nil
+	}
+	destination = filepath.Clean(strings.TrimSpace(destination))
+	parts := strings.Split(strings.TrimPrefix(destination, "/"), "/")
+	if len(parts) < 2 || parts[0] != "home" || parts[1] == "" {
+		return nil
+	}
+	home := rootPath(rootDir, filepath.Join("/home", parts[1]))
+	if _, err := os.Lstat(home); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Mkdir(home, 0o755); err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("mkdir %s: %w", home, err)
+	}
+	if err := os.Chown(home, int(cred.Uid), int(cred.Gid)); err != nil {
+		_ = os.Remove(home)
+		return fmt.Errorf("chown %s: %w", home, err)
+	}
+	return nil
+}
+
 func ChownPathForUser(rootDir, target, user string) error {
 	cred, err := CredentialForUserInRoot(rootDir, user)
 	if err != nil || cred == nil {

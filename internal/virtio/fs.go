@@ -4567,30 +4567,9 @@ func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string,
 			return 0, FuseAttr{}, errno
 		}
 	}
-	linked := &imageNode{
-		id:            p.nextNodeID,
-		inode:         p.imageNodeInodeLocked(node),
-		parent:        newParent,
-		name:          name,
-		mode:          node.mode,
-		rawMode:       node.rawMode,
-		uid:           node.uid,
-		gid:           node.gid,
-		rdev:          node.rdev,
-		size:          node.size,
-		data:          append([]byte(nil), node.data...),
-		symlinkTarget: node.symlinkTarget,
-		modTime:       node.modTime,
-	}
-	if node.isSymlink() {
-		linked.mode = fs.ModeSymlink | node.mode.Perm()
-	}
-	p.nextNodeID++
-	p.nodes[linked.id] = linked
-	p.registerImageNodeLinkLocked(linked)
-	p.refreshImageNodeLinksLocked(linked)
-	parentNode.entries[name] = linked.id
-	return linked.id, p.attr(linked), 0
+	parentNode.entries[name] = node.id
+	p.refreshImageNodeLinksLocked(node)
+	return node.id, p.attr(node), 0
 }
 
 func (p *imageFS) RmDir(parent uint64, name string) int32 {
@@ -4867,8 +4846,11 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 		}
 		parentNode.whiteouts[name] = true
 	}
-	delete(p.nodes, childID)
-	p.unregisterImageNodeLinkLocked(child)
+	if p.imageNodeReferenceCountLocked(childID) == 0 {
+		delete(p.nodes, childID)
+	} else {
+		p.refreshImageNodeLinksLocked(child)
+	}
 	return 0
 }
 
@@ -4913,19 +4895,18 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		p.debugChildfLocked("rename-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
 	}
+	var replaced *imageNode
 	if existingID, exists := newParentNode.entries[newName]; exists && existingID != childID {
-		existing := p.nodes[existingID]
-		if existing != nil && existing.isDir() && !child.isDir() {
+		replaced = p.nodes[existingID]
+		if replaced != nil && replaced.isDir() && !child.isDir() {
 			p.debugChildfLocked("rename-target-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return -linuxEISDIR
 		}
-		if existing != nil && !existing.isDir() && child.isDir() {
+		if replaced != nil && !replaced.isDir() && child.isDir() {
 			p.debugChildfLocked("rename-target-not-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxENOTDIR)
 			return -linuxENOTDIR
 		}
 		p.debugChildfLocked("rename-replace-target", newParent, newName, "existing=%d", existingID)
-		delete(p.nodes, existingID)
-		p.unregisterImageNodeLinkLocked(existing)
 	}
 	delete(parentNode.entries, name)
 	if parentNode.abstractDir != nil {
@@ -4941,6 +4922,14 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	child.parent = newParent
 	child.name = newName
 	child.modTime = time.Now()
+	if replaced != nil {
+		if p.imageNodeReferenceCountLocked(replaced.id) == 0 {
+			delete(p.nodes, replaced.id)
+		} else {
+			p.refreshImageNodeLinksLocked(replaced)
+		}
+	}
+	p.refreshImageNodeLinksLocked(child)
 	return 0
 }
 
@@ -5035,13 +5024,6 @@ func (p *imageFS) registerImageNodeLinkLocked(node *imageNode) {
 	}
 }
 
-func (p *imageFS) unregisterImageNodeLinkLocked(node *imageNode) {
-	if node == nil || node.isDir() {
-		return
-	}
-	p.refreshImageNodeLinksLocked(node)
-}
-
 func (p *imageFS) imageNodeLinkCountLocked(node *imageNode) uint32 {
 	if node == nil || node.isDir() {
 		return 1
@@ -5058,9 +5040,9 @@ func (p *imageFS) refreshImageNodeLinksLocked(node *imageNode) {
 	}
 	inode := p.imageNodeInodeLocked(node)
 	nlink := uint32(0)
-	for _, candidate := range p.nodes {
+	for id, candidate := range p.nodes {
 		if candidate != nil && !candidate.isDir() && p.imageNodeInodeLocked(candidate) == inode {
-			nlink++
+			nlink += p.imageNodeReferenceCountLocked(id)
 		}
 	}
 	if nlink == 0 {
@@ -5071,6 +5053,21 @@ func (p *imageFS) refreshImageNodeLinksLocked(node *imageNode) {
 			candidate.nlink = nlink
 		}
 	}
+}
+
+func (p *imageFS) imageNodeReferenceCountLocked(nodeID uint64) uint32 {
+	var count uint32
+	for _, candidate := range p.nodes {
+		if candidate == nil || !candidate.isDir() {
+			continue
+		}
+		for _, childID := range candidate.entries {
+			if childID == nodeID {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func (p *imageFS) imageNodeInodeLocked(node *imageNode) uint64 {

@@ -83,6 +83,51 @@ func TestEnsureCredentialWorkDirCreatesRootCommandDirectory(t *testing.T) {
 	}
 }
 
+func TestEnsureCredentialArchiveHomeCreatesOnlyMissingWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "home"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		uid, gid = 1000, 1000
+	}
+	cred := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+	if err := EnsureCredentialArchiveHome(root, "/home/cc/project/file", cred); err != nil {
+		t.Fatalf("create archive workspace: %v", err)
+	}
+	workspace, err := os.Stat(filepath.Join(root, "home", "cc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := workspace.Sys().(*syscall.Stat_t)
+	if int(stat.Uid) != uid || int(stat.Gid) != gid {
+		t.Fatalf("workspace owner = %d:%d, want %d:%d", stat.Uid, stat.Gid, uid, gid)
+	}
+	if _, err := os.Stat(filepath.Join(root, "home", "cc", "project")); !os.IsNotExist(err) {
+		t.Fatalf("archive destination parent was created eagerly: %v", err)
+	}
+
+	protected := filepath.Join(root, "home", "protected")
+	if err := os.Mkdir(protected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(protected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureCredentialArchiveHome(root, "/home/protected/file", cred); err != nil {
+		t.Fatalf("inspect existing workspace: %v", err)
+	}
+	after, err := os.Stat(protected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode() != after.Mode() || before.Sys().(*syscall.Stat_t).Uid != after.Sys().(*syscall.Stat_t).Uid || before.Sys().(*syscall.Stat_t).Gid != after.Sys().(*syscall.Stat_t).Gid {
+		t.Fatal("existing archive workspace metadata changed")
+	}
+}
+
 func TestCredentialForUser(t *testing.T) {
 	root, err := CredentialForUser("root")
 	if err != nil || root != nil {
