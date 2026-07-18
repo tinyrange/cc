@@ -155,8 +155,15 @@ func TestLookupPathCleansInputAndReportsNonDirectory(t *testing.T) {
 func TestImageFSPreservesTrailingSpaceNamesAcrossBackends(t *testing.T) {
 	t.Run("host", func(t *testing.T) {
 		rootDir := t.TempDir()
-		mustWriteFile(t, filepath.Join(rootDir, "collision"), "A")
-		mustWriteFile(t, filepath.Join(rootDir, "collision "), "B")
+		plainPath := filepath.Join(rootDir, "collision")
+		spacedPath := filepath.Join(rootDir, "collision ")
+		mustWriteFile(t, plainPath, "A")
+		mustWriteFile(t, spacedPath, "B")
+		plainInfo, plainErr := os.Stat(plainPath)
+		spacedInfo, spacedErr := os.Stat(spacedPath)
+		if plainErr == nil && spacedErr == nil && os.SameFile(plainInfo, spacedInfo) {
+			t.Skip("host filesystem aliases trailing-space names")
+		}
 		root := NewHostFS(rootDir, nil)
 		if got := readFile(t, root, "/collision"); got != "A" {
 			t.Fatalf("plain file = %q", got)
