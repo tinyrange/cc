@@ -138,6 +138,36 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 	if !gotOutput {
 		t.Fatal("replacement control did not receive command output")
 	}
+	if err := encoder.Encode(request{
+		Kind: "exec", ID: "empty-stdin-cancel",
+		Command: []string{"/bin/sh", "-c", "trap '' TERM INT; while :; do sleep 1; done"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(request{Kind: "stdin_close", ID: "empty-stdin-cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		line, err := secondReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read empty-stdin command start: %v", err)
+		}
+		if strings.TrimSpace(line) == BeginMarkerPrefix+"empty-stdin-cancel" {
+			break
+		}
+	}
+	if err := encoder.Encode(request{Kind: "signal", ID: "empty-stdin-cancel", Signal: "KILL"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		line, err := secondReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read empty-stdin cancellation: %v", err)
+		}
+		if strings.TrimSpace(line) == ExitMarkerPrefix+"empty-stdin-cancel:137" {
+			break
+		}
+	}
 
 	cancel()
 	_ = second.Close()

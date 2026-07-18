@@ -178,6 +178,7 @@ type managedExec struct {
 
 	processMu sync.Mutex
 	process   *os.Process
+	pending   syscall.Signal
 	pty       *os.File
 	ptyImpl   PTY
 }
@@ -264,6 +265,7 @@ func Run(opts Options) error {
 	control := newReconnectingGuestControl(ctx)
 	active := NewActiveExecSet()
 	pending := NewPendingRequests[request]()
+	startOrphanReaper(ctx)
 	connected := false
 	for {
 		conn, err := connectControl(ctx, opts)
@@ -373,17 +375,13 @@ func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveE
 				continue
 			}
 			if len(req.Stdin) != 0 {
-				startExecWithReader(opts, control, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil, func() {})
+				startManagedExec(opts, control, active, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil)
 				continue
 			}
 			if req.TTY || req.ControlFD {
 				stdinR, stdinW := io.Pipe()
 				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
-				active.Add(req.ID, managed)
-				go runExec(opts, control, req, stdinR, managed, func() {
-					_ = managed.close()
-					active.Delete(req.ID)
-				})
+				startManagedExec(opts, control, active, req, stdinR, managed)
 				continue
 			}
 			pending.Put(req.ID, req)
@@ -412,11 +410,7 @@ func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveE
 			if pendingOK {
 				stdinR, stdinW := io.Pipe()
 				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
-				active.Add(req.ID, managed)
-				go runExec(opts, control, pendingReq, stdinR, managed, func() {
-					_ = managed.close()
-					active.Delete(req.ID)
-				})
+				startManagedExec(opts, control, active, pendingReq, stdinR, managed)
 				_ = managed.write(req.Stdin)
 				continue
 			}
@@ -428,7 +422,7 @@ func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveE
 		case "stdin_close":
 			pendingReq, pendingOK := pending.Take(req.ID)
 			if pendingOK {
-				startExecWithReader(opts, control, pendingReq, io.NopCloser(bytes.NewReader(nil)), nil, func() {})
+				startManagedExec(opts, control, active, pendingReq, io.NopCloser(bytes.NewReader(nil)), nil)
 				continue
 			}
 			_ = HandleActiveControl(active, ActiveControlRequest{
@@ -496,8 +490,13 @@ func (m *managedExec) close() error {
 
 func (m *managedExec) setProcess(p *os.Process) {
 	m.processMu.Lock()
-	defer m.processMu.Unlock()
 	m.process = p
+	pending := m.pending
+	m.pending = 0
+	m.processMu.Unlock()
+	if pending != 0 {
+		_ = signalProcessGroup(p, pending)
+	}
 }
 
 func (m *managedExec) setPTY(pty *os.File) {
@@ -550,20 +549,39 @@ func (m *managedExec) signal(name string) error {
 		_ = m.close()
 	}
 	m.processMu.Lock()
-	defer m.processMu.Unlock()
 	if m.process == nil {
-		return fmt.Errorf("process is not started")
+		if m.pending == 0 || sig == syscall.SIGKILL {
+			m.pending = sig
+		}
+		m.processMu.Unlock()
+		return nil
 	}
-	if m.process.Pid > 0 {
-		if err := syscall.Kill(-m.process.Pid, sig); err == nil || errors.Is(err, syscall.ESRCH) {
+	process := m.process
+	m.processMu.Unlock()
+	return signalProcessGroup(process, sig)
+}
+
+func signalProcessGroup(process *os.Process, sig syscall.Signal) error {
+	if process.Pid > 0 {
+		if err := syscall.Kill(-process.Pid, sig); err == nil || errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
 	}
-	return m.process.Signal(sig)
+	return process.Signal(sig)
 }
 
-func startExecWithReader(opts Options, control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
-	go runExec(opts, control, req, stdin, managed, cleanup)
+func startManagedExec(opts Options, control io.Writer, active *ActiveExecSet, req request, stdin io.ReadCloser, managed *managedExec) {
+	if managed == nil {
+		managed = &managedExec{ptyImpl: opts.PTY}
+	}
+	closePending := active.Add(req.ID, managed)
+	if closePending {
+		_ = managed.close()
+	}
+	go runExec(opts, control, req, stdin, managed, func() {
+		_ = managed.close()
+		active.Delete(req.ID)
+	})
 }
 
 func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
@@ -650,7 +668,7 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		wg.Add(1)
 		go copyMarked(&wg, control, proto.ControlMarkerPrefix, req.ID, controlR)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startManagedCommand(cmd); err != nil {
 		if managed != nil {
 			_ = managed.close()
 		}
@@ -683,7 +701,7 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	if managed != nil {
 		managed.setProcess(cmd.Process)
 	}
-	waitErr := cmd.Wait()
+	waitErr := waitManagedCommand(cmd)
 	if stdin != nil {
 		_ = stdin.Close()
 	}
