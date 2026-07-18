@@ -31,8 +31,9 @@ type Client struct {
 var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflow")
 
 type workerCall struct {
-	frames chan WorkerFrame
-	done   chan error
+	frames   chan WorkerFrame
+	done     chan error
+	inputAck chan struct{}
 }
 
 type WorkerRequirements struct {
@@ -59,8 +60,9 @@ func (e *MissingWorkerCapabilityError) Error() string {
 
 func newWorkerCall() *workerCall {
 	return &workerCall{
-		frames: make(chan WorkerFrame, 256),
-		done:   make(chan error, 1),
+		frames:   make(chan WorkerFrame, 256),
+		done:     make(chan error, 1),
+		inputAck: make(chan struct{}, 1),
 	}
 }
 
@@ -285,6 +287,13 @@ func (c *Client) receiveLoop() {
 		if call == nil {
 			continue
 		}
+		if frame.Type == WorkerFrameExecInputAck {
+			select {
+			case call.inputAck <- struct{}{}:
+			default:
+			}
+			continue
+		}
 		select {
 		case call.frames <- frame:
 		default:
@@ -463,7 +472,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	if inputs != nil {
 		stopInputs = make(chan struct{})
 		defer close(stopInputs)
-		go c.forwardExecInputs(requestID, inputs, stopInputs)
+		go c.forwardExecInputs(requestID, call, inputs, stopInputs)
 	}
 
 	cancelDone := make(chan struct{})
@@ -598,7 +607,7 @@ func (c *Client) nextID() uint64 {
 	return c.next
 }
 
-func (c *Client) forwardExecInputs(id uint64, inputs <-chan client.ExecInput, stop <-chan struct{}) {
+func (c *Client) forwardExecInputs(id uint64, call *workerCall, inputs <-chan client.ExecInput, stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:
@@ -607,7 +616,9 @@ func (c *Client) forwardExecInputs(id uint64, inputs <-chan client.ExecInput, st
 			if !ok {
 				frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Closed: true})
 				if err == nil {
-					_ = c.codec.Send(frame)
+					if c.codec.Send(frame) == nil {
+						c.waitExecInputAck(call, stop)
+					}
 				}
 				return
 			}
@@ -618,7 +629,19 @@ func (c *Client) forwardExecInputs(id uint64, inputs <-chan client.ExecInput, st
 			if err := c.codec.Send(frame); err != nil {
 				return
 			}
+			if !c.waitExecInputAck(call, stop) {
+				return
+			}
 		}
+	}
+}
+
+func (c *Client) waitExecInputAck(call *workerCall, stop <-chan struct{}) bool {
+	select {
+	case <-call.inputAck:
+		return true
+	case <-stop:
+		return false
 	}
 }
 

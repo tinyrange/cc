@@ -109,6 +109,41 @@ func TestWriteAndExtractTarPreservesSymlink(t *testing.T) {
 	}
 }
 
+func TestWriteAndExtractTarPreservesHardLink(t *testing.T) {
+	srcDir := t.TempDir()
+	first := filepath.Join(srcDir, "first")
+	second := filepath.Join(srcDir, "second")
+	if err := os.WriteFile(first, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(first, second); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if err := WritePathTar(&archive, srcDir, filepath.Base(srcDir), info); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "out")
+	if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "", destination, true); err != nil {
+		t.Fatal(err)
+	}
+	firstInfo, err := os.Stat(filepath.Join(destination, filepath.Base(srcDir), "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInfo, err := os.Stat(filepath.Join(destination, filepath.Base(srcDir), "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(firstInfo, secondInfo) {
+		t.Fatal("extracted files do not share an inode")
+	}
+}
+
 func TestExtractTarToPathConflictSemantics(t *testing.T) {
 	t.Run("file over file overwrites", func(t *testing.T) {
 		var archive bytes.Buffer
@@ -298,6 +333,38 @@ func TestExtractTarToPathRejectsPreexistingSymlinkParent(t *testing.T) {
 	}
 	if got := readTestFile(t, outPath); got != "unchanged" {
 		t.Fatalf("outside content = %q", got)
+	}
+}
+
+func TestExtractTarToPathRejectsSymlinkDestinationParent(t *testing.T) {
+	root := t.TempDir()
+	destination := filepath.Join(root, "destination")
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, destination); err != nil {
+		t.Fatal(err)
+	}
+
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(&tar.Header{Name: "payload", Typeflag: tar.TypeReg, Mode: 0o644, Size: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "", filepath.Join(destination, "injected"), true)
+	if !errors.Is(err, ErrUnsafeTarExtractionPath) {
+		t.Fatalf("ExtractTarToPath error = %v, want unsafe path", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "injected")); !os.IsNotExist(err) {
+		t.Fatalf("outside destination was modified: %v", err)
 	}
 }
 

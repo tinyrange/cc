@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -434,6 +436,48 @@ func TestConfigureManagedExecProcessAttrsSetsProcessGroup(t *testing.T) {
 	configureManagedExecProcessAttrs(cmd, "", nil, false)
 	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
 		t.Fatalf("SysProcAttr = %+v, want Setpgid", cmd.SysProcAttr)
+	}
+}
+
+func TestValidateManagedExecWorkDirRejectsInvalidDirectories(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManagedExecWorkDir(root, "/missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing workdir error = %v", err)
+	}
+	if err := validateManagedExecWorkDir(root, "/file"); err == nil {
+		t.Fatal("file workdir was accepted")
+	}
+}
+
+func TestTerminateManagedExecProcessGroupReapsDescendants(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 30 >/dev/null 2>&1 & echo $!")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := startManagedExecProcess(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := waitManagedExecProcess(cmd, started); result.ExitCode != 0 {
+		t.Fatalf("shell exit = %+v", result)
+	}
+	terminateManagedExecProcessGroup(cmd.Process.Pid)
+	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("descendant %d still exists: %v", childPID, err)
 	}
 }
 

@@ -656,8 +656,13 @@ type workerActiveExec struct {
 	once   sync.Once
 	mu     sync.Mutex
 	cond   *sync.Cond
-	queue  []client.ExecInput
+	queue  []workerQueuedExecInput
 	closed bool
+}
+
+type workerQueuedExecInput struct {
+	input     client.ExecInput
+	delivered chan struct{}
 }
 
 type workerOperationRegistry struct {
@@ -741,9 +746,10 @@ func workerVMKey(id string) string {
 }
 
 const (
-	workerExecInputQueueCapacity = 64
-	workerExecStdinQueueLimit    = 56
-	workerExecControlQueueLimit  = workerExecInputQueueCapacity - 1
+	workerExecInputQueueCapacity   = 64
+	workerExecStdinQueueLimit      = 56
+	workerExecControlQueueLimit    = workerExecInputQueueCapacity - 1
+	workerExecInputDeliveryTimeout = 5 * time.Second
 )
 
 var (
@@ -757,7 +763,7 @@ func newWorkerActiveExec(cancel context.CancelFunc, withInputs bool) *workerActi
 		exec.inputs = make(chan client.ExecInput, 16)
 		exec.done = make(chan struct{})
 		exec.cond = sync.NewCond(&exec.mu)
-		exec.queue = make([]client.ExecInput, 0, workerExecInputQueueCapacity)
+		exec.queue = make([]workerQueuedExecInput, 0, workerExecInputQueueCapacity)
 	}
 	return exec
 }
@@ -778,13 +784,18 @@ func (e *workerActiveExec) closeInputs() {
 }
 
 func (e *workerActiveExec) sendInput(input client.ExecInput) error {
+	_, err := e.sendInputWithDelivery(input)
+	return err
+}
+
+func (e *workerActiveExec) sendInputWithDelivery(input client.ExecInput) (<-chan struct{}, error) {
 	if e == nil || e.inputs == nil {
-		return errWorkerExecInputsClosed
+		return nil, errWorkerExecInputsClosed
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return errWorkerExecInputsClosed
+		return nil, errWorkerExecInputsClosed
 	}
 	limit := workerExecControlQueueLimit
 	if input.Kind == "stdin" {
@@ -793,14 +804,15 @@ func (e *workerActiveExec) sendInput(input client.ExecInput) error {
 		limit = workerExecInputQueueCapacity
 	}
 	if len(e.queue) >= limit {
-		return errWorkerExecInputOverflow
+		return nil, errWorkerExecInputOverflow
 	}
 	if input.Kind == "stdin_close" {
 		e.closed = true
 	}
-	e.queue = append(e.queue, input)
+	delivered := make(chan struct{})
+	e.queue = append(e.queue, workerQueuedExecInput{input: input, delivered: delivered})
 	e.cond.Signal()
-	return nil
+	return delivered, nil
 }
 
 func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) error {
@@ -815,6 +827,21 @@ func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) erro
 	return err
 }
 
+func acknowledgeWorkerExecInput(codec *vm.WorkerCodec, id uint64, exec *workerActiveExec, delivered <-chan struct{}) error {
+	timer := time.NewTimer(workerExecInputDeliveryTimeout)
+	defer timer.Stop()
+	select {
+	case <-delivered:
+		return sendWorkerPayload(codec, id, vm.WorkerFrameExecInputAck, map[string]string{"status": "delivered"})
+	case <-timer.C:
+		if exec.cancel != nil {
+			exec.cancel()
+		}
+		exec.closeInputs()
+		return fmt.Errorf("worker exec input was not consumed within %s", workerExecInputDeliveryTimeout)
+	}
+}
+
 func (e *workerActiveExec) forwardInputs() {
 	defer close(e.inputs)
 	for {
@@ -826,17 +853,20 @@ func (e *workerActiveExec) forwardInputs() {
 			e.mu.Unlock()
 			return
 		}
-		input := e.queue[0]
+		queued := e.queue[0]
 		copy(e.queue, e.queue[1:])
-		e.queue[len(e.queue)-1] = client.ExecInput{}
+		e.queue[len(e.queue)-1] = workerQueuedExecInput{}
 		e.queue = e.queue[:len(e.queue)-1]
 		e.mu.Unlock()
-		if input.Kind == "stdin_close" {
+		if queued.input.Kind == "stdin_close" {
+			close(queued.delivered)
 			return
 		}
 		select {
-		case e.inputs <- input:
+		case e.inputs <- queued.input:
+			close(queued.delivered)
 		case <-e.done:
+			close(queued.delivered)
 			return
 		}
 	}
@@ -993,10 +1023,28 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 				continue
 			}
 			if req.Closed {
-				_ = enqueueWorkerExecInput(exec, client.ExecInput{Kind: "stdin_close"})
+				delivered, err := exec.sendInputWithDelivery(client.ExecInput{Kind: "stdin_close"})
+				if err == nil {
+					go func(id uint64, delivered <-chan struct{}) {
+						if err := acknowledgeWorkerExecInput(codec, id, exec, delivered); err != nil {
+							_ = sendWorkerError(codec, id, err)
+						}
+					}(frame.ID, delivered)
+				}
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+				}
 				continue
 			}
-			if err := enqueueWorkerExecInput(exec, req.Input); errors.Is(err, errWorkerExecInputOverflow) {
+			delivered, err := exec.sendInputWithDelivery(req.Input)
+			if err == nil {
+				go func(id uint64, delivered <-chan struct{}) {
+					if err := acknowledgeWorkerExecInput(codec, id, exec, delivered); err != nil {
+						_ = sendWorkerError(codec, id, err)
+					}
+				}(frame.ID, delivered)
+			}
+			if err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 			}
 		case vm.WorkerFrameCancel:

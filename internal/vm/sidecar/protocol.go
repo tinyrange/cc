@@ -9,7 +9,7 @@ import (
 	"j5.nz/cc/client"
 )
 
-const WorkerProtocolVersion = 1
+const WorkerProtocolVersion = 2
 
 const (
 	WorkerServiceControl   = "control"
@@ -29,6 +29,7 @@ const (
 	WorkerFrameExec         = "exec"
 	WorkerFrameAddShare     = "add_share"
 	WorkerFrameExecInput    = "exec_input"
+	WorkerFrameExecInputAck = "exec_input_ack"
 	WorkerFrameCancel       = "cancel"
 	WorkerFrameFlush        = "flush"
 	WorkerFrameConsole      = "console"

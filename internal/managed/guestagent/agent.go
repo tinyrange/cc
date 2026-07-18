@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -694,6 +695,7 @@ func archivePath(control io.Writer, id, rootDir, src string) error {
 func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
+	hardlinks := make(map[string]string)
 	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -722,10 +724,21 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 			return err
 		}
 		header.Name = filepath.ToSlash(rel)
+		if info.Mode().IsRegular() {
+			if key, ok := archiveHardlinkKey(info); ok {
+				if first, exists := hardlinks[key]; exists {
+					header.Typeflag = tar.TypeLink
+					header.Linkname = first
+					header.Size = 0
+				} else {
+					hardlinks[key] = header.Name
+				}
+			}
+		}
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
-		if !info.Mode().IsRegular() {
+		if !info.Mode().IsRegular() || header.Typeflag == tar.TypeLink {
 			return nil
 		}
 		file, err := os.Open(filePath)
@@ -739,6 +752,38 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 		}
 		return closeErr
 	})
+}
+
+func archiveHardlinkKey(info os.FileInfo) (string, bool) {
+	value := reflect.ValueOf(info.Sys())
+	if value.Kind() == reflect.Pointer {
+		value = value.Elem()
+	}
+	if !value.IsValid() || value.Kind() != reflect.Struct {
+		return "", false
+	}
+	dev, devOK := archiveStatField(value.FieldByName("Dev"))
+	ino, inoOK := archiveStatField(value.FieldByName("Ino"))
+	nlink, nlinkOK := archiveStatField(value.FieldByName("Nlink"))
+	if !devOK || !inoOK || !nlinkOK || nlink < 2 {
+		return "", false
+	}
+	return fmt.Sprintf("%d:%d", dev, ino), true
+}
+
+func archiveStatField(value reflect.Value) (uint64, bool) {
+	if !value.IsValid() {
+		return 0, false
+	}
+	switch value.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return value.Uint(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		integer := value.Int()
+		return uint64(integer), integer >= 0
+	default:
+		return 0, false
+	}
 }
 
 func extractTarToPath(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, limits *client.ArchiveLimits) error {
@@ -824,7 +869,11 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 	if dstDir {
 		extractionRoot = dst
 	}
-	if err := os.MkdirAll(extractionRoot, 0o755); err != nil {
+	extractionBoundary := "/"
+	if strings.TrimSpace(rootDir) != "" {
+		extractionBoundary = filepath.Clean(rootDir)
+	}
+	if err := ensureTarParents(extractionBoundary, extractionRoot, owner); err != nil {
 		return err
 	}
 	if dstDir && !dstExisted {
@@ -946,6 +995,30 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			}
 			if err := os.Rename(tmpName, target); err != nil {
 				_ = os.Remove(tmpName)
+				return err
+			}
+		case tar.TypeLink:
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
+				return err
+			}
+			source, err := tarTarget(dst, dstDir, header.Linkname)
+			if err != nil {
+				return fmt.Errorf("%w: hard link %q: %v", ErrUnsafeTarExtractionPath, header.Name, err)
+			}
+			sourceInfo, err := os.Lstat(source)
+			if err != nil {
+				return fmt.Errorf("hard link source %q: %w", header.Linkname, err)
+			}
+			if !sourceInfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: hard link source is not a regular file: %s", ErrUnsafeTarExtractionPath, source)
+			}
+			if err := ensureTarTargetCompatible(target, false); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Link(source, target); err != nil {
 				return err
 			}
 		}

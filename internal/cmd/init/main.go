@@ -37,6 +37,8 @@ const initDurationMarker = "__CCX3_INIT_MS__:"
 const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
+const archiveMode = "--ccx3-fs-archive"
+const extractMode = "--ccx3-fs-extract"
 
 const (
 	managedExecTimingRecv            = "recv"
@@ -58,9 +60,15 @@ const stage2Path = "/etc/ccx3/stage2"
 const stage2ConfigPath = "/etc/ccx3/config.json"
 const initSystemSystemd = "systemd"
 const systemdReadyTimeout = 30 * time.Second
-const execProtocolChunkSize = 256
+
+// Exec output is base64-framed by the managed protocol. Small fragments create
+// thousands of sidecar frames for ordinary file transfers and can overflow a
+// bounded transport queue even while its consumer is making progress.
+const execProtocolChunkSize = 32 << 10
 const defaultVsockConnectTimeout = 5 * time.Second
 const stage2VsockConnectAttemptTimeout = 500 * time.Millisecond
+const managedExecGroupTerminateGrace = 500 * time.Millisecond
+const managedExecGroupKillWait = 2 * time.Second
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -379,6 +387,20 @@ func main() {
 		if err := runExecPivot(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "ccx3-init: exec pivot: %v\n", err)
 			os.Exit(126)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == archiveMode {
+		if err := runArchiveHelper(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: fs archive: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == extractMode {
+		if err := runExtractHelper(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: fs extract: %v\n", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -2115,7 +2137,7 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 			writeKernel("ccx3-init: fs_archive request missing id")
 			return true
 		}
-		go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path)
+		go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User))
 	case "fs_mkdir":
 		if req.ID == "" {
 			writeKernel("ccx3-init: fs_mkdir request missing id")
@@ -2373,20 +2395,35 @@ func runSyncRequest(cfg config, control io.Writer, id string) {
 	proto.WriteExit(control, id, 0)
 }
 
-func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src string) {
+func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src, user string) {
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
-	if err := archivePathToControl(cfg, control, id, rootDir, src); err != nil {
+	if err := archivePathToControl(cfg, control, id, rootDir, src, user); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs archive: "+err.Error()+"\n")
 	}
 	proto.WriteExit(control, id, exitCode)
 }
 
-func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string) error {
+func archivePathToControl(cfg config, control io.Writer, id, rootDir, src, user string) error {
 	if strings.TrimSpace(src) == "" {
 		return fmt.Errorf("source path is required")
+	}
+	credential, err := guestagent.CredentialForUserInRoot(rootDir, user)
+	if err != nil {
+		return err
+	}
+	if credential != nil {
+		cmd := exec.Command("/proc/self/exe", archiveMode, rootDir, src)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+		cmd.Stdout = execOutputWriter{write: func(data []byte) { writeExecStdoutBytes(cfg, control, id, data) }}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := runArchiveHelperCommand(cmd); err != nil {
+			return archiveHelperError(err, stderr.String())
+		}
+		return nil
 	}
 	src = rootPath(rootDir, filepath.Clean(src))
 	info, err := os.Lstat(src)
@@ -2413,6 +2450,77 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 	}
 }
 
+type execOutputWriter struct {
+	write func([]byte)
+}
+
+func (w execOutputWriter) Write(data []byte) (int, error) {
+	if len(data) > 0 && w.write != nil {
+		w.write(data)
+	}
+	return len(data), nil
+}
+
+func runArchiveHelper(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("archive helper requires root and source paths")
+	}
+	src := rootPath(args[0], filepath.Clean(args[1]))
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	return guestagent.WritePathTar(os.Stdout, src, filepath.Base(src), info)
+}
+
+type extractHelperRequest struct {
+	RootDir string                `json:"root_dir,omitempty"`
+	Path    string                `json:"path"`
+	IsDir   bool                  `json:"is_dir,omitempty"`
+	Limits  *client.ArchiveLimits `json:"limits,omitempty"`
+}
+
+func runExtractHelper(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("extract helper requires one request")
+	}
+	var request extractHelperRequest
+	if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
+		return fmt.Errorf("decode request: %w", err)
+	}
+	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), request.Limits)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return guestagent.ExtractTarToPathContext(ctx, os.Stdin, request.RootDir, request.Path, request.IsDir, request.Limits)
+}
+
+func archiveHelperError(runErr error, stderr string) error {
+	stderr = strings.TrimSpace(stderr)
+	if stderr != "" {
+		return errors.New(stderr)
+	}
+	return runErr
+}
+
+func runArchiveHelperCommand(cmd *exec.Cmd) error {
+	managedChildren.Lock()
+	err := cmd.Start()
+	if err == nil {
+		managedChildren.pids[cmd.Process.Pid] = struct{}{}
+	}
+	managedChildren.Unlock()
+	if err != nil {
+		return err
+	}
+	err = cmd.Wait()
+	managedChildren.Lock()
+	delete(managedChildren.pids, cmd.Process.Pid)
+	managedChildren.Unlock()
+	return err
+}
+
 func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, limits *client.ArchiveLimits, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
 	defer stdin.Close()
@@ -2422,15 +2530,26 @@ func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string,
 	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), limits)
 	if err == nil {
 		defer cancel()
-		var owner *guestagent.ArchiveOwnership
 		credential, credentialErr := guestagent.CredentialForUserInRoot(rootDir, user)
 		if credentialErr != nil {
 			err = credentialErr
 		} else if credential != nil {
-			owner = &guestagent.ArchiveOwnership{UID: int(credential.Uid), GID: int(credential.Gid)}
+			request, marshalErr := json.Marshal(extractHelperRequest{RootDir: rootDir, Path: dst, IsDir: dstDir, Limits: limits})
+			if marshalErr != nil {
+				err = marshalErr
+			} else {
+				cmd := exec.Command("/proc/self/exe", extractMode, string(request))
+				cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+				cmd.Stdin = stdin
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				if runErr := runArchiveHelperCommand(cmd); runErr != nil {
+					err = archiveHelperError(runErr, stderr.String())
+				}
+			}
 		}
-		if err == nil {
-			err = guestagent.ExtractTarToPathContextWithOwnership(ctx, stdin, rootDir, dst, dstDir, limits, owner)
+		if err == nil && credential == nil {
+			err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
 		}
 	}
 	if err != nil {
@@ -2839,6 +2958,12 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		reporter.Exit(126)
 		return
 	}
+	if err := validateManagedExecWorkDir(rootDir, workDir); err != nil {
+		writeKernel("ccx3-init: validate workdir: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: invalid workdir: "+err.Error()+"\n")
+		reporter.Exit(126)
+		return
+	}
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
@@ -3001,11 +3126,8 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 
 	reporter.Timing(managedExecTimingWaitBegin)
 	var waitResult managedExecWaitResult
-	if !tty {
-		waitManagedExecStreams(done, cap(done))
-		reporter.Timing(managedExecTimingStreamsDone)
-	}
 	waitResult = waitManagedExecProcess(cmd, execStart)
+	terminateManagedExecProcessGroup(cmd.Process.Pid)
 	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()
@@ -3013,10 +3135,8 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if !tty {
 		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 	}
-	if tty {
-		waitManagedExecStreams(done, cap(done))
-		reporter.Timing(managedExecTimingStreamsDone)
-	}
+	waitManagedExecStreams(done, cap(done))
+	reporter.Timing(managedExecTimingStreamsDone)
 
 	if waitResult.ExitErr != nil {
 		writeKernel("ccx3-init: exec error: " + waitResult.ExitErr.Error())
@@ -3029,6 +3149,52 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		reporter.Timing(managedExecTimingExitSent)
 		reporter.Exit(waitResult.ExitCode)
 	}
+}
+
+func terminateManagedExecProcessGroup(pgid int) {
+	if pgid <= 0 || !managedExecProcessGroupExists(pgid) {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if waitManagedExecProcessGroup(pgid, managedExecGroupTerminateGrace) {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = waitManagedExecProcessGroup(pgid, managedExecGroupKillWait)
+}
+
+func waitManagedExecProcessGroup(pgid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		reapOrphanedChildren(os.Getpid())
+		if !managedExecProcessGroupExists(pgid) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func managedExecProcessGroupExists(pgid int) bool {
+	err := syscall.Kill(-pgid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func validateManagedExecWorkDir(rootDir, workDir string) error {
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	target := rootPath(rootDir, filepath.Clean(workDir))
+	info, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", workDir)
+	}
+	return nil
 }
 
 func configureHostname(hostname string) error {
