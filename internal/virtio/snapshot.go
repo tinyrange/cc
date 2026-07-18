@@ -81,13 +81,13 @@ func (p *imageFS) snapshotEntryLocked(node *imageNode) (imagefs.Entry, error) {
 		}}, nil
 	default:
 		var source imagefs.File
-		var data []byte
+		var data sparseImageData
 		if node.abstractFile != nil {
 			source = node.abstractFile
 		} else {
-			data = append([]byte(nil), node.data...)
-			if uint64(len(data)) > attr.Size {
-				data = data[:attr.Size]
+			data = make(sparseImageData, len(node.data))
+			for pageIndex, page := range node.data {
+				data[pageIndex] = append([]byte(nil), page...)
 			}
 		}
 		return imagefs.Entry{File: &snapshotFile{
@@ -159,7 +159,7 @@ type snapshotFile struct {
 	gid     uint32
 	rdev    uint32
 	size    uint64
-	data    []byte
+	data    sparseImageData
 	source  imagefs.File
 	modTime time.Time
 }
@@ -179,13 +179,9 @@ func (f *snapshotFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	if f.source != nil {
 		return f.source.ReadAt(off, uint32(end-off))
 	}
-	if off >= uint64(len(f.data)) {
-		return nil, nil
-	}
-	if end > uint64(len(f.data)) {
-		end = uint64(len(f.data))
-	}
-	return append([]byte(nil), f.data[off:end]...), nil
+	data := make([]byte, end-off)
+	f.data.readAt(data, off)
+	return data, nil
 }
 
 type snapshotSymlink struct {

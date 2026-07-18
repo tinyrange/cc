@@ -155,6 +155,7 @@ type managedExec struct {
 	stdin   io.WriteCloser
 	pty     *os.File
 	process *os.Process
+	family  *guestagent.ProcessFamily
 	group   bool
 	start   time.Time
 }
@@ -180,10 +181,12 @@ func (m *managedExec) closeStdin() error {
 	return err
 }
 
-func (m *managedExec) setProcess(proc *os.Process, group bool) {
+func (m *managedExec) setProcess(proc *os.Process, group bool, familyToken string) {
+	family := guestagent.NewProcessFamily(proc.Pid, familyToken)
 	m.stdinMu.Lock()
 	defer m.stdinMu.Unlock()
 	m.process = proc
+	m.family = family
 	m.group = group
 }
 
@@ -203,16 +206,33 @@ func (m *managedExec) signal(name string) error {
 	if m.process == nil {
 		return fmt.Errorf("process is not started")
 	}
-	if m.group && m.process.Pid > 0 {
-		err := syscall.Kill(-m.process.Pid, sig)
+	process := m.process
+	family := m.family
+	if family != nil {
+		_ = family.Signal(sig)
+	}
+	if m.group && process.Pid > 0 {
+		err := syscall.Kill(-process.Pid, sig)
 		if err == nil {
+			if family != nil {
+				return family.Signal(sig)
+			}
 			return nil
 		}
 		if errors.Is(err, syscall.ESRCH) {
+			if family != nil {
+				return family.Signal(sig)
+			}
 			return nil
 		}
 	}
-	return m.process.Signal(sig)
+	err = process.Signal(sig)
+	if family != nil {
+		if familyErr := family.Signal(sig); err == nil {
+			err = familyErr
+		}
+	}
+	return err
 }
 
 func (m *managedExec) resize(cols, rows int) error {
@@ -2983,6 +3003,8 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		reporter.Exit(126)
 		return
 	}
+	familyToken := guestagent.ProcessFamilyToken(id)
+	env = guestagent.WithProcessFamilyEnvironment(env, familyToken)
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
@@ -3137,7 +3159,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		stdinDone = make(chan struct{}, 1)
 		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
 	}
-	managed.setProcess(cmd.Process, signalGroup)
+	managed.setProcess(cmd.Process, signalGroup, familyToken)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil
@@ -3147,6 +3169,12 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	var waitResult managedExecWaitResult
 	waitResult = waitManagedExecProcess(cmd, execStart)
 	terminateManagedExecProcessGroup(cmd.Process.Pid)
+	managed.stdinMu.Lock()
+	family := managed.family
+	managed.stdinMu.Unlock()
+	if family != nil {
+		family.Terminate()
+	}
 	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()

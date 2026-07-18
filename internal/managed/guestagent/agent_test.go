@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -386,6 +387,45 @@ func TestManagedExecSignalIsNotBlockedByStdinBackpressure(t *testing.T) {
 	}
 	close(unblock)
 	_ = cmd.Wait()
+}
+
+func TestManagedExecContainsDetachedProcessBeforeExit(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "detached.pid")
+	command := "setsid sh -c 'trap \"\" TERM HUP INT; exec sleep 30' >/dev/null 2>&1 & echo $! >'" + strings.ReplaceAll(pidFile, "'", "'\\''") + "'"
+	var control bytes.Buffer
+	managed := &managedExec{}
+	started := time.Now()
+	runExec(Options{}, &control, request{
+		ID: "detached", Command: []string{"/bin/sh", "-c", command}, Env: os.Environ(),
+	}, nil, managed, func() {})
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("detached command cleanup took %s", elapsed)
+	}
+	wantExit := ExitMarkerPrefix + "detached:0"
+	foundExit := false
+	for _, line := range strings.Split(strings.TrimSpace(control.String()), "\n") {
+		foundExit = foundExit || line == wantExit
+	}
+	if !foundExit {
+		t.Fatalf("control protocol = %q, want terminal event %q", control.String(), wantExit)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("detached process %d survived command completion", pid)
 }
 
 type fakeArchiveFileInfo struct{ sys any }

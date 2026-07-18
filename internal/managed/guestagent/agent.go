@@ -178,6 +178,7 @@ type managedExec struct {
 
 	processMu sync.Mutex
 	process   *os.Process
+	family    *ProcessFamily
 	pending   syscall.Signal
 	pty       *os.File
 	ptyImpl   PTY
@@ -488,14 +489,17 @@ func (m *managedExec) close() error {
 	return stdin.Close()
 }
 
-func (m *managedExec) setProcess(p *os.Process) {
+func (m *managedExec) setProcess(p *os.Process, familyToken string) {
+	family := NewProcessFamily(p.Pid, familyToken)
 	m.processMu.Lock()
 	m.process = p
+	m.family = family
 	pending := m.pending
 	m.pending = 0
 	m.processMu.Unlock()
 	if pending != 0 {
 		_ = signalProcessGroup(p, pending)
+		_ = family.Signal(pending)
 	}
 }
 
@@ -557,8 +561,21 @@ func (m *managedExec) signal(name string) error {
 		return nil
 	}
 	process := m.process
+	family := m.family
 	m.processMu.Unlock()
-	return signalProcessGroup(process, sig)
+	if family != nil {
+		err = family.Signal(sig)
+	}
+	groupErr := signalProcessGroup(process, sig)
+	if err == nil {
+		err = groupErr
+	}
+	if family != nil {
+		// Refresh once more after the group signal to catch a child which raced
+		// with the first process-table snapshot.
+		_ = family.Signal(sig)
+	}
+	return err
 }
 
 func signalProcessGroup(process *os.Process, sig syscall.Signal) error {
@@ -599,6 +616,8 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		proto.WriteExit(control, req.ID, 126)
 		return
 	}
+	familyToken := ProcessFamilyToken(req.ID)
+	req.Env = WithProcessFamilyEnvironment(req.Env, familyToken)
 	cmd := execCommand(req)
 	var controlR, controlW *os.File
 	if req.ControlFD {
@@ -615,7 +634,7 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
 	}
 	var wg sync.WaitGroup
-	var stdoutW, stderrW *io.PipeWriter
+	var stdoutR, stdoutW, stderrR, stderrW *os.File
 	var ptyMaster, ptySlave *os.File
 	if req.TTY && opts.PTY != nil {
 		var err error
@@ -653,10 +672,34 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		}
 	} else {
 		cmd.Stdin = stdin
-		stdoutR, stdoutPipeW := io.Pipe()
-		stderrR, stderrPipeW := io.Pipe()
-		stdoutW = stdoutPipeW
-		stderrW = stderrPipeW
+		var err error
+		stdoutR, stdoutW, err = os.Pipe()
+		if err == nil {
+			stderrR, stderrW, err = os.Pipe()
+		}
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			if controlR != nil {
+				_ = controlR.Close()
+			}
+			if controlW != nil {
+				_ = controlW.Close()
+			}
+			if stdoutR != nil {
+				_ = stdoutR.Close()
+			}
+			if stdoutW != nil {
+				_ = stdoutW.Close()
+			}
+			writeErr(opts, control, req.ID, fmt.Errorf("open output pipes: %w", err))
+			proto.WriteExit(control, req.ID, 126)
+			return
+		}
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -691,6 +734,12 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 			_ = ptySlave.Close()
 		}
 		wg.Wait()
+		if stdoutR != nil {
+			_ = stdoutR.Close()
+		}
+		if stderrR != nil {
+			_ = stderrR.Close()
+		}
 		writeErr(opts, control, req.ID, err)
 		proto.WriteExit(control, req.ID, 126)
 		return
@@ -699,9 +748,17 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		_ = controlW.Close()
 	}
 	if managed != nil {
-		managed.setProcess(cmd.Process)
+		managed.setProcess(cmd.Process, familyToken)
 	}
 	waitErr := waitManagedCommand(cmd)
+	if managed != nil {
+		managed.processMu.Lock()
+		family := managed.family
+		managed.processMu.Unlock()
+		if family != nil {
+			family.Terminate()
+		}
+	}
 	if stdin != nil {
 		_ = stdin.Close()
 	}
@@ -718,6 +775,12 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		_ = ptyMaster.Close()
 	}
 	wg.Wait()
+	if stdoutR != nil {
+		_ = stdoutR.Close()
+	}
+	if stderrR != nil {
+		_ = stderrR.Close()
+	}
 	if controlR != nil {
 		_ = controlR.Close()
 	}
