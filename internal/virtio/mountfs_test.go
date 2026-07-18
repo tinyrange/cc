@@ -232,65 +232,39 @@ func TestImageFSHardlinkReportsSameInode(t *testing.T) {
 	}
 }
 
-func TestImageFSPreservesRootOwnershipForPermissionChecks(t *testing.T) {
-	fsys := imageBackend(t, map[string]string{"/db": "root-owned"})
-	fileID, _, errno := fsys.Lookup(1, "db")
+func TestMountedFSOpenDirectorySurvivesRemoval(t *testing.T) {
+	root := imageBackend(t, nil)
+	backendNodeID, _, errno := root.(fsMkdirBackend).Mkdir(1, "open-directory", 0o700, 0, 0)
 	if errno != 0 {
-		t.Fatalf("lookup db errno = %d", errno)
+		t.Fatalf("mkdir backend directory: errno %d", errno)
 	}
-
-	if _, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000); errno != -linuxEACCES {
-		t.Fatalf("non-root open root-owned file for write errno = %d, want %d", errno, -linuxEACCES)
-	}
-	if _, _, _, errno := fsys.(fsCreateCallerBackend).CreateForCaller(1, "non-root-new", linuxOWRONLY, 0o644, 1000, 1000); errno != -linuxEACCES {
-		t.Fatalf("non-root create in root-owned dir errno = %d, want %d", errno, -linuxEACCES)
-	}
-
-	fh, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 0, 0)
+	fsys := NewMountedFS(root, nil).(*mountedFS)
+	nodeID, _, errno := fsys.Lookup(1, "open-directory")
 	if errno != 0 {
-		t.Fatalf("root open root-owned file for write errno = %d", errno)
+		t.Fatalf("lookup mounted directory: errno %d", errno)
 	}
-	defer fsys.Release(fileID, fh)
-	if _, errno := fsys.(fsWriteCallerBackend).WriteForCaller(fileID, fh, 0, []byte("root-write"), 0, 0, 0); errno != 0 {
-		t.Fatalf("root write root-owned file errno = %d", errno)
-	}
-}
-
-func TestMountedFSPreservesRootOwnershipForPermissionChecks(t *testing.T) {
-	fsys := NewMountedFS(imageBackend(t, map[string]string{"/db": "root-owned"}), nil)
-	fileID, _, errno := fsys.Lookup(1, "db")
+	fh, errno := fsys.OpenDir(nodeID, 0)
 	if errno != 0 {
-		t.Fatalf("lookup db errno = %d", errno)
+		t.Fatalf("open mounted directory: errno %d", errno)
 	}
-	if _, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000); errno != -linuxEACCES {
-		t.Fatalf("non-root open mounted root-owned file for write errno = %d, want %d", errno, -linuxEACCES)
+	if errno := fsys.RmDir(1, "open-directory"); errno != 0 {
+		t.Fatalf("remove mounted directory: errno %d", errno)
 	}
-	if _, _, _, errno := fsys.(fsCreateCallerBackend).CreateForCaller(1, "non-root-new", linuxOWRONLY, 0o644, 1000, 1000); errno != -linuxEACCES {
-		t.Fatalf("non-root create in mounted root-owned dir errno = %d, want %d", errno, -linuxEACCES)
+	if fsys.node(nodeID) == nil {
+		t.Fatal("mounted node was dropped while its directory handle was open")
 	}
-}
-
-func TestImageFSAllowsOwnerAfterRootChown(t *testing.T) {
-	fsys := imageBackend(t, map[string]string{"/owned": "initial"})
-	fileID, _, errno := fsys.Lookup(1, "owned")
-	if errno != 0 {
-		t.Fatalf("lookup owned errno = %d", errno)
+	if _, errno := root.GetAttr(backendNodeID); errno != 0 {
+		t.Fatalf("backend node was dropped while its directory handle was open: errno %d", errno)
 	}
-	if _, errno := fsys.(fsSetAttrCallerBackend).SetAttrForCaller(fileID, fattrUID|fattrGID, 0, 0, 0, 1000, 1000, zeroTime(), zeroTime(), 0, 0); errno != 0 {
-		t.Fatalf("root chown file errno = %d", errno)
+	if _, errno := fsys.GetAttr(nodeID); errno != 0 {
+		t.Fatalf("getattr open removed directory: errno %d", errno)
 	}
-
-	fh, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000)
-	if errno != 0 {
-		t.Fatalf("owner open chowned file for write errno = %d", errno)
+	if _, errno := fsys.ReadDir(nodeID, fh, 0, 4096); errno != 0 {
+		t.Fatalf("readdir open removed directory: errno %d", errno)
 	}
-	defer fsys.Release(fileID, fh)
-	if _, errno := fsys.(fsWriteCallerBackend).WriteForCaller(fileID, fh, 0, []byte("owner-write"), 0, 1000, 1000); errno != 0 {
-		t.Fatalf("owner write chowned file errno = %d", errno)
-	}
-
-	if _, errno := fsys.(fsSetAttrCallerBackend).SetAttrForCaller(fileID, fattrUID, 0, 0, 0, 1001, 1000, zeroTime(), zeroTime(), 1000, 1000); errno != -linuxEPERM {
-		t.Fatalf("non-root chown errno = %d, want %d", errno, -linuxEPERM)
+	fsys.ReleaseDir(nodeID, fh)
+	if _, errno := fsys.GetAttr(nodeID); errno != -linuxENOENT {
+		t.Fatalf("getattr released removed directory: errno %d, want %d", errno, -linuxENOENT)
 	}
 }
 

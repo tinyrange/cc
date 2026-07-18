@@ -80,3 +80,39 @@ func TestVirtioFSPollReportsUnsupportedWithoutNotifications(t *testing.T) {
 		t.Fatalf("POLL reply = unique %d errno %d extra %x", reply.unique, reply.errno, reply.extra)
 	}
 }
+
+func TestVirtioFSMountedExchangeFailsInsteadOfReportingUnsafeSuccess(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	for _, name := range []string{"left", "right"} {
+		nodeID, fh := createImageFile(t, backend, name, name)
+		backend.Release(nodeID, fh)
+	}
+	req := make([]byte, fuseInHeaderSize+16+len("left\x00right\x00"))
+	binary.LittleEndian.PutUint32(req[4:8], fuseRename2)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	binary.LittleEndian.PutUint64(req[40:48], 1)
+	binary.LittleEndian.PutUint32(req[48:52], linuxRenameExchange)
+	copy(req[fuseInHeaderSize+16:], "left\x00right\x00")
+
+	reply, err := (&FS{backend: backend}).dispatchFUSE(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.errno != -linuxENOSYS {
+		t.Fatalf("mounted exchange errno = %d, want %d", reply.errno, -linuxENOSYS)
+	}
+	for _, name := range []string{"left", "right"} {
+		nodeID, _, errno := backend.Lookup(1, name)
+		if errno != 0 {
+			t.Fatalf("lookup %q: errno %d", name, errno)
+		}
+		fh, errno := backend.Open(nodeID, linuxORDONLY)
+		if errno != 0 {
+			t.Fatalf("open %q: errno %d", name, errno)
+		}
+		if got := readImageHandle(t, backend, nodeID, fh); got != name {
+			t.Fatalf("%s changed to %q after rejected exchange", name, got)
+		}
+		backend.Release(nodeID, fh)
+	}
+}

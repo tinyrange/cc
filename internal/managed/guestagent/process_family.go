@@ -3,11 +3,9 @@
 package guestagent
 
 import (
-	"crypto/sha256"
 	"errors"
-	"fmt"
 	"os"
-	"strings"
+	"os/exec"
 	"sync"
 	"syscall"
 	"time"
@@ -17,45 +15,68 @@ import (
 // Unlike a process group, the retained PID set follows children across setsid
 // and daemon reparenting so command cancellation can contain the whole workload.
 type ProcessFamily struct {
-	root  int
-	token string
-	done  chan struct{}
-	once  sync.Once
-	mu    sync.Mutex
-	pids  map[int]struct{}
+	root    int
+	tracker processFamilyTracker
+	done    chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	pids    map[int]struct{}
 }
 
-const processFamilyEnvironmentName = "CC_EXEC_FAMILY"
-
-func ProcessFamilyToken(id string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(id)))[:24]
+type processFamilyTracker interface {
+	Snapshot() map[int]struct{}
+	Close()
 }
 
-func WithProcessFamilyEnvironment(env []string, token string) []string {
-	if len(env) == 0 {
-		env = os.Environ()
-	} else {
-		env = append([]string(nil), env...)
-	}
-	prefix := processFamilyEnvironmentName + "="
-	for i := range env {
-		if strings.HasPrefix(env[i], prefix) {
-			env[i] = prefix + token
-			return env
-		}
-	}
-	return append(env, prefix+token)
+type processFamilyKiller interface {
+	Kill() error
 }
 
-func NewProcessFamily(root int, token ...string) *ProcessFamily {
-	familyToken := ""
-	if len(token) != 0 {
-		familyToken = token[0]
+type processFamilyPreparation interface {
+	Start(root int) (processFamilyTracker, error)
+	Abort()
+}
+
+type PreparedProcessFamily struct {
+	platform processFamilyPreparation
+}
+
+func PrepareProcessFamily(cmd *exec.Cmd, id string) (*PreparedProcessFamily, error) {
+	platform, err := prepareProcessFamily(cmd, id)
+	if err != nil {
+		return nil, err
 	}
+	return &PreparedProcessFamily{platform: platform}, nil
+}
+
+func (p *PreparedProcessFamily) Start(root int) *ProcessFamily {
+	var tracker processFamilyTracker
+	if p != nil && p.platform != nil {
+		tracker, _ = p.platform.Start(root)
+		p.platform = nil
+	}
+	return newProcessFamily(root, tracker)
+}
+
+func (p *PreparedProcessFamily) Abort() {
+	if p != nil && p.platform != nil {
+		p.platform.Abort()
+		p.platform = nil
+	}
+}
+
+func NewProcessFamily(root int) *ProcessFamily {
+	return newProcessFamily(root, nil)
+}
+
+func newProcessFamily(root int, tracker processFamilyTracker) *ProcessFamily {
 	if root <= 1 || root == os.Getpid() {
+		if tracker != nil {
+			tracker.Close()
+		}
 		return &ProcessFamily{done: make(chan struct{}), pids: make(map[int]struct{})}
 	}
-	f := &ProcessFamily{root: root, token: familyToken, done: make(chan struct{}), pids: map[int]struct{}{root: {}}}
+	f := &ProcessFamily{root: root, tracker: tracker, done: make(chan struct{}), pids: map[int]struct{}{root: {}}}
 	f.refresh()
 	go f.watch()
 	return f
@@ -75,8 +96,15 @@ func (f *ProcessFamily) watch() {
 }
 
 func (f *ProcessFamily) refresh() {
-	table, tagged := processSnapshot(f.token)
-	if len(table) == 0 {
+	tracked := map[int]struct{}{}
+	if f.tracker != nil {
+		// Platform trackers are armed before the command's start gate opens.
+		// Snapshot first so the gate cannot remain closed merely because a
+		// process-table facility is temporarily unavailable.
+		tracked = f.tracker.Snapshot()
+	}
+	table, _ := processSnapshot("")
+	if len(table) == 0 && len(tracked) == 0 {
 		return
 	}
 	f.mu.Lock()
@@ -86,7 +114,7 @@ func (f *ProcessFamily) refresh() {
 			delete(f.pids, pid)
 		}
 	}
-	for pid := range tagged {
+	for pid := range tracked {
 		if pid > 1 && pid != os.Getpid() {
 			f.pids[pid] = struct{}{}
 		}
@@ -140,6 +168,9 @@ func (f *ProcessFamily) Terminate() {
 		time.Sleep(5 * time.Millisecond)
 	}
 	_ = f.Signal(syscall.SIGKILL)
+	if killer, ok := f.tracker.(processFamilyKiller); ok {
+		_ = killer.Kill()
+	}
 	deadline = time.Now().Add(250 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		f.reapExited()
@@ -185,5 +216,10 @@ func (f *ProcessFamily) alive() bool {
 }
 
 func (f *ProcessFamily) Close() {
-	f.once.Do(func() { close(f.done) })
+	f.once.Do(func() {
+		close(f.done)
+		if f.tracker != nil {
+			f.tracker.Close()
+		}
+	})
 }

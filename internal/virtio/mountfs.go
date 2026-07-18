@@ -406,12 +406,13 @@ func (m *mountedFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid u
 	return m.storeHandle(backend, backendNodeID, fh, false), 0
 }
 
-func (m *mountedFS) Release(_ uint64, fh uint64) {
+func (m *mountedFS) Release(nodeID uint64, fh uint64) {
 	handle := m.takeHandle(fh, false)
 	if handle == nil {
 		return
 	}
 	handle.backend.Release(handle.nodeID, handle.fh)
+	m.collectDetachedNode(nodeID)
 }
 
 func (m *mountedFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
@@ -452,6 +453,38 @@ func (m *mountedFS) ListXattr(nodeID uint64) ([]byte, int32) {
 		return nil, 0
 	}
 	return xattrBackend.ListXattr(backendNodeID)
+}
+
+func (m *mountedFS) SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32 {
+	node := m.node(nodeID)
+	if node == nil {
+		return -linuxENOENT
+	}
+	backend, backendNodeID, errno := m.resolveBackendNodeCached(node.path)
+	if errno != 0 {
+		return errno
+	}
+	xattrBackend, ok := backend.(fsXattrMutationBackend)
+	if !ok {
+		return -linuxabi.ENOSYS
+	}
+	return xattrBackend.SetXattr(backendNodeID, name, value, flags)
+}
+
+func (m *mountedFS) RemoveXattr(nodeID uint64, name string) int32 {
+	node := m.node(nodeID)
+	if node == nil {
+		return -linuxENOENT
+	}
+	backend, backendNodeID, errno := m.resolveBackendNodeCached(node.path)
+	if errno != 0 {
+		return errno
+	}
+	xattrBackend, ok := backend.(fsXattrMutationBackend)
+	if !ok {
+		return -linuxabi.ENOSYS
+	}
+	return xattrBackend.RemoveXattr(backendNodeID, name)
 }
 
 func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
@@ -519,12 +552,13 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 	return encodeDirEntries(entries, off, maxBytes), 0
 }
 
-func (m *mountedFS) ReleaseDir(_ uint64, fh uint64) {
+func (m *mountedFS) ReleaseDir(nodeID uint64, fh uint64) {
 	handle := m.takeHandle(fh, true)
 	if handle == nil || handle.backend == nil {
 		return
 	}
 	handle.backend.ReleaseDir(handle.nodeID, handle.fh)
+	m.collectDetachedNode(nodeID)
 }
 
 func (m *mountedFS) Readlink(nodeID uint64) (string, int32) {
@@ -1006,7 +1040,10 @@ func (m *mountedFS) resolveAttr(node *mountedNode) (FuseAttr, int32) {
 	if m.isSyntheticPath(node.path) {
 		return syntheticDirAttr(), 0
 	}
-	backend, nodeID, errno := m.resolveBackendNodeCached(node.path)
+	backend, nodeID, errno := node.backend, node.backendNodeID, int32(0)
+	if !node.backendResolved {
+		backend, nodeID, errno = m.resolveBackendNodeCached(node.path)
+	}
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
@@ -1298,8 +1335,36 @@ func (m *mountedFS) removeNode(guestPath string) {
 			continue
 		}
 		delete(m.pathToNode, existingPath)
-		delete(m.nodes, id)
+		node := m.nodes[id]
+		if !m.nodeHasHandleLocked(node) {
+			delete(m.nodes, id)
+		}
 	}
+}
+
+func (m *mountedFS) nodeHasHandleLocked(node *mountedNode) bool {
+	if node == nil || !node.backendResolved {
+		return false
+	}
+	for _, handle := range m.handles {
+		if handle.backend == node.backend && handle.nodeID == node.backendNodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mountedFS) collectDetachedNode(nodeID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node := m.nodes[nodeID]
+	if node == nil || m.nodeHasHandleLocked(node) {
+		return
+	}
+	if id, linked := m.pathToNode[node.path]; linked && id == nodeID {
+		return
+	}
+	delete(m.nodes, nodeID)
 }
 
 func (m *mountedFS) renameNode(oldPath, newPath string) {

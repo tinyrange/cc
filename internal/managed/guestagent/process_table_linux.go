@@ -3,7 +3,6 @@
 package guestagent
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,7 +12,7 @@ import (
 
 const processFamilyPollInterval = 2 * time.Millisecond
 
-func processSnapshot(token string) (map[int]int, map[int]struct{}) {
+func processSnapshot(string) (map[int]int, map[int]struct{}) {
 	table := make(map[int]int)
 	tagged := make(map[int]struct{})
 	entries, err := os.ReadDir("/proc")
@@ -42,13 +41,6 @@ func processSnapshot(token string) (map[int]int, map[int]struct{}) {
 		ppid, err := strconv.Atoi(fields[1])
 		if err == nil {
 			table[pid] = ppid
-		}
-		if token != "" {
-			environ, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "environ"))
-			marker := []byte(processFamilyEnvironmentName + "=" + token)
-			if err == nil && bytes.Contains(append(environ, 0), append(marker, 0)) {
-				tagged[pid] = struct{}{}
-			}
 		}
 	}
 	return table, tagged

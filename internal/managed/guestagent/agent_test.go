@@ -267,6 +267,10 @@ func TestWriteAndExtractTarPreservesSymlink(t *testing.T) {
 	if err := os.Symlink("target", filepath.Join(srcDir, "link")); err != nil {
 		t.Fatal(err)
 	}
+	wantLinkTime := time.Unix(1_700_000_000, 123_456_789)
+	if err := setArchiveTimes(filepath.Join(srcDir, "link"), wantLinkTime, true); err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Lstat(srcDir)
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +313,13 @@ func TestWriteAndExtractTarPreservesSymlink(t *testing.T) {
 	if link != "target" {
 		t.Fatalf("extracted link = %q", link)
 	}
+	linkInfo, err := os.Lstat(filepath.Join(dstDir, "out", rootName, "link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta := linkInfo.ModTime().Sub(wantLinkTime); delta < -time.Microsecond || delta > time.Microsecond {
+		t.Fatalf("extracted link mtime = %s, want %s", linkInfo.ModTime(), wantLinkTime)
+	}
 }
 
 func TestWriteAndExtractTarPreservesHardLink(t *testing.T) {
@@ -343,6 +354,64 @@ func TestWriteAndExtractTarPreservesHardLink(t *testing.T) {
 	}
 	if !os.SameFile(firstInfo, secondInfo) {
 		t.Fatal("extracted files do not share an inode")
+	}
+}
+
+func TestWriteAndExtractTarPreservesSparseAllocationAndXattrs(t *testing.T) {
+	srcDir := t.TempDir()
+	source := filepath.Join(srcDir, "sparse")
+	file, err := os.Create(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const logicalSize = int64(64 << 20)
+	if _, err := file.WriteAt([]byte("tail"), logicalSize-4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archiveSeekData(int(file.Fd()), 0); err != nil {
+		_ = file.Close()
+		t.Skipf("test filesystem does not report sparse extents: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveSetXattr(source, "user.vmsh-test", []byte{0, 1, 0xff}, false); err != nil {
+		t.Skipf("test filesystem does not support user xattrs: %v", err)
+	}
+	info, err := os.Lstat(srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if err := WritePathTar(&archive, srcDir, filepath.Base(srcDir), info); err != nil {
+		t.Fatal(err)
+	}
+	if archive.Len() > 1<<20 {
+		t.Fatalf("sparse archive expanded to %d bytes", archive.Len())
+	}
+	destination := filepath.Join(t.TempDir(), "out")
+	if err := ExtractTarToPath(bytes.NewReader(archive.Bytes()), "", destination, true); err != nil {
+		t.Fatal(err)
+	}
+	extracted := filepath.Join(destination, filepath.Base(srcDir), "sparse")
+	extractedInfo, err := os.Stat(extracted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extractedInfo.Size() != logicalSize {
+		t.Fatalf("sparse logical size = %d, want %d", extractedInfo.Size(), logicalSize)
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Stat(extracted, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if int64(stat.Blocks)*512 > 1<<20 {
+		t.Fatalf("sparse extracted allocation = %d bytes", int64(stat.Blocks)*512)
+	}
+	value := make([]byte, 16)
+	n, err := archiveGetXattr(extracted, "user.vmsh-test", value)
+	if err != nil || string(value[:n]) != string([]byte{0, 1, 0xff}) {
+		t.Fatalf("extracted xattr = %v, %v", value[:n], err)
 	}
 }
 
@@ -390,6 +459,13 @@ func TestManagedExecSignalIsNotBlockedByStdinBackpressure(t *testing.T) {
 }
 
 func TestManagedExecContainsDetachedProcessBeforeExit(t *testing.T) {
+	probe, err := os.MkdirTemp("/sys/fs/cgroup", "cc-process-family-test-")
+	if err != nil {
+		t.Skipf("kernel cgroup containment is unavailable: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
 	pidFile := filepath.Join(t.TempDir(), "detached.pid")
 	command := "setsid sh -c 'trap \"\" TERM HUP INT; exec sleep 30' >/dev/null 2>&1 & echo $! >'" + strings.ReplaceAll(pidFile, "'", "'\\''") + "'"
 	var control bytes.Buffer

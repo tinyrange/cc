@@ -179,3 +179,93 @@ func TestImageFSDirectoryAndFileLinkCounts(t *testing.T) {
 		t.Fatalf("root with subdirectory nlink = %d", rootAttr.NLink)
 	}
 }
+
+func TestImageFSOpenDirectorySurvivesRemoval(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	dirID, _, errno := backend.Mkdir(1, "removed", 0o755, 0, 0)
+	if errno != 0 {
+		t.Fatalf("mkdir: errno %d", errno)
+	}
+	fh, errno := backend.OpenDir(dirID, 0)
+	if errno != 0 {
+		t.Fatalf("opendir: errno %d", errno)
+	}
+	if errno := backend.RmDir(1, "removed"); errno != 0 {
+		t.Fatalf("rmdir: errno %d", errno)
+	}
+	if _, errno := backend.GetAttr(dirID); errno != 0 {
+		t.Fatalf("getattr through open directory: errno %d", errno)
+	}
+	if entries, errno := backend.ReadDir(dirID, fh, 0, 4096); errno != 0 || len(entries) == 0 {
+		t.Fatalf("readdir through removed directory: bytes=%d errno=%d", len(entries), errno)
+	}
+	backend.ReleaseDir(dirID, fh)
+	if _, errno := backend.GetAttr(dirID); errno != -linuxENOENT {
+		t.Fatalf("getattr after released directory: errno %d, want %d", errno, -linuxENOENT)
+	}
+}
+
+func TestImageFSSetgidInheritanceAndPrivilegeBitClearing(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	dirID, _, errno := backend.Mkdir(1, "shared", 0o2775, 0, 42)
+	if errno != 0 {
+		t.Fatalf("mkdir shared: errno %d", errno)
+	}
+	childDir, childAttr, errno := backend.Mkdir(dirID, "child", 0o775, 1000, 1000)
+	if errno != 0 || childAttr.GID != 42 || childAttr.Mode&0o2000 == 0 {
+		t.Fatalf("child directory attr = %+v errno %d", childAttr, errno)
+	}
+	_, _ = childDir, childAttr
+	fileID, fh, fileAttr, errno := backend.Create(dirID, "tool", linuxORDWR|linuxOCREAT, 0o6755, 1000, 1000)
+	if errno != 0 || fileAttr.GID != 42 {
+		t.Fatalf("inherited file attr = %+v errno %d", fileAttr, errno)
+	}
+	if _, errno := backend.WriteForCaller(fileID, fh, 0, []byte("x"), 0, 1000, 42); errno != 0 {
+		t.Fatalf("write privileged file: errno %d", errno)
+	}
+	fileAttr, _ = backend.GetAttr(fileID)
+	if fileAttr.Mode&0o6000 != 0 {
+		t.Fatalf("privilege bits after non-root write = %#o", fileAttr.Mode)
+	}
+	if _, errno := backend.SetAttr(fileID, fattrMode, 0, 0, 0o6755, 0, 0, time.Time{}, time.Time{}); errno != 0 {
+		t.Fatalf("restore privilege bits: errno %d", errno)
+	}
+	if _, errno := backend.SetAttr(fileID, fattrGID, 0, 0, 0, 0, 77, time.Time{}, time.Time{}); errno != 0 {
+		t.Fatalf("chgrp privileged file: errno %d", errno)
+	}
+	fileAttr, _ = backend.GetAttr(fileID)
+	if fileAttr.GID != 77 || fileAttr.Mode&0o6000 != 0 {
+		t.Fatalf("attr after chgrp = %+v", fileAttr)
+	}
+}
+
+func TestImageFSXattrsAndSparseSeek(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, fh := createImageFile(t, backend, "data", "")
+	if errno := backend.SetXattr(nodeID, "user.test", []byte{0, 1, 2, 0xff}, 0); errno != 0 {
+		t.Fatalf("setxattr: errno %d", errno)
+	}
+	value, errno := backend.GetXattr(nodeID, "user.test")
+	if errno != 0 || string(value) != string([]byte{0, 1, 2, 0xff}) {
+		t.Fatalf("getxattr = %v errno %d", value, errno)
+	}
+	names, errno := backend.ListXattr(nodeID)
+	if errno != 0 || string(names) != "user.test\x00" {
+		t.Fatalf("listxattr = %q errno %d", names, errno)
+	}
+	if errno := backend.RemoveXattr(nodeID, "user.test"); errno != 0 {
+		t.Fatalf("removexattr: errno %d", errno)
+	}
+	if _, errno := backend.GetXattr(nodeID, "user.test"); errno != -linuxENODATA {
+		t.Fatalf("get removed xattr errno = %d, want %d", errno, -linuxENODATA)
+	}
+	if _, errno := backend.Write(nodeID, fh, 2*imageDataPageSize, []byte("tail"), 0); errno != 0 {
+		t.Fatalf("write sparse extent: errno %d", errno)
+	}
+	if got, errno := backend.Lseek(nodeID, fh, 0, 3); errno != 0 || got != 2*imageDataPageSize {
+		t.Fatalf("SEEK_DATA = %d errno %d", got, errno)
+	}
+	if got, errno := backend.Lseek(nodeID, fh, 2*imageDataPageSize, 4); errno != 0 || got != 2*imageDataPageSize+4 {
+		t.Fatalf("SEEK_HOLE = %d errno %d", got, errno)
+	}
+}

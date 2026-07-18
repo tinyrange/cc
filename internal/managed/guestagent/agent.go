@@ -18,11 +18,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -489,8 +491,7 @@ func (m *managedExec) close() error {
 	return stdin.Close()
 }
 
-func (m *managedExec) setProcess(p *os.Process, familyToken string) {
-	family := NewProcessFamily(p.Pid, familyToken)
+func (m *managedExec) setProcess(p *os.Process, family *ProcessFamily) {
 	m.processMu.Lock()
 	m.process = p
 	m.family = family
@@ -616,8 +617,6 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		proto.WriteExit(control, req.ID, 126)
 		return
 	}
-	familyToken := ProcessFamilyToken(req.ID)
-	req.Env = WithProcessFamilyEnvironment(req.Env, familyToken)
 	cmd := execCommand(req)
 	var controlR, controlW *os.File
 	if req.ControlFD {
@@ -711,7 +710,14 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		wg.Add(1)
 		go copyMarked(&wg, control, proto.ControlMarkerPrefix, req.ID, controlR)
 	}
+	preparedFamily, prepareErr := PrepareProcessFamily(cmd, req.ID)
+	if prepareErr != nil {
+		writeErr(opts, control, req.ID, fmt.Errorf("prepare command containment: %w", prepareErr))
+		proto.WriteExit(control, req.ID, 126)
+		return
+	}
 	if err := startManagedCommand(cmd); err != nil {
+		preparedFamily.Abort()
 		if managed != nil {
 			_ = managed.close()
 		}
@@ -747,17 +753,18 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	if controlW != nil {
 		_ = controlW.Close()
 	}
+	family := preparedFamily.Start(cmd.Process.Pid)
 	if managed != nil {
-		managed.setProcess(cmd.Process, familyToken)
+		managed.setProcess(cmd.Process, family)
 	}
 	waitErr := waitManagedCommand(cmd)
 	if managed != nil {
 		managed.processMu.Lock()
-		family := managed.family
+		family = managed.family
 		managed.processMu.Unlock()
-		if family != nil {
-			family.Terminate()
-		}
+	}
+	if family != nil {
+		family.Terminate()
 	}
 	if stdin != nil {
 		_ = stdin.Close()
@@ -996,6 +1003,14 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 			return err
 		}
 		header.Name = filepath.ToSlash(rel)
+		header.Format = tar.FormatPAX
+		xattrs, err := archiveXattrs(filePath)
+		if err != nil {
+			return err
+		}
+		if len(xattrs) != 0 {
+			header.PAXRecords = xattrs
+		}
 		if info.Mode().IsRegular() {
 			if key, ok := archiveHardlinkKey(info); ok {
 				if first, exists := hardlinks[key]; exists {
@@ -1007,23 +1022,137 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 				}
 			}
 		}
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
 		if !info.Mode().IsRegular() || header.Typeflag == tar.TypeLink {
+			if err := tw.WriteHeader(header); err != nil {
+				return err
+			}
 			return nil
 		}
 		file, err := os.Open(filePath)
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(tw, file)
+		exts, sparse := archiveSparseExtents(file, info.Size())
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if sparse {
+			physical := int64(0)
+			mapValues := make([]string, 0, len(exts)*2)
+			for _, extent := range exts {
+				physical += extent.length
+				mapValues = append(mapValues, strconv.FormatInt(extent.offset, 10), strconv.FormatInt(extent.length, 10))
+			}
+			if header.PAXRecords == nil {
+				header.PAXRecords = make(map[string]string)
+			}
+			header.PAXRecords["VMSH.sparse.numblocks"] = strconv.Itoa(len(exts))
+			header.PAXRecords["VMSH.sparse.map"] = strings.Join(mapValues, ",")
+			header.PAXRecords["VMSH.sparse.size"] = strconv.FormatInt(info.Size(), 10)
+			header.Size = physical
+		}
+		if err := tw.WriteHeader(header); err != nil {
+			_ = file.Close()
+			return err
+		}
+		var copyErr error
+		if sparse {
+			for _, extent := range exts {
+				if _, err := file.Seek(extent.offset, io.SeekStart); err != nil {
+					copyErr = err
+					break
+				}
+				if _, err := io.CopyN(tw, file, extent.length); err != nil {
+					copyErr = err
+					break
+				}
+			}
+		} else {
+			_, copyErr = io.Copy(tw, file)
+		}
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
 		}
 		return closeErr
 	})
+}
+
+type archiveSparseExtent struct {
+	offset int64
+	length int64
+}
+
+func archiveSparseExtents(file *os.File, size int64) ([]archiveSparseExtent, bool) {
+	if size <= 0 {
+		return nil, false
+	}
+	var extents []archiveSparseExtent
+	for offset := int64(0); offset < size; {
+		data, err := archiveSeekData(int(file.Fd()), offset)
+		if errors.Is(err, syscall.ENXIO) {
+			break
+		}
+		if err != nil || data < offset || data >= size {
+			return nil, false
+		}
+		hole, err := archiveSeekHole(int(file.Fd()), data)
+		if err != nil || hole <= data {
+			return nil, false
+		}
+		if hole > size {
+			hole = size
+		}
+		extents = append(extents, archiveSparseExtent{offset: data, length: hole - data})
+		offset = hole
+	}
+	physical := int64(0)
+	for _, extent := range extents {
+		physical += extent.length
+	}
+	return extents, physical < size
+}
+
+const archiveXattrPrefix = "VMSH.xattr."
+
+func archiveXattrs(path string) (map[string]string, error) {
+	size, err := archiveListXattrs(path, nil)
+	if err != nil {
+		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list extended attributes for %q: %w", path, err)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	names := make([]byte, size)
+	size, err = archiveListXattrs(path, names)
+	if err != nil {
+		return nil, fmt.Errorf("list extended attributes for %q: %w", path, err)
+	}
+	records := make(map[string]string)
+	for _, name := range strings.Split(string(names[:size]), "\x00") {
+		// Artifacts cross trust and VM boundaries. Preserve the portable user
+		// namespace, but never replay security, trusted, or system metadata
+		// supplied by another filesystem.
+		if !strings.HasPrefix(name, "user.") {
+			continue
+		}
+		valueSize, err := archiveGetXattr(path, name, nil)
+		if err != nil {
+			return nil, fmt.Errorf("read extended attribute %q for %q: %w", name, path, err)
+		}
+		value := make([]byte, valueSize)
+		valueSize, err = archiveGetXattr(path, name, value)
+		if err != nil {
+			return nil, fmt.Errorf("read extended attribute %q for %q: %w", name, path, err)
+		}
+		key := archiveXattrPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+		records[key] = base64.StdEncoding.EncodeToString(value[:valueSize])
+	}
+	return records, nil
 }
 
 func archiveHardlinkKey(info os.FileInfo) (string, bool) {
@@ -1179,7 +1308,11 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 		if header.Size < 0 {
 			return fmt.Errorf("archive entry %q has negative size", header.Name)
 		}
-		entryBytes := uint64(header.Size)
+		logicalSize, sizeErr := archiveLogicalSize(header)
+		if sizeErr != nil {
+			return sizeErr
+		}
+		entryBytes := uint64(logicalSize)
 		if entryBytes > limits.MaxFileBytes {
 			return &ArchiveLimitError{Resource: "file bytes", Limit: limits.MaxFileBytes, Actual: entryBytes}
 		}
@@ -1206,6 +1339,9 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			if err := applyArchiveOwnership(target, false, owner); err != nil {
 				return err
 			}
+			if err := applyArchiveXattrs(target, false, header); err != nil {
+				return err
+			}
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
 			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
@@ -1226,6 +1362,12 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			if err := applyArchiveOwnership(target, true, owner); err != nil {
 				return err
 			}
+			if err := applyArchiveXattrs(target, true, header); err != nil {
+				return err
+			}
+			if err := setArchiveTimes(target, header.ModTime, true); err != nil {
+				return err
+			}
 		case tar.TypeReg, tar.TypeRegA:
 			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
@@ -1238,7 +1380,7 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 				return err
 			}
 			tmpName := file.Name()
-			_, copyErr := io.Copy(file, contextReader{ctx: ctx, r: tr})
+			copyErr := copyTarRegularFile(ctx, file, tr, header)
 			closeErr := file.Close()
 			if copyErr != nil {
 				_ = os.Remove(tmpName)
@@ -1261,6 +1403,10 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 				return err
 			}
 			if err := os.Chtimes(tmpName, header.ModTime, header.ModTime); err != nil {
+				_ = os.Remove(tmpName)
+				return err
+			}
+			if err := applyArchiveXattrs(tmpName, false, header); err != nil {
 				_ = os.Remove(tmpName)
 				return err
 			}
@@ -1300,6 +1446,121 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			}
 		}
 	}
+}
+
+func copyTarRegularFile(ctx context.Context, file *os.File, tr *tar.Reader, header *tar.Header) error {
+	exts, logicalSize, sparse, err := archiveSparseMap(header)
+	if err != nil {
+		return err
+	}
+	reader := contextReader{ctx: ctx, r: tr}
+	if !sparse {
+		_, err := io.Copy(file, reader)
+		return err
+	}
+	for _, extent := range exts {
+		if extent.offset < 0 || extent.length < 0 || extent.offset > logicalSize-extent.length {
+			return fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		if _, err := file.Seek(extent.offset, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(file, reader, extent.length); err != nil {
+			return err
+		}
+	}
+	return file.Truncate(logicalSize)
+}
+
+func archiveSparseMap(header *tar.Header) ([]archiveSparseExtent, int64, bool, error) {
+	if header == nil || header.PAXRecords == nil {
+		return nil, 0, false, nil
+	}
+	encodedSize, present := header.PAXRecords["VMSH.sparse.size"]
+	if !present {
+		return nil, 0, false, nil
+	}
+	logicalSize, sizeErr := strconv.ParseInt(encodedSize, 10, 64)
+	if sizeErr != nil || logicalSize < 0 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse size", header.Name)
+	}
+	count, err := strconv.Atoi(header.PAXRecords["VMSH.sparse.numblocks"])
+	if err != nil || count < 0 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse extent count", header.Name)
+	}
+	values := []string{}
+	if encoded := header.PAXRecords["VMSH.sparse.map"]; encoded != "" {
+		values = strings.Split(encoded, ",")
+	}
+	if len(values) != count*2 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+	}
+	exts := make([]archiveSparseExtent, 0, count)
+	var physicalSize int64
+	var previousEnd int64
+	for i := 0; i < len(values); i += 2 {
+		offset, offsetErr := strconv.ParseInt(values[i], 10, 64)
+		length, lengthErr := strconv.ParseInt(values[i+1], 10, 64)
+		if offsetErr != nil || lengthErr != nil || offset < 0 || length < 0 {
+			return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		if offset < previousEnd || offset > logicalSize-length || physicalSize > header.Size-length {
+			return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		physicalSize += length
+		previousEnd = offset + length
+		exts = append(exts, archiveSparseExtent{offset: offset, length: length})
+	}
+	if physicalSize != header.Size {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse payload size", header.Name)
+	}
+	return exts, logicalSize, true, nil
+}
+
+func archiveLogicalSize(header *tar.Header) (int64, error) {
+	_, logicalSize, sparse, err := archiveSparseMap(header)
+	if err != nil {
+		return 0, err
+	}
+	if sparse {
+		return logicalSize, nil
+	}
+	return header.Size, nil
+}
+
+func applyArchiveXattrs(path string, symlink bool, header *tar.Header) error {
+	if header == nil {
+		return nil
+	}
+	for key, encoded := range header.PAXRecords {
+		if !strings.HasPrefix(key, archiveXattrPrefix) {
+			continue
+		}
+		name, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, archiveXattrPrefix))
+		if err != nil || !bytes.HasPrefix(name, []byte("user.")) || bytes.IndexByte(name, 0) >= 0 {
+			return fmt.Errorf("archive entry %q has an invalid extended attribute name", header.Name)
+		}
+		value, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return fmt.Errorf("archive entry %q has an invalid extended attribute value", header.Name)
+		}
+		err = archiveSetXattr(path, string(name), value, symlink)
+		if err != nil {
+			return fmt.Errorf("restore extended attribute %q for %q: %w", string(name), path, err)
+		}
+	}
+	return nil
+}
+
+func setArchiveTimes(path string, timestamp time.Time, symlink bool) error {
+	if !symlink {
+		return os.Chtimes(path, timestamp, timestamp)
+	}
+	times := []unix.Timespec{
+		{Sec: timestamp.Unix(), Nsec: int64(timestamp.Nanosecond())},
+		{Sec: timestamp.Unix(), Nsec: int64(timestamp.Nanosecond())},
+	}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, path, times, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func applyArchiveOwnership(target string, symlink bool, owner *ArchiveOwnership) error {

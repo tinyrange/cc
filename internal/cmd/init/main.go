@@ -181,8 +181,7 @@ func (m *managedExec) closeStdin() error {
 	return err
 }
 
-func (m *managedExec) setProcess(proc *os.Process, group bool, familyToken string) {
-	family := guestagent.NewProcessFamily(proc.Pid, familyToken)
+func (m *managedExec) setProcess(proc *os.Process, group bool, family *guestagent.ProcessFamily) {
 	m.stdinMu.Lock()
 	defer m.stdinMu.Unlock()
 	m.process = proc
@@ -3003,8 +3002,6 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		reporter.Exit(126)
 		return
 	}
-	familyToken := guestagent.ProcessFamilyToken(id)
-	env = guestagent.WithProcessFamilyEnvironment(env, familyToken)
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
 		done       chan struct{}
@@ -3127,10 +3124,19 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go copyManagedExecReader(done, controlR, nil, nil, reporter.ControlBytes)
 	}
 	configureManagedExecProcessAttrs(cmd, rootDir, execCred, useExecPivot)
+	preparedFamily, prepareFamilyErr := guestagent.PrepareProcessFamily(cmd, id)
+	if prepareFamilyErr != nil {
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
+		writeKernel("ccx3-init: prepare command containment: " + prepareFamilyErr.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: prepare command containment: "+prepareFamilyErr.Error()+"\n")
+		reporter.Exit(126)
+		return
+	}
 
 	reporter.Timing(managedExecTimingStartCall)
 	startErr := startManagedExecProcess(cmd, &controlW)
 	if startErr != nil {
+		preparedFamily.Abort()
 		_ = managed.closeStdin()
 		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 		if ptySlave != nil {
@@ -3159,7 +3165,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		stdinDone = make(chan struct{}, 1)
 		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
 	}
-	managed.setProcess(cmd.Process, signalGroup, familyToken)
+	managed.setProcess(cmd.Process, signalGroup, preparedFamily.Start(cmd.Process.Pid))
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil
