@@ -869,9 +869,9 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 	if dstDir {
 		extractionRoot = dst
 	}
-	extractionBoundary := "/"
-	if strings.TrimSpace(rootDir) != "" {
-		extractionBoundary = filepath.Clean(rootDir)
+	extractionBoundary, err := nearestExistingTarParent(extractionRoot)
+	if err != nil {
+		return err
 	}
 	if err := ensureTarParents(extractionBoundary, extractionRoot, owner); err != nil {
 		return err
@@ -1117,6 +1117,16 @@ func ensureTarParents(root, parent string, owner *ArchiveOwnership) error {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("%w: target parent escapes destination: %s", ErrUnsafeTarExtractionPath, parent)
 	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: target parent is a symlink: %s", ErrUnsafeTarExtractionPath, root)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("tar target parent is not a directory: %s", root)
+	}
 	if rel == "." {
 		return nil
 	}
@@ -1144,6 +1154,22 @@ func ensureTarParents(root, parent string, owner *ArchiveOwnership) error {
 		}
 	}
 	return nil
+}
+
+func nearestExistingTarParent(parent string) (string, error) {
+	current := filepath.Clean(parent)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			return current, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return "", fmt.Errorf("no existing parent for tar target %s", parent)
+		}
+		current = next
+	}
 }
 
 func validateTarSymlinkTarget(root, target, linkname string) error {
