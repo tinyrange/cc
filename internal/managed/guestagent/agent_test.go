@@ -19,12 +19,44 @@ import (
 	"j5.nz/cc/client"
 )
 
+func TestRootUserRequestClassification(t *testing.T) {
+	for _, user := range []string{"", "root", "0", "0:0", "root:wheel"} {
+		if !isRootUserRequest(user) {
+			t.Errorf("root user request %q was rejected", user)
+		}
+	}
+	for _, user := range []string{"1000", "1000:1000", "nobody", "root:nobody"} {
+		if isRootUserRequest(user) {
+			t.Errorf("non-root user request %q was accepted", user)
+		}
+	}
+}
+
 func TestRootPathCleansRootAndName(t *testing.T) {
 	if got := rootPath("/mnt/root", "../etc/passwd"); got != "/mnt/root/etc/passwd" {
 		t.Fatalf("rootPath = %q", got)
 	}
 	if got := rootPath("/", "bin/sh"); got != "/bin/sh" {
 		t.Fatalf("rootPath at root = %q", got)
+	}
+}
+
+func TestValidateExecWorkDir(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateExecWorkDir(root, "/work"); err != nil {
+		t.Fatalf("validate directory workdir: %v", err)
+	}
+	if err := validateExecWorkDir(root, "/missing"); err == nil {
+		t.Fatal("accepted a missing workdir")
+	}
+	if err := validateExecWorkDir(root, "/file"); err == nil {
+		t.Fatal("accepted a regular file workdir")
 	}
 }
 

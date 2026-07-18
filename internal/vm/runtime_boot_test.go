@@ -106,6 +106,14 @@ func TestRuntimeArchiveControlsInitializeUserHomeAndPreserveHardLinks(t *testing
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
 		ID: "archive-user-home", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
 	})
+	rootFirst := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/true"},
+		WorkDir: "/home/cc",
+		User:    "root",
+	})
+	if rootFirst.ExitCode != 0 {
+		t.Fatalf("root command in shared workspace exited with %d: %s", rootFirst.ExitCode, rootFirst.Output)
+	}
 	runRuntimeControl(t, inst, client.ExecRequest{
 		Kind:      "fs_extract",
 		Path:      "/home/cc/first-copy",
@@ -364,6 +372,20 @@ func bootManagedBSDRuntimeContract(t *testing.T, tc managedBSDRuntimeBootCase) (
 	if resp.ExitCode != 0 || normalized != expectedOutput {
 		t.Fatalf("%s exec response = code %d output %q, want %q", tc.name, resp.ExitCode, resp.Output, expectedOutput)
 	}
+
+	const escalationProbe = "/root/cc-nonroot-escalation-probe"
+	nonRoot, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "touch " + escalationProbe},
+		WorkDir: "/",
+		User:    "1000:1000",
+	})
+	requireRunResponse(t, nonRoot, err, 126)
+	probe, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "test ! -e " + escalationProbe},
+		WorkDir: "/",
+		User:    "root",
+	})
+	requireRunResponse(t, probe, err, 0)
 
 	var controlOutput string
 	var controlExit *int

@@ -90,6 +90,11 @@ func EnsureCredentialWorkDir(rootDir, workDir string, cred *syscall.Credential) 
 	if !strings.HasPrefix(workDir, "/home/") {
 		return nil
 	}
+	// /home/cc is the shared default workspace. Its ownership must not depend
+	// on whether a root or unprivileged command happens to use it first.
+	if workDir == "/home/cc" && (cred == nil || cred.Uid == 0) {
+		cred = &syscall.Credential{Uid: 1000, Gid: 1000}
+	}
 	return ensureCredentialDirectory(rootDir, workDir, cred)
 }
 

@@ -243,6 +243,15 @@ func commandLoop(opts Options, control net.Conn) error {
 		if req.Kind == "" {
 			req.Kind = "exec"
 		}
+		if requestStartsWork(req.Kind) {
+			if err := validateGuestUser(req.User); err != nil {
+				proto := DefaultProtocol()
+				proto.WriteBegin(control, req.ID)
+				writeErr(opts, control, req.ID, err)
+				proto.WriteExit(control, req.ID, 126)
+				continue
+			}
+		}
 		switch req.Kind {
 		case "exec":
 			if req.ID == "" || len(req.Command) == 0 {
@@ -325,6 +334,24 @@ func commandLoop(opts Options, control net.Conn) error {
 				Rows: req.Rows,
 			})
 		}
+	}
+}
+
+func requestStartsWork(kind string) bool {
+	switch kind {
+	case "exec", "sync", "fs_mkdir", "fs_write", "fs_extract", "fs_archive":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRootUserRequest(user string) bool {
+	switch strings.ToLower(strings.TrimSpace(user)) {
+	case "", "root", "0", "0:0", "root:root", "root:wheel":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -418,6 +445,17 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	defer cleanup()
 	proto := DefaultProtocol()
 	proto.WriteBegin(control, req.ID)
+	if err := validateExecWorkDir(req.RootDir, req.WorkDir); err != nil {
+		if managed != nil {
+			_ = managed.close()
+		}
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		writeErr(opts, control, req.ID, fmt.Errorf("invalid workdir: %w", err))
+		proto.WriteExit(control, req.ID, 126)
+		return
+	}
 	cmd := execCommand(req)
 	var controlR, controlW *os.File
 	if req.ControlFD {
@@ -550,6 +588,21 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		}
 	}
 	proto.WriteExit(control, req.ID, code)
+}
+
+func validateExecWorkDir(rootDir, workDir string) error {
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	path := rootPath(rootDir, workDir)
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	return nil
 }
 
 func execCommand(req request) *exec.Cmd {

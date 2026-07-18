@@ -70,6 +70,9 @@ func TestEnsureCredentialWorkDirCreatesHomeSubdirectory(t *testing.T) {
 }
 
 func TestEnsureCredentialWorkDirCreatesRootCommandDirectory(t *testing.T) {
+	if os.Geteuid() != 0 && (os.Geteuid() != 1000 || os.Getegid() != 1000) {
+		t.Skip("test process cannot assign the default workspace identity")
+	}
 	root := t.TempDir()
 	if err := EnsureCredentialWorkDir(root, "/home/cc", nil); err != nil {
 		t.Fatalf("ensure root workdir: %v", err)
@@ -80,6 +83,10 @@ func TestEnsureCredentialWorkDirCreatesRootCommandDirectory(t *testing.T) {
 	}
 	if !info.IsDir() {
 		t.Fatal("root workdir is not a directory")
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if stat.Uid != 1000 || stat.Gid != 1000 {
+		t.Fatalf("root command workspace owner = %d:%d, want 1000:1000", stat.Uid, stat.Gid)
 	}
 }
 
