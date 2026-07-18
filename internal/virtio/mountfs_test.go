@@ -113,6 +113,55 @@ func TestMountedFSLookupRoutesSyntheticMountPaths(t *testing.T) {
 	}
 }
 
+func TestMountedFSPreservesTrailingSpaceNames(t *testing.T) {
+	root := imageBackend(t, nil)
+	fsys := NewMountedFS(root, nil).(*mountedFS)
+	var create fsCreateCallerBackend = fsys
+	var write fsWriteCallerBackend = fsys
+
+	created := make(map[string]uint64)
+	for name, contents := range map[string]string{"collision": "A", "collision ": "B"} {
+		nodeID, fh, _, errno := create.CreateForCaller(1, name, linuxOWRONLY|linuxOCREAT|linuxOEXCL, 0o644, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create %q errno = %d", name, errno)
+		}
+		if _, errno := write.WriteForCaller(nodeID, fh, 0, []byte(contents), 0, 0, 0); errno != 0 {
+			t.Fatalf("write %q errno = %d", name, errno)
+		}
+		fsys.Release(nodeID, fh)
+		created[name] = nodeID
+	}
+	if created["collision"] == created["collision "] {
+		t.Fatalf("byte-distinct names share node %d", created["collision"])
+	}
+	for name, want := range map[string]string{"collision": "A", "collision ": "B"} {
+		nodeID, _, errno := fsys.Lookup(1, name)
+		if errno != 0 {
+			t.Fatalf("lookup %q errno = %d", name, errno)
+		}
+		fh, errno := fsys.Open(nodeID, linuxORDONLY)
+		if errno != 0 {
+			t.Fatalf("open %q errno = %d", name, errno)
+		}
+		data, errno := fsys.Read(nodeID, fh, 0, 16)
+		fsys.Release(nodeID, fh)
+		if errno != 0 || string(data) != want {
+			t.Fatalf("read %q = %q, errno %d; want %q", name, data, errno, want)
+		}
+	}
+
+	paths := fsys.SnapshotNodePaths()
+	restored := NewMountedFS(root, nil).(*mountedFS)
+	if err := restored.RestoreNodePaths(paths); err != nil {
+		t.Fatalf("restore node paths: %v", err)
+	}
+	plainID, _, plainErrno := restored.Lookup(1, "collision")
+	spacedID, _, spacedErrno := restored.Lookup(1, "collision ")
+	if plainErrno != 0 || spacedErrno != 0 || plainID == spacedID {
+		t.Fatalf("restored names = plain(%d,%d) spaced(%d,%d)", plainID, plainErrno, spacedID, spacedErrno)
+	}
+}
+
 func TestMountedFSPassthroughHardlinkReportsSameInode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows passthrough inode reporting does not expose stable hardlink inode identity")

@@ -311,7 +311,14 @@ func TestManagerExplicitShutdownRecordsStoppedState(t *testing.T) {
 func TestManagerRejectsInvalidResourcesBeforeHostAllocation(t *testing.T) {
 	host := newFakeHost(VMHostCapabilities{MaxVMs: 4})
 	manager := testManager(host)
-	_, err := manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: ^uint64(0), CPUs: 1})
+	_, err := manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: 1, CPUs: 1})
+	if err == nil {
+		t.Fatal("memory request below the supported minimum was accepted")
+	}
+	if len(host.starts) != 0 {
+		t.Fatalf("host starts after minimum-memory rejection = %+v", host.starts)
+	}
+	_, err = manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: ^uint64(0), CPUs: 1})
 	if err == nil {
 		t.Fatal("overflowing memory request was accepted")
 	}

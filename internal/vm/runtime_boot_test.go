@@ -50,7 +50,7 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 
 	resp, err := env.backend.Run(ctx, client.RunRequest{
 		Image:    env.imageName,
-		MemoryMB: env.memoryMB,
+		MemoryMB: minimumGuestMemoryMB,
 		CPUs:     1,
 		Command: []string{
 			"sh",
@@ -60,6 +60,23 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	})
 	requireRunResponse(t, resp, err, 0)
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
+}
+
+func TestRuntimeLinuxImageFSPreservesTrailingSpaceNames(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		Command: []string{
+			"sh", "-lc",
+			"set -eu; printf A > /tmp/collision; printf B > '/tmp/collision '; test \"$(cat /tmp/collision)\" = A; test \"$(cat '/tmp/collision ')\" = B; test \"$(stat -c %i /tmp/collision)\" != \"$(stat -c %i '/tmp/collision ')\"",
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeCancelsInteractiveShellWithBlockedForegroundCommand(t *testing.T) {
@@ -292,14 +309,14 @@ func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
 	}
 
 	resp, err := inst.Exec(ctx, client.ExecRequest{
-		Command: []string{"sh", "-c", "set -eu; pkg_info -q >/tmp/pkg-list; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
+		Command: []string{"sh", "-c", "set -eu; test \"$(date +%z)\" = +0000; pkg_info -q >/tmp/pkg-list; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
 		WorkDir: "/tmp",
 	})
 	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
-	_, _ = bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
+	ctx, inst := bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
 		name:     "FreeBSD",
 		envVar:   "CC_TEST_FREEBSD_KVM",
 		image:    "@freebsd",
@@ -308,6 +325,16 @@ func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
 		guestOS:  "FreeBSD",
 		label:    "freebsd",
 	})
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "set -eu; printf A > /tmp/collision; printf B > '/tmp/collision '; test \"$(cat /tmp/collision)\" = A; test \"$(cat '/tmp/collision ')\" = B; mkdir /tmp/work '/tmp/work '; : > /tmp/work/plain; : > '/tmp/work '/spaced"},
+		WorkDir: "/tmp",
+	})
+	requireRunResponse(t, resp, err, 0)
+	resp, err = inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "test -f spaced; test ! -e plain"},
+		WorkDir: "/tmp/work ",
+	})
+	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {

@@ -83,8 +83,11 @@ func EnsureCredentialUser(rootDir string, cred *syscall.Credential) error {
 }
 
 func EnsureCredentialWorkDir(rootDir, workDir string, cred *syscall.Credential) error {
-	workDir = filepath.Clean(strings.TrimSpace(workDir))
-	if workDir == "" || workDir == "." || workDir == "/" {
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	workDir = filepath.Clean(workDir)
+	if workDir == "." || workDir == "/" {
 		return nil
 	}
 	if !strings.HasPrefix(workDir, "/home/") {
@@ -105,7 +108,10 @@ func EnsureCredentialArchiveHome(rootDir, destination string, cred *syscall.Cred
 	if cred == nil || cred.Uid == 0 {
 		return nil
 	}
-	destination = filepath.Clean(strings.TrimSpace(destination))
+	if strings.TrimSpace(destination) == "" {
+		return nil
+	}
+	destination = filepath.Clean(destination)
 	parts := strings.Split(strings.TrimPrefix(destination, "/"), "/")
 	if len(parts) < 2 || parts[0] != "home" || parts[1] == "" {
 		return nil

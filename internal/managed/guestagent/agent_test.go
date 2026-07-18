@@ -44,6 +44,33 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 	if line, err := firstReader.ReadString('\n'); err != nil || strings.TrimSpace(line) != ReadyMarker {
 		t.Fatalf("first control ready = %q, %v", line, err)
 	}
+	firstEncoder := json.NewEncoder(first)
+	if err := firstEncoder.Encode(request{
+		Kind: "exec", ID: "active", ControlFD: true,
+		Command: []string{"/bin/sh", "-c", `IFS= read -r line; printf 'continued:%s' "$line"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := firstReader.ReadString('\n'); err != nil || strings.TrimSpace(line) != BeginMarkerPrefix+"active" {
+		t.Fatalf("active command begin = %q, %v", line, err)
+	}
+	if err := firstEncoder.Encode(request{
+		Kind: "exec", ID: "cancel", ControlFD: true,
+		Command: []string{"/bin/sh", "-c", "printf cancel-ready; trap '' TERM INT; while :; do sleep 1; done"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantCancelReady := OutputMarkerPrefix + "cancel:" + base64.StdEncoding.EncodeToString([]byte("cancel-ready"))
+	gotCancelBegin, gotCancelReady := false, false
+	for !gotCancelBegin || !gotCancelReady {
+		line, err := firstReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("prepare cancel command: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		gotCancelBegin = gotCancelBegin || line == BeginMarkerPrefix+"cancel"
+		gotCancelReady = gotCancelReady || line == wantCancelReady
+	}
 	_ = first.Close()
 
 	second, err := listener.Accept()
@@ -59,6 +86,38 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 		t.Fatalf("replacement control ready = %q, %v", line, err)
 	}
 	encoder := json.NewEncoder(second)
+	if err := encoder.Encode(request{Kind: "stdin", ID: "active", Stdin: []byte("across-reconnect\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(request{Kind: "stdin_close", ID: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	wantContinued := OutputMarkerPrefix + "active:" + base64.StdEncoding.EncodeToString([]byte("continued:across-reconnect"))
+	gotContinued, gotActiveExit := false, false
+	for !gotActiveExit {
+		line, err := secondReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read continued command result: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		gotContinued = gotContinued || line == wantContinued
+		gotActiveExit = line == ExitMarkerPrefix+"active:0"
+	}
+	if !gotContinued {
+		t.Fatal("active command output did not follow the replacement connection")
+	}
+	if err := encoder.Encode(request{Kind: "signal", ID: "cancel", Signal: "KILL"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		line, err := secondReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read canceled command result: %v", err)
+		}
+		if strings.TrimSpace(line) == ExitMarkerPrefix+"cancel:137" {
+			break
+		}
+	}
 	if err := encoder.Encode(request{Kind: "exec", ID: "reconnected", Command: []string{"/bin/sh", "-c", "printf recovered"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +170,12 @@ func TestRootPathCleansRootAndName(t *testing.T) {
 	}
 	if got := rootPath("/", "bin/sh"); got != "/bin/sh" {
 		t.Fatalf("rootPath at root = %q", got)
+	}
+	if got := rootPath("/", "/tmp/collision "); got != "/tmp/collision " {
+		t.Fatalf("rootPath discarded trailing space: %q", got)
+	}
+	if got := rootPath("/", "/tmp/work "); got == rootPath("/", "/tmp/work") {
+		t.Fatalf("rootPath aliases byte-distinct guest paths: %q", got)
 	}
 }
 

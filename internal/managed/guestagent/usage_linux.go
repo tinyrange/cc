@@ -16,17 +16,6 @@ type ExecUsage struct {
 	MaxRSSBytes   uint64  `json:"max_rss_bytes,omitempty"`
 }
 
-func ProcessExitCode(state *os.ProcessState, fallback int) int {
-	if state == nil {
-		return fallback
-	}
-	status, ok := state.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() {
-		return fallback
-	}
-	return 128 + int(status.Signal())
-}
-
 func UsageFromProcessState(state *os.ProcessState, wall time.Duration) *ExecUsage {
 	usage := &ExecUsage{WallSeconds: wall.Seconds()}
 	if state == nil {

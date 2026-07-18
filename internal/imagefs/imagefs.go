@@ -89,7 +89,7 @@ func LookupPath(root Directory, guestPath string) (Entry, error) {
 	if root == nil {
 		return Entry{}, fmt.Errorf("root filesystem is nil")
 	}
-	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	clean := path.Clean("/" + strings.TrimPrefix(guestPath, "/"))
 	if clean == "/" {
 		return Entry{Dir: root}, nil
 	}
@@ -160,7 +160,7 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 }
 
 func ResolvePath(root Directory, guestPath string) (string, Entry, error) {
-	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	clean := path.Clean("/" + strings.TrimPrefix(guestPath, "/"))
 	for depth := 0; depth < 40; depth++ {
 		resolved, entry, err := resolvePathOnce(root, clean)
 		if err != nil {
@@ -178,7 +178,7 @@ func resolvePathOnce(root Directory, guestPath string) (string, Entry, error) {
 	if root == nil {
 		return "", Entry{}, fmt.Errorf("root filesystem is nil")
 	}
-	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	clean := path.Clean("/" + strings.TrimPrefix(guestPath, "/"))
 	if clean == "/" {
 		return clean, Entry{Dir: root}, nil
 	}
@@ -191,7 +191,7 @@ func resolvePathOnce(root Directory, guestPath string) (string, Entry, error) {
 		}
 		currentPath := "/" + strings.Join(parts[:i+1], "/")
 		if entry.Symlink != nil {
-			target := fsmeta.NormalizeSymlinkTarget(strings.TrimSpace(entry.Symlink.Target()))
+			target := fsmeta.NormalizeSymlinkTarget(entry.Symlink.Target())
 			if target == "" {
 				return "", Entry{}, fmt.Errorf("%q symlink target is empty", currentPath)
 			}

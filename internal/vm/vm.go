@@ -21,6 +21,7 @@ import (
 
 const DefaultInstanceID = "default"
 const maxExitTombstones = 64
+const minimumGuestMemoryMB = 128
 
 var ErrManagerClosing = errors.New("VM manager is shutting down")
 
@@ -1048,6 +1049,9 @@ func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {
 	}
 	if *cpus < 0 {
 		return fmt.Errorf("cpus must be positive")
+	}
+	if *memoryMB < minimumGuestMemoryMB {
+		return fmt.Errorf("memory_mb must be at least %d MiB", minimumGuestMemoryMB)
 	}
 	maxAllocationMB := uint64(^uint(0)>>1) >> 20
 	if *memoryMB > maxAllocationMB {

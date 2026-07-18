@@ -502,7 +502,7 @@ func (l *tarSymlink) Owner() (uint32, uint32) { return l.node.uid, l.node.gid }
 func (l *tarSymlink) RDev() uint32            { return l.node.rdev }
 
 func cleanTarPath(name string) string {
-	return path.Clean("/" + strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(name), "."), "/"))
+	return path.Clean("/" + strings.TrimPrefix(strings.TrimPrefix(name, "."), "/"))
 }
 
 func tarRDev(hdr *tar.Header) (uint32, error) {

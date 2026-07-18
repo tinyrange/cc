@@ -172,13 +172,86 @@ func (p Protocol) WriteTiming(w io.Writer, id, phase string, start time.Time) {
 type request = protocol.ManagedExecRequest
 
 type managedExec struct {
-	stdinMu sync.Mutex
-	stdin   io.WriteCloser
+	stdinMu      sync.Mutex
+	stdinWriteMu sync.Mutex
+	stdin        io.WriteCloser
 
 	processMu sync.Mutex
 	process   *os.Process
 	pty       *os.File
 	ptyImpl   PTY
+}
+
+// reconnectingGuestControl is the logical guest-to-host protocol writer. A
+// BSD control TCP connection can be replaced while commands are still alive;
+// their output must follow the replacement connection rather than remain tied
+// to the socket on which the command started.
+type reconnectingGuestControl struct {
+	ctx context.Context
+
+	mu      sync.Mutex
+	conn    net.Conn
+	changed chan struct{}
+}
+
+func newReconnectingGuestControl(ctx context.Context) *reconnectingGuestControl {
+	return &reconnectingGuestControl{ctx: ctx, changed: make(chan struct{})}
+}
+
+func (c *reconnectingGuestControl) signalChangedLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *reconnectingGuestControl) setConnection(conn net.Conn) {
+	c.mu.Lock()
+	c.conn = conn
+	c.signalChangedLocked()
+	c.mu.Unlock()
+}
+
+func (c *reconnectingGuestControl) clearConnection(conn net.Conn) {
+	c.mu.Lock()
+	if c.conn == conn {
+		c.conn = nil
+		c.signalChangedLocked()
+	}
+	c.mu.Unlock()
+}
+
+func (c *reconnectingGuestControl) connection() (net.Conn, error) {
+	for {
+		c.mu.Lock()
+		conn := c.conn
+		changed := c.changed
+		c.mu.Unlock()
+		if conn != nil {
+			return conn, nil
+		}
+		select {
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (c *reconnectingGuestControl) Write(data []byte) (int, error) {
+	for {
+		conn, err := c.connection()
+		if err != nil {
+			return 0, err
+		}
+		n, _ := conn.Write(data)
+		if n == len(data) {
+			return n, nil
+		}
+		c.clearConnection(conn)
+		_ = conn.Close()
+		// A partial protocol line on the failed physical connection is
+		// discarded with that connection. Resend the complete line after
+		// reconnect so the logical transcript always receives a valid frame.
+	}
 }
 
 func Run(opts Options) error {
@@ -188,6 +261,9 @@ func Run(opts Options) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	control := newReconnectingGuestControl(ctx)
+	active := NewActiveExecSet()
+	pending := NewPendingRequests[request]()
 	connected := false
 	for {
 		conn, err := connectControl(ctx, opts)
@@ -199,7 +275,13 @@ func Run(opts Options) error {
 			continue
 		}
 		connected = true
-		WriteProtocolLine(conn, ReadyMarker)
+		// Write readiness before publishing the replacement connection so
+		// resumed command output cannot overtake the connection marker.
+		if _, err := io.WriteString(conn, ReadyMarker+"\n"); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		control.setConnection(conn)
 		done := make(chan struct{})
 		go func() {
 			select {
@@ -208,8 +290,9 @@ func Run(opts Options) error {
 			case <-done:
 			}
 		}()
-		err = commandLoop(opts, conn)
+		err = commandLoop(opts, conn, control, active, pending)
 		close(done)
+		control.clearConnection(conn)
 		_ = conn.Close()
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -256,10 +339,8 @@ func connectControl(ctx context.Context, opts Options) (net.Conn, error) {
 	return nil, fmt.Errorf("connect control: %w", last)
 }
 
-func commandLoop(opts Options, control net.Conn) error {
-	reader := bufio.NewReader(control)
-	active := NewActiveExecSet()
-	pending := NewPendingRequests[request]()
+func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveExecSet, pending *PendingRequests[request]) error {
+	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -390,24 +471,27 @@ func isRootUserRequest(user string) bool {
 }
 
 func (m *managedExec) write(data []byte) error {
+	m.stdinWriteMu.Lock()
+	defer m.stdinWriteMu.Unlock()
 	m.stdinMu.Lock()
-	defer m.stdinMu.Unlock()
-	if m.stdin == nil {
+	stdin := m.stdin
+	m.stdinMu.Unlock()
+	if stdin == nil {
 		return fmt.Errorf("stdin is closed")
 	}
-	_, err := m.stdin.Write(data)
+	_, err := stdin.Write(data)
 	return err
 }
 
 func (m *managedExec) close() error {
 	m.stdinMu.Lock()
-	defer m.stdinMu.Unlock()
-	if m.stdin == nil {
+	stdin := m.stdin
+	m.stdin = nil
+	m.stdinMu.Unlock()
+	if stdin == nil {
 		return nil
 	}
-	err := m.stdin.Close()
-	m.stdin = nil
-	return err
+	return stdin.Close()
 }
 
 func (m *managedExec) setProcess(p *os.Process) {
@@ -458,6 +542,13 @@ func (m *managedExec) signal(name string) error {
 	if err != nil {
 		return err
 	}
+	// A streamed stdin reader keeps os/exec's copy goroutine alive. SIGKILL
+	// guarantees that the command cannot consume more input, so close it before
+	// waiting for the process; otherwise Wait can retain a killed command until
+	// the control connection happens to close stdin separately.
+	if sig == syscall.SIGKILL {
+		_ = m.close()
+	}
 	m.processMu.Lock()
 	defer m.processMu.Unlock()
 	if m.process == nil {
@@ -471,7 +562,7 @@ func (m *managedExec) signal(name string) error {
 	return m.process.Signal(sig)
 }
 
-func startExecWithReader(opts Options, control net.Conn, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
+func startExecWithReader(opts Options, control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
 	go runExec(opts, control, req, stdin, managed, cleanup)
 }
 
@@ -615,13 +706,24 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	code := 0
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			code = exitErr.ExitCode()
+			code = ProcessExitCode(cmd.ProcessState, exitErr.ExitCode())
 		} else {
 			writeErr(opts, control, req.ID, waitErr)
 			code = 126
 		}
 	}
 	proto.WriteExit(control, req.ID, code)
+}
+
+func ProcessExitCode(state *os.ProcessState, fallback int) int {
+	if state == nil {
+		return fallback
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return fallback
+	}
+	return 128 + int(status.Signal())
 }
 
 func validateExecWorkDir(rootDir, workDir string) error {
@@ -1374,11 +1476,11 @@ func writeConsole(s string) {
 }
 
 func rootPath(rootDir, name string) string {
-	cleanRoot := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(rootDir), "/"))
+	cleanRoot := filepath.Clean("/" + strings.TrimPrefix(rootDir, "/"))
 	if cleanRoot == "/" {
 		cleanRoot = ""
 	}
-	cleanName := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(name), "/"))
+	cleanName := filepath.Clean("/" + strings.TrimPrefix(name, "/"))
 	return filepath.Join(cleanRoot, cleanName)
 }
 

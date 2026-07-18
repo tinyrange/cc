@@ -61,6 +61,12 @@ func TestEnsureCredentialWorkDirCreatesHomeSubdirectory(t *testing.T) {
 	if !info.IsDir() {
 		t.Fatalf("workdir is not a directory")
 	}
+	if err := EnsureCredentialWorkDir(root, "/home/ubuntu ", cred); err != nil {
+		t.Fatalf("ensure spaced workdir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "home", "ubuntu ")); err != nil {
+		t.Fatalf("stat spaced workdir: %v", err)
+	}
 	if err := EnsureCredentialWorkDir(root, "/work/project", cred); err != nil {
 		t.Fatalf("ensure non-home workdir: %v", err)
 	}
@@ -113,6 +119,12 @@ func TestEnsureCredentialArchiveHomeCreatesOnlyMissingWorkspace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "home", "cc", "project")); !os.IsNotExist(err) {
 		t.Fatalf("archive destination parent was created eagerly: %v", err)
+	}
+	if err := EnsureCredentialArchiveHome(root, "/home/release /file", cred); err != nil {
+		t.Fatalf("create spaced archive workspace: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "home", "release ")); err != nil {
+		t.Fatalf("stat spaced archive workspace: %v", err)
 	}
 
 	protected := filepath.Join(root, "home", "protected")

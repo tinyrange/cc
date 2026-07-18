@@ -268,5 +268,5 @@ func (l *overlaySymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
 func (l *overlaySymlink) RDev() uint32            { return l.rdev }
 
 func cleanOverlayPath(guestPath string) string {
-	return path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	return path.Clean("/" + strings.TrimPrefix(guestPath, "/"))
 }

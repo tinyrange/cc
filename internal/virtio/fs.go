@@ -3884,7 +3884,7 @@ func (p *imageFS) SnapshotNodePaths() []string {
 
 func (p *imageFS) RestoreNodePaths(paths []string) error {
 	for _, nodePath := range paths {
-		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		nodePath = path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
 		if nodePath == "/" {
 			continue
 		}

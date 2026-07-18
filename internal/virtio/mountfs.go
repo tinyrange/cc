@@ -243,7 +243,6 @@ func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
 }
 
 func cleanMountPath(value string) string {
-	value = strings.TrimSpace(value)
 	if value == "" {
 		return "/"
 	}
@@ -273,7 +272,7 @@ func (m *mountedFS) SnapshotNodePaths() []string {
 
 func (m *mountedFS) RestoreNodePaths(paths []string) error {
 	for _, nodePath := range paths {
-		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		nodePath = path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
 		if nodePath == "/" {
 			continue
 		}

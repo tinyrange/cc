@@ -84,3 +84,57 @@ func TestBSDControlAcceptsReplacementConnection(t *testing.T) {
 	}
 	_ = first.Close()
 }
+
+func TestBSDControlRetriesRequestAfterWriteConnectionLoss(t *testing.T) {
+	control := newReconnectingBSDControl()
+	defer control.Close()
+
+	firstClient, firstServer := net.Pipe()
+	if !control.setConnection(firstServer) {
+		t.Fatal("first connection was rejected")
+	}
+	_ = firstClient.Close()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := control.Write([]byte("survives-loss\n"))
+		writeDone <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		control.mu.Lock()
+		cleared := control.conn == nil
+		control.mu.Unlock()
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed connection was not discarded")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	secondClient, secondServer := net.Pipe()
+	defer secondClient.Close()
+	if !control.setConnection(secondServer) {
+		t.Fatal("replacement connection was rejected")
+	}
+	if err := secondClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(secondClient).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "survives-loss\n" {
+		t.Fatalf("replacement request = %q", line)
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write did not finish on replacement connection")
+	}
+}

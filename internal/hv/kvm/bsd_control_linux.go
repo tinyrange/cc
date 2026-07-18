@@ -96,15 +96,21 @@ func (c *reconnectingBSDControl) Read(data []byte) (int, error) {
 }
 
 func (c *reconnectingBSDControl) Write(data []byte) (int, error) {
-	conn, err := c.connection()
-	if err != nil {
-		return 0, err
-	}
-	n, err := conn.Write(data)
-	if err != nil {
+	for {
+		conn, err := c.connection()
+		if err != nil {
+			return 0, err
+		}
+		n, _ := conn.Write(data)
+		if n == len(data) {
+			return n, nil
+		}
 		c.clearConnection(conn)
+		_ = conn.Close()
+		// Requests are newline-delimited frames. If the physical connection
+		// accepted only a prefix, that prefix disappears with its guest-side
+		// reader; resend the complete frame on the replacement connection.
 	}
-	return n, err
 }
 
 func (c *reconnectingBSDControl) Close() error {
