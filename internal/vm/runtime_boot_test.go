@@ -21,11 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
-	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/oci"
 )
 
@@ -271,7 +269,7 @@ func TestRuntimeArchiveTransferPreservesMountedXattrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantValue := []byte{0, 1, 0xff}
-	if err := unix.Setxattr(sourceFile, "user.vmsh-test", wantValue, 0); err != nil {
+	if err := setRuntimeTestXattr(sourceFile, "user.vmsh-test", wantValue); err != nil {
 		t.Skipf("host test filesystem does not support user xattrs: %v", err)
 	}
 	info, err := os.Lstat(sourceDir)
@@ -279,7 +277,7 @@ func TestRuntimeArchiveTransferPreservesMountedXattrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var input bytes.Buffer
-	if err := guestagent.WritePathTar(&input, sourceDir, filepath.Base(sourceDir), info); err != nil {
+	if err := writeRuntimePathTar(&input, sourceDir, filepath.Base(sourceDir), info); err != nil {
 		t.Fatal(err)
 	}
 
@@ -330,6 +328,9 @@ func TestRuntimeArchiveTransferPreservesMountedXattrs(t *testing.T) {
 }
 
 func TestRuntimeMountedImageFSRejectsUnsafeExchangeAndHonorsPOSIXLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("runtime helper archive requires a POSIX host")
+	}
 	helperDir := t.TempDir()
 	renameat2Syscall := 316
 	if runtime.GOARCH == "arm64" {
@@ -382,7 +383,7 @@ func main() {
 		t.Fatal(err)
 	}
 	var payload bytes.Buffer
-	if err := guestagent.WritePathTar(&payload, binaryPath, "lock-helper", info); err != nil {
+	if err := writeRuntimePathTar(&payload, binaryPath, "lock-helper", info); err != nil {
 		t.Fatal(err)
 	}
 
