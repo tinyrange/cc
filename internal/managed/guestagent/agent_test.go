@@ -4,10 +4,14 @@ package guestagent
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +22,75 @@ import (
 
 	"j5.nz/cc/client"
 )
+
+func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(Options{Name: "test", DialAddr: listener.Addr().String(), ConnectTries: 20, Context: ctx})
+	}()
+
+	first, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReader := bufio.NewReader(first)
+	if line, err := firstReader.ReadString('\n'); err != nil || strings.TrimSpace(line) != ReadyMarker {
+		t.Fatalf("first control ready = %q, %v", line, err)
+	}
+	_ = first.Close()
+
+	second, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := second.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	secondReader := bufio.NewReader(second)
+	if line, err := secondReader.ReadString('\n'); err != nil || strings.TrimSpace(line) != ReadyMarker {
+		t.Fatalf("replacement control ready = %q, %v", line, err)
+	}
+	encoder := json.NewEncoder(second)
+	if err := encoder.Encode(request{Kind: "exec", ID: "reconnected", Command: []string{"/bin/sh", "-c", "printf recovered"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(request{Kind: "stdin_close", ID: "reconnected"}); err != nil {
+		t.Fatal(err)
+	}
+	wantOutput := OutputMarkerPrefix + "reconnected:" + base64.StdEncoding.EncodeToString([]byte("recovered"))
+	gotOutput, gotExit := false, false
+	for !gotExit {
+		line, err := secondReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read replacement control result: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		gotOutput = gotOutput || line == wantOutput
+		gotExit = line == ExitMarkerPrefix+"reconnected:0"
+	}
+	if !gotOutput {
+		t.Fatal("replacement control did not receive command output")
+	}
+
+	cancel()
+	_ = second.Close()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run after cancellation = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop after cancellation")
+	}
+}
 
 func TestRootUserRequestClassification(t *testing.T) {
 	for _, user := range []string{"", "root", "0", "0:0", "root:wheel"} {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"strings"
 
 	"j5.nz/cc/client"
@@ -78,18 +77,8 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 		}
 	}
 
-	connCh := make(chan net.Conn, 1)
-	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
+	control, connected, acceptErrCh := acceptBSDControlConnections(ln, controlTranscript)
 
 	kvmVM, err = NewVM()
 	if err != nil {
@@ -128,15 +117,14 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 		done.finish(cfg.Run(runCtx, vmForRun, uart, pci, serialOut))
 	}()
 
-	var control net.Conn
 	select {
 	case err := <-acceptErrCh:
 		cleanupStartup()
 		return nil, bsdStartupError(err, serialOut.String(), controlTranscript.String())
-	case conn := <-connCh:
-		control = conn
+	case <-connected:
 	case <-done.done():
 		err := done.result()
+		_ = control.Close()
 		cleanupStartup()
 		return nil, bsdStartupError(err, serialOut.String(), controlTranscript.String())
 	case <-ctx.Done():

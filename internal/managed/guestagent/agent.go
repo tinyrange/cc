@@ -43,6 +43,7 @@ type Options struct {
 	DialAddr     string
 	ConnectTries int
 	PTY          PTY
+	Context      context.Context
 }
 
 type PTY interface {
@@ -183,13 +184,38 @@ type managedExec struct {
 func Run(opts Options) error {
 	opts = normalizeOptions(opts)
 	_ = os.Chdir("/")
-	conn, err := connectControl(opts)
-	if err != nil {
-		return err
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer conn.Close()
-	WriteProtocolLine(conn, ReadyMarker)
-	return commandLoop(opts, conn)
+	connected := false
+	for {
+		conn, err := connectControl(ctx, opts)
+		if err != nil {
+			if ctx.Err() != nil || !connected {
+				return err
+			}
+			writeConsole("ccx3-" + opts.Name + "-init: control reconnect failed; retrying: " + err.Error() + "\n")
+			continue
+		}
+		connected = true
+		WriteProtocolLine(conn, ReadyMarker)
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+			case <-done:
+			}
+		}()
+		err = commandLoop(opts, conn)
+		close(done)
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		writeConsole("ccx3-" + opts.Name + "-init: control connection lost; reconnecting: " + err.Error() + "\n")
+	}
 }
 
 func WriteConsole(s string) {
@@ -209,15 +235,23 @@ func normalizeOptions(opts Options) Options {
 	return opts
 }
 
-func connectControl(opts Options) (net.Conn, error) {
+func connectControl(ctx context.Context, opts Options) (net.Conn, error) {
 	var last error
 	for i := 0; i < opts.ConnectTries; i++ {
-		conn, err := net.DialTimeout("tcp4", opts.DialAddr, time.Second)
+		dialCtx, cancel := context.WithTimeout(ctx, time.Second)
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp4", opts.DialAddr)
+		cancel()
 		if err == nil {
 			return conn, nil
 		}
 		last = err
-		time.Sleep(250 * time.Millisecond)
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	return nil, fmt.Errorf("connect control: %w", last)
 }

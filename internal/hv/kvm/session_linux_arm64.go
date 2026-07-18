@@ -358,5 +358,5 @@ func transcriptError(err error, serialText, controlText string) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, serialText, controlText)
+	return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, boundedManagedTranscript(serialText), boundedManagedTranscript(controlText))
 }

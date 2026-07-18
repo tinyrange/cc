@@ -110,18 +110,8 @@ func startFreeBSDArm64ManagedSession(ctx context.Context, cfg freeBSDArm64Sessio
 		}
 	}
 
-	connCh := make(chan net.Conn, 1)
-	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
+	control, connected, acceptErrCh := acceptBSDControlConnections(ln, controlTranscript)
 
 	kvmVM, err = NewVM()
 	if err != nil {
@@ -181,15 +171,14 @@ func startFreeBSDArm64ManagedSession(ctx context.Context, cfg freeBSDArm64Sessio
 		done.finish(runFreeBSDArm64ManagedVM(runCtx, vmForRun, uart, pci, cfg.NetDevice, rng, serialOut))
 	}()
 
-	var control net.Conn
 	select {
 	case err := <-acceptErrCh:
 		cleanupStartup()
 		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
-	case conn := <-connCh:
-		control = conn
+	case <-connected:
 	case <-done.done():
 		err := done.result()
+		_ = control.Close()
 		cleanupStartup()
 		return nil, freeBSDStartupError(err, serialOut.String(), controlTranscript.String())
 	case <-ctx.Done():
