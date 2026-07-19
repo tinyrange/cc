@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -396,6 +397,25 @@ func (s *ContainerSession) VirtioFSStats() []virtio.FSStats {
 	return out
 }
 
+func (s *ContainerSession) BackingUsage() (current, highWater uint64, err error) {
+	if s == nil {
+		return 0, 0, nil
+	}
+	var errs []error
+	for i, fsdev := range s.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		deviceCurrent, deviceHighWater, deviceErr := fsdev.BackingUsage()
+		current += deviceCurrent
+		highWater += deviceHighWater
+		if deviceErr != nil {
+			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
+		}
+	}
+	return current, highWater, errors.Join(errs...)
+}
+
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	_, _ = ctx, forward
 	return fmt.Errorf("instance network port forwarding is not supported on darwin/arm64")
@@ -491,6 +511,8 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	execReq.User = user
 
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	var err error
 	if s.inlineExec {
@@ -575,6 +597,8 @@ func (s *ContainerSession) withControlDebug(op string, err error) error {
 func (s *ContainerSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.controlWriter(), managedagent.SyncRequest(id))
 	s.sendMu.Unlock()
@@ -679,6 +703,8 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	timing.Since(ctx, "exec.marshal_request", start)
 
 	transcriptStart := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(transcriptStart)
+	defer releaseTranscript()
 	writeStart := time.Now()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.controlWriter(), managedagent.ExecRequest(id, execReq))

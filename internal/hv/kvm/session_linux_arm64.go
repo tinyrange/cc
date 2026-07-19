@@ -258,6 +258,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
@@ -289,6 +291,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 func (s *ManagedSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.control, managedagent.SyncRequest(id))
 	s.sendMu.Unlock()

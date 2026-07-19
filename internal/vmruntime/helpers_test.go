@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,69 @@ func TestSerialTranscriptCloseWakesPollingReaderWithoutPanicking(t *testing.T) {
 	}
 	if err := <-done; !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("wait after close = %v", err)
+	}
+}
+
+func TestSerialTranscriptReclaimsReleasedReaderStorage(t *testing.T) {
+	transcript := NewSerialTranscript()
+	start := transcript.Len()
+	release := transcript.RetainFrom(start)
+	data := bytes.Repeat([]byte("x"), 8<<20)
+	if _, err := transcript.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if transcript.file == nil {
+		t.Fatal("large transcript did not spill")
+	}
+	before := transcript.Len()
+	release()
+	info, err := transcript.file.Stat()
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("released transcript backing = %#v, %v", info, err)
+	}
+	if transcript.Len() != before {
+		t.Fatalf("logical offset changed from %d to %d", before, transcript.Len())
+	}
+	if got := transcript.String(); len(got) > serialTranscriptTailBytes+128 {
+		t.Fatalf("diagnostic transcript retained %d bytes", len(got))
+	}
+
+	start = transcript.Len()
+	release = transcript.RetainFrom(start)
+	if _, err := transcript.Write([]byte("next-command\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, next := transcript.ReadFrom(start)
+	if got != "next-command\n" || next != transcript.Len() {
+		t.Fatalf("read after reclaim = %q, %d", got, next)
+	}
+	release()
+}
+
+func TestSerialTranscriptWaitForReadsGrowingStreamIncrementally(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < 16; i++ {
+			if _, err := transcript.Write(bytes.Repeat([]byte{'a'}, serialTranscriptReadBytes)); err != nil {
+				done <- err
+				return
+			}
+		}
+		_, err := transcript.Write([]byte("marker\n"))
+		done <- err
+	}()
+	text, err := transcript.WaitFor(t.Context(), 0, func(text string) bool {
+		return strings.HasSuffix(text, "marker\n")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) != 16*serialTranscriptReadBytes+len("marker\n") {
+		t.Fatalf("wait returned %d bytes", len(text))
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

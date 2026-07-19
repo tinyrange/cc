@@ -43,6 +43,10 @@ type StreamExecStats struct {
 }
 
 func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
+	if retained, ok := opts.Transcript.(interface{ RetainFrom(int) func() }); ok {
+		release := retained.RetainFrom(opts.Start)
+		defer release()
+	}
 	offset := opts.Start
 	var pending string
 	var stats StreamExecStats

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -57,6 +58,28 @@ func TestProcessFamilyFollowsSetsidDescendant(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("setsid descendant %d survived command-family cancellation", childPID)
+}
+
+type kernelTrackedFamily struct{ snapshots atomic.Int64 }
+
+func (t *kernelTrackedFamily) Snapshot() map[int]struct{} {
+	t.snapshots.Add(1)
+	return nil
+}
+func (*kernelTrackedFamily) Close() {}
+
+func TestKernelTrackedProcessFamilyDoesNotPollPerCommand(t *testing.T) {
+	tracker := &kernelTrackedFamily{}
+	family := newProcessFamily(os.Getpid()+100000, tracker)
+	defer family.Close()
+	time.Sleep(5 * processFamilyPollInterval)
+	if got := tracker.snapshots.Load(); got != 0 {
+		t.Fatalf("idle kernel-tracked command performed %d process scans", got)
+	}
+	_ = family.Signal(syscall.SIGTERM)
+	if got := tracker.snapshots.Load(); got != 1 {
+		t.Fatalf("cancellation performed %d process scans, want one", got)
+	}
 }
 
 func shellQuoteForTest(value string) string {

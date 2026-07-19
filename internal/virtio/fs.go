@@ -418,31 +418,34 @@ var fsReqPool = sync.Pool{
 }
 
 type FSStats struct {
-	Tag             string        `json:"tag"`
-	Async           bool          `json:"async"`
-	WorkerCount     int           `json:"worker_count"`
-	CacheMode       string        `json:"cache_mode"`
-	WritebackCache  bool          `json:"writeback_cache"`
-	EventIdx        bool          `json:"event_idx"`
-	MMIOReads       uint64        `json:"mmio_reads"`
-	MMIOWrites      uint64        `json:"mmio_writes"`
-	QueueNotifies   []uint64      `json:"queue_notifies"`
-	KickPollLoops   uint64        `json:"kick_poll_loops"`
-	KickPollHits    uint64        `json:"kick_poll_hits"`
-	KickPollMisses  uint64        `json:"kick_poll_misses"`
-	KickPollWorks   uint64        `json:"kick_poll_works"`
-	FUSERequests    uint64        `json:"fuse_requests"`
-	InterruptRaises uint64        `json:"interrupt_raises"`
-	IRQTransitions  uint64        `json:"irq_transitions"`
-	IRQHigh         bool          `json:"irq_high"`
-	InterruptStatus uint32        `json:"interrupt_status"`
-	QueueReady      []bool        `json:"queue_ready"`
-	QueueLastAvail  []uint16      `json:"queue_last_avail"`
-	QueueAvailIdx   []uint16      `json:"queue_avail_idx"`
-	QueueUsedIdx    []uint16      `json:"queue_used_idx"`
-	QueueNoNotify   []bool        `json:"queue_no_notify"`
-	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
-	Stages          []TimingStats `json:"stages"`
+	Tag                   string        `json:"tag"`
+	Async                 bool          `json:"async"`
+	WorkerCount           int           `json:"worker_count"`
+	CacheMode             string        `json:"cache_mode"`
+	WritebackCache        bool          `json:"writeback_cache"`
+	EventIdx              bool          `json:"event_idx"`
+	MMIOReads             uint64        `json:"mmio_reads"`
+	MMIOWrites            uint64        `json:"mmio_writes"`
+	QueueNotifies         []uint64      `json:"queue_notifies"`
+	KickPollLoops         uint64        `json:"kick_poll_loops"`
+	KickPollHits          uint64        `json:"kick_poll_hits"`
+	KickPollMisses        uint64        `json:"kick_poll_misses"`
+	KickPollWorks         uint64        `json:"kick_poll_works"`
+	FUSERequests          uint64        `json:"fuse_requests"`
+	InterruptRaises       uint64        `json:"interrupt_raises"`
+	IRQTransitions        uint64        `json:"irq_transitions"`
+	IRQHigh               bool          `json:"irq_high"`
+	InterruptStatus       uint32        `json:"interrupt_status"`
+	QueueReady            []bool        `json:"queue_ready"`
+	QueueLastAvail        []uint16      `json:"queue_last_avail"`
+	QueueAvailIdx         []uint16      `json:"queue_avail_idx"`
+	QueueUsedIdx          []uint16      `json:"queue_used_idx"`
+	QueueNoNotify         []bool        `json:"queue_no_notify"`
+	FUSEOps               []FUSEOpStats `json:"fuse_ops"`
+	Stages                []TimingStats `json:"stages"`
+	BackingBytes          uint64        `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes uint64        `json:"backing_high_water_bytes,omitempty"`
+	BackingReclaimError   string        `json:"backing_reclaim_error,omitempty"`
 }
 
 type FUSEOpStats struct {
@@ -2451,6 +2454,9 @@ func (f *FS) logPathf(op string, nodeID uint64, suffix string) {
 }
 
 func (f *FS) readIPAInto(addr uint64, dst []byte) error {
+	if f.mem == nil {
+		return fmt.Errorf("guest memory is detached")
+	}
 	if reader, ok := f.mem.(guestMemoryReaderInto); ok {
 		return reader.ReadIPAInto(addr, dst)
 	}
@@ -2465,6 +2471,9 @@ func (f *FS) readIPAInto(addr uint64, dst []byte) error {
 func (f *FS) writeIPAFrom(addr uint64, src []byte) error {
 	if len(src) == 0 {
 		return nil
+	}
+	if f.mem == nil {
+		return fmt.Errorf("guest memory is detached")
 	}
 	return f.mem.WriteIPA(addr, src)
 }
@@ -2785,7 +2794,7 @@ func (f *FS) Stats() FSStats {
 			stages = append(stages, stats)
 		}
 	}
-	return FSStats{
+	stats := FSStats{
 		Tag:             tag,
 		Async:           f.Async,
 		WorkerCount:     f.workerCount,
@@ -2812,6 +2821,32 @@ func (f *FS) Stats() FSStats {
 		FUSEOps:         ops,
 		Stages:          stages,
 	}
+	if provider, ok := f.backend.(interface {
+		BackingUsage() (uint64, uint64, error)
+	}); ok {
+		current, highWater, usageErr := provider.BackingUsage()
+		stats.BackingBytes, stats.BackingHighWaterBytes = current, highWater
+		if usageErr != nil {
+			stats.BackingReclaimError = usageErr.Error()
+		}
+	}
+	return stats
+}
+
+func (f *FS) BackingUsage() (current, highWater uint64, reclaimErr error) {
+	if f == nil {
+		return 0, 0, nil
+	}
+	f.mu.Lock()
+	backend := f.backend
+	f.mu.Unlock()
+	provider, ok := backend.(interface {
+		BackingUsage() (uint64, uint64, error)
+	})
+	if !ok {
+		return 0, 0, nil
+	}
+	return provider.BackingUsage()
 }
 
 func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
@@ -5395,6 +5430,13 @@ func (p *imageFS) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.dataStore.close()
+}
+
+func (p *imageFS) BackingUsage() (uint64, uint64, error) {
+	if p == nil {
+		return 0, 0, nil
+	}
+	return p.dataStore.usage()
 }
 
 func imageNodeXattrBytes(node *imageNode) int {

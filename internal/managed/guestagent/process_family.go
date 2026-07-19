@@ -77,7 +77,13 @@ func newProcessFamily(root int, tracker processFamilyTracker) *ProcessFamily {
 		return &ProcessFamily{done: make(chan struct{}), pids: make(map[int]struct{})}
 	}
 	f := &ProcessFamily{root: root, tracker: tracker, done: make(chan struct{}), pids: map[int]struct{}{root: {}}}
-	go f.watch()
+	// Linux cgroups already track forks, setsid, and daemon reparenting in the
+	// kernel. Per-command process-table polling is both redundant there and
+	// catastrophically expensive for many persistent contexts. Platforms
+	// without a kernel tracker retain the process-table observer.
+	if tracker == nil {
+		go f.watch()
+	}
 	return f
 }
 

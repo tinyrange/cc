@@ -181,6 +181,38 @@ func TestImageFSWrittenDataDoesNotAccumulateInHostHeap(t *testing.T) {
 	}
 }
 
+func TestImageFSDeletedDataReclaimsBackingStore(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, fh := createImageFile(t, backend, "temporary", "")
+	page := make([]byte, imageDataPageSize)
+	const written = 8 << 20
+	for off := 0; off < written; off += len(page) {
+		if _, errno := backend.Write(nodeID, fh, uint64(off), page, 0); errno != 0 {
+			t.Fatalf("write at %d: errno %d", off, errno)
+		}
+	}
+	current, highWater, err := backend.BackingUsage()
+	if err != nil || current != written || highWater != written {
+		t.Fatalf("usage after write = current %d high-water %d error %v", current, highWater, err)
+	}
+	if errno := backend.Unlink(1, "temporary"); errno != 0 {
+		t.Fatalf("unlink: errno %d", errno)
+	}
+	// POSIX keeps the unlinked file alive while its handle is open.
+	if current, _, _ := backend.BackingUsage(); current != written {
+		t.Fatalf("usage with open unlinked handle = %d, want %d", current, written)
+	}
+	backend.Release(nodeID, fh)
+	current, highWater, err = backend.BackingUsage()
+	if err != nil || current != 0 || highWater != written {
+		t.Fatalf("usage after final release = current %d high-water %d error %v", current, highWater, err)
+	}
+	info, err := backend.dataStore.file.Stat()
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("backing store after release = %#v, %v", info, err)
+	}
+}
+
 func TestImageFSDirectoryAndFileLinkCounts(t *testing.T) {
 	backend := newEmptyImageFS(t)
 	nodeID, fh := createImageFile(t, backend, "one", "data")

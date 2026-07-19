@@ -61,6 +61,18 @@ func TestFSStatsConcurrentTimingSnapshots(t *testing.T) {
 	}
 }
 
+func TestFSStatsRemainReadableAfterGuestMemoryDetaches(t *testing.T) {
+	fs := &FS{queues: make([]queue, 1)}
+	fs.queues[0].ready = true
+	fs.queues[0].size = 8
+	fs.queues[0].descAddr = 0x1000
+	fs.Attach(nil, nil)
+	stats := fs.Stats()
+	if len(stats.QueueAvailIdx) != 1 || stats.QueueAvailIdx[0] != 0 {
+		t.Fatalf("detached queue availability = %v", stats.QueueAvailIdx)
+	}
+}
+
 func assertTimingStatsDoNotRegress(t *testing.T, previous, current TimingStats) {
 	t.Helper()
 	if current.Count < previous.Count || current.TotalNanos < previous.TotalNanos || current.MaxNanos < previous.MaxNanos {

@@ -3,6 +3,7 @@ package vmruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,22 +30,28 @@ const (
 )
 
 type SerialTranscript struct {
-	mu       sync.Mutex
-	buf      []byte
-	file     *os.File
-	path     string
-	size     int
-	closed   bool
-	spillErr error
+	mu         sync.Mutex
+	buf        []byte
+	file       *os.File
+	path       string
+	base       int
+	fileBase   int
+	size       int
+	tail       []byte
+	readers    map[uint64]int
+	nextReader uint64
+	closed     bool
+	spillErr   error
 }
 
 const (
 	serialTranscriptMemoryBytes = 1 << 20
 	serialTranscriptReadBytes   = 256 << 10
+	serialTranscriptTailBytes   = 64 << 10
 )
 
 func NewSerialTranscript() *SerialTranscript {
-	s := &SerialTranscript{}
+	s := &SerialTranscript{readers: make(map[uint64]int)}
 	runtime.SetFinalizer(s, (*SerialTranscript).finalize)
 	return s
 }
@@ -55,9 +62,10 @@ func (s *SerialTranscript) Write(data []byte) (int, error) {
 	if s.closed {
 		return 0, os.ErrClosed
 	}
-	if s.file == nil && s.size+len(data) <= serialTranscriptMemoryBytes {
+	if s.file == nil && len(s.buf)+len(data) <= serialTranscriptMemoryBytes {
 		s.buf = append(s.buf, data...)
 		s.size += len(data)
+		s.appendTailLocked(data)
 		return len(data), nil
 	}
 	if s.file == nil {
@@ -66,8 +74,9 @@ func (s *SerialTranscript) Write(data []byte) (int, error) {
 			return 0, err
 		}
 	}
-	n, err := s.file.WriteAt(data, int64(s.size))
+	n, err := s.file.WriteAt(data, int64(s.size-s.fileBase))
 	s.size += n
+	s.appendTailLocked(data[:n])
 	return n, err
 }
 
@@ -91,7 +100,7 @@ func (s *SerialTranscript) openSpillLocked() error {
 			return err
 		}
 	}
-	s.file, s.path, s.buf = f, f.Name(), nil
+	s.file, s.path, s.buf, s.fileBase = f, f.Name(), nil, s.base
 	if err := os.Remove(s.path); err == nil {
 		s.path = ""
 	}
@@ -107,8 +116,82 @@ func (s *SerialTranscript) Len() int {
 func (s *SerialTranscript) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, _ := s.readLocked(0, s.size)
-	return string(data)
+	if len(s.tail) == s.size {
+		return string(s.tail)
+	}
+	return fmt.Sprintf("[... %d earlier transcript bytes omitted ...]\n%s", s.size-len(s.tail), s.tail)
+}
+
+func (s *SerialTranscript) appendTailLocked(data []byte) {
+	if len(data) >= serialTranscriptTailBytes {
+		s.tail = append(s.tail[:0], data[len(data)-serialTranscriptTailBytes:]...)
+		return
+	}
+	if drop := len(s.tail) + len(data) - serialTranscriptTailBytes; drop > 0 {
+		copy(s.tail, s.tail[drop:])
+		s.tail = s.tail[:len(s.tail)-drop]
+	}
+	s.tail = append(s.tail, data...)
+}
+
+// RetainFrom registers a live reader. Releasing it permits transcript storage
+// older than every remaining reader to be reclaimed. Offsets remain absolute,
+// so concurrent commands can finish in any order without invalidating cursors.
+func (s *SerialTranscript) RetainFrom(offset int) func() {
+	if s == nil {
+		return func() {}
+	}
+	s.mu.Lock()
+	if offset < s.base {
+		offset = s.base
+	}
+	s.nextReader++
+	id := s.nextReader
+	s.readers[id] = offset
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			delete(s.readers, id)
+			target := s.size
+			for _, readerOffset := range s.readers {
+				if readerOffset < target {
+					target = readerOffset
+				}
+			}
+			s.discardBeforeLocked(target)
+			s.mu.Unlock()
+		})
+	}
+}
+
+func (s *SerialTranscript) discardBeforeLocked(offset int) {
+	if offset <= s.base {
+		return
+	}
+	if offset > s.size {
+		offset = s.size
+	}
+	if s.file == nil {
+		drop := offset - s.base
+		if drop >= len(s.buf) {
+			s.buf = nil
+		} else {
+			s.buf = append(s.buf[:0], s.buf[drop:]...)
+		}
+		s.base = offset
+		return
+	}
+	if offset == s.size {
+		if err := s.file.Truncate(0); err != nil {
+			s.spillErr = errors.Join(s.spillErr, err)
+			return
+		}
+		s.base, s.fileBase = offset, offset
+		return
+	}
+	s.base = offset
 }
 
 // ReadFrom returns only transcript bytes at and after offset. Callers which
@@ -120,6 +203,9 @@ func (s *SerialTranscript) ReadFrom(offset int) (string, int) {
 	defer s.mu.Unlock()
 	if offset < 0 {
 		offset = 0
+	}
+	if offset < s.base {
+		offset = s.base
 	}
 	if offset > s.size {
 		offset = s.size
@@ -136,6 +222,9 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 	if start < 0 {
 		start = 0
 	}
+	if start < s.base {
+		start = s.base
+	}
 	if end > s.size {
 		end = s.size
 	}
@@ -143,10 +232,10 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 		return nil, nil
 	}
 	if s.file == nil {
-		return append([]byte(nil), s.buf[start:end]...), s.spillErr
+		return append([]byte(nil), s.buf[start-s.base:end-s.base]...), s.spillErr
 	}
 	data := make([]byte, end-start)
-	n, err := s.file.ReadAt(data, int64(start))
+	n, err := s.file.ReadAt(data, int64(start-s.fileBase))
 	if errors.Is(err, io.EOF) && n == len(data) {
 		err = nil
 	}
@@ -154,22 +243,44 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 }
 
 func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
+	var accumulated strings.Builder
+	offset := start
+	dirty := false
 	for {
-		s.mu.Lock()
-		data, err := s.readLocked(start, s.size)
-		s.mu.Unlock()
-		if err != nil {
-			return "", err
-		}
-		text := string(data)
-		if predicate(text) {
-			return text, nil
+		text, next := s.ReadFrom(offset)
+		if next > offset {
+			accumulated.WriteString(text)
+			offset = next
+			dirty = true
+			continue
+		} else {
+			s.mu.Lock()
+			err := s.spillErr
+			closed := s.closed
+			s.mu.Unlock()
+			if err != nil {
+				return "", err
+			}
+			if closed {
+				return "", os.ErrClosed
+			}
 		}
 
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
+		// Debounce the predicate until the producer is momentarily quiescent.
+		// Managed stdout arrives as many small protocol lines; reparsing the
+		// complete command after every line is otherwise quadratic even though
+		// the backing transcript itself is streamed.
 		time.Sleep(5 * time.Millisecond)
+		if s.Len() > offset {
+			continue
+		}
+		if dirty && predicate(accumulated.String()) {
+			return accumulated.String(), nil
+		}
+		dirty = false
 	}
 }
 
@@ -185,7 +296,7 @@ func (s *SerialTranscript) Close() error {
 	}
 	s.closed = true
 	f, path := s.file, s.path
-	s.file, s.path, s.buf, s.size = nil, "", nil, 0
+	s.file, s.path, s.buf, s.tail, s.readers, s.size = nil, "", nil, nil, nil, 0
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {

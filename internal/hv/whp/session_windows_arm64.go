@@ -234,6 +234,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed exec %s start command=%q\n", id, strings.Join(req.Command, " "))
 	}
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
@@ -279,6 +281,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed stream %s start command=%q\n", id, strings.Join(req.Command, " "))
 	}
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	if err := s.sendExecMessage(managedagent.ExecRequest(id, req)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -353,6 +357,8 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed flush %s start\n", id)
 	}
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	if err := s.sendExecMessage(managedagent.SyncRequest(id)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}

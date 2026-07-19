@@ -67,6 +67,10 @@ type instanceBalloonController interface {
 	SetBalloonMB(uint64) error
 }
 
+type instanceBackingUsageProvider interface {
+	BackingUsage() (uint64, uint64, error)
+}
+
 type Manager struct {
 	mu            sync.Mutex
 	host          VMHost
@@ -914,10 +918,11 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 }
 
 type managerStatusSnapshot struct {
-	id       string
-	machine  *Machine
-	state    client.InstanceState
-	provider networkIPv4Provider
+	id              string
+	machine         *Machine
+	state           client.InstanceState
+	provider        networkIPv4Provider
+	backingProvider instanceBackingUsageProvider
 }
 
 func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
@@ -953,20 +958,32 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
 		snapshot.provider = provider
 	}
+	if provider, ok := machine.instance.(instanceBackingUsageProvider); ok {
+		snapshot.backingProvider = provider
+	}
 	return snapshot
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil {
 		return snapshot.state
 	}
-	ipv4 := snapshot.provider.NetworkIPv4()
+	if snapshot.provider != nil {
+		snapshot.state.NetworkIPv4 = snapshot.provider.NetworkIPv4()
+	}
+	if snapshot.backingProvider != nil {
+		current, highWater, err := snapshot.backingProvider.BackingUsage()
+		snapshot.state.BackingBytes = current
+		snapshot.state.BackingHighWaterBytes = highWater
+		if err != nil {
+			snapshot.state.BackingReclaimError = err.Error()
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running == nil || m.running[snapshot.id] != snapshot.machine {
 		return m.statusSnapshotLocked(snapshot.id).state
 	}
-	snapshot.state.NetworkIPv4 = ipv4
 	return snapshot.state
 }
 

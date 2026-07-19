@@ -128,6 +128,27 @@ func TestManagerRetargetsRunningGuestBalloon(t *testing.T) {
 	}
 }
 
+func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &backingUsageTestInstance{
+		fakeInstance: newFakeInstance(),
+		current:      3 << 20,
+		highWater:    9 << 20,
+		reclaimErr:   errors.New("backing filesystem refused reclamation"),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "backing", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	state := manager.StatusOf("backing")
+	if state.MemoryMB != 512 || state.BackingBytes != 3<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
+		t.Fatalf("reported state = %+v", state)
+	}
+}
+
 func TestManagerStatusProviderDoesNotBlockManagementAndReconcilesShutdown(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -1134,6 +1155,17 @@ type fakeInstance struct {
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
 	waitErr        error
 	balloonTarget  uint64
+}
+
+type backingUsageTestInstance struct {
+	*fakeInstance
+	current    uint64
+	highWater  uint64
+	reclaimErr error
+}
+
+func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, error) {
+	return i.current, i.highWater, i.reclaimErr
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

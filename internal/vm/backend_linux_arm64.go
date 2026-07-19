@@ -575,6 +575,13 @@ func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
 	return virtioFSStats(i.fsdevs)
 }
 
+func (i *linuxInstance) BackingUsage() (uint64, uint64, error) {
+	if i == nil {
+		return 0, 0, nil
+	}
+	return virtioFSBackingUsage(i.fsdevs)
+}
+
 func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil {
 		return client.ExecRequest{}, fmt.Errorf("instance is not running")
