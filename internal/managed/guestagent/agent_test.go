@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/protocol"
 )
 
 func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
@@ -145,9 +146,6 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := encoder.Encode(request{Kind: "stdin_close", ID: "empty-stdin-cancel"}); err != nil {
-		t.Fatal(err)
-	}
 	for {
 		line, err := secondReader.ReadString('\n')
 		if err != nil {
@@ -157,17 +155,19 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 			break
 		}
 	}
-	if err := encoder.Encode(request{Kind: "signal", ID: "empty-stdin-cancel", Signal: "KILL"}); err != nil {
+	if err := encoder.Encode(request{Kind: "signal", ID: "empty-stdin-cancel", Signal: "KILL", ControlID: "cancel-1"}); err != nil {
 		t.Fatal(err)
 	}
-	for {
+	gotAck := false
+	gotCancelExit := false
+	for !gotAck || !gotCancelExit {
 		line, err := secondReader.ReadString('\n')
 		if err != nil {
 			t.Fatalf("read empty-stdin cancellation: %v", err)
 		}
-		if strings.TrimSpace(line) == ExitMarkerPrefix+"empty-stdin-cancel:137" {
-			break
-		}
+		line = strings.TrimSpace(line)
+		gotAck = gotAck || line == protocol.ControlAckPrefix+"cancel-1"
+		gotCancelExit = gotCancelExit || line == ExitMarkerPrefix+"empty-stdin-cancel:137"
 	}
 
 	cancel()

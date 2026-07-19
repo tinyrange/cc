@@ -11,6 +11,7 @@ const (
 	UsageMarkerPrefix   = "__CCX3_USAGE__:"
 	ExitMarkerPrefix    = "__CCX3_EXIT__:"
 	TimingMarkerPrefix  = "__CCX3_TIMING__:"
+	ControlAckPrefix    = "__CCX3_ACK__:"
 )
 
 type ManagedExecRequest struct {
@@ -29,6 +30,7 @@ type ManagedExecRequest struct {
 	ControlFD     bool                  `json:"control_fd,omitempty"`
 	Kind          string                `json:"kind,omitempty"`
 	Signal        string                `json:"signal,omitempty"`
+	ControlID     string                `json:"control_id,omitempty"`
 	Cols          int                   `json:"cols,omitempty"`
 	Rows          int                   `json:"rows,omitempty"`
 	ArchiveLimits *client.ArchiveLimits `json:"archive_limits,omitempty"`

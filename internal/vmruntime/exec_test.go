@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/protocol"
 )
 
 func TestExtractManagedExecResultCollectsOutputStderrAndUsage(t *testing.T) {
@@ -183,6 +184,13 @@ func TestEnvHelpers(t *testing.T) {
 	}
 	if got := DefaultHostname(" (none) "); got != "ccx3" {
 		t.Fatalf("DefaultHostname = %q, want ccx3", got)
+	}
+}
+
+func TestHasManagedControlAck(t *testing.T) {
+	text := protocol.ControlAckPrefix + "signal-7\n"
+	if !HasManagedControlAck(text, "signal-7") || HasManagedControlAck(text, "signal-8") {
+		t.Fatalf("control acknowledgement matching failed for %q", text)
 	}
 }
 

@@ -13,12 +13,14 @@ type ActiveExecSet struct {
 	mu                sync.Mutex
 	active            map[string]ActiveExec
 	pendingStdinClose map[string]bool
+	acknowledged      map[string]map[string]struct{}
 }
 
 func NewActiveExecSet() *ActiveExecSet {
 	return &ActiveExecSet{
 		active:            map[string]ActiveExec{},
 		pendingStdinClose: map[string]bool{},
+		acknowledged:      map[string]map[string]struct{}{},
 	}
 }
 
@@ -42,6 +44,29 @@ func (s *ActiveExecSet) Delete(id string) {
 	defer s.mu.Unlock()
 	delete(s.active, id)
 	delete(s.pendingStdinClose, id)
+	delete(s.acknowledged, id)
+}
+
+func (s *ActiveExecSet) ControlAcknowledged(id, controlID string) bool {
+	if s == nil || id == "" || controlID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.acknowledged[id][controlID]
+	return ok
+}
+
+func (s *ActiveExecSet) AcknowledgeControl(id, controlID string) {
+	if s == nil || id == "" || controlID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.acknowledged[id] == nil {
+		s.acknowledged[id] = make(map[string]struct{})
+	}
+	s.acknowledged[id][controlID] = struct{}{}
 }
 
 func (s *ActiveExecSet) Get(id string) ActiveExec {

@@ -294,6 +294,14 @@ func (v *Vsock) Poke() error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	// A backend read can queue a packet just before the guest replenishes the
+	// RX ring. If the corresponding queue notification is missed, merely
+	// raising an interrupt leaves that packet pending forever because there is
+	// no used descriptor for the guest to discover. Retry delivery before the
+	// wakeup so periodic keepalives make forward progress.
+	if err := v.processRXLocked(); err != nil {
+		return err
+	}
 	if v.irq == nil {
 		return nil
 	}

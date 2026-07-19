@@ -387,7 +387,13 @@ func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveE
 				startManagedExec(opts, control, active, req, stdinR, managed)
 				continue
 			}
-			pending.Put(req.ID, req)
+			// Start streamed commands before their first stdin message. Keeping
+			// them pending made a signal race with stdin_close: the signal could
+			// be discarded before the command became active, leaving it running
+			// indefinitely. EOF remains explicit and is delivered by stdin_close.
+			stdinR, stdinW := io.Pipe()
+			managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
+			startManagedExec(opts, control, active, req, stdinR, managed)
 		case "sync":
 			go runSync(control, req.ID)
 		case "fs_mkdir":
@@ -433,11 +439,19 @@ func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveE
 				ID:   req.ID,
 			})
 		case "signal":
-			_ = HandleActiveControl(active, ActiveControlRequest{
+			if req.ControlID != "" && active.ControlAcknowledged(req.ID, req.ControlID) {
+				WriteProtocolLine(control, protocol.ControlAckPrefix+req.ControlID)
+				continue
+			}
+			result := HandleActiveControl(active, ActiveControlRequest{
 				Kind:   req.Kind,
 				ID:     req.ID,
 				Signal: req.Signal,
 			})
+			if req.ControlID != "" && result.Found && result.Err == nil {
+				active.AcknowledgeControl(req.ID, req.ControlID)
+				WriteProtocolLine(control, protocol.ControlAckPrefix+req.ControlID)
+			}
 		case "resize":
 			_ = HandleActiveControl(active, ActiveControlRequest{
 				Kind: req.Kind,
@@ -564,10 +578,13 @@ func (m *managedExec) signal(name string) error {
 	process := m.process
 	family := m.family
 	m.processMu.Unlock()
+	// Deliver the requested signal to the command's process group first. A
+	// descendant tracker is best-effort bookkeeping for processes which escaped
+	// that group; it must not delay or prevent the ordinary command lifecycle.
+	groupErr := signalProcessGroup(process, sig)
 	if family != nil {
 		err = family.Signal(sig)
 	}
-	groupErr := signalProcessGroup(process, sig)
 	if err == nil {
 		err = groupErr
 	}

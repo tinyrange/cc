@@ -107,18 +107,20 @@ func WriteFull(w io.Writer, payload []byte) error {
 	return nil
 }
 
-func ForwardInputs(ctx context.Context, id string, inputs <-chan client.ExecInput, send SendFunc) {
+func ForwardInputs(ctx context.Context, id string, inputs <-chan client.ExecInput, send SendFunc) error {
 	stdinClosed := false
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case input, ok := <-inputs:
 			if !ok {
 				if !stdinClosed {
-					_ = send(StdinCloseRequest(id))
+					if err := send(StdinCloseRequest(id)); err != nil {
+						return err
+					}
 				}
-				return
+				return nil
 			}
 			if input.Kind == "stdin_close" {
 				if stdinClosed {
@@ -129,7 +131,9 @@ func ForwardInputs(ctx context.Context, id string, inputs <-chan client.ExecInpu
 				continue
 			}
 			if msg, ok := InputRequest(id, input); ok {
-				_ = send(msg)
+				if err := send(msg); err != nil {
+					return err
+				}
 			}
 		}
 	}

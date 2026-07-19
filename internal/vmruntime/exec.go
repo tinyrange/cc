@@ -23,6 +23,10 @@ func HasManagedExecFirstByte(text, id string) bool {
 		strings.Contains(text, CommandExitMarkerPref+id+":")
 }
 
+func HasManagedControlAck(text, controlID string) bool {
+	return controlID != "" && strings.Contains(text, protocol.ControlAckPrefix+controlID)
+}
+
 func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, *client.ResourceUsage, bool) {
 	beginMarker := CommandBeginMarker + id
 	outputPrefix := CommandOutputMarker + id + ":"

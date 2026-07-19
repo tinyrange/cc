@@ -19,6 +19,8 @@ const (
 	execTerminateGrace = 500 * time.Millisecond
 	execKillWait       = 2 * time.Second
 	execKeepalive      = 100 * time.Millisecond
+	execSignalAckWait  = 100 * time.Millisecond
+	execSignalAttempts = 5
 )
 
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -32,14 +34,19 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
 	defer stopKeepalive()
+	inputErr := make(chan error, 1)
 	if inputs != nil {
-		go s.forwardExecInputs(ctx, id, inputs)
+		go func() {
+			if err := s.forwardExecInputs(ctx, id, inputs); err != nil {
+				inputErr <- err
+			}
+		}()
 	} else if len(req.Stdin) == 0 && !req.TTY {
 		if err := s.sendStdinClose(id); err != nil {
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	return s.streamExecEvents(ctx, start, id, onEvent)
+	return s.streamExecEvents(ctx, start, id, inputErr, onEvent)
 }
 
 // startExecKeepalive gives a blocked restored vCPU a periodic interrupt while
@@ -92,16 +99,54 @@ func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error 
 	return managedagent.Send(s.control, managedagent.ExecRequest(id, req))
 }
 
-func (s *ManagedSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
-	managedagent.ForwardInputs(ctx, id, inputs, s.sendExecMessage)
+func (s *ManagedSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) error {
+	return managedagent.ForwardInputs(ctx, id, inputs, func(msg vmruntime.ManagedExecRequest) error {
+		if msg.Kind == "signal" {
+			return s.sendExecSignal(ctx, id, msg.Signal)
+		}
+		return s.sendExecMessage(msg)
+	})
 }
 
 func (s *ManagedSession) sendExecInput(id string, input client.ExecInput) error {
+	if input.Kind == "signal" {
+		ctx, cancel := context.WithTimeout(context.Background(), execSignalAckWait*execSignalAttempts)
+		defer cancel()
+		return s.sendExecSignal(ctx, id, input.Signal)
+	}
 	msg, ok := managedagent.InputRequest(id, input)
 	if !ok {
 		return nil
 	}
 	return s.sendExecMessage(msg)
+}
+
+func (s *ManagedSession) sendExecSignal(ctx context.Context, id, signal string) error {
+	controlID := id + "-" + strconv.FormatUint(s.nextID.Add(1), 10)
+	msg, _ := managedagent.InputRequest(id, client.ExecInput{Kind: "signal", Signal: signal})
+	msg.ControlID = controlID
+	start := s.transcript.Len()
+	var lastErr error
+	for attempt := 0; attempt < execSignalAttempts; attempt++ {
+		if err := s.sendExecMessage(msg); err != nil {
+			lastErr = err
+		} else {
+			ackCtx, cancel := context.WithTimeout(ctx, execSignalAckWait)
+			_, err := s.waitForTranscript(ackCtx, start, func(text string) bool {
+				return vmruntime.HasManagedControlAck(text, controlID)
+			})
+			cancel()
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		_ = s.vsock.Poke()
+	}
+	return fmt.Errorf("guest did not acknowledge %s signal for exec %s: %w", signal, id, lastErr)
 }
 
 func (s *ManagedSession) sendStdinClose(id string) error {
@@ -114,7 +159,7 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	return managedagent.Send(s.control, msg)
 }
 
-func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, inputErr <-chan error, onEvent func(client.ExecEvent) error) error {
 	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
 		Start:      start,
@@ -128,6 +173,8 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 		},
 		Wait: func(context.Context) error {
 			select {
+			case err := <-inputErr:
+				return fmt.Errorf("deliver exec input: %w", err)
 			case <-s.done.done():
 				return sessionExitError(s.done.result())
 			case <-ctx.Done():
