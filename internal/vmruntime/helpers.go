@@ -331,6 +331,11 @@ func (s *SerialTranscript) discardBeforeLocked(offset int) {
 // transcript: guest output can be arbitrarily large, and doing so lets bulk
 // output delay unrelated command lifecycle and cancellation events.
 func (s *SerialTranscript) ReadFrom(offset int) (string, int) {
+	text, next, _ := s.readFrom(offset)
+	return text, next
+}
+
+func (s *SerialTranscript) readFrom(offset int) (string, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if offset < 0 {
@@ -343,8 +348,8 @@ func (s *SerialTranscript) ReadFrom(offset int) (string, int) {
 		offset = s.size
 	}
 	end := min(s.size, offset+serialTranscriptReadBytes)
-	data, _ := s.readLocked(offset, end)
-	return string(data), end
+	data, err := s.readLocked(offset, end)
+	return string(data), offset + len(data), err
 }
 
 func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
@@ -431,7 +436,10 @@ func (s *SerialTranscript) waitFor(ctx context.Context, start int, commandID str
 	offset := start
 	dirty := false
 	for {
-		text, next := s.ReadFrom(offset)
+		text, next, readErr := s.readFrom(offset)
+		if readErr != nil {
+			return "", readErr
+		}
 		if next > offset {
 			if commandID != "" {
 				var terminal bool
@@ -482,7 +490,7 @@ func (s *SerialTranscript) waitFor(ctx context.Context, start int, commandID str
 			continue
 		}
 		if dirty {
-			candidate := window
+			candidate := string(window)
 			if commandID != "" {
 				if record, terminal := commandRecord(partialLine, commandID); len(record) != 0 && terminal {
 					terminalDirty = true
@@ -492,17 +500,17 @@ func (s *SerialTranscript) waitFor(ctx context.Context, start int, commandID str
 					continue
 				}
 				var err error
-				candidate, err = commandRecords.materialize()
+				candidate, err = commandRecords.materializeString()
 				if err != nil {
 					return "", err
 				}
 				if record, _ := commandRecord(partialLine, commandID); len(record) != 0 {
-					candidate = append(candidate, record...)
+					candidate += string(record)
 				}
 				terminalDirty = false
 			}
-			if predicate(string(candidate)) {
-				return string(candidate), nil
+			if predicate(candidate) {
+				return candidate, nil
 			}
 		}
 		dirty = false
@@ -549,15 +557,16 @@ func commandRecord(line []byte, id string) ([]byte, bool) {
 	return nil, false
 }
 
-func (s *SerialTranscript) materialize() ([]byte, error) {
+func (s *SerialTranscript) materializeString() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out bytes.Buffer
+	var out strings.Builder
+	out.Grow(s.size - s.base)
 	for offset := s.base; offset < s.size; {
 		next := min(s.size, offset+serialTranscriptReadBytes)
 		data, err := s.readLocked(offset, next)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		if len(data) == 0 {
 			break
@@ -565,7 +574,7 @@ func (s *SerialTranscript) materialize() ([]byte, error) {
 		_, _ = out.Write(data)
 		offset += len(data)
 	}
-	return out.Bytes(), nil
+	return out.String(), nil
 }
 
 func (s *SerialTranscript) Close() error {

@@ -103,6 +103,7 @@ type ServerOptions struct {
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
 	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
 	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
+	CompleteRequest        func(string, uint64, RuntimeView)
 }
 
 type RuntimeView interface {
@@ -687,6 +688,10 @@ func newWorkerOperationRegistry() *workerOperationRegistry {
 }
 
 func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(context.Context)) {
+	r.startWithCleanup(frameID, vmID, run, nil)
+}
+
+func (r *workerOperationRegistry) startWithCleanup(frameID uint64, vmID string, run func(context.Context), cleanup func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var previous <-chan struct{}
 	var done chan struct{}
@@ -701,6 +706,9 @@ func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(co
 
 	go func() {
 		defer cancel()
+		if cleanup != nil {
+			defer cleanup()
+		}
 		defer func() {
 			r.mu.Lock()
 			delete(r.active, frameID)
@@ -911,7 +919,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+			operations.startWithCleanup(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
 				state, err := srvState.vms.StartStream(ctx, req, func(event client.BootEvent) error {
 					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
 				})
@@ -920,6 +928,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					return
 				}
 				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+			}, func() {
+				if opts.CompleteRequest != nil {
+					opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+				}
 			})
 		case vm.WorkerFrameStartBlank:
 			var req client.StartInstanceRequest
@@ -935,7 +947,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+			operations.startWithCleanup(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
 				state, err := srvState.vms.StartBlankStream(ctx, req, func(event client.BootEvent) error {
 					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
 				})
@@ -944,6 +956,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					return
 				}
 				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+			}, func() {
+				if opts.CompleteRequest != nil {
+					opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+				}
 			})
 		case vm.WorkerFrameStatus:
 			var req vm.WorkerStatusRequest
@@ -1742,6 +1758,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -1889,6 +1908,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -2034,6 +2056,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+		}
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if req.Image != "" && !builtInBSDImage {
 			if _, err := srvState.images.Open(req.Image); err != nil {
@@ -2081,7 +2106,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
 			_ = ws.SetDeadline(time.Time{})
-			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, opts.CompleteRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
 				if err := srvState.vms.RunStream(runCtx, req, inputs, onEvent); err != nil {
@@ -2308,7 +2333,7 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}
 }
 
-func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, complete func(string, uint64, RuntimeView), runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
 	defer ws.Close()
 
 	var req client.RunRequest
@@ -2321,6 +2346,9 @@ func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
 			return
 		}
+	}
+	if complete != nil {
+		defer complete(req.ID, req.PolicyToken, runtime)
 	}
 
 	inputs := make(chan client.ExecInput, 16)

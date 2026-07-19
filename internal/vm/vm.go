@@ -600,9 +600,10 @@ func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation
 
 func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
 	machine.lifecycleMu.Lock()
-	machine.balloonMu.Lock()
+	// Closing the instance is the recovery mechanism for a backend balloon
+	// request which has stopped making progress. Do not wait behind balloonMu:
+	// Close must be allowed to tear down the device and make that request return.
 	err := machine.instance.Close()
-	machine.balloonMu.Unlock()
 	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
@@ -693,29 +694,54 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		}
 		return err
 	}
-	for _, share := range req.Shares {
-		locked, unlock, lockErr := m.lockMachineOperation(id)
-		if lockErr != nil {
-			return lockErr
-		}
-		if locked != machine {
-			unlock()
-			return stoppedVMError(id)
-		}
-		err := machine.instance.AddShare(ctx, share)
+	if err := validateRuntimeShares(req.Shares); err != nil {
+		return err
+	}
+	locked, unlock, lockErr := m.lockMachineOperation(id)
+	if lockErr != nil {
+		return lockErr
+	}
+	if locked != machine {
 		unlock()
+		return stoppedVMError(id)
+	}
+	for _, share := range req.Shares {
+		err := machine.instance.AddShare(ctx, share)
 		if err != nil {
+			unlock()
 			if m.instanceIsStopping(id, machine) {
 				return stoppedVMError(id)
 			}
 			return err
 		}
 	}
+	unlock()
 	err := machine.instance.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	if err != nil && m.instanceIsStopping(id, machine) {
 		return stoppedVMError(id)
 	}
 	return err
+}
+
+func validateRuntimeShares(shares []client.ShareMount) error {
+	seen := make(map[string]client.ShareMount, len(shares))
+	for _, share := range shares {
+		mount := strings.TrimSpace(share.Mount)
+		if mount == "" {
+			return fmt.Errorf("share mount path is required")
+		}
+		if !strings.HasPrefix(mount, "/") {
+			return fmt.Errorf("share mount path %q must be absolute", mount)
+		}
+		if existing, ok := seen[mount]; ok {
+			if existing.Source != share.Source || existing.Writable != share.Writable || existing.Cache != share.Cache {
+				return fmt.Errorf("share mount %q is specified more than once with different settings", mount)
+			}
+			continue
+		}
+		seen[mount] = share
+	}
+	return nil
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {

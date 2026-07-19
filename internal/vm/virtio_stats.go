@@ -28,6 +28,9 @@ func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uin
 			continue
 		}
 		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
+		metadataCurrent, metadataHighWater := fsdev.BackingMetadataUsage()
+		deviceCurrent += metadataCurrent
+		deviceHighWater += metadataHighWater
 		current += deviceCurrent
 		highWater += deviceHighWater
 		physical += devicePhysical

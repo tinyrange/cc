@@ -63,6 +63,32 @@ func TestSerialTranscriptCloseWakesPollingReaderWithoutPanicking(t *testing.T) {
 	}
 }
 
+func TestSerialTranscriptReadErrorNeverAdvancesPastDeliveredBytes(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	data := bytes.Repeat([]byte("x"), (2<<20)+17)
+	if _, err := transcript.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	transcript.mu.Lock()
+	if transcript.file == nil {
+		transcript.mu.Unlock()
+		t.Fatal("transcript did not spill")
+	}
+	if err := transcript.file.Truncate(1); err != nil {
+		transcript.mu.Unlock()
+		t.Fatal(err)
+	}
+	transcript.mu.Unlock()
+	text, next, err := transcript.readFrom(0)
+	if err == nil {
+		t.Fatal("short backing read was not reported")
+	}
+	if next != len(text) || next > 1 {
+		t.Fatalf("short read delivered %d bytes but advanced to %d", len(text), next)
+	}
+}
+
 func TestSerialTranscriptReclaimsReleasedReaderStorage(t *testing.T) {
 	transcript := NewSerialTranscript()
 	start := transcript.Len()

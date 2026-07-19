@@ -126,10 +126,11 @@ func (i *managedInstance) closeNetwork() {
 	}
 	i.netOnce.Do(func() {
 		i.netMu.Lock()
-		defer i.netMu.Unlock()
-		if i.network != nil {
-			_ = i.network.Close()
-			i.network = nil
+		network := i.network
+		i.network = nil
+		i.netMu.Unlock()
+		if network != nil {
+			_ = network.Close()
 		}
 	})
 }

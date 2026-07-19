@@ -365,6 +365,7 @@ type CreateInstanceRequest struct {
 	SnapshotDir     string         `json:"snapshot_dir,omitempty"`
 	RestoreSnapshot string         `json:"restore_snapshot,omitempty"`
 	TimeoutSeconds  float64        `json:"timeout_seconds,omitempty"`
+	PolicyToken     uint64         `json:"-"`
 }
 
 type StartInstanceRequest struct {
@@ -383,6 +384,7 @@ type StartInstanceRequest struct {
 	SnapshotDir     string         `json:"snapshot_dir,omitempty"`
 	RestoreSnapshot string         `json:"restore_snapshot,omitempty"`
 	TimeoutSeconds  float64        `json:"timeout_seconds,omitempty"`
+	PolicyToken     uint64         `json:"-"`
 }
 
 type InstanceState struct {
@@ -437,6 +439,7 @@ type RunRequest struct {
 	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
 	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
+	PolicyToken    uint64         `json:"-"`
 }
 
 type ExecResponse struct {

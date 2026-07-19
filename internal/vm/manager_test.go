@@ -128,7 +128,7 @@ func TestManagerRetargetsRunningGuestBalloon(t *testing.T) {
 	}
 }
 
-func TestManagerSerializesBalloonRetargetWithShutdown(t *testing.T) {
+func TestManagerShutdownAbortsHungBalloonRetarget(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
 	inst := &blockingBalloonInstance{
@@ -152,22 +152,22 @@ func TestManagerSerializesBalloonRetargetWithShutdown(t *testing.T) {
 	for manager.StatusOf("pressure").Status != "stopping" && time.Now().Before(deadline) {
 		runtime.Gosched()
 	}
-	if state := manager.StatusOf("pressure"); state.Status != "stopping" || state.BalloonStatus != "" {
+	if state := manager.StatusOf("pressure"); state.Status != "stopping" && state.Status != "stopped" {
 		t.Fatalf("state while shutdown owns the VM = %+v", state)
 	}
 	select {
 	case <-inst.closeStarted:
-		t.Fatal("instance close raced an active balloon device operation")
-	default:
+	case <-time.After(time.Second):
+		t.Fatal("instance close waited behind a hung balloon device operation")
 	}
 	if err := manager.SetInstanceBalloon("pressure", 512); err == nil {
 		t.Fatal("balloon retarget was accepted after shutdown took ownership")
 	}
-	close(inst.releaseBalloon)
-	if err := <-balloonDone; err != nil {
+	if err := <-shutdownDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-shutdownDone; err != nil {
+	close(inst.releaseBalloon)
+	if err := <-balloonDone; err != nil {
 		t.Fatal(err)
 	}
 }
@@ -238,6 +238,30 @@ func TestManagerRunStreamShareMutationCannotRaceShutdown(t *testing.T) {
 	}
 	if err := <-shutdownDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerRunStreamValidatesAllSharesBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shares", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.RunStreamIn(ctx, "shares", client.RunRequest{
+		Image: "alpine", Command: []string{"true"},
+		Shares: []client.ShareMount{{Source: "/host/one", Mount: "/one"}, {Source: "/host/two"}},
+	}, nil, nil)
+	if err == nil {
+		t.Fatal("invalid share set was admitted")
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if len(inst.shares) != 0 {
+		t.Fatalf("failed multi-share request left mutations: %+v", inst.shares)
 	}
 }
 

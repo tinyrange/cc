@@ -1,13 +1,31 @@
 package virtio
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"runtime"
 	"testing"
 	"time"
 
 	"j5.nz/cc/internal/imagefs"
 )
+
+type copyUpProbeFile struct {
+	calls [][2]uint64
+}
+
+func (f *copyUpProbeFile) Stat() (uint64, fs.FileMode) { return (uint64(4) << 30) + 7, 0o644 }
+func (f *copyUpProbeFile) ModTime() time.Time          { return time.Unix(0, 0) }
+func (f *copyUpProbeFile) Owner() (uint32, uint32)     { return 0, 0 }
+func (f *copyUpProbeFile) RDev() uint32                { return 0 }
+func (f *copyUpProbeFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	f.calls = append(f.calls, [2]uint64{off, uint64(size)})
+	if len(f.calls) == 1 {
+		return make([]byte, size), nil
+	}
+	return nil, errors.New("injected lower-layer read failure")
+}
 
 func newEmptyImageFS(t *testing.T) *imageFS {
 	t.Helper()
@@ -71,6 +89,45 @@ func TestImageFSOpenHandleSurvivesUnlinkAndReplacement(t *testing.T) {
 	}
 	if got := readImageHandle(t, backend, replacementID, replacementFH); got != "new-target" {
 		t.Fatalf("replacement contents = %q", got)
+	}
+}
+
+func TestImageFSCopyUpStreamsLargeLowerFileAndPreservesSourceOnFailure(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	probe := &copyUpProbeFile{}
+	node := &imageNode{abstractFile: probe}
+	if errno := backend.copyUpFileLocked(node); errno == 0 {
+		t.Fatal("copy-up unexpectedly succeeded after injected read failure")
+	}
+	if len(probe.calls) != 2 || probe.calls[0] != [2]uint64{0, 1 << 20} || probe.calls[1] != [2]uint64{1 << 20, 1 << 20} {
+		t.Fatalf("copy-up reads = %#v, want bounded sequential chunks", probe.calls)
+	}
+	if node.abstractFile != probe || node.size != 0 || len(node.data.extents) != 0 {
+		t.Fatalf("failed copy-up replaced lower file: node=%+v", node)
+	}
+	if current, _, _, _ := backend.dataStore.usage(); current != 0 {
+		t.Fatalf("failed copy-up retained %d backing bytes", current)
+	}
+}
+
+func TestImageFSSequentialWritesUseCompactExtentsAndReportMetadata(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, fh := createImageFile(t, backend, "sequential", "")
+	page := make([]byte, imageDataPageSize)
+	for off := uint64(0); off < 8<<20; off += imageDataPageSize {
+		if _, errno := backend.Write(nodeID, fh, off, page, 0); errno != 0 {
+			t.Fatalf("write at %d: errno %d", off, errno)
+		}
+	}
+	backend.mu.Lock()
+	extents := append([]imageDataExtent(nil), backend.nodes[nodeID].data.extents...)
+	backend.mu.Unlock()
+	if len(extents) != 1 || extents[0].count != (8<<20)/imageDataPageSize {
+		t.Fatalf("sequential page index = %+v, want one extent", extents)
+	}
+	metadata, highWater := backend.BackingMetadataUsage()
+	if metadata == 0 || highWater < metadata {
+		t.Fatalf("metadata usage = current %d high-water %d", metadata, highWater)
 	}
 }
 

@@ -89,17 +89,19 @@ func (p *imageFS) snapshotEntryLocked(node *imageNode, store *imageDataStore) (i
 		if node.abstractFile != nil {
 			source = node.abstractFile
 		} else {
-			data = snapshotSparseData{pages: make(map[uint64]uint64, len(node.data)), store: store}
-			for pageIndex, location := range node.data {
-				var page [imageDataPageSize]byte
-				if err := p.dataStore.readPage(location, page[:]); err != nil {
-					return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
+			data = snapshotSparseData{pages: make(map[uint64]uint64), store: store}
+			for _, extent := range node.data.extents {
+				for pageOffset := uint64(0); pageOffset < extent.count; pageOffset++ {
+					var page [imageDataPageSize]byte
+					if err := p.dataStore.readPage(extent.location+pageOffset, page[:]); err != nil {
+						return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
+					}
+					snapshotLocation, err := store.allocatePage(page[:])
+					if err != nil {
+						return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
+					}
+					data.pages[extent.page+pageOffset] = snapshotLocation
 				}
-				snapshotLocation, err := store.allocatePage(page[:])
-				if err != nil {
-					return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
-				}
-				data.pages[pageIndex] = snapshotLocation
 			}
 		}
 		file := &snapshotFile{

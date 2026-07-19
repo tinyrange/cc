@@ -16,13 +16,18 @@ import (
 // and backing-filesystem exhaustion is returned to the guest as an ordinary
 // write failure rather than becoming an unbounded host-heap failure.
 type imageDataStore struct {
-	mu                      sync.Mutex
-	dir                     string
-	file                    *os.File
-	path                    string
-	next                    uint64
-	nextLocation            uint64
-	locations               map[uint64]uint64
+	mu           sync.Mutex
+	dir          string
+	file         *os.File
+	path         string
+	next         uint64
+	nextLocation uint64
+	// locations uses the stable allocation token as a slice index and stores
+	// offset+1 (zero means released). Tokens are dense and monotonic, so a map
+	// added substantial per-page heap overhead without buying sparsity.
+	locations               []uint64
+	liveLocations           int
+	freeLocations           []uint64
 	free                    []uint64
 	freeSet                 map[uint64]struct{}
 	pendingReclaim          map[uint64]struct{}
@@ -93,7 +98,7 @@ func newImageDataStore() *imageDataStore {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		dir = os.TempDir()
 	}
-	return &imageDataStore{dir: dir, refs: 1, locations: make(map[uint64]uint64), freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
+	return &imageDataStore{dir: dir, refs: 1, locations: []uint64{0}, freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
 }
 
 func (s *imageDataStore) retain() {
@@ -162,10 +167,25 @@ func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 	if s.current > s.highWater {
 		s.highWater = s.current
 	}
-	s.nextLocation++
-	location := s.nextLocation
-	s.locations[location] = offset
+	var location uint64
+	if len(s.freeLocations) != 0 {
+		location = s.freeLocations[len(s.freeLocations)-1]
+		s.freeLocations = s.freeLocations[:len(s.freeLocations)-1]
+		s.locations[location] = offset + 1
+	} else {
+		s.nextLocation++
+		location = s.nextLocation
+		s.locations = append(s.locations, offset+1)
+	}
+	s.liveLocations++
 	return location, nil
+}
+
+func (s *imageDataStore) locationOffsetLocked(location uint64) (uint64, bool) {
+	if location == 0 || location >= uint64(len(s.locations)) || s.locations[location] == 0 {
+		return 0, false
+	}
+	return s.locations[location] - 1, true
 }
 
 func (s *imageDataStore) readPage(location uint64, dst []byte) error {
@@ -175,7 +195,7 @@ func (s *imageDataStore) readPage(location uint64, dst []byte) error {
 		clear(dst)
 		return nil
 	}
-	offset, ok := s.locations[location]
+	offset, ok := s.locationOffsetLocked(location)
 	if !ok {
 		return os.ErrNotExist
 	}
@@ -192,7 +212,7 @@ func (s *imageDataStore) writeAt(location, pageOffset uint64, data []byte) error
 	if s.file == nil {
 		return os.ErrNotExist
 	}
-	offset, ok := s.locations[location]
+	offset, ok := s.locationOffsetLocked(location)
 	if !ok {
 		return os.ErrNotExist
 	}
@@ -206,12 +226,14 @@ func (s *imageDataStore) releasePage(location uint64) {
 		s.mu.Unlock()
 		return
 	}
-	offset, exists := s.locations[location]
+	offset, exists := s.locationOffsetLocked(location)
 	if !exists {
 		s.mu.Unlock()
 		return
 	}
-	delete(s.locations, location)
+	s.locations[location] = 0
+	s.liveLocations--
+	s.freeLocations = append(s.freeLocations, location)
 	s.free = append(s.free, offset)
 	s.freeSet[offset] = struct{}{}
 	scheduleReclaim := len(s.pendingReclaim) == 0
@@ -294,7 +316,7 @@ func shouldCompactPortableImageStore(live, allocated uint64) bool {
 var errRangeReclaimUnsupported = errors.New("backing filesystem does not support range reclamation")
 
 func (s *imageDataStore) compactLocked() error {
-	if s.file == nil || len(s.locations) == 0 {
+	if s.file == nil || s.liveLocations == 0 {
 		return nil
 	}
 	f, err := os.CreateTemp(s.dir, "pages-compact-*")
@@ -311,10 +333,14 @@ func (s *imageDataStore) compactLocked() error {
 			_ = os.Remove(path)
 		}
 	}
-	newLocations := make(map[uint64]uint64, len(s.locations))
+	newLocations := make([]uint64, len(s.locations))
 	var page [imageDataPageSize]byte
 	var next uint64
-	for location, oldOffset := range s.locations {
+	for location, encodedOffset := range s.locations {
+		if encodedOffset == 0 {
+			continue
+		}
+		oldOffset := encodedOffset - 1
 		n, readErr := s.file.ReadAt(page[:], int64(oldOffset))
 		if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(page)) {
 			cleanup()
@@ -324,7 +350,7 @@ func (s *imageDataStore) compactLocked() error {
 			cleanup()
 			return err
 		}
-		newLocations[location] = next
+		newLocations[location] = next + 1
 		next += imageDataPageSize
 	}
 	oldFile, oldPath := s.file, s.path
@@ -377,6 +403,15 @@ func (s *imageDataStore) usage() (current, highWater, physical uint64, reclaimEr
 	return s.current, s.highWater, physical, errors.Join(s.reclaimErr, s.staleCleanupErr, reclaimErr)
 }
 
+func (s *imageDataStore) metadataUsage() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return uint64(cap(s.locations))*8 + uint64(cap(s.freeLocations)+len(s.freeSet)+len(s.pendingReclaim))*16
+}
+
 func (s *imageDataStore) sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -406,7 +441,7 @@ func (s *imageDataStore) close() error {
 	s.closed = true
 	s.flushReclaimLocked()
 	f, path, stale := s.file, s.path, s.stale
-	s.file, s.path, s.locations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil
+	s.file, s.path, s.locations, s.freeLocations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {

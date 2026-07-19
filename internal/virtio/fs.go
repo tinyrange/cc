@@ -418,35 +418,37 @@ var fsReqPool = sync.Pool{
 }
 
 type FSStats struct {
-	Tag                   string        `json:"tag"`
-	Async                 bool          `json:"async"`
-	WorkerCount           int           `json:"worker_count"`
-	CacheMode             string        `json:"cache_mode"`
-	WritebackCache        bool          `json:"writeback_cache"`
-	EventIdx              bool          `json:"event_idx"`
-	MMIOReads             uint64        `json:"mmio_reads"`
-	MMIOWrites            uint64        `json:"mmio_writes"`
-	QueueNotifies         []uint64      `json:"queue_notifies"`
-	KickPollLoops         uint64        `json:"kick_poll_loops"`
-	KickPollHits          uint64        `json:"kick_poll_hits"`
-	KickPollMisses        uint64        `json:"kick_poll_misses"`
-	KickPollWorks         uint64        `json:"kick_poll_works"`
-	FUSERequests          uint64        `json:"fuse_requests"`
-	InterruptRaises       uint64        `json:"interrupt_raises"`
-	IRQTransitions        uint64        `json:"irq_transitions"`
-	IRQHigh               bool          `json:"irq_high"`
-	InterruptStatus       uint32        `json:"interrupt_status"`
-	QueueReady            []bool        `json:"queue_ready"`
-	QueueLastAvail        []uint16      `json:"queue_last_avail"`
-	QueueAvailIdx         []uint16      `json:"queue_avail_idx"`
-	QueueUsedIdx          []uint16      `json:"queue_used_idx"`
-	QueueNoNotify         []bool        `json:"queue_no_notify"`
-	FUSEOps               []FUSEOpStats `json:"fuse_ops"`
-	Stages                []TimingStats `json:"stages"`
-	BackingBytes          uint64        `json:"backing_bytes,omitempty"`
-	BackingHighWaterBytes uint64        `json:"backing_high_water_bytes,omitempty"`
-	BackingPhysicalBytes  uint64        `json:"backing_physical_bytes,omitempty"`
-	BackingReclaimError   string        `json:"backing_reclaim_error,omitempty"`
+	Tag                           string        `json:"tag"`
+	Async                         bool          `json:"async"`
+	WorkerCount                   int           `json:"worker_count"`
+	CacheMode                     string        `json:"cache_mode"`
+	WritebackCache                bool          `json:"writeback_cache"`
+	EventIdx                      bool          `json:"event_idx"`
+	MMIOReads                     uint64        `json:"mmio_reads"`
+	MMIOWrites                    uint64        `json:"mmio_writes"`
+	QueueNotifies                 []uint64      `json:"queue_notifies"`
+	KickPollLoops                 uint64        `json:"kick_poll_loops"`
+	KickPollHits                  uint64        `json:"kick_poll_hits"`
+	KickPollMisses                uint64        `json:"kick_poll_misses"`
+	KickPollWorks                 uint64        `json:"kick_poll_works"`
+	FUSERequests                  uint64        `json:"fuse_requests"`
+	InterruptRaises               uint64        `json:"interrupt_raises"`
+	IRQTransitions                uint64        `json:"irq_transitions"`
+	IRQHigh                       bool          `json:"irq_high"`
+	InterruptStatus               uint32        `json:"interrupt_status"`
+	QueueReady                    []bool        `json:"queue_ready"`
+	QueueLastAvail                []uint16      `json:"queue_last_avail"`
+	QueueAvailIdx                 []uint16      `json:"queue_avail_idx"`
+	QueueUsedIdx                  []uint16      `json:"queue_used_idx"`
+	QueueNoNotify                 []bool        `json:"queue_no_notify"`
+	FUSEOps                       []FUSEOpStats `json:"fuse_ops"`
+	Stages                        []TimingStats `json:"stages"`
+	BackingBytes                  uint64        `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes         uint64        `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes          uint64        `json:"backing_physical_bytes,omitempty"`
+	BackingMetadataBytes          uint64        `json:"backing_metadata_bytes,omitempty"`
+	BackingMetadataHighWaterBytes uint64        `json:"backing_metadata_high_water_bytes,omitempty"`
+	BackingReclaimError           string        `json:"backing_reclaim_error,omitempty"`
 }
 
 type FUSEOpStats struct {
@@ -2832,6 +2834,9 @@ func (f *FS) Stats() FSStats {
 			stats.BackingReclaimError = usageErr.Error()
 		}
 	}
+	if provider, ok := f.backend.(interface{ BackingMetadataUsage() (uint64, uint64) }); ok {
+		stats.BackingMetadataBytes, stats.BackingMetadataHighWaterBytes = provider.BackingMetadataUsage()
+	}
 	return stats
 }
 
@@ -2849,6 +2854,20 @@ func (f *FS) BackingUsage() (current, highWater, physical uint64, reclaimErr err
 		return 0, 0, 0, nil
 	}
 	return provider.BackingUsage()
+}
+
+func (f *FS) BackingMetadataUsage() (current, highWater uint64) {
+	if f == nil {
+		return 0, 0
+	}
+	f.mu.Lock()
+	backend := f.backend
+	f.mu.Unlock()
+	provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) })
+	if !ok {
+		return 0, 0
+	}
+	return provider.BackingMetadataUsage()
 }
 
 func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
@@ -3118,14 +3137,15 @@ type imageFS struct {
 	debugPaths []string
 	debugLog   io.Writer
 
-	mu             sync.Mutex
-	nextNodeID     uint64
-	nextHandle     uint64
-	nodes          map[uint64]*imageNode
-	handles        map[uint64]imageHandle
-	dirHandles     map[uint64][]dirEntry
-	dirHandleNodes map[uint64]uint64
-	xattrBytes     uint64
+	mu                sync.Mutex
+	nextNodeID        uint64
+	nextHandle        uint64
+	nodes             map[uint64]*imageNode
+	handles           map[uint64]imageHandle
+	dirHandles        map[uint64][]dirEntry
+	dirHandleNodes    map[uint64]uint64
+	xattrBytes        uint64
+	metadataHighWater uint64
 }
 
 type imageHandle struct {
@@ -3168,17 +3188,84 @@ const (
 	imageMaxXattrBytes        = 16 << 20
 )
 
-// sparseImageData stores only pages which have actually been written. A file's
-// logical size lives on imageNode, so truncate(2) can create holes without
-// committing an equal amount of host memory.
-type sparseImageData map[uint64]uint64
+// sparseImageData stores only runs of pages which have actually been written.
+// Both logical page indexes and allocation tokens are sequential for ordinary
+// writes, so an extent avoids one heap map entry per 4 KiB page while retaining
+// sparse/random-write semantics.
+type sparseImageData struct {
+	extents []imageDataExtent
+}
+
+type imageDataExtent struct {
+	page     uint64
+	location uint64
+	count    uint64
+}
+
+func (d sparseImageData) location(page uint64) (uint64, bool) {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) || page < d.extents[i].page {
+		return 0, false
+	}
+	extent := d.extents[i]
+	return extent.location + page - extent.page, true
+}
+
+func (d sparseImageData) nextDataPage(page uint64) (uint64, bool) {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) {
+		return 0, false
+	}
+	if page < d.extents[i].page {
+		return d.extents[i].page, true
+	}
+	return page, true
+}
+
+func (d sparseImageData) nextHolePage(page uint64) uint64 {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) || page < d.extents[i].page {
+		return page
+	}
+	return d.extents[i].page + d.extents[i].count
+}
+
+func (d *sparseImageData) insert(page, location uint64) {
+	i := sort.Search(len(d.extents), func(i int) bool { return d.extents[i].page >= page })
+	if i > 0 {
+		previous := &d.extents[i-1]
+		if previous.page+previous.count == page && previous.location+previous.count == location {
+			previous.count++
+			if i < len(d.extents) && page+1 == d.extents[i].page && location+1 == d.extents[i].location {
+				previous.count += d.extents[i].count
+				d.extents = append(d.extents[:i], d.extents[i+1:]...)
+			}
+			return
+		}
+	}
+	if i < len(d.extents) && page+1 == d.extents[i].page && location+1 == d.extents[i].location {
+		d.extents[i].page = page
+		d.extents[i].location = location
+		d.extents[i].count++
+		return
+	}
+	d.extents = append(d.extents, imageDataExtent{})
+	copy(d.extents[i+1:], d.extents[i:])
+	d.extents[i] = imageDataExtent{page: page, location: location, count: 1}
+}
 
 func (d sparseImageData) readAt(store *imageDataStore, dst []byte, off uint64) error {
 	for len(dst) > 0 {
 		pageIndex := off / imageDataPageSize
 		pageOffset := off % imageDataPageSize
 		n := min(len(dst), int(imageDataPageSize-pageOffset))
-		if location, ok := d[pageIndex]; ok {
+		if location, ok := d.location(pageIndex); ok {
 			var page [imageDataPageSize]byte
 			if err := store.readPage(location, page[:]); err != nil {
 				return err
@@ -3192,15 +3279,12 @@ func (d sparseImageData) readAt(store *imageDataStore, dst []byte, off uint64) e
 }
 
 func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64) (int, error) {
-	if *d == nil {
-		*d = sparseImageData{}
-	}
 	written := 0
 	for len(src) > 0 {
 		pageIndex := off / imageDataPageSize
 		pageOffset := off % imageDataPageSize
 		n := min(len(src), int(imageDataPageSize-pageOffset))
-		location, ok := (*d)[pageIndex]
+		location, ok := d.location(pageIndex)
 		if !ok {
 			var page [imageDataPageSize]byte
 			copy(page[pageOffset:pageOffset+uint64(n)], src[:n])
@@ -3209,7 +3293,7 @@ func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64)
 			if err != nil {
 				return written, err
 			}
-			(*d)[pageIndex] = location
+			d.insert(pageIndex, location)
 		} else if err := store.writeAt(location, pageOffset, src[:n]); err != nil {
 			return written, err
 		}
@@ -3220,19 +3304,31 @@ func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64)
 	return written, nil
 }
 
-func (d sparseImageData) truncate(store *imageDataStore, size uint64) error {
-	for pageIndex, location := range d {
-		pageStart := pageIndex * imageDataPageSize
-		if pageStart >= size {
-			delete(d, pageIndex)
-			store.releasePage(location)
+func (d *sparseImageData) truncate(store *imageDataStore, size uint64) error {
+	keepPages := size / imageDataPageSize
+	if size%imageDataPageSize != 0 {
+		keepPages++
+	}
+	kept := d.extents[:0]
+	for _, extent := range d.extents {
+		keep := min(extent.count, max(uint64(0), keepPages-min(keepPages, extent.page)))
+		if extent.page >= keepPages {
+			keep = 0
+		}
+		for page := keep; page < extent.count; page++ {
+			store.releasePage(extent.location + page)
+		}
+		if keep != 0 {
+			extent.count = keep
+			kept = append(kept, extent)
 		}
 	}
+	d.extents = kept
 	if size == 0 || size%imageDataPageSize == 0 {
 		return nil
 	}
 	pageIndex := size / imageDataPageSize
-	if location, ok := d[pageIndex]; ok {
+	if location, ok := d.location(pageIndex); ok {
 		var zero [imageDataPageSize]byte
 		if err := store.writeAt(location, size%imageDataPageSize, zero[:imageDataPageSize-size%imageDataPageSize]); err != nil {
 			return err
@@ -3242,19 +3338,23 @@ func (d sparseImageData) truncate(store *imageDataStore, size uint64) error {
 }
 
 func (d sparseImageData) release(store *imageDataStore) {
-	for _, location := range d {
-		store.releasePage(location)
+	for _, extent := range d.extents {
+		for page := uint64(0); page < extent.count; page++ {
+			store.releasePage(extent.location + page)
+		}
 	}
 }
 
 func (d sparseImageData) allocatedBytes(size uint64) uint64 {
 	var allocated uint64
-	for pageIndex := range d {
-		pageStart := pageIndex * imageDataPageSize
-		if pageStart >= size {
-			continue
+	for _, extent := range d.extents {
+		for page := uint64(0); page < extent.count; page++ {
+			pageStart := (extent.page + page) * imageDataPageSize
+			if pageStart >= size {
+				break
+			}
+			allocated += min(imageDataPageSize, size-pageStart)
 		}
-		allocated += min(imageDataPageSize, size-pageStart)
 	}
 	return allocated
 }
@@ -4345,7 +4445,7 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 		}
 		if flags&linuxOTRUNC != 0 {
 			node.data.release(p.dataStore)
-			node.data = nil
+			node.data = sparseImageData{}
 			node.size = 0
 			if uid != 0 {
 				node.mode &^= fs.FileMode(0o6000)
@@ -4483,29 +4583,25 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 	switch whence {
 	case 3: // SEEK_DATA
 		page := offset / imageDataPageSize
-		if _, ok := node.data[page]; ok {
+		if _, ok := node.data.location(page); ok {
 			p.mu.Unlock()
 			return offset, 0
 		}
-		for candidate := page + 1; candidate*imageDataPageSize < node.size; candidate++ {
-			if _, ok := node.data[candidate]; ok {
-				p.mu.Unlock()
-				return candidate * imageDataPageSize, 0
-			}
+		if candidate, ok := node.data.nextDataPage(page + 1); ok && candidate*imageDataPageSize < node.size {
+			p.mu.Unlock()
+			return candidate * imageDataPageSize, 0
 		}
 		p.mu.Unlock()
 		return 0, -linuxENXIO
 	case 4: // SEEK_HOLE
 		page := offset / imageDataPageSize
-		if _, ok := node.data[page]; !ok {
+		if _, ok := node.data.location(page); !ok {
 			p.mu.Unlock()
 			return offset, 0
 		}
-		for candidate := page + 1; candidate*imageDataPageSize < node.size; candidate++ {
-			if _, ok := node.data[candidate]; !ok {
-				p.mu.Unlock()
-				return candidate * imageDataPageSize, 0
-			}
+		if candidate := node.data.nextHolePage(page); candidate*imageDataPageSize < node.size {
+			p.mu.Unlock()
+			return candidate * imageDataPageSize, 0
 		}
 		size := node.size
 		p.mu.Unlock()
@@ -4863,7 +4959,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 			if flags&linuxOTRUNC != 0 {
 				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
 				node.data.release(p.dataStore)
-				node.data = nil
+				node.data = sparseImageData{}
 				node.size = 0
 				if uid != 0 {
 					node.mode &^= fs.FileMode(0o6000)
@@ -5441,6 +5537,26 @@ func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
 	return p.dataStore.usage()
 }
 
+func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
+	if p == nil {
+		return 0, 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// This is deliberately accounting, not a guest quota. Empty files and page
+	// indexes consume host heap even when no backing blocks are allocated; make
+	// that pressure visible to the same host recovery telemetry as file data.
+	metadata := uint64(len(p.nodes))*256 + uint64(len(p.handles))*64 + uint64(len(p.dirHandles))*64 + p.xattrBytes
+	for _, node := range p.nodes {
+		metadata += uint64(len(node.name)+len(node.symlinkTarget)) + uint64(len(node.entries)+len(node.whiteouts))*64 + uint64(len(node.data.extents))*32
+	}
+	metadata += p.dataStore.metadataUsage()
+	if metadata > p.metadataHighWater {
+		p.metadataHighWater = metadata
+	}
+	return metadata, p.metadataHighWater
+}
+
 func imageNodeXattrBytes(node *imageNode) int {
 	if node == nil {
 		return 0
@@ -5637,18 +5753,31 @@ func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 		return 0
 	}
 	size, mode := node.abstractFile.Stat()
-	data, err := node.abstractFile.ReadAt(0, uint32(size))
-	if err != nil {
-		return errnoFromError(err)
-	}
 	var copied sparseImageData
-	if _, err := copied.writeAt(p.dataStore, data, 0); err != nil {
-		copied.release(p.dataStore)
-		return errnoFromError(err)
+	const copyChunk = uint32(1 << 20)
+	for offset := uint64(0); offset < size; {
+		want := uint64(copyChunk)
+		if remaining := size - offset; remaining < want {
+			want = remaining
+		}
+		data, err := node.abstractFile.ReadAt(offset, uint32(want))
+		if err != nil {
+			copied.release(p.dataStore)
+			return errnoFromError(err)
+		}
+		if uint64(len(data)) != want {
+			copied.release(p.dataStore)
+			return -linuxEIO
+		}
+		if _, err := copied.writeAt(p.dataStore, data, offset); err != nil {
+			copied.release(p.dataStore)
+			return errnoFromError(err)
+		}
+		offset += want
 	}
 	node.data.release(p.dataStore)
 	node.data = copied
-	node.size = uint64(len(data))
+	node.size = size
 	node.mode = mode
 	node.abstractFile = nil
 	if node.modTime.IsZero() {
