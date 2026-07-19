@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
 )
 
 // imageDataStore keeps writable imageFS pages in a sparse host file instead of
@@ -13,20 +15,64 @@ import (
 // and backing-filesystem exhaustion is returned to the guest as an ordinary
 // write failure rather than becoming an unbounded host-heap failure.
 type imageDataStore struct {
-	mu           sync.Mutex
-	dir          string
-	file         *os.File
-	path         string
-	next         uint64
-	nextLocation uint64
-	locations    map[uint64]uint64
-	free         []uint64
-	freeSet      map[uint64]struct{}
-	current      uint64
-	highWater    uint64
-	reclaimErr   error
-	closed       bool
-	refs         int
+	mu             sync.Mutex
+	dir            string
+	file           *os.File
+	path           string
+	next           uint64
+	nextLocation   uint64
+	locations      map[uint64]uint64
+	free           []uint64
+	freeSet        map[uint64]struct{}
+	pendingReclaim map[uint64]struct{}
+	current        uint64
+	highWater      uint64
+	reclaimErr     error
+	closed         bool
+	refs           int
+}
+
+type imageDataReclaimQueue struct {
+	mu      sync.Mutex
+	pending map[*imageDataStore]struct{}
+	wake    chan struct{}
+}
+
+var globalImageDataReclaimer = newImageDataReclaimQueue()
+
+func newImageDataReclaimQueue() *imageDataReclaimQueue {
+	q := &imageDataReclaimQueue{pending: make(map[*imageDataStore]struct{}), wake: make(chan struct{}, 1)}
+	go q.run()
+	return q
+}
+
+func (q *imageDataReclaimQueue) schedule(store *imageDataStore) {
+	q.mu.Lock()
+	q.pending[store] = struct{}{}
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *imageDataReclaimQueue) run() {
+	for range q.wake {
+		// Gather adjacent 4 KiB releases into filesystem-sized operations.
+		time.Sleep(5 * time.Millisecond)
+		q.mu.Lock()
+		stores := make([]*imageDataStore, 0, len(q.pending))
+		for store := range q.pending {
+			stores = append(stores, store)
+		}
+		clear(q.pending)
+		q.mu.Unlock()
+		for _, store := range stores {
+			store.mu.Lock()
+			store.flushReclaimLocked()
+			store.mu.Unlock()
+		}
+	}
 }
 
 func newImageDataStore() *imageDataStore {
@@ -38,7 +84,7 @@ func newImageDataStore() *imageDataStore {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		dir = os.TempDir()
 	}
-	return &imageDataStore{dir: dir, refs: 1, locations: make(map[uint64]uint64), freeSet: make(map[uint64]struct{})}
+	return &imageDataStore{dir: dir, refs: 1, locations: make(map[uint64]uint64), freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
 }
 
 func (s *imageDataStore) retain() {
@@ -87,6 +133,7 @@ func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 		s.free = s.free[:len(s.free)-1]
 		if _, ok := s.freeSet[offset]; ok {
 			delete(s.freeSet, offset)
+			delete(s.pendingReclaim, offset)
 			reused = true
 			break
 		}
@@ -146,45 +193,82 @@ func (s *imageDataStore) writeAt(location, pageOffset uint64, data []byte) error
 
 func (s *imageDataStore) releasePage(location uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return
 	}
 	offset, exists := s.locations[location]
 	if !exists {
+		s.mu.Unlock()
 		return
 	}
 	delete(s.locations, location)
 	s.free = append(s.free, offset)
 	s.freeSet[offset] = struct{}{}
+	scheduleReclaim := len(s.pendingReclaim) == 0
+	s.pendingReclaim[offset] = struct{}{}
 	if s.current >= imageDataPageSize {
 		s.current -= imageDataPageSize
 	}
-	if s.file != nil {
-		reclaimErr := reclaimFileRange(s.file, int64(offset), int64(imageDataPageSize))
-		if reclaimErr != nil && !errors.Is(reclaimErr, errRangeReclaimUnsupported) && s.reclaimErr == nil {
-			s.reclaimErr = reclaimErr
+	s.mu.Unlock()
+	if scheduleReclaim {
+		globalImageDataReclaimer.schedule(s)
+	}
+}
+
+func (s *imageDataStore) flushReclaimLocked() {
+	if s.file == nil || len(s.pendingReclaim) == 0 {
+		return
+	}
+	offsets := make([]uint64, 0, len(s.pendingReclaim))
+	for offset := range s.pendingReclaim {
+		if _, free := s.freeSet[offset]; free {
+			offsets = append(offsets, offset)
 		}
-		// Tail coalescing is portable and returns all blocks after a large
-		// recently-created file is deleted even where hole punching is absent.
-		oldNext := s.next
-		for s.next >= imageDataPageSize {
-			tail := s.next - imageDataPageSize
-			if _, free := s.freeSet[tail]; !free {
-				break
-			}
-			delete(s.freeSet, tail)
-			s.next = tail
+	}
+	clear(s.pendingReclaim)
+
+	oldNext := s.next
+	for s.next >= imageDataPageSize {
+		tail := s.next - imageDataPageSize
+		if _, free := s.freeSet[tail]; !free {
+			break
 		}
-		if s.next != oldNext {
-			if err := s.file.Truncate(int64(s.next)); err != nil && s.reclaimErr == nil {
-				s.reclaimErr = err
-			}
+		delete(s.freeSet, tail)
+		s.next = tail
+	}
+	if s.next != oldNext {
+		if err := s.file.Truncate(int64(s.next)); err != nil && s.reclaimErr == nil {
+			s.reclaimErr = err
 		}
-		if errors.Is(reclaimErr, errRangeReclaimUnsupported) && len(s.freeSet) > len(s.locations) && s.next >= 8<<20 {
-			if err := s.compactLocked(); err != nil && s.reclaimErr == nil {
-				s.reclaimErr = err
-			}
+	}
+
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	unsupported := false
+	for i := 0; i < len(offsets); {
+		start := offsets[i]
+		if start >= s.next {
+			i++
+			continue
+		}
+		end := start + imageDataPageSize
+		i++
+		for i < len(offsets) && offsets[i] == end && end < s.next {
+			end += imageDataPageSize
+			i++
+		}
+		err := reclaimFileRange(s.file, int64(start), int64(end-start))
+		if errors.Is(err, errRangeReclaimUnsupported) {
+			unsupported = true
+			break
+		}
+		if err != nil && s.reclaimErr == nil {
+			s.reclaimErr = err
+		}
+	}
+	if unsupported && len(s.freeSet) > len(s.locations) && s.next >= 8<<20 {
+		if err := s.compactLocked(); err != nil && s.reclaimErr == nil {
+			s.reclaimErr = err
 		}
 	}
 }
@@ -229,6 +313,7 @@ func (s *imageDataStore) compactLocked() error {
 	s.file, s.path, s.locations, s.next = f, path, newLocations, next
 	s.free = nil
 	s.freeSet = make(map[uint64]struct{})
+	s.pendingReclaim = make(map[uint64]struct{})
 	if err := oldFile.Close(); err != nil {
 		return err
 	}
@@ -252,6 +337,7 @@ func (s *imageDataStore) usage() (current, highWater uint64, reclaimErr error) {
 func (s *imageDataStore) sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.flushReclaimLocked()
 	if s.file == nil {
 		return nil
 	}
@@ -273,8 +359,9 @@ func (s *imageDataStore) close() error {
 		return nil
 	}
 	s.closed = true
+	s.flushReclaimLocked()
 	f, path := s.file, s.path
-	s.file, s.path, s.locations, s.free, s.freeSet = nil, "", nil, nil, nil
+	s.file, s.path, s.locations, s.free, s.freeSet, s.pendingReclaim = nil, "", nil, nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {

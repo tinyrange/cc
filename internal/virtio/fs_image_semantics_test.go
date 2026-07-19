@@ -207,9 +207,16 @@ func TestImageFSDeletedDataReclaimsBackingStore(t *testing.T) {
 	if err != nil || current != 0 || highWater != written {
 		t.Fatalf("usage after final release = current %d high-water %d error %v", current, highWater, err)
 	}
-	info, err := backend.dataStore.file.Stat()
-	if err != nil || info.Size() != 0 {
-		t.Fatalf("backing store after release = %#v, %v", info, err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		info, statErr := backend.dataStore.file.Stat()
+		if statErr == nil && info.Size() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backing store after asynchronous release = %#v, %v", info, statErr)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

@@ -27,6 +27,14 @@ func (i *darwinInstance) SetBalloonMB(target uint64) error {
 	return i.session.SetBalloonMB(target)
 }
 
+func (i *darwinInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	if i == nil || i.session == nil {
+		return 0, 0, false, false
+	}
+	target, actual, ready := i.session.BalloonState()
+	return target, actual, ready, true
+}
+
 type darwinInstance struct {
 	*managedInstanceCore
 	session   *hvf.ContainerSession

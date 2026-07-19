@@ -258,6 +258,14 @@ func (s *ManagedSession) SetBalloonMB(target uint64) error {
 	return s.balloon.SetTargetPages(balloonTargetPages(target))
 }
 
+func (s *ManagedSession) BalloonState() (targetMB, actualMB uint64, driverReady bool) {
+	if s == nil || s.balloon == nil {
+		return 0, 0, false
+	}
+	target, actual, ready := s.balloon.State()
+	return uint64(target) * 4096 >> 20, uint64(actual) * 4096 >> 20, ready
+}
+
 func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	if len(req.Command) == 0 {
 		return client.ExecResponse{}, fmt.Errorf("exec command is required")

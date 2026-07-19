@@ -703,8 +703,8 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	timing.Since(ctx, "exec.marshal_request", start)
 
 	transcriptStart := s.transcript.Len()
-	releaseTranscript := s.transcript.RetainFrom(transcriptStart)
-	defer releaseTranscript()
+	reader := s.transcript.RetainReader(transcriptStart)
+	defer reader.Close()
 	writeStart := time.Now()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.controlWriter(), managedagent.ExecRequest(id, execReq))
@@ -725,7 +725,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	streamStart := time.Now()
-	err = s.streamExecEvents(ctx, transcriptStart, id, execStart, onEvent)
+	err = s.streamExecEvents(ctx, transcriptStart, id, reader, execStart, onEvent)
 	timing.Since(ctx, "exec.stream_events", streamStart)
 	timing.Since(ctx, "exec.total", execStart)
 	return err
@@ -745,10 +745,11 @@ func (s *ContainerSession) sendExecMessage(msg vmruntime.ManagedExecRequest) err
 	return managedagent.Send(s.controlWriter(), msg)
 }
 
-func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, execStart time.Time, onEvent func(client.ExecEvent) error) error {
+func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, reader vmruntime.TranscriptReader, execStart time.Time, onEvent func(client.ExecEvent) error) error {
 	guestPhases := map[string]int{}
 	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -808,8 +809,7 @@ func (s *ContainerSession) waitForExecExit(id string, start int, timeout time.Du
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
-		return ok
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }
@@ -922,6 +922,14 @@ func (s *ContainerSession) SetBalloonMB(target uint64) error {
 		return fmt.Errorf("virtio balloon is unavailable")
 	}
 	return s.balloon.SetTargetPages(balloonTargetPages(target))
+}
+
+func (s *ContainerSession) BalloonState() (targetMB, actualMB uint64, driverReady bool) {
+	if s == nil || s.balloon == nil {
+		return 0, 0, false
+	}
+	target, actual, ready := s.balloon.State()
+	return uint64(target) * 4096 >> 20, uint64(actual) * 4096 >> 20, ready
 }
 
 func (s *ContainerSession) writeControlPayload(payload []byte) error {

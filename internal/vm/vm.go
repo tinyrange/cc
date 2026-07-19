@@ -67,6 +67,10 @@ type instanceBalloonController interface {
 	SetBalloonMB(uint64) error
 }
 
+type instanceBalloonStateProvider interface {
+	BalloonState() (targetMB, actualMB uint64, driverReady, supported bool)
+}
+
 type instanceBackingUsageProvider interface {
 	BackingUsage() (uint64, uint64, error)
 }
@@ -923,6 +927,7 @@ type managerStatusSnapshot struct {
 	state           client.InstanceState
 	provider        networkIPv4Provider
 	backingProvider instanceBackingUsageProvider
+	balloonProvider instanceBalloonStateProvider
 }
 
 func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
@@ -961,11 +966,17 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	if provider, ok := machine.instance.(instanceBackingUsageProvider); ok {
 		snapshot.backingProvider = provider
 	}
+	if provider, ok := machine.instance.(instanceBalloonStateProvider); ok {
+		snapshot.balloonProvider = provider
+	} else {
+		snapshot.state.BalloonMB = 0
+		snapshot.state.BalloonStatus = "unsupported"
+	}
 	return snapshot
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil && snapshot.backingProvider == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.balloonProvider == nil {
 		return snapshot.state
 	}
 	if snapshot.provider != nil {
@@ -977,6 +988,26 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 		snapshot.state.BackingHighWaterBytes = highWater
 		if err != nil {
 			snapshot.state.BackingReclaimError = err.Error()
+		}
+	}
+	if snapshot.balloonProvider != nil {
+		target, actual, ready, supported := snapshot.balloonProvider.BalloonState()
+		if !supported {
+			snapshot.state.BalloonMB = 0
+			snapshot.state.BalloonStatus = "unsupported"
+		} else {
+			snapshot.state.BalloonMB = target
+			snapshot.state.BalloonActualMB = actual
+			switch {
+			case !ready:
+				snapshot.state.BalloonStatus = "driver_unavailable"
+			case target == actual:
+				snapshot.state.BalloonStatus = "converged"
+			case actual < target:
+				snapshot.state.BalloonStatus = "inflating"
+			default:
+				snapshot.state.BalloonStatus = "deflating"
+			}
 		}
 	}
 	m.mu.Lock()

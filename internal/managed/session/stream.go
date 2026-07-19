@@ -15,6 +15,7 @@ type Transcript interface {
 
 type StreamExecOptions struct {
 	Transcript     Transcript
+	Reader         vmruntime.TranscriptReader
 	Start          int
 	ID             string
 	OnEvent        func(client.ExecEvent) error
@@ -43,9 +44,14 @@ type StreamExecStats struct {
 }
 
 func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
-	if retained, ok := opts.Transcript.(interface{ RetainFrom(int) func() }); ok {
-		release := retained.RetainFrom(opts.Start)
-		defer release()
+	reader := opts.Reader
+	if reader == nil {
+		if retained, ok := opts.Transcript.(interface {
+			RetainReader(int) vmruntime.TranscriptReader
+		}); ok {
+			reader = retained.RetainReader(opts.Start)
+			defer reader.Close()
+		}
 	}
 	offset := opts.Start
 	var pending string
@@ -71,6 +77,9 @@ func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
 			appendStart := time.Now()
 			pending += text
 			offset = next
+			if reader != nil {
+				reader.Advance(next)
+			}
 			observe(StreamExecObservation{Kind: "append_pending", Duration: time.Since(appendStart), Stats: stats})
 			for {
 				lineStart := time.Now()

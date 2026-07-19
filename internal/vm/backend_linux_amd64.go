@@ -677,6 +677,20 @@ func (i *linuxInstance) SetBalloonMB(target uint64) error {
 	return controller.SetBalloonMB(target)
 }
 
+func (i *linuxInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	if i == nil || i.session == nil {
+		return 0, 0, false, false
+	}
+	provider, ok := i.session.(interface {
+		BalloonState() (uint64, uint64, bool)
+	})
+	if !ok {
+		return 0, 0, false, false
+	}
+	target, actual, ready := provider.BalloonState()
+	return target, actual, ready, true
+}
+
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,48 @@ import (
 
 	"j5.nz/cc/internal/imagefs"
 )
+
+type mountedLifecycleBackend struct {
+	FSBackend
+	current, highWater uint64
+	usageErr           error
+	closes             int
+	closeErr           error
+}
+
+func (b *mountedLifecycleBackend) BackingUsage() (uint64, uint64, error) {
+	return b.current, b.highWater, b.usageErr
+}
+
+func (b *mountedLifecycleBackend) Close() error {
+	b.closes++
+	return b.closeErr
+}
+
+func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
+	rootErr := errors.New("root reclaim degraded")
+	closeErr := errors.New("share close failed")
+	root := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 10, highWater: 20, usageErr: rootErr}
+	share := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 30, highWater: 40, closeErr: closeErr}
+	fsys := NewMountedFS(root, []ShareMount{
+		{GuestPath: "/one", Backend: share},
+		{GuestPath: "/two", Backend: share},
+	}).(*mountedFS)
+
+	current, highWater, err := fsys.BackingUsage()
+	if current != 40 || highWater != 60 || !errors.Is(err, rootErr) {
+		t.Fatalf("backing usage = %d, %d, %v", current, highWater, err)
+	}
+	if err := fsys.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("close error = %v", err)
+	}
+	if err := fsys.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("second close error = %v", err)
+	}
+	if root.closes != 1 || share.closes != 1 {
+		t.Fatalf("close counts root=%d share=%d, want one each", root.closes, share.closes)
+	}
+}
 
 func TestMountedFSAddShareSnapshotsAndConflicts(t *testing.T) {
 	rootBackend := imageBackend(t, map[string]string{"/root.txt": "root"})

@@ -37,3 +37,32 @@ func TestImageDataStorePortableCompactionPreservesLiveLocations(t *testing.T) {
 		t.Fatal("live page changed during compaction")
 	}
 }
+
+func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) {
+	store := newImageDataStore()
+	defer store.close()
+	locations := make([]uint64, 256)
+	for i := range locations {
+		location, err := store.allocatePage([]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		locations[i] = location
+	}
+	for _, location := range locations {
+		store.releasePage(location)
+	}
+	current, highWater, err := store.usage()
+	if current != 0 || highWater != uint64(len(locations))*imageDataPageSize || err != nil {
+		t.Fatalf("usage after logical release = %d, %d, %v", current, highWater, err)
+	}
+	if err := store.sync(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	next := store.next
+	store.mu.Unlock()
+	if next != 0 {
+		t.Fatalf("backing length after batched reclaim = %d, want 0", next)
+	}
+}

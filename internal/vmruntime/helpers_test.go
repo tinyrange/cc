@@ -119,10 +119,33 @@ func TestSerialTranscriptWaitForReadsGrowingStreamIncrementally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(text) != 16*serialTranscriptReadBytes+len("marker\n") {
-		t.Fatalf("wait returned %d bytes", len(text))
+	if len(text) > serialTranscriptWaitBytes || !strings.HasSuffix(text, "marker\n") {
+		t.Fatalf("bounded wait returned %d bytes without its marker", len(text))
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSerialTranscriptMovableReaderDoesNotPinLaterOutput(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	reader := transcript.RetainReader(0)
+	defer reader.Close()
+	data := bytes.Repeat([]byte("x"), 8<<20)
+	if _, err := transcript.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	for offset := 0; offset < transcript.Len(); {
+		_, next := transcript.ReadFrom(offset)
+		if next == offset {
+			t.Fatal("reader stopped advancing")
+		}
+		offset = next
+		reader.Advance(next)
+	}
+	info, err := transcript.file.Stat()
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("advanced reader retained transcript backing = %#v, %v", info, err)
 	}
 }

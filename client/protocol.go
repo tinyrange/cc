@@ -393,6 +393,8 @@ type InstanceState struct {
 	Kernel                string `json:"kernel,omitempty"`
 	MemoryMB              uint64 `json:"memory_mb,omitempty"`
 	BalloonMB             uint64 `json:"balloon_mb,omitempty"`
+	BalloonActualMB       uint64 `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus         string `json:"balloon_status,omitempty"`
 	CPUs                  int    `json:"cpus,omitempty"`
 	NestedVirt            bool   `json:"nested_virtualization,omitempty"`
 	StartedAt             string `json:"started_at,omitempty"`

@@ -1037,6 +1037,9 @@ func (h *fakeHost) StartStream(_ context.Context, req client.CreateInstanceReque
 	h.starts = append(h.starts, req)
 	inst := h.popInstanceLocked()
 	h.mu.Unlock()
+	if controller, ok := inst.(interface{ SetBalloonMB(uint64) error }); ok {
+		_ = controller.SetBalloonMB(req.BalloonMB)
+	}
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "status", Message: "fake start"}); err != nil {
 			return nil, err
@@ -1054,6 +1057,9 @@ func (h *fakeHost) StartBlankStream(_ context.Context, req client.StartInstanceR
 	h.blankStarts = append(h.blankStarts, req)
 	inst := h.popInstanceLocked()
 	h.mu.Unlock()
+	if controller, ok := inst.(interface{ SetBalloonMB(uint64) error }); ok {
+		_ = controller.SetBalloonMB(req.BalloonMB)
+	}
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "status", Message: "fake blank start"}); err != nil {
 			return nil, err
@@ -1173,6 +1179,12 @@ func (i *fakeInstance) SetBalloonMB(target uint64) error {
 	i.balloonTarget = target
 	i.mu.Unlock()
 	return nil
+}
+
+func (i *fakeInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.balloonTarget, i.balloonTarget, true, true
 }
 
 type shutdownTestInstance struct {

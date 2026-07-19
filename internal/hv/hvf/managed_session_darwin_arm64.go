@@ -39,8 +39,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := s.nextExecID()
 	start := s.transcript.Len()
-	releaseTranscript := s.transcript.RetainFrom(start)
-	defer releaseTranscript()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	if err := s.sendExecStart(id, req); err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -75,6 +75,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	id := s.nextExecID()
 	start := s.transcript.Len()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	releaseTranscript := s.transcript.RetainFrom(start)
 	defer releaseTranscript()
 	if err := s.sendExecStart(id, req); err != nil {
@@ -87,7 +89,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	return s.streamExecEvents(ctx, start, id, onEvent)
+	return s.streamExecEvents(ctx, start, id, reader, onEvent)
 }
 
 func (s *ManagedSession) Flush(ctx context.Context) error {
@@ -186,9 +188,10 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	return managedagent.Send(s.control, msg)
 }
 
-func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, reader vmruntime.TranscriptReader, onEvent func(client.ExecEvent) error) error {
 	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -225,8 +228,7 @@ func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Dura
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, err := s.waitForTranscript(ctx, start, func(text string) bool {
-		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
-		return ok
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }

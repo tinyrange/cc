@@ -385,6 +385,34 @@ func (i *hostedInstance) AllowServiceProxyPort(ctx context.Context, port int) er
 	return allower.AllowServiceProxyPort(ctx, port)
 }
 
+func (i *hostedInstance) SetBalloonMB(target uint64) error {
+	controller, ok := i.Instance.(interface{ SetBalloonMB(uint64) error })
+	if !ok {
+		return fmt.Errorf("dynamic ballooning is unsupported")
+	}
+	return controller.SetBalloonMB(target)
+}
+
+func (i *hostedInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	provider, ok := i.Instance.(interface {
+		BalloonState() (uint64, uint64, bool, bool)
+	})
+	if !ok {
+		return 0, 0, false, false
+	}
+	return provider.BalloonState()
+}
+
+func (i *hostedInstance) BackingUsage() (uint64, uint64, error) {
+	provider, ok := i.Instance.(interface {
+		BackingUsage() (uint64, uint64, error)
+	})
+	if !ok {
+		return 0, 0, nil
+	}
+	return provider.BackingUsage()
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil

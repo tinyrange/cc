@@ -234,8 +234,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed exec %s start command=%q\n", id, strings.Join(req.Command, " "))
 	}
 	start := s.transcript.Len()
-	releaseTranscript := s.transcript.RetainFrom(start)
-	defer releaseTranscript()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	s.sendMu.Lock()
 	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
@@ -281,6 +281,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed stream %s start command=%q\n", id, strings.Join(req.Command, " "))
 	}
 	start := s.transcript.Len()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	releaseTranscript := s.transcript.RetainFrom(start)
 	defer releaseTranscript()
 	if err := s.sendExecMessage(managedagent.ExecRequest(id, req)); err != nil {
@@ -293,6 +295,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	err := managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -343,8 +346,7 @@ func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Dura
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
-		return ok
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }

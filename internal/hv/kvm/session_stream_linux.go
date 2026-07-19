@@ -30,8 +30,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	id := s.nextExecID()
 	start := s.transcript.Len()
-	releaseTranscript := s.transcript.RetainFrom(start)
-	defer releaseTranscript()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	if err := s.sendExecStart(id, req); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -58,7 +58,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	return s.streamExecEvents(ctx, start, id, inputErr, onEvent)
+	return s.streamExecEvents(ctx, start, id, reader, inputErr, onEvent)
 }
 
 // startExecKeepalive gives a blocked restored vCPU a periodic interrupt while
@@ -169,9 +169,10 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	return managedagent.Send(s.control, msg)
 }
 
-func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, inputErr <-chan error, onEvent func(client.ExecEvent) error) error {
+func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, reader vmruntime.TranscriptReader, inputErr <-chan error, onEvent func(client.ExecEvent) error) error {
 	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -210,8 +211,7 @@ func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Dura
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, err := s.waitForTranscript(ctx, start, func(text string) bool {
-		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
-		return ok
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }

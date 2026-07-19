@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,6 +35,8 @@ type mountedFS struct {
 	writebackCache bool
 	debugPaths     []string
 	debugLog       io.Writer
+	closeOnce      sync.Once
+	closeErr       error
 
 	mu         sync.RWMutex
 	nextNodeID uint64
@@ -43,6 +46,80 @@ type mountedFS struct {
 	pathToNode map[string]uint64
 	inodes     map[mountedBackendInode]uint64
 	handles    map[uint64]*mountedHandle
+}
+
+func (m *mountedFS) distinctBackends() []FSBackend {
+	m.mu.RLock()
+	backends := make([]FSBackend, 0, len(m.mounts)+1)
+	if m.root != nil {
+		backends = append(backends, m.root)
+	}
+	for _, mount := range m.mounts {
+		duplicate := false
+		for _, existing := range backends {
+			if sameFSBackend(existing, mount.backend) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && mount.backend != nil {
+			backends = append(backends, mount.backend)
+		}
+	}
+	m.mu.RUnlock()
+	return backends
+}
+
+func sameFSBackend(a, b FSBackend) bool {
+	if a == nil || b == nil || reflect.TypeOf(a) != reflect.TypeOf(b) {
+		return a == nil && b == nil
+	}
+	typ := reflect.TypeOf(a)
+	if typ.Comparable() {
+		return reflect.ValueOf(a).Interface() == reflect.ValueOf(b).Interface()
+	}
+	return backendPointer(a) != 0 && backendPointer(a) == backendPointer(b)
+}
+
+// BackingUsage forwards optional backing-store telemetry through the mount
+// router. Each distinct backend is counted once even when it is mounted at
+// multiple guest paths.
+func (m *mountedFS) BackingUsage() (current, highWater uint64, reclaimErr error) {
+	var errs []error
+	for _, backend := range m.distinctBackends() {
+		provider, ok := backend.(interface {
+			BackingUsage() (uint64, uint64, error)
+		})
+		if !ok {
+			continue
+		}
+		backendCurrent, backendHighWater, err := provider.BackingUsage()
+		current += backendCurrent
+		highWater += backendHighWater
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return current, highWater, errors.Join(errs...)
+}
+
+// Close deterministically releases the root and every distinct mounted
+// backend. Virtio FS may call this from more than one shutdown path, so the
+// ownership boundary is idempotent.
+func (m *mountedFS) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.closeOnce.Do(func() {
+		var errs []error
+		for _, backend := range m.distinctBackends() {
+			if closer, ok := backend.(interface{ Close() error }); ok {
+				errs = append(errs, closer.Close())
+			}
+		}
+		m.closeErr = errors.Join(errs...)
+	})
+	return m.closeErr
 }
 
 type shareMount struct {

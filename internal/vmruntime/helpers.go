@@ -1,6 +1,7 @@
 package vmruntime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -48,7 +49,19 @@ const (
 	serialTranscriptMemoryBytes = 1 << 20
 	serialTranscriptReadBytes   = 256 << 10
 	serialTranscriptTailBytes   = 64 << 10
+	serialTranscriptWaitBytes   = 1 << 20
 )
+
+type TranscriptReader interface {
+	Advance(int)
+	Close()
+}
+
+type serialTranscriptReader struct {
+	transcript *SerialTranscript
+	id         uint64
+	once       sync.Once
+}
 
 func NewSerialTranscript() *SerialTranscript {
 	s := &SerialTranscript{readers: make(map[uint64]int)}
@@ -138,10 +151,22 @@ func (s *SerialTranscript) appendTailLocked(data []byte) {
 // older than every remaining reader to be reclaimed. Offsets remain absolute,
 // so concurrent commands can finish in any order without invalidating cursors.
 func (s *SerialTranscript) RetainFrom(offset int) func() {
+	reader := s.RetainReader(offset)
+	return reader.Close
+}
+
+// RetainReader registers a movable reader cursor. Streaming parsers advance
+// it after copying bytes into their own small framing buffer, which prevents a
+// quiet, long-lived command from pinning unrelated later output.
+func (s *SerialTranscript) RetainReader(offset int) TranscriptReader {
 	if s == nil {
-		return func() {}
+		return &serialTranscriptReader{}
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return &serialTranscriptReader{}
+	}
 	if offset < s.base {
 		offset = s.base
 	}
@@ -149,21 +174,46 @@ func (s *SerialTranscript) RetainFrom(offset int) func() {
 	id := s.nextReader
 	s.readers[id] = offset
 	s.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.mu.Lock()
-			delete(s.readers, id)
-			target := s.size
-			for _, readerOffset := range s.readers {
-				if readerOffset < target {
-					target = readerOffset
-				}
-			}
-			s.discardBeforeLocked(target)
-			s.mu.Unlock()
-		})
+	return &serialTranscriptReader{transcript: s, id: id}
+}
+
+func (r *serialTranscriptReader) Advance(offset int) {
+	if r == nil || r.transcript == nil {
+		return
 	}
+	s := r.transcript
+	s.mu.Lock()
+	if current, ok := s.readers[r.id]; ok && offset > current {
+		if offset > s.size {
+			offset = s.size
+		}
+		s.readers[r.id] = offset
+		s.discardToReadersLocked()
+	}
+	s.mu.Unlock()
+}
+
+func (r *serialTranscriptReader) Close() {
+	if r == nil || r.transcript == nil {
+		return
+	}
+	r.once.Do(func() {
+		s := r.transcript
+		s.mu.Lock()
+		delete(s.readers, r.id)
+		s.discardToReadersLocked()
+		s.mu.Unlock()
+	})
+}
+
+func (s *SerialTranscript) discardToReadersLocked() {
+	target := s.size
+	for _, readerOffset := range s.readers {
+		if readerOffset < target {
+			target = readerOffset
+		}
+	}
+	s.discardBeforeLocked(target)
 }
 
 func (s *SerialTranscript) discardBeforeLocked(offset int) {
@@ -243,13 +293,20 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 }
 
 func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
-	var accumulated strings.Builder
+	reader := s.RetainReader(start)
+	defer reader.Close()
+	var window []byte
 	offset := start
 	dirty := false
+	materializedTerminalOffset := -1
 	for {
 		text, next := s.ReadFrom(offset)
 		if next > offset {
-			accumulated.WriteString(text)
+			window = append(window, text...)
+			if len(window) > serialTranscriptWaitBytes {
+				copy(window, window[len(window)-serialTranscriptWaitBytes:])
+				window = window[:serialTranscriptWaitBytes]
+			}
 			offset = next
 			dirty = true
 			continue
@@ -277,11 +334,44 @@ func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate fun
 		if s.Len() > offset {
 			continue
 		}
-		if dirty && predicate(accumulated.String()) {
-			return accumulated.String(), nil
+		if dirty && predicate(string(window)) {
+			return string(window), nil
+		}
+		// Synchronous compatibility APIs return the complete command output as
+		// one string. Materialize that payload only after its terminal protocol
+		// record is visible; while the command is active WaitFor retains only the
+		// bounded parser window above. Streaming APIs never take this path.
+		if dirty && materializedTerminalOffset != offset && bytes.Contains(window, []byte(CommandExitMarkerPref)) {
+			materializedTerminalOffset = offset
+			full, err := s.readRangeString(start, offset)
+			if err != nil {
+				return "", err
+			}
+			if predicate(full) {
+				return full, nil
+			}
 		}
 		dirty = false
 	}
+}
+
+func (s *SerialTranscript) readRangeString(start, end int) (string, error) {
+	var out strings.Builder
+	for offset := start; offset < end; {
+		s.mu.Lock()
+		next := min(end, offset+serialTranscriptReadBytes)
+		data, err := s.readLocked(offset, next)
+		s.mu.Unlock()
+		if err != nil {
+			return "", err
+		}
+		if len(data) == 0 {
+			break
+		}
+		out.Write(data)
+		offset += len(data)
+	}
+	return out.String(), nil
 }
 
 func (s *SerialTranscript) Close() error {
