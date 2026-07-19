@@ -16,6 +16,7 @@ import (
 )
 
 func TestEnsureDownloadedRecoversFromRepositoryIndexPackageRace(t *testing.T) {
+	arch := defaultArch()
 	packageData := gzipTar(t, nil)
 	actualDigest := sha1.Sum(packageData)
 	staleDigest := sha1.Sum([]byte("previous package"))
@@ -35,7 +36,7 @@ func TestEnsureDownloadedRecoversFromRepositoryIndexPackageRace(t *testing.T) {
 			if request == 1 {
 				digest = staleDigest[:]
 			}
-			index := fmt.Sprintf("P:linux-virt\nV:1.0-r0\nA:x86_64\nS:%d\nC:Q1%s\n\n", len(packageData), base64.StdEncoding.EncodeToString(digest))
+			index := fmt.Sprintf("P:linux-virt\nV:1.0-r0\nA:%s\nS:%d\nC:Q1%s\n\n", arch, len(packageData), base64.StdEncoding.EncodeToString(digest))
 			_, _ = w.Write(gzipTar(t, map[string][]byte{"APKINDEX": []byte(index)}))
 		case strings.HasSuffix(r.URL.Path, "/linux-virt-1.0-r0.apk"):
 			mu.Lock()
