@@ -71,6 +71,31 @@ func TestImageDataStoreRetainsFailedReplacementCleanupForRetry(t *testing.T) {
 	}
 }
 
+func TestImageDataStoreClearsRecoveredStaleCleanupCondition(t *testing.T) {
+	store := newImageDataStore()
+	dir := t.TempDir()
+	stalePath := filepath.Join(dir, "replaced")
+	if err := os.Mkdir(stalePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(stalePath, "scanner-hold")
+	if err := os.WriteFile(child, []byte("hold"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.stale = append(store.stale, imageDataStaleFile{path: stalePath})
+	store.mu.Unlock()
+	if _, _, _, err := store.usage(); err == nil {
+		t.Fatal("active stale cleanup failure was not reported")
+	}
+	if err := os.Remove(child); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.usage(); err != nil {
+		t.Fatalf("successful cleanup retry retained a stale current error: %v", err)
+	}
+}
+
 func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) {
 	store := newImageDataStore()
 	defer store.close()

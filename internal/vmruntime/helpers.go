@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,18 +44,25 @@ type SerialTranscript struct {
 	closed     bool
 	spillErr   error
 	reclaimErr error
-	reclaimAt  int
 	staleFiles []*os.File
 	stalePaths []string
+	segments   []serialTranscriptSegment
+}
+
+type serialTranscriptSegment struct {
+	file *os.File
+	path string
+	base int
+	end  int
 }
 
 const (
-	serialTranscriptMemoryBytes         = 1 << 20
-	serialTranscriptReadBytes           = 256 << 10
-	serialTranscriptTailBytes           = 64 << 10
-	serialTranscriptWaitBytes           = 1 << 20
-	serialTranscriptReclaimBytes        = 8 << 20
-	serialTranscriptMaxReclaimCopyBytes = 8 << 20
+	serialTranscriptMemoryBytes  = 1 << 20
+	serialTranscriptReadBytes    = 256 << 10
+	serialTranscriptTailBytes    = 64 << 10
+	serialTranscriptWaitBytes    = 1 << 20
+	serialTranscriptReclaimBytes = 8 << 20
+	serialTranscriptSegmentBytes = 8 << 20
 )
 
 type TranscriptReader interface {
@@ -94,10 +100,27 @@ func (s *SerialTranscript) Write(data []byte) (int, error) {
 			return 0, err
 		}
 	}
-	n, err := s.file.WriteAt(data, int64(s.size-s.fileBase))
-	s.size += n
-	s.appendTailLocked(data[:n])
-	return n, err
+	written := 0
+	for len(data) != 0 {
+		capacity := serialTranscriptSegmentBytes - (s.size - s.fileBase)
+		if capacity == 0 {
+			if err := s.rotateSpillLocked(); err != nil {
+				s.spillErr = errors.Join(s.spillErr, err)
+				return written, err
+			}
+			capacity = serialTranscriptSegmentBytes
+		}
+		count := min(len(data), capacity)
+		n, err := s.file.WriteAt(data[:count], int64(s.size-s.fileBase))
+		s.size += n
+		written += n
+		s.appendTailLocked(data[:n])
+		data = data[n:]
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 func (s *SerialTranscript) openSpillLocked() error {
@@ -125,6 +148,45 @@ func (s *SerialTranscript) openSpillLocked() error {
 		s.path = ""
 	}
 	return nil
+}
+
+func (s *SerialTranscript) rotateSpillLocked() error {
+	dir := filepath.Dir(s.file.Name())
+	next, err := os.CreateTemp(dir, "serial-*")
+	if err != nil {
+		return err
+	}
+	path := next.Name()
+	if err := os.Remove(path); err == nil {
+		path = ""
+	}
+	old := serialTranscriptSegment{file: s.file, path: s.path, base: s.fileBase, end: s.size}
+	if old.end <= s.base {
+		s.cleanupTranscriptSegmentLocked(old)
+	} else {
+		s.segments = append(s.segments, old)
+	}
+	s.file, s.path, s.fileBase = next, path, s.size
+	return nil
+}
+
+func (s *SerialTranscript) cleanupTranscriptSegmentLocked(segment serialTranscriptSegment) {
+	if segment.file != nil {
+		if err := segment.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			s.reclaimErr = errors.Join(s.reclaimErr, err)
+			s.staleFiles = append(s.staleFiles, segment.file)
+			if segment.path != "" {
+				s.stalePaths = append(s.stalePaths, segment.path)
+			}
+			return
+		}
+	}
+	if segment.path != "" {
+		if err := os.Remove(segment.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.reclaimErr = errors.Join(s.reclaimErr, err)
+			s.stalePaths = append(s.stalePaths, segment.path)
+		}
+	}
 }
 
 func (s *SerialTranscript) Len() int {
@@ -240,6 +302,15 @@ func (s *SerialTranscript) discardBeforeLocked(offset int) {
 		s.base = offset
 		return
 	}
+	kept := s.segments[:0]
+	for _, segment := range s.segments {
+		if segment.end <= offset {
+			s.cleanupTranscriptSegmentLocked(segment)
+		} else {
+			kept = append(kept, segment)
+		}
+	}
+	s.segments = kept
 	if offset == s.size {
 		s.base = offset
 		if offset-s.fileBase < serialTranscriptReclaimBytes {
@@ -253,53 +324,6 @@ func (s *SerialTranscript) discardBeforeLocked(offset int) {
 		return
 	}
 	s.base = offset
-	s.compactConsumedPrefixLocked()
-}
-
-func (s *SerialTranscript) compactConsumedPrefixLocked() {
-	consumed := s.base - s.fileBase
-	live := s.size - s.base
-	if consumed < serialTranscriptReclaimBytes || consumed < live || live > serialTranscriptMaxReclaimCopyBytes || s.base-s.reclaimAt < serialTranscriptReclaimBytes {
-		return
-	}
-	s.reclaimAt = s.base
-	dir := filepath.Dir(s.file.Name())
-	next, err := os.CreateTemp(dir, "serial-reclaim-*")
-	if err == nil && live > 0 {
-		_, err = io.CopyN(next, io.NewSectionReader(s.file, int64(consumed), int64(live)), int64(live))
-	}
-	if err != nil {
-		if next != nil {
-			name := next.Name()
-			_ = next.Close()
-			_ = os.Remove(name)
-		}
-		s.reclaimErr = errors.Join(s.reclaimErr, err)
-		slog.Warn("serial transcript prefix reclamation failed; preserving the existing spill file", "error", err)
-		return
-	}
-	name := next.Name()
-	old, oldPath := s.file, s.path
-	s.file = next
-	s.fileBase = s.base
-	if removeErr := os.Remove(name); removeErr != nil {
-		s.path = name
-	} else {
-		s.path = ""
-	}
-	if closeErr := old.Close(); closeErr != nil {
-		s.reclaimErr = errors.Join(s.reclaimErr, closeErr)
-		if _, statErr := old.Stat(); statErr == nil {
-			s.staleFiles = append(s.staleFiles, old)
-		}
-		slog.Warn("serial transcript reclaimed its consumed prefix but could not close the old spill file", "error", closeErr)
-	} else if oldPath != "" {
-		if removeErr := os.Remove(oldPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			s.reclaimErr = errors.Join(s.reclaimErr, removeErr)
-			s.stalePaths = append(s.stalePaths, oldPath)
-			slog.Warn("serial transcript reclaimed its consumed prefix but could not remove the old spill file", "path", oldPath, "error", removeErr)
-		}
-	}
 }
 
 // ReadFrom returns only transcript bytes at and after offset. Callers which
@@ -342,12 +366,36 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 	if s.file == nil {
 		return append([]byte(nil), s.buf[start-s.base:end-s.base]...), s.spillErr
 	}
-	data := make([]byte, end-start)
-	n, err := s.file.ReadAt(data, int64(start-s.fileBase))
-	if errors.Is(err, io.EOF) && n == len(data) {
-		err = nil
+	data := make([]byte, 0, end-start)
+	position := start
+	segments := append([]serialTranscriptSegment(nil), s.segments...)
+	segments = append(segments, serialTranscriptSegment{file: s.file, base: s.fileBase, end: s.size})
+	var readErr error
+	for _, segment := range segments {
+		if position >= end {
+			break
+		}
+		if position >= segment.end || end <= segment.base {
+			continue
+		}
+		segmentStart := max(position, segment.base)
+		segmentEnd := min(end, segment.end)
+		chunk := make([]byte, segmentEnd-segmentStart)
+		n, err := segment.file.ReadAt(chunk, int64(segmentStart-segment.base))
+		if errors.Is(err, io.EOF) && n == len(chunk) {
+			err = nil
+		}
+		data = append(data, chunk[:n]...)
+		position = segmentStart + n
+		if err != nil {
+			readErr = errors.Join(readErr, err)
+			break
+		}
 	}
-	return data[:n], err
+	if position < end && readErr == nil {
+		readErr = io.ErrUnexpectedEOF
+	}
+	return data, errors.Join(s.spillErr, readErr)
 }
 
 func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
@@ -531,13 +579,23 @@ func (s *SerialTranscript) Close() error {
 		return nil
 	}
 	s.closed = true
-	f, path, staleFiles, stalePaths := s.file, s.path, s.staleFiles, s.stalePaths
+	f, path, segments, staleFiles, stalePaths := s.file, s.path, s.segments, s.staleFiles, s.stalePaths
 	s.file, s.path, s.buf, s.tail, s.readers, s.size = nil, "", nil, nil, nil, 0
-	s.staleFiles, s.stalePaths = nil, nil
+	s.segments, s.staleFiles, s.stalePaths = nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {
 		errs = append(errs, f.Close())
+	}
+	for _, segment := range segments {
+		if segment.file != nil {
+			errs = append(errs, segment.file.Close())
+		}
+		if segment.path != "" {
+			if err := os.Remove(segment.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, err)
+			}
+		}
 	}
 	for _, stale := range staleFiles {
 		if stale != nil {

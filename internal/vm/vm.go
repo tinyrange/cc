@@ -104,6 +104,7 @@ type managerStart struct {
 
 type Machine struct {
 	lifecycleMu sync.Mutex
+	balloonMu   sync.Mutex
 	id          string
 	image       string
 	initSystem  string
@@ -564,6 +565,11 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 	m.mu.Lock()
 	machine := m.running[id]
 	if machine == nil {
+		if _, exited := m.exited[id]; exited {
+			delete(m.exited, id)
+			m.mu.Unlock()
+			return nil
+		}
 		m.mu.Unlock()
 		return fmt.Errorf("no VM %q is running", id)
 	}
@@ -594,7 +600,9 @@ func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation
 
 func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
 	machine.lifecycleMu.Lock()
+	machine.balloonMu.Lock()
 	err := machine.instance.Close()
+	machine.balloonMu.Unlock()
 	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
@@ -686,7 +694,17 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		return err
 	}
 	for _, share := range req.Shares {
-		if err := machine.instance.AddShare(ctx, share); err != nil {
+		locked, unlock, lockErr := m.lockMachineOperation(id)
+		if lockErr != nil {
+			return lockErr
+		}
+		if locked != machine {
+			unlock()
+			return stoppedVMError(id)
+		}
+		err := machine.instance.AddShare(ctx, share)
+		unlock()
+		if err != nil {
 			if m.instanceIsStopping(id, machine) {
 				return stoppedVMError(id)
 			}
@@ -1154,16 +1172,16 @@ func (m *Manager) SetInstanceBalloon(id string, targetMB uint64) error {
 	if !ok {
 		return fmt.Errorf("VM %q does not support dynamic ballooning", id)
 	}
-	machine.lifecycleMu.Lock()
+	machine.balloonMu.Lock()
 	m.mu.Lock()
 	if m.running[id] != machine || machine.stopping {
 		m.mu.Unlock()
-		machine.lifecycleMu.Unlock()
+		machine.balloonMu.Unlock()
 		return fmt.Errorf("VM %q is stopping", id)
 	}
 	m.mu.Unlock()
 	err := controller.SetBalloonMB(targetMB)
-	machine.lifecycleMu.Unlock()
+	machine.balloonMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("set VM %q balloon target: %w", id, err)
 	}

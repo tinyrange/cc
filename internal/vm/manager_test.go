@@ -209,6 +209,38 @@ func TestManagerSerializesMutableBackendOperationWithShutdown(t *testing.T) {
 	}
 }
 
+func TestManagerRunStreamShareMutationCannotRaceShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingShareInstance{
+		fakeInstance: newFakeInstance(), shareStarted: make(chan struct{}), releaseShare: make(chan struct{}), closeStarted: make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shared-run", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.RunStreamIn(ctx, "shared-run", client.RunRequest{Image: "alpine", Command: []string{"true"}, Shares: []client.ShareMount{{Mount: "/data"}}}, nil, func(client.ExecEvent) error { return nil })
+	}()
+	<-inst.shareStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "shared-run") }()
+	select {
+	case <-inst.closeStarted:
+		t.Fatal("instance close raced RunStreamIn share mutation")
+	default:
+	}
+	close(inst.releaseShare)
+	if err := <-runDone; err != nil && !strings.Contains(err.Error(), "stopping") {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
@@ -415,6 +447,28 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 		t.Fatalf("replacement state = %+v", state)
 	}
 	_ = manager.ShutdownAll(context.Background())
+}
+
+func TestManagerShutdownReapsCrashedGeneration(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 1})
+	crashed := newFakeInstance()
+	crashed.waitErr = errors.New("hypervisor exited")
+	host.queueInstance(crashed)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "alpha", Image: "alpine", MemoryMB: 256}); err != nil {
+		t.Fatal(err)
+	}
+	_ = crashed.Close()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("alpha").Status != "crashed" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := manager.ShutdownInstance(context.Background(), "alpha"); err != nil {
+		t.Fatalf("reap crashed generation: %v", err)
+	}
+	if states := manager.Statuses(); len(states) != 0 {
+		t.Fatalf("states after reap = %+v, want none", states)
+	}
 }
 
 func TestManagerBoundsCrashDiagnosticsWithoutDuplicatingExitReason(t *testing.T) {

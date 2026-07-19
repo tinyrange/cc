@@ -29,6 +29,7 @@ type imageDataStore struct {
 	current                 uint64
 	highWater               uint64
 	reclaimErr              error
+	staleCleanupErr         error
 	rangeReclaimUnsupported bool
 	closed                  bool
 	refs                    int
@@ -336,7 +337,8 @@ func (s *imageDataStore) compactLocked() error {
 	// transiently. Retain it for later sync/usage/close retries and report the
 	// failure without rolling back the valid compacted store.
 	s.stale = append(s.stale, imageDataStaleFile{file: oldFile, path: oldPath})
-	return s.cleanupStaleLocked()
+	s.staleCleanupErr = s.cleanupStaleLocked()
+	return nil
 }
 
 func (s *imageDataStore) cleanupStaleLocked() error {
@@ -368,13 +370,11 @@ func (s *imageDataStore) usage() (current, highWater, physical uint64, reclaimEr
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.cleanupStaleLocked(); err != nil {
-		s.reclaimErr = errors.Join(s.reclaimErr, err)
-	}
+	s.staleCleanupErr = s.cleanupStaleLocked()
 	if s.file != nil {
 		physical, reclaimErr = allocatedFileBytes(s.file)
 	}
-	return s.current, s.highWater, physical, errors.Join(s.reclaimErr, reclaimErr)
+	return s.current, s.highWater, physical, errors.Join(s.reclaimErr, s.staleCleanupErr, reclaimErr)
 }
 
 func (s *imageDataStore) sync() error {
@@ -382,6 +382,7 @@ func (s *imageDataStore) sync() error {
 	defer s.mu.Unlock()
 	s.flushReclaimLocked()
 	cleanupErr := s.cleanupStaleLocked()
+	s.staleCleanupErr = cleanupErr
 	if s.file == nil {
 		return cleanupErr
 	}

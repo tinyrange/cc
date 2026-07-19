@@ -256,13 +256,14 @@ func TestSerialTranscriptReclaimsConsumedSpillPrefix(t *testing.T) {
 	transcript.mu.Lock()
 	file := transcript.file
 	fileBase := transcript.fileBase
+	segments := append([]serialTranscriptSegment(nil), transcript.segments...)
 	transcript.mu.Unlock()
 	info, err := file.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fileBase != 12<<20 || info.Size() != 8<<20 {
-		t.Fatalf("reclaimed transcript file base=%d size=%d", fileBase, info.Size())
+	if fileBase != 16<<20 || info.Size() != 4<<20 || len(segments) != 1 || segments[0].base != 8<<20 || segments[0].end != 16<<20 {
+		t.Fatalf("segmented transcript file base=%d size=%d segments=%+v", fileBase, info.Size(), segments)
 	}
 	text, next := transcript.ReadFrom(12 << 20)
 	if next <= 12<<20 || text != string(payload[12<<20:12<<20+len(text)]) {
@@ -270,28 +271,26 @@ func TestSerialTranscriptReclaimsConsumedSpillPrefix(t *testing.T) {
 	}
 }
 
-func TestSerialTranscriptDefersCompactionOfLargeLiveSuffix(t *testing.T) {
+func TestSerialTranscriptSegmentsReclaimContinuousConsumedOutputWithoutCopy(t *testing.T) {
 	transcript := NewSerialTranscript()
 	defer transcript.Close()
-	payload := bytes.Repeat([]byte{'x'}, 20<<20)
+	payload := bytes.Repeat([]byte{'x'}, 40<<20)
 	if _, err := transcript.Write(payload); err != nil {
 		t.Fatal(err)
 	}
 	reader := transcript.RetainReader(0)
 	defer reader.Close()
-	reader.Advance(10 << 20)
+	reader.Advance(31 << 20)
 	transcript.mu.Lock()
 	fileBase := transcript.fileBase
+	segments := append([]serialTranscriptSegment(nil), transcript.segments...)
 	transcript.mu.Unlock()
-	if fileBase != 0 {
-		t.Fatalf("large live suffix was copied under the transcript lock: file base=%d", fileBase)
+	if fileBase != 32<<20 || len(segments) != 1 || segments[0].base != 24<<20 {
+		t.Fatalf("continuous segmented reclaim file base=%d segments=%+v", fileBase, segments)
 	}
-	reader.Advance(12 << 20)
-	transcript.mu.Lock()
-	fileBase = transcript.fileBase
-	transcript.mu.Unlock()
-	if fileBase != 12<<20 {
-		t.Fatalf("bounded live suffix was not reclaimed: file base=%d", fileBase)
+	text, next := transcript.ReadFrom(31 << 20)
+	if len(text) == 0 || next <= 31<<20 {
+		t.Fatal("segmented transcript lost the live suffix")
 	}
 }
 
@@ -347,8 +346,11 @@ func TestSerialTranscriptBatchesEndOfFileReclamation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != 0 {
-		t.Fatalf("batched consumed transcript size = %d, want 0", info.Size())
+	transcript.mu.Lock()
+	segments := len(transcript.segments)
+	transcript.mu.Unlock()
+	if info.Size() != 1<<20 || segments != 0 {
+		t.Fatalf("batched segmented transcript size=%d segments=%d, want one bounded active segment", info.Size(), segments)
 	}
 }
 
