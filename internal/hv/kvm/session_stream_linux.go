@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"j5.nz/cc/client"
@@ -34,6 +35,14 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
 	defer stopKeepalive()
+	if req.Kind == "" || req.Kind == "exec" {
+		inputReady := vmruntime.ExecTimingMarker + id + ":input_ready:"
+		if _, err := s.waitForTranscript(ctx, start, func(text string) bool {
+			return strings.Contains(text, inputReady)
+		}); err != nil {
+			return transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
+	}
 	inputErr := make(chan error, 1)
 	if inputs != nil {
 		go func() {
@@ -94,9 +103,7 @@ func (s *ManagedSession) nextExecID() string {
 }
 
 func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return managedagent.Send(s.control, managedagent.ExecRequest(id, req))
+	return s.sendExecMessage(managedagent.ExecRequest(id, req))
 }
 
 func (s *ManagedSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) error {

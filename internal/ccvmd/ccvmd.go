@@ -2081,6 +2081,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 						if eventErr := onEvent(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)}); eventErr != nil {
 							return eventErr
 						}
+						if eventErr := onEvent(client.ExecEvent{Kind: "timeout"}); eventErr != nil {
+							return eventErr
+						}
 						return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 124})
 					}
 					return err
@@ -2402,6 +2405,7 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	if err != nil {
 		if req.TimeoutSeconds > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			_ = enc.Encode(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)})
+			_ = enc.Encode(client.ExecEvent{Kind: "timeout"})
 			_ = enc.Encode(client.ExecEvent{Kind: "exit", ExitCode: 124})
 			if flusher != nil {
 				flusher.Flush()

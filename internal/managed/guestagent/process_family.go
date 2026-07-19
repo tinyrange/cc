@@ -77,12 +77,15 @@ func newProcessFamily(root int, tracker processFamilyTracker) *ProcessFamily {
 		return &ProcessFamily{done: make(chan struct{}), pids: make(map[int]struct{})}
 	}
 	f := &ProcessFamily{root: root, tracker: tracker, done: make(chan struct{}), pids: map[int]struct{}{root: {}}}
-	f.refresh()
 	go f.watch()
 	return f
 }
 
 func (f *ProcessFamily) watch() {
+	// Monitoring must never hold command startup hostage. Platform snapshots can
+	// involve virtual filesystems that are temporarily slow after VM restore;
+	// the root PID and platform tracker are already armed before this starts.
+	f.refresh()
 	ticker := time.NewTicker(processFamilyPollInterval)
 	defer ticker.Stop()
 	for {

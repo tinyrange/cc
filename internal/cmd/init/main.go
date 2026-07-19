@@ -55,11 +55,13 @@ const (
 	managedExecTimingWaitDone        = "wait_done"
 	managedExecTimingStreamsDone     = "streams_done"
 	managedExecTimingExitSent        = "exit_sent"
-	managedExecTimingStdinCloseRecv  = "stdin_close_recv"
 )
 const stage2Mode = "--ccx3-stage2"
 const stage2Path = "/etc/ccx3/stage2"
 const stage2ConfigPath = "/etc/ccx3/config.json"
+const snapshotStage2Path = "/var/tmp/.ccx3-snapshot-stage2"
+const snapshotStage2ConfigPath = "/var/tmp/.ccx3-snapshot-config.json"
+const snapshotModuleDir = "/var/tmp/.ccx3-snapshot-modules"
 const initSystemSystemd = "systemd"
 const systemdReadyTimeout = 30 * time.Second
 
@@ -106,6 +108,7 @@ type config struct {
 	DisableCgroupMount bool     `json:"disable_cgroup_mount,omitempty"`
 	Network            *network `json:"network,omitempty"`
 	SnapshotMMIOBase   uint64   `json:"snapshot_mmio_base,omitempty"`
+	SnapshotModules    []string `json:"snapshot_modules,omitempty"`
 	UnixTime           int64    `json:"unix_time,omitempty"`
 }
 
@@ -304,13 +307,29 @@ func prepareExecRequest(cfg config, req execRequest) preparedExecRequest {
 }
 
 func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveExecSet, req preparedExecRequest, waitReady func() error) {
-	stdinR, stdinW := io.Pipe()
+	// Use a kernel pipe for command input. An io.Pipe requires a guest Go
+	// goroutine to rendezvous with every write; immediately after snapshot
+	// restore that rendezvous could stall even though the child was already
+	// running. The kernel pipe also preserves natural backpressure without an
+	// arbitrary in-memory input limit.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		writeExecStderr(cfg, control, req.ID, "ccx3-init: open command stdin: "+err.Error()+"\n")
+		reporterForConfig(cfg, control, req.ID, time.Now()).Exit(126)
+		return
+	}
 	managed := &managedExec{stdin: stdinW, start: time.Now()}
 	closeStdin := active.Add(req.ID, managed)
-	go runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {
-		_ = managed.closeStdin()
-		active.Delete(req.ID)
-	})
+	// The input sink is fully usable once it is registered: the kernel pipe can
+	// queue data before the command worker runs. Advertise that state without a
+	// goroutine rendezvous, which may not be scheduled promptly after restore.
+	writeExecTiming(control, req.ID, "input_ready", managed.start)
+	go func() {
+		runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {
+			_ = managed.closeStdin()
+			active.Delete(req.ID)
+		})
+	}()
 	if closeStdin {
 		if err := managed.closeStdin(); err != nil {
 			writeKernel("ccx3-init: close pending stdin: " + err.Error())
@@ -543,11 +562,19 @@ func run() error {
 				return bootInitSystem(cfg, bootStart)
 			}
 			if len(deferredModules) > 0 {
-				writeStage(bootStart, "loading deferred modules")
-				if err := loadModulePayloads(deferredModules); err != nil {
+				writeStage(bootStart, "staging deferred modules")
+				cfg.SnapshotModules, err = stageSnapshotModules(deferredModules)
+				if err != nil {
 					return err
 				}
-				writeStage(bootStart, "deferred modules loaded")
+				writeStage(bootStart, "deferred modules staged")
+			}
+			if cfg.SnapshotMMIOBase != 0 {
+				writeStage(bootStart, "preparing snapshot stage2")
+				if err := prepareSnapshotStage2(cfg); err != nil {
+					return fmt.Errorf("prepare snapshot stage2: %w", err)
+				}
+				writeStage(bootStart, "snapshot stage2 prepared")
 			}
 			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
 				return fmt.Errorf("trigger snapshot: %w", err)
@@ -558,6 +585,7 @@ func run() error {
 					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
 				}
 				writeStage(bootStart, "entropy seeded")
+				return execSnapshotStage2()
 			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
@@ -594,6 +622,7 @@ func run() error {
 
 func runStage2() error {
 	writeKernel("ccx3-init: stage2 starting")
+	snapshotRestore := os.Getenv("CCX3_STAGE2_CONFIG") == snapshotStage2ConfigPath
 	var cfg config
 	buf, err := readStage2Config()
 	if err != nil {
@@ -601,6 +630,14 @@ func runStage2() error {
 	}
 	if err := json.Unmarshal(buf, &cfg); err != nil {
 		return fmt.Errorf("decode config: %w", err)
+	}
+	if snapshotRestore {
+		if err := loadModules(cfg.SnapshotModules); err != nil {
+			return fmt.Errorf("load snapshot modules: %w", err)
+		}
+		_ = os.RemoveAll(snapshotModuleDir)
+		_ = os.Remove(snapshotStage2ConfigPath)
+		_ = os.Remove(snapshotStage2Path)
 	}
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = "/"
@@ -622,6 +659,49 @@ func runStage2() error {
 		writeProtocolLineTo(control, cfg.ReadyMarker)
 	}
 	return commandLoop(cfg, control)
+}
+
+func prepareSnapshotStage2(cfg config) error {
+	if err := copyCurrentExecutable(snapshotStage2Path); err != nil {
+		return err
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("encode snapshot stage2 config: %w", err)
+	}
+	if err := os.WriteFile(snapshotStage2ConfigPath, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write snapshot stage2 config: %w", err)
+	}
+	if err := os.Chmod(snapshotStage2ConfigPath, 0o600); err != nil {
+		return fmt.Errorf("chmod snapshot stage2 config: %w", err)
+	}
+	return nil
+}
+
+func stageSnapshotModules(modules []modulePayload) ([]string, error) {
+	if err := os.RemoveAll(snapshotModuleDir); err != nil {
+		return nil, fmt.Errorf("clear snapshot module directory: %w", err)
+	}
+	if err := os.MkdirAll(snapshotModuleDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create snapshot module directory: %w", err)
+	}
+	paths := make([]string, 0, len(modules))
+	for i, module := range modules {
+		path := filepath.Join(snapshotModuleDir, fmt.Sprintf("%03d-%s", i, filepath.Base(module.path)))
+		if err := os.WriteFile(path, module.data, 0o600); err != nil {
+			return nil, fmt.Errorf("stage snapshot module %s: %w", module.path, err)
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func execSnapshotStage2() error {
+	env := append(os.Environ(), "CCX3_STAGE2_CONFIG="+snapshotStage2ConfigPath)
+	if err := syscall.Exec(snapshotStage2Path, []string{snapshotStage2Path, stage2Mode}, env); err != nil {
+		return fmt.Errorf("exec snapshot stage2: %w", err)
+	}
+	return fmt.Errorf("snapshot stage2 returned unexpectedly")
 }
 
 func waitForSystemdControlSocket(timeout time.Duration) error {
@@ -2033,15 +2113,6 @@ func readModulePayloads(modules []string) ([]modulePayload, error) {
 	return payloads, nil
 }
 
-func loadModulePayloads(modules []modulePayload) error {
-	for _, module := range modules {
-		if err := loadModuleData(module.path, module.data); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func loadModuleData(path string, data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("module %s is empty", path)
@@ -2211,10 +2282,6 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 		})
 		if !result.Found {
 			return true
-		}
-		managed, _ := result.Exec.(*managedExec)
-		if managed != nil {
-			writeExecTiming(control, req.ID, managedExecTimingStdinCloseRecv, managed.start)
 		}
 		if result.Err != nil {
 			writeKernel("ccx3-init: close stdin: " + result.Err.Error())
@@ -3061,25 +3128,29 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		var ptyEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			ptyEmit = reporter.Stdout
 		}
+		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		go copyManagedExecReader(done, ptyMaster, nil, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, ptyEmit)
 		if stdin != nil {
 			go copyManagedExecStdinToPTY(done, stdin, ptyMaster)
 		}
 	} else {
 		if stdin != nil {
-			var err error
-			stdinW, err = cmd.StdinPipe()
-			if err != nil {
-				closeManagedExecStdinPipe(stdin, nil, nil)
-				writeKernel("ccx3-init: open stdin pipe: " + err.Error())
-				writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
-				reporter.Exit(126)
-				return
+			if file, ok := stdin.(*os.File); ok {
+				cmd.Stdin = file
+			} else {
+				var err error
+				stdinW, err = cmd.StdinPipe()
+				if err != nil {
+					closeManagedExecStdinPipe(stdin, nil, nil)
+					writeKernel("ccx3-init: open stdin pipe: " + err.Error())
+					writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
+					reporter.Exit(126)
+					return
+				}
 			}
 		} else {
 			devNull, err := os.Open("/dev/null")
@@ -3108,11 +3179,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			return
 		}
 
-		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		var stdoutEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			stdoutEmit = reporter.Stdout
 		}
+		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		go copyManagedExecReader(done, stdoutR, stdoutR.Close, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, stdoutEmit)
 		var stderrEmit func([]byte)
 		if cfg.ErrorMarkerPref != "" {
@@ -3165,15 +3236,15 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		stdinDone = make(chan struct{}, 1)
 		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
 	}
-	managed.setProcess(cmd.Process, signalGroup, preparedFamily.Start(cmd.Process.Pid))
+	startedFamily := preparedFamily.Start(cmd.Process.Pid)
+	managed.setProcess(cmd.Process, signalGroup, startedFamily)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil
 	}
 
 	reporter.Timing(managedExecTimingWaitBegin)
-	var waitResult managedExecWaitResult
-	waitResult = waitManagedExecProcess(cmd, execStart)
+	waitResult := waitManagedExecProcess(cmd, execStart)
 	terminateManagedExecProcessGroup(cmd.Process.Pid)
 	managed.stdinMu.Lock()
 	family := managed.family

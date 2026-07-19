@@ -386,6 +386,20 @@ func main() {
 		data, err := os.ReadFile(new); if err != nil || string(data) != "SOURCE" { os.Exit(7) }
 		fmt.Println("noreplace-renamed"); return
 	}
+	if os.Args[1] == "noreplace-existing" {
+		a, b, c := "/work/sequence-a", "/work/sequence-b", "/work/sequence-c"
+		os.Remove(a); os.Remove(b); os.Remove(c); os.WriteFile(a, []byte("A"), 0600)
+		ap, _ := syscall.BytePtrFromString(a); bp, _ := syscall.BytePtrFromString(b); cp, _ := syscall.BytePtrFromString(c)
+		atFDCWD := ^uintptr(99)
+		_, _, first := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(ap)), atFDCWD, uintptr(unsafe.Pointer(bp)), 1, 0)
+		if first != 0 { panic(first) }
+		os.WriteFile(c, []byte("C"), 0600)
+		_, _, second := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(bp)), atFDCWD, uintptr(unsafe.Pointer(cp)), 1, 0)
+		if second != syscall.EEXIST { fmt.Printf("second=%%v\n", second); os.Exit(10) }
+		bd, _ := os.ReadFile(b); cd, _ := os.ReadFile(c)
+		if string(bd) != "A" || string(cd) != "C" { os.Exit(11) }
+		fmt.Println("noreplace-existing-preserved"); return
+	}
 	if os.Args[1] == "hardlinks" {
 		a, b := "/work/link-a", "/work/link-b"; os.Remove(a); os.Remove(b)
 		if err := os.WriteFile(a, []byte("x"), 0600); err != nil { panic(err) }
@@ -421,7 +435,7 @@ func main() {
  if err == syscall.EAGAIN || err == syscall.EACCES { fmt.Println("blocked"); return }
  if err != nil { panic(err) }
  os.Exit(3)
-}`, renameat2Syscall, renameat2Syscall)
+}`, renameat2Syscall, renameat2Syscall, renameat2Syscall, renameat2Syscall)
 	sourcePath := filepath.Join(helperDir, "main.go")
 	binaryPath := filepath.Join(helperDir, "lock-helper")
 	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
@@ -460,6 +474,37 @@ func main() {
 	})
 	if noreplace.ExitCode != 0 {
 		t.Fatalf("mounted RENAME_NOREPLACE failed for an absent target: exit=%d output=%s", noreplace.ExitCode, noreplace.Output)
+	}
+	contextInputs := make(chan client.ExecInput, 2)
+	var contextControl strings.Builder
+	var contextExit *int
+	commandSent := false
+	if err := inst.ExecStream(context.Background(), client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "printf 'ready\\n' >&3; IFS= read -r command; eval \"$command\"; status=$?; printf 'complete:%s\\n' \"$status\" >&3; exit \"$status\""},
+		User:    "root", ControlFD: true,
+	}, contextInputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			data := event.Data
+			if len(data) == 0 {
+				data = []byte(event.Output)
+			}
+			contextControl.Write(data)
+			if !commandSent && strings.Contains(contextControl.String(), "ready\n") {
+				commandSent = true
+				contextInputs <- client.ExecInput{Kind: "stdin", Data: []byte("/work/lock-bin/lock-helper noreplace-existing\n")}
+				close(contextInputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			contextExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("persistent root rename sequence: %v; control=%q", err, contextControl.String())
+	}
+	if !commandSent || contextExit == nil || *contextExit != 0 || contextControl.String() != "ready\ncomplete:0\n" {
+		t.Fatalf("persistent root rename completion: sent=%t exit=%v control=%q", commandSent, contextExit, contextControl.String())
 	}
 	hardlinks := execInRuntimeRequest(t, inst, client.ExecRequest{
 		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper hardlinks"}, User: "root",
@@ -1115,15 +1160,20 @@ func TestRuntimeRestoresPersistentFromStartupSnapshot(t *testing.T) {
 	}
 
 	snapshotPath := singleSnapshotPath(t, snapshotRoot, captureConsole)
-	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
-		RestoreSnapshot: snapshotPath,
-		MemoryMB:        256,
-		CPUs:            1,
-	})
-	defer restored.Close()
-
-	resp := execInRuntime(t, restored, []string{"sh", "-lc", "set -eu; printf 'restored-startup-snapshot\n'; cat /proc/sys/kernel/ostype"})
-	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
+	shareRoot := t.TempDir()
+	share := client.ShareMount{Source: shareRoot, Mount: "/host", Writable: true, MapOwner: true, OwnerUID: 1000, OwnerGID: 1000, Cache: "strict"}
+	for restore := 0; restore < 3; restore++ {
+		restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+			RestoreSnapshot: snapshotPath,
+			MemoryMB:        256,
+			CPUs:            1,
+			Shares:          []client.ShareMount{share},
+		})
+		execPersistentControlInRuntime(t, restored)
+		if err := restored.Close(); err != nil {
+			t.Fatalf("close restored instance %d: %v", restore, err)
+		}
+	}
 }
 
 func TestRuntimeSnapshotAppliesCurrentBalloonTarget(t *testing.T) {
@@ -1339,7 +1389,7 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	rootMount := execInRuntime(t, inst, []string{
 		"sh",
 		"-lc",
-		"set -eu; awk '$4 == \"/\" && $5 == \"/\" { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo; printf 'root-mount-ok\n'",
+		"set -eu; awk '$4 == \"/\" && $5 == \"/\" { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo; df -k / >/tmp/root-df; test -s /tmp/root-df; printf 'root-mount-ok\n'",
 	})
 	requireGuestOutput(t, rootMount.Output, "root-mount-ok")
 
@@ -1819,7 +1869,7 @@ func execInRuntimeInstanceStream(t *testing.T, env *runtimeBootEnv, inst Instanc
 	var exitCode *int
 	err := env.backend.ExecInInstanceStream(ctx, inst, env.imageName, req, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
-		case "stdout", "stderr":
+		case "stdout", "stderr", "control":
 			writeExecEventOutput(&output, event)
 		case "exit":
 			code := event.ExitCode
@@ -1875,7 +1925,7 @@ func execStreamInRuntime(t *testing.T, inst Instance, req client.ExecRequest, in
 	var exitCode *int
 	err := inst.ExecStream(ctx, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
-		case "stdout", "stderr":
+		case "stdout", "stderr", "control":
 			writeExecEventOutput(&output, event)
 		case "exit":
 			code := event.ExitCode
@@ -1893,6 +1943,46 @@ func execStreamInRuntime(t *testing.T, inst Instance, req client.ExecRequest, in
 		t.Fatalf("stream guest exec %q exited with %d, want %d\noutput:\n%s", req.Command, *exitCode, wantExit, output.String())
 	}
 	return output.String()
+}
+
+func execPersistentControlInRuntime(t *testing.T, inst Instance) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeExecTimeout())
+	defer cancel()
+	inputs := make(chan client.ExecInput, 1)
+	ready := false
+	var control bytes.Buffer
+	var output bytes.Buffer
+	var exitCode *int
+	err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"/bin/sh", "-c", "stty -echo; printf 'ready\\n' >&3; IFS= read -r command; eval \"$command\"; status=$?; printf 'complete:%s\\n' \"$status\" >&3; exit \"$status\""},
+		ControlFD: true,
+		TTY:       true,
+		WorkDir:   "/host",
+		User:      "1000",
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			writeExecEventOutput(&control, event)
+			if !ready {
+				ready = true
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'warm-command\\n'; test \"$PWD\" = /host\n")}
+				close(inputs)
+			}
+		case "stdout":
+			writeExecEventOutput(&output, event)
+		case "exit":
+			code := event.ExitCode
+			exitCode = &code
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("persistent restored guest shell: %v; control=%q output=%q console=%q", err, control.String(), output.String(), runtimeConsoleHistory(inst))
+	}
+	if !ready || exitCode == nil || *exitCode != 0 || control.String() != "ready\ncomplete:0\n" || strings.ReplaceAll(output.String(), "\r\n", "\n") != "warm-command\n" {
+		t.Fatalf("persistent restored guest shell ready=%t exit=%v control=%q output=%q", ready, exitCode, control.String(), output.String())
+	}
 }
 
 func execStreamSignalOnOutput(t *testing.T, inst Instance) string {
