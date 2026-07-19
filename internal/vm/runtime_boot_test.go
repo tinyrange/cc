@@ -327,6 +327,40 @@ func TestRuntimeArchiveTransferPreservesMountedXattrs(t *testing.T) {
 	}
 }
 
+func TestRuntimeArchiveControlEnforcesSparseLogicalLimits(t *testing.T) {
+	const maxFile = int64(64 << 20)
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	header := &tar.Header{
+		Name: "oversized", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{
+			"VMSH.sparse.size":      strconv.FormatInt(maxFile+1, 10),
+			"VMSH.sparse.numblocks": "1",
+			"VMSH.sparse.map":       strconv.FormatInt(maxFile, 10) + ",1",
+		},
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte{'x'})
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-sparse-limits", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/work/oversized", Stdin: archive.Bytes(), User: "root",
+		ArchiveLimits: &client.ArchiveLimits{MaxEntries: 10, MaxFileBytes: maxFile, MaxExpandedBytes: maxFile},
+	}, 1)
+	probe := execInRuntimeRequest(t, inst, client.ExecRequest{Command: []string{"/bin/sh", "-c", "test ! -e /work/oversized"}, User: "root"})
+	if probe.ExitCode != 0 {
+		t.Fatalf("rejected sparse archive left a destination behind: %s", probe.Output)
+	}
+}
+
 func TestRuntimeMountedImageFSRejectsUnsafeExchangeAndHonorsPOSIXLocks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("runtime helper archive requires a POSIX host")
@@ -341,6 +375,26 @@ func TestRuntimeMountedImageFSRejectsUnsafeExchangeAndHonorsPOSIXLocks(t *testin
 	source := fmt.Sprintf(`package main
 import ("fmt"; "os"; "syscall"; "time"; "unsafe")
 func main() {
+	if os.Args[1] == "noreplace" {
+		old, new := "/work/noreplace-old", "/work/noreplace-new"
+		os.Remove(old); os.Remove(new); os.WriteFile(old, []byte("SOURCE"), 0600)
+		op, _ := syscall.BytePtrFromString(old); np, _ := syscall.BytePtrFromString(new)
+		atFDCWD := ^uintptr(99)
+		_, _, errno := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(op)), atFDCWD, uintptr(unsafe.Pointer(np)), 1, 0)
+		if errno != 0 { panic(errno) }
+		if _, err := os.Stat(old); !os.IsNotExist(err) { os.Exit(6) }
+		data, err := os.ReadFile(new); if err != nil || string(data) != "SOURCE" { os.Exit(7) }
+		fmt.Println("noreplace-renamed"); return
+	}
+	if os.Args[1] == "hardlinks" {
+		a, b := "/work/link-a", "/work/link-b"; os.Remove(a); os.Remove(b)
+		if err := os.WriteFile(a, []byte("x"), 0600); err != nil { panic(err) }
+		if err := os.Link(a, b); err != nil { panic(err) }
+		info, err := os.Stat(a); if err != nil || info.Sys().(*syscall.Stat_t).Nlink != 2 { os.Exit(8) }
+		if err := os.Remove(b); err != nil { panic(err) }
+		info, err = os.Stat(a); if err != nil || info.Sys().(*syscall.Stat_t).Nlink != 1 { os.Exit(9) }
+		fmt.Println("hardlink-counts-current"); return
+	}
  if os.Args[1] == "opendir" {
   path := "/work/open-directory"
   if err := os.Mkdir(path, 0700); err != nil { panic(err) }
@@ -367,7 +421,7 @@ func main() {
  if err == syscall.EAGAIN || err == syscall.EACCES { fmt.Println("blocked"); return }
  if err != nil { panic(err) }
  os.Exit(3)
-}`, renameat2Syscall)
+}`, renameat2Syscall, renameat2Syscall)
 	sourcePath := filepath.Join(helperDir, "main.go")
 	binaryPath := filepath.Join(helperDir, "lock-helper")
 	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
@@ -400,6 +454,18 @@ func main() {
 	})
 	if exchange.ExitCode != 0 {
 		t.Fatalf("mounted RENAME_EXCHANGE did not fail safely: exit=%d output=%s", exchange.ExitCode, exchange.Output)
+	}
+	noreplace := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper noreplace"}, User: "root",
+	})
+	if noreplace.ExitCode != 0 {
+		t.Fatalf("mounted RENAME_NOREPLACE failed for an absent target: exit=%d output=%s", noreplace.ExitCode, noreplace.Output)
+	}
+	hardlinks := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper hardlinks"}, User: "root",
+	})
+	if hardlinks.ExitCode != 0 {
+		t.Fatalf("mounted hard-link attributes remained stale: exit=%d output=%s", hardlinks.ExitCode, hardlinks.Output)
 	}
 	openDirectory := execInRuntimeRequest(t, inst, client.ExecRequest{
 		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper opendir"}, User: "root",

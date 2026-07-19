@@ -13,25 +13,27 @@ const (
 )
 
 const (
-	EPERM     int32 = 1
-	ENOENT    int32 = 2
-	EIO       int32 = 5
-	ENXIO     int32 = 6
-	EBADF     int32 = 9
-	EACCES    int32 = 13
-	EBUSY     int32 = 16
-	EEXIST    int32 = 17
-	EXDEV     int32 = 18
-	ENOTDIR   int32 = 20
-	EISDIR    int32 = 21
-	EINVAL    int32 = 22
-	ENOTTY    int32 = 25
-	EFBIG     int32 = 27
-	EROFS     int32 = 30
-	EPIPE     int32 = 32
-	ERANGE    int32 = 34
-	ENOSYS    int32 = 38
-	ENOTEMPTY int32 = 39
-	ENODATA   int32 = 61
-	ETIMEDOUT int32 = 110
+	EPERM      int32 = 1
+	ENOENT     int32 = 2
+	EIO        int32 = 5
+	ENXIO      int32 = 6
+	EBADF      int32 = 9
+	EACCES     int32 = 13
+	EBUSY      int32 = 16
+	EEXIST     int32 = 17
+	EXDEV      int32 = 18
+	ENOTDIR    int32 = 20
+	EISDIR     int32 = 21
+	EINVAL     int32 = 22
+	ENOTTY     int32 = 25
+	EFBIG      int32 = 27
+	ENOSPC     int32 = 28
+	EROFS      int32 = 30
+	EPIPE      int32 = 32
+	ERANGE     int32 = 34
+	ENOSYS     int32 = 38
+	ENOTEMPTY  int32 = 39
+	ENODATA    int32 = 61
+	EOPNOTSUPP int32 = 95
+	ETIMEDOUT  int32 = 110
 )

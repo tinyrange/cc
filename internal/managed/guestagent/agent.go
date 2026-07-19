@@ -1319,7 +1319,14 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 		if entryBytes > limits.MaxExpandedBytes-expanded {
 			return &ArchiveLimitError{Resource: "expanded bytes", Limit: limits.MaxExpandedBytes, Actual: expanded + entryBytes}
 		}
-		expanded += entryBytes
+		metadataBytes, metadataErr := archiveHeaderMetadataBytes(header)
+		if metadataErr != nil {
+			return metadataErr
+		}
+		if metadataBytes > limits.MaxExpandedBytes-expanded-entryBytes {
+			return &ArchiveLimitError{Resource: "expanded bytes", Limit: limits.MaxExpandedBytes, Actual: expanded + entryBytes + metadataBytes}
+		}
+		expanded += entryBytes + metadataBytes
 		target, err := tarTarget(dst, dstDir, header.Name)
 		if err != nil {
 			return err
@@ -1446,6 +1453,29 @@ func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, root
 			}
 		}
 	}
+}
+
+func archiveHeaderMetadataBytes(header *tar.Header) (uint64, error) {
+	var total uint64
+	for key, encoded := range header.PAXRecords {
+		if !strings.HasPrefix(key, archiveXattrPrefix) {
+			continue
+		}
+		name, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, archiveXattrPrefix))
+		if err != nil {
+			return 0, fmt.Errorf("archive entry %q has an invalid extended attribute name", header.Name)
+		}
+		value, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return 0, fmt.Errorf("archive entry %q has an invalid extended attribute value", header.Name)
+		}
+		addition := uint64(len(name) + len(value) + 64)
+		if addition > math.MaxUint64-total {
+			return 0, fmt.Errorf("archive entry %q metadata is too large", header.Name)
+		}
+		total += addition
+	}
+	return total, nil
 }
 
 func copyTarRegularFile(ctx context.Context, file *os.File, tr *tar.Reader, header *tar.Header) error {

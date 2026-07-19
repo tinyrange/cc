@@ -105,8 +105,8 @@ func TestMountedFSLookupRoutesSyntheticMountPaths(t *testing.T) {
 		t.Fatalf("share file data = %q", data)
 	}
 
-	if got := fsys.CachePolicy(1).Mode; got != fsCacheAggressive {
-		t.Fatalf("root cache mode = %q, want %q", got, fsCacheAggressive)
+	if got := fsys.CachePolicy(1).AttrTTL; got != 0 {
+		t.Fatalf("writable root attribute TTL = %s, want immediate mutation visibility", got)
 	}
 	if got := fsys.CachePolicy(shareID).Mode; got != fsCacheStrict {
 		t.Fatalf("share cache mode = %q, want normalized strict mode", got)

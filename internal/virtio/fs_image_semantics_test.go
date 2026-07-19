@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -267,5 +268,31 @@ func TestImageFSXattrsAndSparseSeek(t *testing.T) {
 	}
 	if got, errno := backend.Lseek(nodeID, fh, 2*imageDataPageSize, 4); errno != 0 || got != 2*imageDataPageSize+4 {
 		t.Fatalf("SEEK_HOLE = %d errno %d", got, errno)
+	}
+}
+
+func TestImageFSBoundsAggregateExtendedAttributeMemory(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, _ := createImageFile(t, backend, "xattrs", "")
+	value := make([]byte, 60<<10)
+	accepted := 0
+	for i := 0; i < 128; i++ {
+		errno := backend.SetXattr(nodeID, fmt.Sprintf("user.value-%d", i), value, 0)
+		if errno == -linuxENOSPC {
+			break
+		}
+		if errno != 0 {
+			t.Fatalf("set xattr %d: errno %d", i, errno)
+		}
+		accepted++
+	}
+	if accepted == 0 || accepted >= 128 {
+		t.Fatalf("aggregate xattr budget accepted %d entries", accepted)
+	}
+	if errno := backend.RemoveXattr(nodeID, "user.value-0"); errno != 0 {
+		t.Fatalf("remove xattr: errno %d", errno)
+	}
+	if errno := backend.SetXattr(nodeID, "user.replacement", value, 0); errno != 0 {
+		t.Fatalf("released xattr budget was not reusable: errno %d", errno)
 	}
 }

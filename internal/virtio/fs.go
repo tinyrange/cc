@@ -1923,7 +1923,10 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			// explicit unsupported result is safer than reporting success after
 			// data loss.
 			if flags&linuxRenameExchange != 0 {
-				return reply(-linuxENOSYS, nil), nil
+				// ENOSYS makes Linux permanently disable the entire RENAME2
+				// opcode for this mount. Reject only this flag so later
+				// RENAME_NOREPLACE requests continue reaching the backend.
+				return reply(-linuxEOPNOTSUPP, nil), nil
 			}
 			names := req[fuseInHeaderSize+16:]
 			split := bytesIndexByte(names, 0)
@@ -3079,6 +3082,7 @@ type imageFS struct {
 	handles        map[uint64]imageHandle
 	dirHandles     map[uint64][]dirEntry
 	dirHandleNodes map[uint64]uint64
+	xattrBytes     uint64
 }
 
 type imageHandle struct {
@@ -3114,6 +3118,12 @@ type imageNode struct {
 }
 
 const imageDataPageSize = uint64(4096)
+
+const (
+	imageXattrEntryOverhead   = 64
+	imageMaxXattrBytesPerNode = 256 << 10
+	imageMaxXattrBytes        = 16 << 20
+)
 
 // sparseImageData stores only pages which have actually been written. A file's
 // logical size lives on imageNode, so truncate(2) can create holes without
@@ -5118,10 +5128,20 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	if flags&2 != 0 && !exists {
 		return -linuxENODATA
 	}
+	oldBytes := 0
+	if exists {
+		oldBytes = len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead
+	}
+	newBytes := len(name) + len(value) + imageXattrEntryOverhead
+	nodeBytes := imageNodeXattrBytes(node) - oldBytes + newBytes
+	if nodeBytes > imageMaxXattrBytesPerNode || int64(p.xattrBytes)-int64(oldBytes)+int64(newBytes) > imageMaxXattrBytes {
+		return -linuxENOSPC
+	}
 	if node.xattrs == nil {
 		node.xattrs = make(map[string][]byte)
 	}
 	node.xattrs[name] = append([]byte(nil), value...)
+	p.xattrBytes = uint64(int64(p.xattrBytes) - int64(oldBytes) + int64(newBytes))
 	node.ctime = time.Now()
 	return 0
 }
@@ -5136,6 +5156,7 @@ func (p *imageFS) RemoveXattr(nodeID uint64, name string) int32 {
 	if _, exists := node.xattrs[name]; !exists {
 		return -linuxENODATA
 	}
+	p.xattrBytes -= uint64(len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead)
 	delete(node.xattrs, name)
 	node.ctime = time.Now()
 	return 0
@@ -5301,8 +5322,22 @@ func (p *imageFS) touchImageDirectoryLocked(node *imageNode, now time.Time) {
 
 func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	if p.imageNodeReferenceCountLocked(nodeID) == 0 && !p.imageNodeHasHandleLocked(nodeID) {
+		if node := p.nodes[nodeID]; node != nil {
+			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
+		}
 		delete(p.nodes, nodeID)
 	}
+}
+
+func imageNodeXattrBytes(node *imageNode) int {
+	if node == nil {
+		return 0
+	}
+	total := 0
+	for name, value := range node.xattrs {
+		total += len(name) + len(value) + imageXattrEntryOverhead
+	}
+	return total
 }
 
 func (p *imageFS) imageNodeInodeLocked(node *imageNode) uint64 {
@@ -5526,24 +5561,26 @@ const (
 )
 
 const (
-	linuxEPERM     = linuxabi.EPERM
-	linuxENOENT    = linuxabi.ENOENT
-	linuxENXIO     = linuxabi.ENXIO
-	linuxEIO       = linuxabi.EIO
-	linuxEBADF     = linuxabi.EBADF
-	linuxEACCES    = linuxabi.EACCES
-	linuxEPIPE     = linuxabi.EPIPE
-	linuxEEXIST    = linuxabi.EEXIST
-	linuxENOTDIR   = linuxabi.ENOTDIR
-	linuxEISDIR    = linuxabi.EISDIR
-	linuxEINVAL    = linuxabi.EINVAL
-	linuxENOTTY    = linuxabi.ENOTTY
-	linuxEFBIG     = linuxabi.EFBIG
-	linuxERANGE    = linuxabi.ERANGE
-	linuxENOSYS    = linuxabi.ENOSYS
-	linuxENOTEMPTY = linuxabi.ENOTEMPTY
-	linuxENODATA   = linuxabi.ENODATA
-	linuxETIMEDOUT = linuxabi.ETIMEDOUT
+	linuxEPERM      = linuxabi.EPERM
+	linuxENOENT     = linuxabi.ENOENT
+	linuxENXIO      = linuxabi.ENXIO
+	linuxEIO        = linuxabi.EIO
+	linuxEBADF      = linuxabi.EBADF
+	linuxEACCES     = linuxabi.EACCES
+	linuxEPIPE      = linuxabi.EPIPE
+	linuxEEXIST     = linuxabi.EEXIST
+	linuxENOTDIR    = linuxabi.ENOTDIR
+	linuxEISDIR     = linuxabi.EISDIR
+	linuxEINVAL     = linuxabi.EINVAL
+	linuxENOTTY     = linuxabi.ENOTTY
+	linuxEFBIG      = linuxabi.EFBIG
+	linuxENOSPC     = linuxabi.ENOSPC
+	linuxERANGE     = linuxabi.ERANGE
+	linuxENOSYS     = linuxabi.ENOSYS
+	linuxENOTEMPTY  = linuxabi.ENOTEMPTY
+	linuxENODATA    = linuxabi.ENODATA
+	linuxEOPNOTSUPP = linuxabi.EOPNOTSUPP
+	linuxETIMEDOUT  = linuxabi.ETIMEDOUT
 )
 
 func goModeToLinux(mode fs.FileMode) fs.FileMode {

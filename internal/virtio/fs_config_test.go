@@ -98,8 +98,8 @@ func TestVirtioFSMountedExchangeFailsInsteadOfReportingUnsafeSuccess(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reply.errno != -linuxENOSYS {
-		t.Fatalf("mounted exchange errno = %d, want %d", reply.errno, -linuxENOSYS)
+	if reply.errno != -linuxEOPNOTSUPP {
+		t.Fatalf("mounted exchange errno = %d, want %d", reply.errno, -linuxEOPNOTSUPP)
 	}
 	for _, name := range []string{"left", "right"} {
 		nodeID, _, errno := backend.Lookup(1, name)

@@ -239,7 +239,11 @@ func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
 	if mount := m.mountForPath(node.path); mount != nil {
 		return cachePolicyForMode(mount.cache)
 	}
-	return cachePolicyForMode(fsCacheAggressive)
+	// The writable COW root can retain directory entries, but its attributes
+	// change through link, unlink, chmod, and writes. Keeping those attributes
+	// for the aggressive 60-second TTL makes already-open runtimes observe
+	// impossible link counts after a sibling alias is removed.
+	return FSCachePolicy{Mode: fsCacheNormal, EntryTTL: 60 * time.Second}
 }
 
 func cleanMountPath(value string) string {
