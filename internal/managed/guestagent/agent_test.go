@@ -53,8 +53,14 @@ func TestRunReconnectsAndExecutesAfterControlLoss(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if line, err := firstReader.ReadString('\n'); err != nil || strings.TrimSpace(line) != BeginMarkerPrefix+"active" {
-		t.Fatalf("active command begin = %q, %v", line, err)
+	for {
+		line, err := firstReader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read active command begin: %v", err)
+		}
+		if strings.TrimSpace(line) == BeginMarkerPrefix+"active" {
+			break
+		}
 	}
 	if err := firstEncoder.Encode(request{
 		Kind: "exec", ID: "cancel", ControlFD: true,

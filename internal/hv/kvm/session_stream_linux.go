@@ -37,8 +37,9 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	defer stopKeepalive()
 	if req.Kind == "" || req.Kind == "exec" {
 		inputReady := vmruntime.ExecTimingMarker + id + ":input_ready:"
+		exited := vmruntime.CommandExitMarkerPref + id + ":"
 		if _, err := s.waitForTranscript(ctx, start, func(text string) bool {
-			return strings.Contains(text, inputReady)
+			return strings.Contains(text, inputReady) || strings.Contains(text, exited)
 		}); err != nil {
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}

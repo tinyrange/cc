@@ -610,6 +610,10 @@ func startManagedExec(opts Options, control io.Writer, active *ActiveExecSet, re
 		managed = &managedExec{ptyImpl: opts.PTY}
 	}
 	closePending := active.Add(req.ID, managed)
+	// The request's input sink is usable once it is registered. Advertise that
+	// protocol state before the worker runs so the host can safely send input or
+	// EOF without relying on guest scheduler timing.
+	DefaultProtocol().WriteTiming(control, req.ID, "input_ready", time.Now())
 	if closePending {
 		_ = managed.close()
 	}
