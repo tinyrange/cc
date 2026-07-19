@@ -172,6 +172,43 @@ func TestManagerSerializesBalloonRetargetWithShutdown(t *testing.T) {
 	}
 }
 
+func TestManagerSerializesMutableBackendOperationWithShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingShareInstance{
+		fakeInstance: newFakeInstance(), shareStarted: make(chan struct{}), releaseShare: make(chan struct{}), closeStarted: make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shared", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	shareDone := make(chan error, 1)
+	go func() { shareDone <- manager.AddShareTo(ctx, "shared", client.ShareMount{Mount: "/data"}) }()
+	<-inst.shareStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "shared") }()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("shared").Status != "stopping" && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	select {
+	case <-inst.closeStarted:
+		t.Fatal("instance close raced an active share update")
+	default:
+	}
+	if err := manager.AddPortForwardTo(ctx, "shared", client.PortForward{}); err == nil {
+		t.Fatal("backend operation was admitted after shutdown took ownership")
+	}
+	close(inst.releaseShare)
+	if err := <-shareDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
@@ -367,7 +404,7 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if state.Status != "crashed" || state.ExitReason != "hypervisor exited" || state.ExitedAt == "" || state.StartedAt == "" {
+	if state.Status != "crashed" || state.Error != "hypervisor exited" || state.ExitReason != "VM backend exited unexpectedly" || state.ExitedAt == "" || state.StartedAt == "" {
 		t.Fatalf("crash state = %+v", state)
 	}
 	host.queueInstance(newFakeInstance())
@@ -378,6 +415,31 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 		t.Fatalf("replacement state = %+v", state)
 	}
 	_ = manager.ShutdownAll(context.Background())
+}
+
+func TestManagerBoundsCrashDiagnosticsWithoutDuplicatingExitReason(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 1})
+	crashed := newFakeInstance()
+	crashed.waitErr = errors.New(strings.Repeat("panic-trace\n", 20000))
+	host.queueInstance(crashed)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "panic", Image: "alpine", MemoryMB: 256}); err != nil {
+		t.Fatal(err)
+	}
+	_ = crashed.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		state := manager.StatusOf("panic")
+		if state.Status != "crashed" {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if len(state.Error) > maxLifecycleDiagnosticBytes || state.ExitReason != "VM backend exited unexpectedly" || state.Error == state.ExitReason {
+			t.Fatalf("bounded crash state = %+v", state)
+		}
+		return
+	}
+	t.Fatal("crashed VM did not publish a tombstone")
 }
 
 func TestManagerExplicitShutdownRecordsStoppedState(t *testing.T) {
@@ -1220,6 +1282,24 @@ type blockingBalloonInstance struct {
 	releaseBalloon chan struct{}
 	closeStarted   chan struct{}
 	blockBalloon   atomic.Bool
+}
+
+type blockingShareInstance struct {
+	*fakeInstance
+	shareStarted chan struct{}
+	releaseShare chan struct{}
+	closeStarted chan struct{}
+}
+
+func (i *blockingShareInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	close(i.shareStarted)
+	<-i.releaseShare
+	return i.fakeInstance.AddShare(ctx, share)
+}
+
+func (i *blockingShareInstance) Close() error {
+	close(i.closeStarted)
+	return i.fakeInstance.Close()
 }
 
 func (i *blockingBalloonInstance) SetBalloonMB(target uint64) error {

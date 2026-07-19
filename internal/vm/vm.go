@@ -22,6 +22,7 @@ import (
 const DefaultInstanceID = "default"
 const maxExitTombstones = 64
 const minimumGuestMemoryMB = 128
+const maxLifecycleDiagnosticBytes = 4096
 
 var ErrManagerClosing = errors.New("VM manager is shutting down")
 
@@ -102,21 +103,21 @@ type managerStart struct {
 }
 
 type Machine struct {
-	balloonMu  sync.Mutex
-	id         string
-	image      string
-	initSystem string
-	kernel     string
-	memoryMB   uint64
-	balloonMB  uint64
-	cpus       int
-	nestedVirt bool
-	startedAt  time.Time
-	instance   Instance
-	lastErr    error
-	exitedAt   time.Time
-	stopping   bool
-	stop       *machineStopOperation
+	lifecycleMu sync.Mutex
+	id          string
+	image       string
+	initSystem  string
+	kernel      string
+	memoryMB    uint64
+	balloonMB   uint64
+	cpus        int
+	nestedVirt  bool
+	startedAt   time.Time
+	instance    Instance
+	lastErr     error
+	exitedAt    time.Time
+	stopping    bool
+	stop        *machineStopOperation
 }
 
 type machineStopOperation struct {
@@ -592,9 +593,9 @@ func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation
 }
 
 func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
-	machine.balloonMu.Lock()
+	machine.lifecycleMu.Lock()
 	err := machine.instance.Close()
-	machine.balloonMu.Unlock()
+	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
 	if err == nil {
@@ -745,82 +746,74 @@ func (m *Manager) AddPortForward(ctx context.Context, forward client.PortForward
 }
 
 func (m *Manager) AddShareTo(ctx context.Context, id string, share client.ShareMount) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	return machine.instance.AddShare(ctx, share)
 }
 
 func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward client.PortForward) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	return machine.instance.AddPortForward(ctx, forward)
 }
 
 func (m *Manager) AllowServiceProxyPortTo(ctx context.Context, id string, port int) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	allower, ok := machine.instance.(serviceProxyPortAllower)
 	if !ok {
-		return fmt.Errorf("VM %q network does not support service proxy port updates", id)
+		return fmt.Errorf("VM %q network does not support service proxy port updates", machine.id)
 	}
 	return allower.AllowServiceProxyPort(ctx, port)
 }
 
 func (m *Manager) FlushInstance(ctx context.Context, id string) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	flusher, ok := machine.instance.(instanceFlushProvider)
 	if !ok {
-		return fmt.Errorf("VM %q root filesystem cannot be flushed", id)
+		return fmt.Errorf("VM %q root filesystem cannot be flushed", machine.id)
 	}
 	return flusher.Flush(ctx)
 }
 
 func (m *Manager) ConsoleHistory(ctx context.Context, id string) (string, error) {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return "", fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return "", err
 	}
+	defer unlock()
 	provider, ok := machine.instance.(consoleHistoryProvider)
 	if !ok {
-		return "", fmt.Errorf("VM %q console history is not available", id)
+		return "", fmt.Errorf("VM %q console history is not available", machine.id)
 	}
 	return provider.ConsoleHistory(ctx)
 }
 
 func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName string) (imagefs.Directory, string, error) {
-	id = instanceID(id)
 	imageName = strings.TrimSpace(imageName)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return nil, "", fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return nil, "", err
 	}
-	if err := m.FlushInstance(ctx, id); err != nil {
+	defer unlock()
+	flusher, ok := machine.instance.(instanceFlushProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("VM %q root filesystem cannot be flushed", machine.id)
+	}
+	if err := flusher.Flush(ctx); err != nil {
 		return nil, "", err
 	}
 	if imageName != "" {
@@ -831,17 +824,40 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName strin
 			}
 			return root, imageName, nil
 		}
-		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", id, imageName)
+		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", machine.id, imageName)
 	}
 	snapshotter, ok := machine.instance.(rootSnapshotProvider)
 	if !ok {
-		return nil, "", fmt.Errorf("VM %q root filesystem cannot be snapshotted", id)
+		return nil, "", fmt.Errorf("VM %q root filesystem cannot be snapshotted", machine.id)
 	}
 	root, err := snapshotter.RootSnapshot()
 	if err != nil {
 		return nil, "", err
 	}
 	return root, machine.image, nil
+}
+
+func (m *Manager) lockMachineOperation(id string) (*Machine, func(), error) {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	stopping := machine != nil && machine.stopping
+	m.mu.Unlock()
+	if machine == nil {
+		return nil, nil, fmt.Errorf("no VM %q is running", id)
+	}
+	if stopping {
+		return nil, nil, stoppedVMError(id)
+	}
+	machine.lifecycleMu.Lock()
+	m.mu.Lock()
+	valid := m.running[id] == machine && !machine.stopping
+	m.mu.Unlock()
+	if !valid {
+		machine.lifecycleMu.Unlock()
+		return nil, nil, stoppedVMError(id)
+	}
+	return machine, machine.lifecycleMu.Unlock, nil
 }
 
 func (m *Manager) Status() client.InstanceState {
@@ -1055,8 +1071,8 @@ func (m *Manager) recordExitLocked(machine *Machine, err error) {
 	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
 	if err != nil {
 		state.Status = "crashed"
-		state.Error = err.Error()
-		state.ExitReason = err.Error()
+		state.Error = boundedLifecycleDiagnostic(err.Error())
+		state.ExitReason = "VM backend exited unexpectedly"
 	} else {
 		state.ExitReason = "clean shutdown"
 	}
@@ -1072,6 +1088,21 @@ func (m *Manager) recordExitLocked(machine *Machine, err error) {
 		}
 		delete(m.exited, oldestID)
 	}
+}
+
+func boundedLifecycleDiagnostic(diagnostic string) string {
+	diagnostic = strings.TrimSpace(diagnostic)
+	if len(diagnostic) <= maxLifecycleDiagnosticBytes {
+		return diagnostic
+	}
+	const headBytes = 512
+	omitted := len(diagnostic) - maxLifecycleDiagnosticBytes
+	marker := fmt.Sprintf("\n[... %d diagnostic bytes omitted ...]\n", omitted)
+	tailBytes := maxLifecycleDiagnosticBytes - headBytes - len(marker)
+	if tailBytes < 0 {
+		tailBytes = 0
+	}
+	return diagnostic[:headBytes] + marker + diagnostic[len(diagnostic)-tailBytes:]
 }
 
 func (m *Manager) checkCapacityLocked(maxVMs int, memoryMB uint64, cpus int) error {
@@ -1123,16 +1154,16 @@ func (m *Manager) SetInstanceBalloon(id string, targetMB uint64) error {
 	if !ok {
 		return fmt.Errorf("VM %q does not support dynamic ballooning", id)
 	}
-	machine.balloonMu.Lock()
+	machine.lifecycleMu.Lock()
 	m.mu.Lock()
 	if m.running[id] != machine || machine.stopping {
 		m.mu.Unlock()
-		machine.balloonMu.Unlock()
+		machine.lifecycleMu.Unlock()
 		return fmt.Errorf("VM %q is stopping", id)
 	}
 	m.mu.Unlock()
 	err := controller.SetBalloonMB(targetMB)
-	machine.balloonMu.Unlock()
+	machine.lifecycleMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("set VM %q balloon target: %w", id, err)
 	}

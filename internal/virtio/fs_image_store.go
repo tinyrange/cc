@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,6 +32,12 @@ type imageDataStore struct {
 	rangeReclaimUnsupported bool
 	closed                  bool
 	refs                    int
+	stale                   []imageDataStaleFile
+}
+
+type imageDataStaleFile struct {
+	file *os.File
+	path string
 }
 
 type imageDataReclaimQueue struct {
@@ -324,15 +331,35 @@ func (s *imageDataStore) compactLocked() error {
 	s.free = nil
 	s.freeSet = make(map[uint64]struct{})
 	s.pendingReclaim = make(map[uint64]struct{})
-	if err := oldFile.Close(); err != nil {
-		return err
-	}
-	if oldPath != "" {
-		if err := os.Remove(oldPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+	// The replacement is live, but cleanup ownership for the old file must not
+	// disappear if Windows or an external scanner makes close/removal fail
+	// transiently. Retain it for later sync/usage/close retries and report the
+	// failure without rolling back the valid compacted store.
+	s.stale = append(s.stale, imageDataStaleFile{file: oldFile, path: oldPath})
+	return s.cleanupStaleLocked()
+}
+
+func (s *imageDataStore) cleanupStaleLocked() error {
+	var pending []imageDataStaleFile
+	var errs []error
+	for _, stale := range s.stale {
+		if stale.file != nil {
+			if err := stale.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, fmt.Errorf("close replaced image backing file: %w", err))
+				pending = append(pending, stale)
+				continue
+			}
+			stale.file = nil
+		}
+		if stale.path != "" {
+			if err := os.Remove(stale.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove replaced image backing file %q: %w", stale.path, err))
+				pending = append(pending, stale)
+			}
 		}
 	}
-	return nil
+	s.stale = pending
+	return errors.Join(errs...)
 }
 
 func (s *imageDataStore) usage() (current, highWater, physical uint64, reclaimErr error) {
@@ -341,6 +368,9 @@ func (s *imageDataStore) usage() (current, highWater, physical uint64, reclaimEr
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.cleanupStaleLocked(); err != nil {
+		s.reclaimErr = errors.Join(s.reclaimErr, err)
+	}
 	if s.file != nil {
 		physical, reclaimErr = allocatedFileBytes(s.file)
 	}
@@ -351,10 +381,11 @@ func (s *imageDataStore) sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.flushReclaimLocked()
+	cleanupErr := s.cleanupStaleLocked()
 	if s.file == nil {
-		return nil
+		return cleanupErr
 	}
-	return s.file.Sync()
+	return errors.Join(cleanupErr, s.file.Sync())
 }
 
 func (s *imageDataStore) close() error {
@@ -373,8 +404,8 @@ func (s *imageDataStore) close() error {
 	}
 	s.closed = true
 	s.flushReclaimLocked()
-	f, path := s.file, s.path
-	s.file, s.path, s.locations, s.free, s.freeSet, s.pendingReclaim = nil, "", nil, nil, nil, nil
+	f, path, stale := s.file, s.path, s.stale
+	s.file, s.path, s.locations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {
@@ -383,6 +414,18 @@ func (s *imageDataStore) close() error {
 	if path != "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
+		}
+	}
+	for _, old := range stale {
+		if old.file != nil {
+			if err := old.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+		if old.path != "" {
+			if err := os.Remove(old.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)

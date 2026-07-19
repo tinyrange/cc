@@ -51,11 +51,12 @@ type SerialTranscript struct {
 }
 
 const (
-	serialTranscriptMemoryBytes  = 1 << 20
-	serialTranscriptReadBytes    = 256 << 10
-	serialTranscriptTailBytes    = 64 << 10
-	serialTranscriptWaitBytes    = 1 << 20
-	serialTranscriptReclaimBytes = 8 << 20
+	serialTranscriptMemoryBytes         = 1 << 20
+	serialTranscriptReadBytes           = 256 << 10
+	serialTranscriptTailBytes           = 64 << 10
+	serialTranscriptWaitBytes           = 1 << 20
+	serialTranscriptReclaimBytes        = 8 << 20
+	serialTranscriptMaxReclaimCopyBytes = 8 << 20
 )
 
 type TranscriptReader interface {
@@ -258,7 +259,7 @@ func (s *SerialTranscript) discardBeforeLocked(offset int) {
 func (s *SerialTranscript) compactConsumedPrefixLocked() {
 	consumed := s.base - s.fileBase
 	live := s.size - s.base
-	if consumed < serialTranscriptReclaimBytes || consumed < live || s.base-s.reclaimAt < serialTranscriptReclaimBytes {
+	if consumed < serialTranscriptReclaimBytes || consumed < live || live > serialTranscriptMaxReclaimCopyBytes || s.base-s.reclaimAt < serialTranscriptReclaimBytes {
 		return
 	}
 	s.reclaimAt = s.base
@@ -401,6 +402,12 @@ func (s *SerialTranscript) waitFor(ctx context.Context, start int, commandID str
 			offset = next
 			reader.Advance(offset)
 			dirty = true
+			// Generic waits are used for boot ready/fatal markers. Evaluate the
+			// bounded rolling window as it advances so continuous later output
+			// cannot evict a marker before the producer becomes quiescent.
+			if commandID == "" && predicate(string(window)) {
+				return string(window), nil
+			}
 			continue
 		} else {
 			s.mu.Lock()

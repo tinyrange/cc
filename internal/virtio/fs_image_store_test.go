@@ -2,6 +2,8 @@ package virtio
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -35,6 +37,37 @@ func TestImageDataStorePortableCompactionPreservesLiveLocations(t *testing.T) {
 	}
 	if !bytes.Equal(page, bytes.Repeat([]byte{3}, len(page))) {
 		t.Fatal("live page changed during compaction")
+	}
+}
+
+func TestImageDataStoreRetainsFailedReplacementCleanupForRetry(t *testing.T) {
+	store := newImageDataStore()
+	dir := t.TempDir()
+	stalePath := filepath.Join(dir, "replaced")
+	if err := os.Mkdir(stalePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(stalePath, "scanner-hold")
+	if err := os.WriteFile(child, []byte("hold"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.stale = append(store.stale, imageDataStaleFile{path: stalePath})
+	err := store.cleanupStaleLocked()
+	retained := len(store.stale)
+	store.mu.Unlock()
+	if err == nil || retained != 1 {
+		t.Fatalf("failed cleanup error=%v retained=%d", err, retained)
+	}
+	if err := os.Remove(child); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	err = store.cleanupStaleLocked()
+	retained = len(store.stale)
+	store.mu.Unlock()
+	if err != nil || retained != 0 {
+		t.Fatalf("cleanup retry error=%v retained=%d", err, retained)
 	}
 }
 

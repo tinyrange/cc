@@ -599,6 +599,32 @@ printf 'virtio-balloon-ok\n'`,
 	requireRunResponse(t, resp, err, 0)
 }
 
+func TestRuntimeNamedBlankImagePreservesInitialBalloonTarget(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("dynamic balloon recovery is currently implemented by Linux amd64 KVM")
+	}
+	env := newRuntimeBootEnv(t)
+	manager := NewManagerWithBackend(env.backend)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	const id = "blank-image-balloon"
+	state, err := manager.StartBlank(ctx, client.StartInstanceRequest{
+		ID: id, Image: env.imageName, MemoryMB: 768, BalloonMB: 384, CPUs: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.ShutdownAll(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for state.BalloonStatus != "converged" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		state = manager.StatusOf(id)
+	}
+	if state.BalloonMB != 384 || state.BalloonActualMB != 384 || state.BalloonStatus != "converged" {
+		t.Fatalf("named blank-image balloon state = %+v", state)
+	}
+}
+
 func TestRuntimeRetargetsBalloonWhileGuestRemainsRunning(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Skip("dynamic balloon recovery is currently implemented by Linux amd64 KVM")

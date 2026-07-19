@@ -270,6 +270,59 @@ func TestSerialTranscriptReclaimsConsumedSpillPrefix(t *testing.T) {
 	}
 }
 
+func TestSerialTranscriptDefersCompactionOfLargeLiveSuffix(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	payload := bytes.Repeat([]byte{'x'}, 20<<20)
+	if _, err := transcript.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	reader := transcript.RetainReader(0)
+	defer reader.Close()
+	reader.Advance(10 << 20)
+	transcript.mu.Lock()
+	fileBase := transcript.fileBase
+	transcript.mu.Unlock()
+	if fileBase != 0 {
+		t.Fatalf("large live suffix was copied under the transcript lock: file base=%d", fileBase)
+	}
+	reader.Advance(12 << 20)
+	transcript.mu.Lock()
+	fileBase = transcript.fileBase
+	transcript.mu.Unlock()
+	if fileBase != 12<<20 {
+		t.Fatalf("bounded live suffix was not reclaimed: file base=%d", fileBase)
+	}
+}
+
+func TestSerialTranscriptGenericWaitSeesMarkerBeforeContinuousTailEvictsIt(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := transcript.WaitFor(t.Context(), 0, func(text string) bool {
+			return strings.Contains(text, "guest-ready-marker")
+		})
+		done <- err
+	}()
+	if _, err := transcript.Write([]byte("guest-ready-marker\n")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := transcript.Write(bytes.Repeat([]byte{'n'}, serialTranscriptReadBytes)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("continuous boot output evicted the ready marker before evaluation")
+	}
+}
+
 func TestSerialTranscriptBatchesEndOfFileReclamation(t *testing.T) {
 	transcript := NewSerialTranscript()
 	defer transcript.Close()
