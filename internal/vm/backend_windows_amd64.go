@@ -631,9 +631,9 @@ func (i *windowsInstance) VirtioFSStats() []virtio.FSStats {
 	return virtioFSStats(i.fsdevs)
 }
 
-func (i *windowsInstance) BackingUsage() (uint64, uint64, error) {
+func (i *windowsInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	if i == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	return virtioFSBackingUsage(i.fsdevs)
 }

@@ -401,6 +401,7 @@ type InstanceState struct {
 	NetworkIPv4           string `json:"network_ipv4,omitempty"`
 	BackingBytes          uint64 `json:"backing_bytes,omitempty"`
 	BackingHighWaterBytes uint64 `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes  uint64 `json:"backing_physical_bytes,omitempty"`
 	BackingReclaimError   string `json:"backing_reclaim_error,omitempty"`
 	Error                 string `json:"error,omitempty"`
 	ExitedAt              string `json:"exited_at,omitempty"`

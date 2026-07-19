@@ -21,18 +21,19 @@ func virtioFSStats(fsdevs []*virtio.FS) []virtio.FSStats {
 	return out
 }
 
-func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater uint64, err error) {
+func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uint64, err error) {
 	var errs []error
 	for i, fsdev := range fsdevs {
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, deviceHighWater, deviceErr := fsdev.BackingUsage()
+		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
 		current += deviceCurrent
 		highWater += deviceHighWater
+		physical += devicePhysical
 		if deviceErr != nil {
 			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
 		}
 	}
-	return current, highWater, errors.Join(errs...)
+	return current, highWater, physical, errors.Join(errs...)
 }

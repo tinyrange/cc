@@ -191,7 +191,7 @@ func TestImageFSDeletedDataReclaimsBackingStore(t *testing.T) {
 			t.Fatalf("write at %d: errno %d", off, errno)
 		}
 	}
-	current, highWater, err := backend.BackingUsage()
+	current, highWater, _, err := backend.BackingUsage()
 	if err != nil || current != written || highWater != written {
 		t.Fatalf("usage after write = current %d high-water %d error %v", current, highWater, err)
 	}
@@ -199,11 +199,11 @@ func TestImageFSDeletedDataReclaimsBackingStore(t *testing.T) {
 		t.Fatalf("unlink: errno %d", errno)
 	}
 	// POSIX keeps the unlinked file alive while its handle is open.
-	if current, _, _ := backend.BackingUsage(); current != written {
+	if current, _, _, _ := backend.BackingUsage(); current != written {
 		t.Fatalf("usage with open unlinked handle = %d, want %d", current, written)
 	}
 	backend.Release(nodeID, fh)
-	current, highWater, err = backend.BackingUsage()
+	current, highWater, _, err = backend.BackingUsage()
 	if err != nil || current != 0 || highWater != written {
 		t.Fatalf("usage after final release = current %d high-water %d error %v", current, highWater, err)
 	}

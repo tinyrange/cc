@@ -1378,6 +1378,31 @@ func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
 	}
 }
 
+func TestRuntimeGuestPoweroffTerminatesSessionAndActiveCommand(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	execDone := make(chan error, 1)
+	go func() {
+		_, err := inst.Exec(context.Background(), client.ExecRequest{Command: []string{"poweroff", "-f"}, User: "root"})
+		execDone <- err
+	}()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- inst.Wait() }()
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("guest poweroff was classified as a crash: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guest poweroff left the VM session running")
+	}
+	select {
+	case <-execDone:
+	case <-time.After(time.Second):
+		t.Fatal("guest poweroff left the initiating command running")
+	}
+}
+
 func TestRuntimePersistentLifecycleRemainsResponsiveDuringBulkOutput(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})

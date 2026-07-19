@@ -234,8 +234,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		_, _ = fmt.Fprintf(os.Stderr, "whp-managed exec %s start command=%q\n", id, strings.Join(req.Command, " "))
 	}
 	start := s.transcript.Len()
-	reader := s.transcript.RetainReader(start)
-	defer reader.Close()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
@@ -247,7 +247,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -283,8 +283,6 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	start := s.transcript.Len()
 	reader := s.transcript.RetainReader(start)
 	defer reader.Close()
-	releaseTranscript := s.transcript.RetainFrom(start)
-	defer releaseTranscript()
 	if err := s.sendExecMessage(managedagent.ExecRequest(id, req)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -345,7 +343,7 @@ func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	_, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
@@ -364,7 +362,7 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	if err := s.sendExecMessage(managedagent.SyncRequest(id)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})

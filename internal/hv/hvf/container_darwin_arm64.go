@@ -397,23 +397,24 @@ func (s *ContainerSession) VirtioFSStats() []virtio.FSStats {
 	return out
 }
 
-func (s *ContainerSession) BackingUsage() (current, highWater uint64, err error) {
+func (s *ContainerSession) BackingUsage() (current, highWater, physical uint64, err error) {
 	if s == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	var errs []error
 	for i, fsdev := range s.fsdevs {
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, deviceHighWater, deviceErr := fsdev.BackingUsage()
+		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
 		current += deviceCurrent
 		highWater += deviceHighWater
+		physical += devicePhysical
 		if deviceErr != nil {
 			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
 		}
 	}
-	return current, highWater, errors.Join(errs...)
+	return current, highWater, physical, errors.Join(errs...)
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -546,7 +547,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, s.withControlDebug("wait for exec first byte", err)
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -605,7 +606,7 @@ func (s *ContainerSession) Flush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -808,7 +809,7 @@ func (s *ContainerSession) sendExecSignal(id, name string) error {
 func (s *ContainerSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	_, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil

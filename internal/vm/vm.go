@@ -72,7 +72,7 @@ type instanceBalloonStateProvider interface {
 }
 
 type instanceBackingUsageProvider interface {
-	BackingUsage() (uint64, uint64, error)
+	BackingUsage() (uint64, uint64, uint64, error)
 }
 
 type Manager struct {
@@ -102,6 +102,7 @@ type managerStart struct {
 }
 
 type Machine struct {
+	balloonMu  sync.Mutex
 	id         string
 	image      string
 	initSystem string
@@ -591,7 +592,9 @@ func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation
 }
 
 func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
+	machine.balloonMu.Lock()
 	err := machine.instance.Close()
+	machine.balloonMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
 	if err == nil {
@@ -960,6 +963,10 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
 	}
 	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
+	if machine.stopping {
+		snapshot.state.Status = "stopping"
+		return snapshot
+	}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
 		snapshot.provider = provider
 	}
@@ -983,9 +990,10 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 		snapshot.state.NetworkIPv4 = snapshot.provider.NetworkIPv4()
 	}
 	if snapshot.backingProvider != nil {
-		current, highWater, err := snapshot.backingProvider.BackingUsage()
+		current, highWater, physical, err := snapshot.backingProvider.BackingUsage()
 		snapshot.state.BackingBytes = current
 		snapshot.state.BackingHighWaterBytes = highWater
+		snapshot.state.BackingPhysicalBytes = physical
 		if err != nil {
 			snapshot.state.BackingReclaimError = err.Error()
 		}
@@ -1106,12 +1114,26 @@ func (m *Manager) SetInstanceBalloon(id string, targetMB uint64) error {
 		m.mu.Unlock()
 		return fmt.Errorf("balloon target %d MiB exceeds VM memory %d MiB", targetMB, machine.memoryMB)
 	}
+	if machine.stopping {
+		m.mu.Unlock()
+		return fmt.Errorf("VM %q is stopping", id)
+	}
 	controller, ok := machine.instance.(instanceBalloonController)
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("VM %q does not support dynamic ballooning", id)
 	}
-	if err := controller.SetBalloonMB(targetMB); err != nil {
+	machine.balloonMu.Lock()
+	m.mu.Lock()
+	if m.running[id] != machine || machine.stopping {
+		m.mu.Unlock()
+		machine.balloonMu.Unlock()
+		return fmt.Errorf("VM %q is stopping", id)
+	}
+	m.mu.Unlock()
+	err := controller.SetBalloonMB(targetMB)
+	machine.balloonMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("set VM %q balloon target: %w", id, err)
 	}
 	m.mu.Lock()

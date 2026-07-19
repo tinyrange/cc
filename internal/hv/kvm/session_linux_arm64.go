@@ -268,7 +268,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
 	defer stopKeepalive()
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -299,7 +299,7 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	if err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})

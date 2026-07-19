@@ -40,7 +40,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	if req.Kind == "" || req.Kind == "exec" {
 		inputReady := vmruntime.ExecTimingMarker + id + ":input_ready:"
 		exited := vmruntime.CommandExitMarkerPref + id + ":"
-		if _, err := s.waitForTranscript(ctx, start, func(text string) bool {
+		if _, err := s.waitForTranscriptCommandEvent(ctx, start, id, func(text string) bool {
 			return strings.Contains(text, inputReady) || strings.Contains(text, exited)
 		}); err != nil {
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
@@ -210,7 +210,7 @@ func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	_, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil

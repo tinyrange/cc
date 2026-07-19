@@ -14,14 +14,14 @@ import (
 
 type mountedLifecycleBackend struct {
 	FSBackend
-	current, highWater uint64
-	usageErr           error
-	closes             int
-	closeErr           error
+	current, highWater, physical uint64
+	usageErr                     error
+	closes                       int
+	closeErr                     error
 }
 
-func (b *mountedLifecycleBackend) BackingUsage() (uint64, uint64, error) {
-	return b.current, b.highWater, b.usageErr
+func (b *mountedLifecycleBackend) BackingUsage() (uint64, uint64, uint64, error) {
+	return b.current, b.highWater, b.physical, b.usageErr
 }
 
 func (b *mountedLifecycleBackend) Close() error {
@@ -39,7 +39,7 @@ func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 		{GuestPath: "/two", Backend: share},
 	}).(*mountedFS)
 
-	current, highWater, err := fsys.BackingUsage()
+	current, highWater, _, err := fsys.BackingUsage()
 	if current != 40 || highWater != 60 || !errors.Is(err, rootErr) {
 		t.Fatalf("backing usage = %d, %d, %v", current, highWater, err)
 	}

@@ -20,7 +20,7 @@ func installBootACPI(memory []byte, memStart uint64, numCPUs int) (uint64, error
 	}
 	writer := acpiTableWriter{base: acpiTableAddress}
 	facs := writer.appendRaw(buildBootFACS())
-	dsdt := writer.append("DSDT", 2, "CCKVMDSD", nil)
+	dsdt := writer.append("DSDT", 2, "CCKVMDSD", buildBootDSDT())
 	fadt := writer.append("FACP", 6, "CCKVMFAD", buildBootFADT(facs, dsdt))
 	madt := writer.append("APIC", 3, "CCKVMAPC", buildBootMADT(numCPUs))
 	hpet := writer.append("HPET", 1, "CCKVMHPT", buildBootHPET())
@@ -32,6 +32,16 @@ func installBootACPI(memory []byte, memStart uint64, numCPUs int) (uint64, error
 		return 0, fmt.Errorf("write ACPI RSDP: %w", err)
 	}
 	return acpiRSDPAddress, nil
+}
+
+func buildBootDSDT() []byte {
+	// Name (_S5, Package (0x04) { 0x05, 0x05, Zero, Zero }). Linux uses
+	// this object to translate poweroff into an S5 write to PM1_CONTROL.
+	return []byte{
+		0x08, '_', 'S', '5', '_',
+		0x12, 0x08, 0x04,
+		0x0a, 0x05, 0x0a, 0x05, 0x00, 0x00,
+	}
 }
 
 type acpiTableWriter struct {

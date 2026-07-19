@@ -52,7 +52,7 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 	for _, location := range locations {
 		store.releasePage(location)
 	}
-	current, highWater, err := store.usage()
+	current, highWater, _, err := store.usage()
 	if current != 0 || highWater != uint64(len(locations))*imageDataPageSize || err != nil {
 		t.Fatalf("usage after logical release = %d, %d, %v", current, highWater, err)
 	}
@@ -64,5 +64,18 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 	store.mu.Unlock()
 	if next != 0 {
 		t.Fatalf("backing length after batched reclaim = %d, want 0", next)
+	}
+}
+
+func TestPortableImageStoreCompactsBeforeTwofoldAmplification(t *testing.T) {
+	page := uint64(imageDataPageSize)
+	if !shouldCompactPortableImageStore(1000*page, 1999*page) {
+		t.Fatal("nearly twofold physical amplification was retained")
+	}
+	if shouldCompactPortableImageStore(1000*page, 1499*page) {
+		t.Fatal("sub-threshold dead space triggered compaction")
+	}
+	if shouldCompactPortableImageStore(1<<20, 1792<<10) {
+		t.Fatal("small backing file triggered portable compaction")
 	}
 }

@@ -1,11 +1,14 @@
 package vmruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,6 +171,131 @@ func TestSerialTranscriptWaitFor(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("wait for transcript: %v", err)
+	}
+}
+
+func TestSerialTranscriptWaitForCommandIgnoresUnrelatedExitForMaterialization(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	start := transcript.Len()
+	var maxPredicateBytes atomic.Int64
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		text, err := transcript.WaitForCommand(ctx, start, "wanted", func(text string) bool {
+			for size := int64(len(text)); ; {
+				previous := maxPredicateBytes.Load()
+				if size <= previous || maxPredicateBytes.CompareAndSwap(previous, size) {
+					break
+				}
+			}
+			return strings.Contains(text, CommandBeginMarker+"wanted") && strings.Contains(text, CommandExitMarkerPref+"wanted:")
+		})
+		if err == nil && (!strings.Contains(text, CommandBeginMarker+"wanted") || !strings.Contains(text, CommandExitMarkerPref+"wanted:")) {
+			err = fmt.Errorf("completed command records = %q", text)
+		}
+		done <- err
+	}()
+	if _, err := transcript.Write([]byte(CommandBeginMarker + "wanted\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transcript.Write(bytes.Repeat([]byte("unrelated output\n"), (2<<20)/17)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transcript.Write([]byte(CommandExitMarkerPref + "other:0\n")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := maxPredicateBytes.Load(); got > 256 {
+		t.Fatalf("unrelated exit materialized %d bytes", got)
+	}
+	if _, err := transcript.Write([]byte(CommandExitMarkerPref + "wanted:0\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSerialTranscriptWaitForCommandEventSurvivesUnrelatedOutput(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		text, err := transcript.WaitForCommandEvent(ctx, 0, "wanted", func(text string) bool {
+			return strings.Contains(text, ExecTimingMarker+"wanted:input_ready:")
+		})
+		if err == nil && !strings.Contains(text, CommandBeginMarker+"wanted") {
+			err = fmt.Errorf("filtered command event omitted begin record: %q", text)
+		}
+		done <- err
+	}()
+	data := []byte(CommandBeginMarker + "wanted\n" + ExecTimingMarker + "wanted:input_ready:1\n")
+	data = append(data, bytes.Repeat([]byte("unrelated output\n"), (2<<20)/17)...)
+	if _, err := transcript.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSerialTranscriptReclaimsConsumedSpillPrefix(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	payload := bytes.Repeat([]byte("0123456789abcdef"), (20<<20)/16)
+	if _, err := transcript.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	reader := transcript.RetainReader(0)
+	defer reader.Close()
+	reader.Advance(12 << 20)
+	transcript.mu.Lock()
+	file := transcript.file
+	fileBase := transcript.fileBase
+	transcript.mu.Unlock()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileBase != 12<<20 || info.Size() != 8<<20 {
+		t.Fatalf("reclaimed transcript file base=%d size=%d", fileBase, info.Size())
+	}
+	text, next := transcript.ReadFrom(12 << 20)
+	if next <= 12<<20 || text != string(payload[12<<20:12<<20+len(text)]) {
+		t.Fatal("absolute cursor did not survive transcript compaction")
+	}
+}
+
+func TestSerialTranscriptBatchesEndOfFileReclamation(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	reader := transcript.RetainReader(0)
+	defer reader.Close()
+	if _, err := transcript.Write(bytes.Repeat([]byte{'a'}, 2<<20)); err != nil {
+		t.Fatal(err)
+	}
+	reader.Advance(transcript.Len())
+	info, err := transcript.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 2<<20 {
+		t.Fatalf("small consumed batch was reclaimed immediately: %d", info.Size())
+	}
+	if _, err := transcript.Write(bytes.Repeat([]byte{'b'}, 7<<20)); err != nil {
+		t.Fatal(err)
+	}
+	reader.Advance(transcript.Len())
+	info, err = transcript.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("batched consumed transcript size = %d, want 0", info.Size())
 	}
 }
 

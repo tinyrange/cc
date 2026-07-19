@@ -403,12 +403,12 @@ func (i *hostedInstance) BalloonState() (targetMB, actualMB uint64, driverReady,
 	return provider.BalloonState()
 }
 
-func (i *hostedInstance) BackingUsage() (uint64, uint64, error) {
+func (i *hostedInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	provider, ok := i.Instance.(interface {
-		BackingUsage() (uint64, uint64, error)
+		BackingUsage() (uint64, uint64, uint64, error)
 	})
 	if !ok {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	return provider.BackingUsage()
 }

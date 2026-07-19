@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -43,13 +44,18 @@ type SerialTranscript struct {
 	nextReader uint64
 	closed     bool
 	spillErr   error
+	reclaimErr error
+	reclaimAt  int
+	staleFiles []*os.File
+	stalePaths []string
 }
 
 const (
-	serialTranscriptMemoryBytes = 1 << 20
-	serialTranscriptReadBytes   = 256 << 10
-	serialTranscriptTailBytes   = 64 << 10
-	serialTranscriptWaitBytes   = 1 << 20
+	serialTranscriptMemoryBytes  = 1 << 20
+	serialTranscriptReadBytes    = 256 << 10
+	serialTranscriptTailBytes    = 64 << 10
+	serialTranscriptWaitBytes    = 1 << 20
+	serialTranscriptReclaimBytes = 8 << 20
 )
 
 type TranscriptReader interface {
@@ -228,20 +234,71 @@ func (s *SerialTranscript) discardBeforeLocked(offset int) {
 		if drop >= len(s.buf) {
 			s.buf = nil
 		} else {
-			s.buf = append(s.buf[:0], s.buf[drop:]...)
+			s.buf = s.buf[drop:]
 		}
 		s.base = offset
 		return
 	}
 	if offset == s.size {
+		s.base = offset
+		if offset-s.fileBase < serialTranscriptReclaimBytes {
+			return
+		}
 		if err := s.file.Truncate(0); err != nil {
 			s.spillErr = errors.Join(s.spillErr, err)
 			return
 		}
-		s.base, s.fileBase = offset, offset
+		s.fileBase = offset
 		return
 	}
 	s.base = offset
+	s.compactConsumedPrefixLocked()
+}
+
+func (s *SerialTranscript) compactConsumedPrefixLocked() {
+	consumed := s.base - s.fileBase
+	live := s.size - s.base
+	if consumed < serialTranscriptReclaimBytes || consumed < live || s.base-s.reclaimAt < serialTranscriptReclaimBytes {
+		return
+	}
+	s.reclaimAt = s.base
+	dir := filepath.Dir(s.file.Name())
+	next, err := os.CreateTemp(dir, "serial-reclaim-*")
+	if err == nil && live > 0 {
+		_, err = io.CopyN(next, io.NewSectionReader(s.file, int64(consumed), int64(live)), int64(live))
+	}
+	if err != nil {
+		if next != nil {
+			name := next.Name()
+			_ = next.Close()
+			_ = os.Remove(name)
+		}
+		s.reclaimErr = errors.Join(s.reclaimErr, err)
+		slog.Warn("serial transcript prefix reclamation failed; preserving the existing spill file", "error", err)
+		return
+	}
+	name := next.Name()
+	old, oldPath := s.file, s.path
+	s.file = next
+	s.fileBase = s.base
+	if removeErr := os.Remove(name); removeErr != nil {
+		s.path = name
+	} else {
+		s.path = ""
+	}
+	if closeErr := old.Close(); closeErr != nil {
+		s.reclaimErr = errors.Join(s.reclaimErr, closeErr)
+		if _, statErr := old.Stat(); statErr == nil {
+			s.staleFiles = append(s.staleFiles, old)
+		}
+		slog.Warn("serial transcript reclaimed its consumed prefix but could not close the old spill file", "error", closeErr)
+	} else if oldPath != "" {
+		if removeErr := os.Remove(oldPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			s.reclaimErr = errors.Join(s.reclaimErr, removeErr)
+			s.stalePaths = append(s.stalePaths, oldPath)
+			slog.Warn("serial transcript reclaimed its consumed prefix but could not remove the old spill file", "path", oldPath, "error", removeErr)
+		}
+	}
 }
 
 // ReadFrom returns only transcript bytes at and after offset. Callers which
@@ -293,21 +350,56 @@ func (s *SerialTranscript) readLocked(start, end int) ([]byte, error) {
 }
 
 func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
+	return s.waitFor(ctx, start, "", false, predicate)
+}
+
+// WaitForCommand permits complete compatibility output to be materialized
+// only after this command's terminal record is present. An unrelated command
+// completing on the shared control transcript must not repeatedly read a
+// large active command back from disk.
+func (s *SerialTranscript) WaitForCommand(ctx context.Context, start int, id string, predicate func(string) bool) (string, error) {
+	return s.waitFor(ctx, start, id, false, predicate)
+}
+
+// WaitForCommandEvent waits on the requested command's filtered protocol
+// records before command exit. It is intended for bounded lifecycle events
+// such as input readiness; complete output waits should use WaitForCommand.
+func (s *SerialTranscript) WaitForCommandEvent(ctx context.Context, start int, id string, predicate func(string) bool) (string, error) {
+	return s.waitFor(ctx, start, id, true, predicate)
+}
+
+func (s *SerialTranscript) waitFor(ctx context.Context, start int, commandID string, beforeExit bool, predicate func(string) bool) (string, error) {
 	reader := s.RetainReader(start)
 	defer reader.Close()
 	var window []byte
+	var partialLine []byte
+	var commandRecords *SerialTranscript
+	if commandID != "" {
+		commandRecords = NewSerialTranscript()
+		defer commandRecords.Close()
+	}
+	terminalDirty := false
 	offset := start
 	dirty := false
-	materializedTerminalOffset := -1
 	for {
 		text, next := s.ReadFrom(offset)
 		if next > offset {
+			if commandID != "" {
+				var terminal bool
+				var err error
+				partialLine, terminal, err = appendCommandRecords(commandRecords, partialLine, []byte(text), commandID)
+				if err != nil {
+					return "", err
+				}
+				terminalDirty = terminalDirty || terminal
+			}
 			window = append(window, text...)
 			if len(window) > serialTranscriptWaitBytes {
 				copy(window, window[len(window)-serialTranscriptWaitBytes:])
 				window = window[:serialTranscriptWaitBytes]
 			}
 			offset = next
+			reader.Advance(offset)
 			dirty = true
 			continue
 		} else {
@@ -334,44 +426,91 @@ func (s *SerialTranscript) WaitFor(ctx context.Context, start int, predicate fun
 		if s.Len() > offset {
 			continue
 		}
-		if dirty && predicate(string(window)) {
-			return string(window), nil
-		}
-		// Synchronous compatibility APIs return the complete command output as
-		// one string. Materialize that payload only after its terminal protocol
-		// record is visible; while the command is active WaitFor retains only the
-		// bounded parser window above. Streaming APIs never take this path.
-		if dirty && materializedTerminalOffset != offset && bytes.Contains(window, []byte(CommandExitMarkerPref)) {
-			materializedTerminalOffset = offset
-			full, err := s.readRangeString(start, offset)
-			if err != nil {
-				return "", err
+		if dirty {
+			candidate := window
+			if commandID != "" {
+				if record, terminal := commandRecord(partialLine, commandID); len(record) != 0 && terminal {
+					terminalDirty = true
+				}
+				if !terminalDirty && !beforeExit {
+					dirty = false
+					continue
+				}
+				var err error
+				candidate, err = commandRecords.materialize()
+				if err != nil {
+					return "", err
+				}
+				if record, _ := commandRecord(partialLine, commandID); len(record) != 0 {
+					candidate = append(candidate, record...)
+				}
+				terminalDirty = false
 			}
-			if predicate(full) {
-				return full, nil
+			if predicate(string(candidate)) {
+				return string(candidate), nil
 			}
 		}
 		dirty = false
 	}
 }
 
-func (s *SerialTranscript) readRangeString(start, end int) (string, error) {
-	var out strings.Builder
-	for offset := start; offset < end; {
-		s.mu.Lock()
-		next := min(end, offset+serialTranscriptReadBytes)
+func appendCommandRecords(records io.Writer, partial, data []byte, id string) ([]byte, bool, error) {
+	partial = append(partial, data...)
+	terminalSeen := false
+	for {
+		newline := bytes.IndexByte(partial, '\n')
+		if newline < 0 {
+			return partial, terminalSeen, nil
+		}
+		line := partial[:newline]
+		if record, terminal := commandRecord(line, id); len(record) != 0 {
+			if _, err := records.Write(record); err != nil {
+				return partial, terminalSeen, err
+			}
+			if _, err := records.Write([]byte{'\n'}); err != nil {
+				return partial, terminalSeen, err
+			}
+			terminalSeen = terminalSeen || terminal
+		}
+		partial = partial[newline+1:]
+	}
+}
+
+func commandRecord(line []byte, id string) ([]byte, bool) {
+	prefixes := []string{
+		CommandBeginMarker + id,
+		CommandOutputMarker + id + ":",
+		CommandErrorMarker + id + ":",
+		CommandControlMarker + id + ":",
+		CommandUsageMarker + id + ":",
+		ExecTimingMarker + id + ":",
+		CommandExitMarkerPref + id + ":",
+	}
+	for _, prefix := range prefixes {
+		if index := bytes.Index(line, []byte(prefix)); index >= 0 {
+			return line[index:], prefix == CommandExitMarkerPref+id+":"
+		}
+	}
+	return nil, false
+}
+
+func (s *SerialTranscript) materialize() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out bytes.Buffer
+	for offset := s.base; offset < s.size; {
+		next := min(s.size, offset+serialTranscriptReadBytes)
 		data, err := s.readLocked(offset, next)
-		s.mu.Unlock()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if len(data) == 0 {
 			break
 		}
-		out.Write(data)
+		_, _ = out.Write(data)
 		offset += len(data)
 	}
-	return out.String(), nil
+	return out.Bytes(), nil
 }
 
 func (s *SerialTranscript) Close() error {
@@ -385,15 +524,26 @@ func (s *SerialTranscript) Close() error {
 		return nil
 	}
 	s.closed = true
-	f, path := s.file, s.path
+	f, path, staleFiles, stalePaths := s.file, s.path, s.staleFiles, s.stalePaths
 	s.file, s.path, s.buf, s.tail, s.readers, s.size = nil, "", nil, nil, nil, 0
+	s.staleFiles, s.stalePaths = nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {
 		errs = append(errs, f.Close())
 	}
+	for _, stale := range staleFiles {
+		if stale != nil {
+			errs = append(errs, stale.Close())
+		}
+	}
 	if path != "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	for _, stalePath := range stalePaths {
+		if err := os.Remove(stalePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}

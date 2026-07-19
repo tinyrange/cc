@@ -169,7 +169,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	if err := managedagent.SendExec(control, execID, req); err != nil {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
-	segment, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
+	segment, err := controlTranscript.WaitForCommand(runCtx, 0, execID, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, execID, dmesg)
 		return ok
 	})

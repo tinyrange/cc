@@ -128,6 +128,50 @@ func TestManagerRetargetsRunningGuestBalloon(t *testing.T) {
 	}
 }
 
+func TestManagerSerializesBalloonRetargetWithShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingBalloonInstance{
+		fakeInstance:   newFakeInstance(),
+		balloonStarted: make(chan struct{}),
+		releaseBalloon: make(chan struct{}),
+		closeStarted:   make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "pressure", Image: "alpine", MemoryMB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	inst.blockBalloon.Store(true)
+	balloonDone := make(chan error, 1)
+	go func() { balloonDone <- manager.SetInstanceBalloon("pressure", 768) }()
+	<-inst.balloonStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "pressure") }()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("pressure").Status != "stopping" && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if state := manager.StatusOf("pressure"); state.Status != "stopping" || state.BalloonStatus != "" {
+		t.Fatalf("state while shutdown owns the VM = %+v", state)
+	}
+	select {
+	case <-inst.closeStarted:
+		t.Fatal("instance close raced an active balloon device operation")
+	default:
+	}
+	if err := manager.SetInstanceBalloon("pressure", 512); err == nil {
+		t.Fatal("balloon retarget was accepted after shutdown took ownership")
+	}
+	close(inst.releaseBalloon)
+	if err := <-balloonDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
@@ -135,6 +179,7 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		fakeInstance: newFakeInstance(),
 		current:      3 << 20,
 		highWater:    9 << 20,
+		physical:     5 << 20,
 		reclaimErr:   errors.New("backing filesystem refused reclamation"),
 	}
 	host.queueInstance(inst)
@@ -144,7 +189,7 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := manager.StatusOf("backing")
-	if state.MemoryMB != 512 || state.BackingBytes != 3<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
+	if state.MemoryMB != 512 || state.BackingBytes != 3<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
 		t.Fatalf("reported state = %+v", state)
 	}
 }
@@ -559,7 +604,7 @@ func TestManagerShutdownAllDeadlinePreservesFailedAndPendingInstances(t *testing
 		t.Fatalf("ShutdownAll error = %v, want deadline and beta cleanup errors", err)
 	}
 
-	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "running" {
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "stopping" {
 		t.Fatalf("pending instance state = %+v", state)
 	}
 	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
@@ -1165,13 +1210,34 @@ type fakeInstance struct {
 
 type backingUsageTestInstance struct {
 	*fakeInstance
-	current    uint64
-	highWater  uint64
-	reclaimErr error
+	current, highWater, physical uint64
+	reclaimErr                   error
 }
 
-func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, error) {
-	return i.current, i.highWater, i.reclaimErr
+type blockingBalloonInstance struct {
+	*fakeInstance
+	balloonStarted chan struct{}
+	releaseBalloon chan struct{}
+	closeStarted   chan struct{}
+	blockBalloon   atomic.Bool
+}
+
+func (i *blockingBalloonInstance) SetBalloonMB(target uint64) error {
+	if !i.blockBalloon.Load() {
+		return i.fakeInstance.SetBalloonMB(target)
+	}
+	close(i.balloonStarted)
+	<-i.releaseBalloon
+	return i.fakeInstance.SetBalloonMB(target)
+}
+
+func (i *blockingBalloonInstance) Close() error {
+	close(i.closeStarted)
+	return i.fakeInstance.Close()
+}
+
+func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	return i.current, i.highWater, i.physical, i.reclaimErr
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

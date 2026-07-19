@@ -15,21 +15,22 @@ import (
 // and backing-filesystem exhaustion is returned to the guest as an ordinary
 // write failure rather than becoming an unbounded host-heap failure.
 type imageDataStore struct {
-	mu             sync.Mutex
-	dir            string
-	file           *os.File
-	path           string
-	next           uint64
-	nextLocation   uint64
-	locations      map[uint64]uint64
-	free           []uint64
-	freeSet        map[uint64]struct{}
-	pendingReclaim map[uint64]struct{}
-	current        uint64
-	highWater      uint64
-	reclaimErr     error
-	closed         bool
-	refs           int
+	mu                      sync.Mutex
+	dir                     string
+	file                    *os.File
+	path                    string
+	next                    uint64
+	nextLocation            uint64
+	locations               map[uint64]uint64
+	free                    []uint64
+	freeSet                 map[uint64]struct{}
+	pendingReclaim          map[uint64]struct{}
+	current                 uint64
+	highWater               uint64
+	reclaimErr              error
+	rangeReclaimUnsupported bool
+	closed                  bool
+	refs                    int
 }
 
 type imageDataReclaimQueue struct {
@@ -260,17 +261,26 @@ func (s *imageDataStore) flushReclaimLocked() {
 		err := reclaimFileRange(s.file, int64(start), int64(end-start))
 		if errors.Is(err, errRangeReclaimUnsupported) {
 			unsupported = true
+			s.rangeReclaimUnsupported = true
 			break
 		}
 		if err != nil && s.reclaimErr == nil {
 			s.reclaimErr = err
 		}
 	}
-	if unsupported && len(s.freeSet) > len(s.locations) && s.next >= 8<<20 {
+	if (unsupported || s.rangeReclaimUnsupported) && shouldCompactPortableImageStore(s.current, s.next) {
 		if err := s.compactLocked(); err != nil && s.reclaimErr == nil {
 			s.reclaimErr = err
 		}
 	}
+}
+
+func shouldCompactPortableImageStore(live, allocated uint64) bool {
+	if allocated < 4<<20 || allocated <= live {
+		return false
+	}
+	dead := allocated - live
+	return dead >= (live+1)/2
 }
 
 var errRangeReclaimUnsupported = errors.New("backing filesystem does not support range reclamation")
@@ -325,13 +335,16 @@ func (s *imageDataStore) compactLocked() error {
 	return nil
 }
 
-func (s *imageDataStore) usage() (current, highWater uint64, reclaimErr error) {
+func (s *imageDataStore) usage() (current, highWater, physical uint64, reclaimErr error) {
 	if s == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.current, s.highWater, s.reclaimErr
+	if s.file != nil {
+		physical, reclaimErr = allocatedFileBytes(s.file)
+	}
+	return s.current, s.highWater, physical, errors.Join(s.reclaimErr, reclaimErr)
 }
 
 func (s *imageDataStore) sync() error {

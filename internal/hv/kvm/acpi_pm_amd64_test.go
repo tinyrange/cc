@@ -2,7 +2,10 @@
 
 package kvm
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestACPIPMPersistsEnableAndControlRegisters(t *testing.T) {
 	pm := NewACPIPM()
@@ -27,6 +30,15 @@ func TestACPIPMPersistsEnableAndControlRegisters(t *testing.T) {
 	}
 	if got := control.Data; got[0] != 0x01 || got[1] != 0x00 {
 		t.Fatalf("control bytes = %#v, want [0x01 0x00]", got)
+	}
+}
+
+func TestACPIPMPoweroffWriteIsTerminal(t *testing.T) {
+	pm := NewACPIPM()
+	write := IOExit{Port: acpiPM1ControlPort, Size: 2, Count: 1, Write: true, Data: []byte{0x00, 0x34}}
+	handled, err := pm.HandleIO(write)
+	if !handled || !errors.Is(err, errGuestPoweroff) {
+		t.Fatalf("poweroff handled=%v err=%v", handled, err)
 	}
 }
 

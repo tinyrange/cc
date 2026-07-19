@@ -84,23 +84,24 @@ func sameFSBackend(a, b FSBackend) bool {
 // BackingUsage forwards optional backing-store telemetry through the mount
 // router. Each distinct backend is counted once even when it is mounted at
 // multiple guest paths.
-func (m *mountedFS) BackingUsage() (current, highWater uint64, reclaimErr error) {
+func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaimErr error) {
 	var errs []error
 	for _, backend := range m.distinctBackends() {
 		provider, ok := backend.(interface {
-			BackingUsage() (uint64, uint64, error)
+			BackingUsage() (uint64, uint64, uint64, error)
 		})
 		if !ok {
 			continue
 		}
-		backendCurrent, backendHighWater, err := provider.BackingUsage()
+		backendCurrent, backendHighWater, backendPhysical, err := provider.BackingUsage()
 		current += backendCurrent
 		highWater += backendHighWater
+		physical += backendPhysical
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	return current, highWater, errors.Join(errs...)
+	return current, highWater, physical, errors.Join(errs...)
 }
 
 // Close deterministically releases the root and every distinct mounted

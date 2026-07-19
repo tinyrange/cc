@@ -123,9 +123,9 @@ func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
 	return i.session.VirtioFSStats()
 }
 
-func (i *darwinInstance) BackingUsage() (uint64, uint64, error) {
+func (i *darwinInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	if i == nil || i.session == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	return i.session.BackingUsage()
 }

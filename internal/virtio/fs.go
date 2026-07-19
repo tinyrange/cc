@@ -445,6 +445,7 @@ type FSStats struct {
 	Stages                []TimingStats `json:"stages"`
 	BackingBytes          uint64        `json:"backing_bytes,omitempty"`
 	BackingHighWaterBytes uint64        `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes  uint64        `json:"backing_physical_bytes,omitempty"`
 	BackingReclaimError   string        `json:"backing_reclaim_error,omitempty"`
 }
 
@@ -2822,10 +2823,11 @@ func (f *FS) Stats() FSStats {
 		Stages:          stages,
 	}
 	if provider, ok := f.backend.(interface {
-		BackingUsage() (uint64, uint64, error)
+		BackingUsage() (uint64, uint64, uint64, error)
 	}); ok {
-		current, highWater, usageErr := provider.BackingUsage()
+		current, highWater, physical, usageErr := provider.BackingUsage()
 		stats.BackingBytes, stats.BackingHighWaterBytes = current, highWater
+		stats.BackingPhysicalBytes = physical
 		if usageErr != nil {
 			stats.BackingReclaimError = usageErr.Error()
 		}
@@ -2833,18 +2835,18 @@ func (f *FS) Stats() FSStats {
 	return stats
 }
 
-func (f *FS) BackingUsage() (current, highWater uint64, reclaimErr error) {
+func (f *FS) BackingUsage() (current, highWater, physical uint64, reclaimErr error) {
 	if f == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	f.mu.Lock()
 	backend := f.backend
 	f.mu.Unlock()
 	provider, ok := backend.(interface {
-		BackingUsage() (uint64, uint64, error)
+		BackingUsage() (uint64, uint64, uint64, error)
 	})
 	if !ok {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	return provider.BackingUsage()
 }
@@ -5432,9 +5434,9 @@ func (p *imageFS) Close() error {
 	return p.dataStore.close()
 }
 
-func (p *imageFS) BackingUsage() (uint64, uint64, error) {
+func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
 	if p == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	return p.dataStore.usage()
 }

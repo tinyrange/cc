@@ -39,8 +39,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := s.nextExecID()
 	start := s.transcript.Len()
-	reader := s.transcript.RetainReader(start)
-	defer reader.Close()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	if err := s.sendExecStart(id, req); err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -49,7 +49,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 			return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -77,8 +77,6 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	start := s.transcript.Len()
 	reader := s.transcript.RetainReader(start)
 	defer reader.Close()
-	releaseTranscript := s.transcript.RetainFrom(start)
-	defer releaseTranscript()
 	if err := s.sendExecStart(id, req); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -103,7 +101,7 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	if err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -227,13 +225,17 @@ func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	_, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }
 
 func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predicate func(string) bool) (string, error) {
+	return s.waitForTranscriptCommand(ctx, start, "", predicate)
+}
+
+func (s *ManagedSession) waitForTranscriptCommand(ctx context.Context, start int, commandID string, predicate func(string) bool) (string, error) {
 	if s == nil || s.transcript == nil {
 		return "", fmt.Errorf("managed session is not running")
 	}
@@ -246,7 +248,13 @@ func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predi
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		segment, err := s.transcript.WaitFor(waitCtx, start, predicate)
+		var segment string
+		var err error
+		if commandID == "" {
+			segment, err = s.transcript.WaitFor(waitCtx, start, predicate)
+		} else {
+			segment, err = s.transcript.WaitForCommand(waitCtx, start, commandID, predicate)
+		}
 		resultCh <- result{segment: segment, err: err}
 	}()
 
