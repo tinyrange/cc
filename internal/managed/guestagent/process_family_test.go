@@ -66,7 +66,8 @@ func (t *kernelTrackedFamily) Snapshot() map[int]struct{} {
 	t.snapshots.Add(1)
 	return nil
 }
-func (*kernelTrackedFamily) Close() {}
+func (*kernelTrackedFamily) Close()                   {}
+func (*kernelTrackedFamily) kernelTracksDescendants() {}
 
 func TestKernelTrackedProcessFamilyDoesNotPollPerCommand(t *testing.T) {
 	tracker := &kernelTrackedFamily{}
@@ -81,6 +82,26 @@ func TestKernelTrackedProcessFamilyDoesNotPollPerCommand(t *testing.T) {
 		t.Fatalf("cancellation performed %d process scans, want one", got)
 	}
 }
+
+func TestNativeTrackerWithoutKernelDescendantCapabilityIsPolled(t *testing.T) {
+	tracker := &kernelTrackedFamily{}
+	family := newProcessFamily(os.Getpid()+100000, &pollRequiredFamily{tracker: tracker})
+	defer family.Close()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for tracker.snapshots.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := tracker.snapshots.Load(); got == 0 {
+		t.Fatal("platform tracker was never refreshed; a tracker-owned command start gate could remain closed")
+	}
+}
+
+type pollRequiredFamily struct{ tracker *kernelTrackedFamily }
+
+// Deliberately hide kernelTracksDescendants while preserving the tracker
+// methods, matching the BSD native tracker contract.
+func (t *pollRequiredFamily) Snapshot() map[int]struct{} { return t.tracker.Snapshot() }
+func (t *pollRequiredFamily) Close()                     { t.tracker.Close() }
 
 func shellQuoteForTest(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"

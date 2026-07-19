@@ -64,6 +64,8 @@ type linuxCgroupTracker struct {
 	once sync.Once
 }
 
+func (*linuxCgroupTracker) kernelTracksDescendants() {}
+
 func (t *linuxCgroupTracker) Snapshot() map[int]struct{} {
 	pids := make(map[int]struct{})
 	if t.path == "" {

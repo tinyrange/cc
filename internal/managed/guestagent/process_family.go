@@ -32,6 +32,15 @@ type processFamilyKiller interface {
 	Kill() error
 }
 
+// processFamilyKernelTracker marks trackers whose kernel primitive follows the
+// complete descendant set without process-table polling. Other platform
+// trackers may still require refresh both to open a command start gate and to
+// discover descendants not represented by their native notification stream.
+type processFamilyKernelTracker interface {
+	processFamilyTracker
+	kernelTracksDescendants()
+}
+
 type processFamilyPreparation interface {
 	Start(root int) (processFamilyTracker, error)
 	Abort()
@@ -79,9 +88,10 @@ func newProcessFamily(root int, tracker processFamilyTracker) *ProcessFamily {
 	f := &ProcessFamily{root: root, tracker: tracker, done: make(chan struct{}), pids: map[int]struct{}{root: {}}}
 	// Linux cgroups already track forks, setsid, and daemon reparenting in the
 	// kernel. Per-command process-table polling is both redundant there and
-	// catastrophically expensive for many persistent contexts. Platforms
-	// without a kernel tracker retain the process-table observer.
-	if tracker == nil {
+	// catastrophically expensive for many persistent contexts. BSD's native
+	// tracker deliberately is not marked: its first snapshot opens the process
+	// start gate and its event stream still benefits from ancestry observation.
+	if _, kernelTracked := tracker.(processFamilyKernelTracker); !kernelTracked {
 		go f.watch()
 	}
 	return f
