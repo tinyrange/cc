@@ -25,6 +25,7 @@ type ManagedSession struct {
 	control    io.ReadWriteCloser
 	listener   io.Closer
 	vsock      *virtio.Vsock
+	balloon    *virtio.Balloon
 	fsdevs     []*virtio.FS
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
@@ -238,6 +239,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		balloon:    balloon,
 		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {
@@ -247,6 +249,13 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		serialOut:  serialOut,
 		dmesg:      dmesg,
 	}, nil
+}
+
+func (s *ManagedSession) SetBalloonMB(target uint64) error {
+	if s == nil || s.balloon == nil {
+		return fmt.Errorf("virtio balloon is unavailable")
+	}
+	return s.balloon.SetTargetPages(balloonTargetPages(target))
 }
 
 func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -352,6 +361,12 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.done != nil {
 		_ = s.done.wait()
+	}
+	if s.transcript != nil {
+		_ = s.transcript.Close()
+	}
+	if s.serialOut != nil && s.serialOut != s.transcript {
+		_ = s.serialOut.Close()
 	}
 	return nil
 }

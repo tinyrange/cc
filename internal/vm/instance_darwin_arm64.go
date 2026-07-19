@@ -4,6 +4,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"j5.nz/cc/client"
@@ -18,6 +19,13 @@ import (
 	"j5.nz/cc/internal/vm/netstate"
 	"j5.nz/cc/internal/vmruntime"
 )
+
+func (i *darwinInstance) SetBalloonMB(target uint64) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("running instance has no managed session")
+	}
+	return i.session.SetBalloonMB(target)
+}
 
 type darwinInstance struct {
 	*managedInstanceCore

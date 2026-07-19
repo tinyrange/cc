@@ -10,7 +10,7 @@ import (
 )
 
 type Transcript interface {
-	String() string
+	ReadFrom(offset int) (text string, next int)
 }
 
 type StreamExecOptions struct {
@@ -56,16 +56,17 @@ func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
 		stats.Loops++
 		observe(StreamExecObservation{Kind: "loop", Stats: stats})
 		text := ""
+		next := offset
 		readStart := time.Now()
 		if opts.Transcript != nil {
-			text = opts.Transcript.String()
+			text, next = opts.Transcript.ReadFrom(offset)
 		}
-		observe(StreamExecObservation{Kind: "transcript_string", Duration: time.Since(readStart), Stats: stats})
-		if offset < len(text) {
+		observe(StreamExecObservation{Kind: "transcript_read", Duration: time.Since(readStart), Stats: stats})
+		if len(text) > 0 {
 			stats.Reads++
 			appendStart := time.Now()
-			pending += text[offset:]
-			offset = len(text)
+			pending += text
+			offset = next
 			observe(StreamExecObservation{Kind: "append_pending", Duration: time.Since(appendStart), Stats: stats})
 			for {
 				lineStart := time.Now()

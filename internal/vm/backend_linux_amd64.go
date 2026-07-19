@@ -659,6 +659,17 @@ func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
 	return virtioFSStats(i.fsdevs)
 }
 
+func (i *linuxInstance) SetBalloonMB(target uint64) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("running instance has no managed session")
+	}
+	controller, ok := i.session.(interface{ SetBalloonMB(uint64) error })
+	if !ok {
+		return fmt.Errorf("running instance does not support dynamic ballooning")
+	}
+	return controller.SetBalloonMB(target)
+}
+
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

@@ -54,6 +54,7 @@ type RuntimeView interface {
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
+	SetInstanceBalloon(string, uint64) error
 }
 
 func Main(args []string) {

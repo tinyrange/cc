@@ -80,4 +80,12 @@ func TestStreamExecEventsObservesParsing(t *testing.T) {
 
 type staticTranscript string
 
-func (s staticTranscript) String() string { return string(s) }
+func (s staticTranscript) ReadFrom(offset int) (string, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(s) {
+		offset = len(s)
+	}
+	return string(s[offset:]), len(s)
+}

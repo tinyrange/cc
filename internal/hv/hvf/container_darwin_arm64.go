@@ -169,6 +169,7 @@ type ContainerSession struct {
 	serialOut   *arm64vm.SerialTranscript
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
+	balloon     *virtio.Balloon
 	rootFS      virtio.ShareMounter
 	fsdevs      []*virtio.FS
 	sendMu      sync.Mutex
@@ -880,8 +881,21 @@ func (s *ContainerSession) Close() error {
 	case <-time.After(15 * time.Second):
 		return fmt.Errorf("container session did not stop within 15s")
 	}
+	if s.transcript != nil {
+		_ = s.transcript.Close()
+	}
+	if s.serialOut != nil && s.serialOut != s.transcript {
+		_ = s.serialOut.Close()
+	}
 	exitTiming.Dump()
 	return nil
+}
+
+func (s *ContainerSession) SetBalloonMB(target uint64) error {
+	if s == nil || s.balloon == nil {
+		return fmt.Errorf("virtio balloon is unavailable")
+	}
+	return s.balloon.SetTargetPages(balloonTargetPages(target))
 }
 
 func (s *ContainerSession) writeControlPayload(payload []byte) error {
@@ -1332,6 +1346,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			transcript:  controlTranscript,
 			serialOut:   serialOut,
 			vsock:       vsock,
+			balloon:     balloon,
 			rootFS:      rootFS,
 			fsdevs:      fsdevs,
 			shares:      shareState,

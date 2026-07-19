@@ -527,6 +527,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		balloon:    balloon,
 		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {

@@ -330,22 +330,41 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 		}
 	}
 
-	entry, err := m.fetchIndexEntry(ctx)
-	if err != nil {
-		return err
-	}
-
-	filename := fmt.Sprintf("%s-%s.apk", entry.Name, entry.Version)
 	destDir := filepath.Join(m.root, "packages")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create kernel package dir: %w", err)
 	}
-	apkPath := filepath.Join(destDir, filename)
-	tarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", entry.Name, entry.Version))
-
-	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath, entry, report); err != nil {
-		return err
+	var entry indexEntry
+	var apkPath string
+	var downloadErr error
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		entry, err = m.fetchIndexEntry(ctx)
+		if err != nil {
+			return err
+		}
+		filename := fmt.Sprintf("%s-%s.apk", entry.Name, entry.Version)
+		apkPath = filepath.Join(destDir, filename)
+		packageURL := m.packageURL(filename)
+		if attempt > 0 {
+			separator := "?"
+			if strings.Contains(packageURL, "?") {
+				separator = "&"
+			}
+			packageURL += separator + "cc-repository-retry=" + strconv.Itoa(attempt)
+		}
+		downloadErr = m.downloadFile(ctx, packageURL, apkPath, entry, report)
+		if downloadErr == nil {
+			break
+		}
+		if !isAlpineRepositoryRace(downloadErr) {
+			return downloadErr
+		}
 	}
+	if downloadErr != nil {
+		return fmt.Errorf("Alpine repository index and kernel package remained inconsistent after refresh: %w", downloadErr)
+	}
+	tarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", entry.Name, entry.Version))
 	if err := decompressAPKToTar(apkPath, tarPath); err != nil {
 		return err
 	}
@@ -374,6 +393,12 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 	m.mu.Unlock()
 
 	return nil
+}
+
+func isAlpineRepositoryRace(err error) bool {
+	var digestErr *download.DigestError
+	var lengthErr *download.LengthError
+	return errors.As(err, &digestErr) || errors.As(err, &lengthErr)
 }
 
 func (m *Manager) readKernelConfig() (map[string]Tristate, error) {
@@ -588,6 +613,7 @@ func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
 	if err != nil {
 		return indexEntry{}, err
 	}
+	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
@@ -621,6 +647,7 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, entry 
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("download kernel package: %w", err)

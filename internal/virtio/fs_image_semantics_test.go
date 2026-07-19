@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ func newEmptyImageFS(t *testing.T) *imageFS {
 	if !ok {
 		t.Fatal("NewImageFS did not return an image filesystem")
 	}
+	t.Cleanup(func() { _ = backend.Close() })
 	return backend
 }
 
@@ -148,6 +150,37 @@ func TestImageFSMetadataAndSparseStorage(t *testing.T) {
 	}
 }
 
+func TestImageFSWrittenDataDoesNotAccumulateInHostHeap(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, fh := createImageFile(t, backend, "large", "")
+	page := make([]byte, imageDataPageSize)
+	for i := range page {
+		page[i] = byte(i)
+	}
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	const written = 32 << 20
+	for off := 0; off < written; off += len(page) {
+		if _, errno := backend.Write(nodeID, fh, uint64(off), page, 0); errno != 0 {
+			t.Fatalf("write at %d: errno %d", off, errno)
+		}
+	}
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	heapGrowth := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	if heapGrowth > 8<<20 {
+		t.Fatalf("writing %d bytes retained %d bytes of Go heap", written, heapGrowth)
+	}
+	if backend.dataStore.file == nil {
+		t.Fatal("writable data was not placed in the backing store")
+	}
+	if info, err := backend.dataStore.file.Stat(); err != nil || info.Size() < written {
+		t.Fatalf("backing store stat = %#v, %v", info, err)
+	}
+}
+
 func TestImageFSDirectoryAndFileLinkCounts(t *testing.T) {
 	backend := newEmptyImageFS(t)
 	nodeID, fh := createImageFile(t, backend, "one", "data")
@@ -203,6 +236,23 @@ func TestImageFSOpenDirectorySurvivesRemoval(t *testing.T) {
 	backend.ReleaseDir(dirID, fh)
 	if _, errno := backend.GetAttr(dirID); errno != -linuxENOENT {
 		t.Fatalf("getattr after released directory: errno %d, want %d", errno, -linuxENOENT)
+	}
+}
+
+func TestImageFSRootSurvivesDirectoryHandleRelease(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	nodeID, fileHandle := createImageFile(t, backend, "still-here", "data")
+	backend.Release(nodeID, fileHandle)
+	fh, errno := backend.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("open root: errno %d", errno)
+	}
+	backend.ReleaseDir(1, fh)
+	if _, errno := backend.GetAttr(1); errno != 0 {
+		t.Fatalf("getattr root after release: errno %d", errno)
+	}
+	if _, _, errno := backend.Lookup(1, "still-here"); errno != 0 {
+		t.Fatalf("lookup after root release: errno %d", errno)
 	}
 }
 

@@ -599,6 +599,47 @@ printf 'virtio-balloon-ok\n'`,
 	requireRunResponse(t, resp, err, 0)
 }
 
+func TestRuntimeRetargetsBalloonWhileGuestRemainsRunning(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("dynamic balloon recovery is currently implemented by Linux amd64 KVM")
+	}
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{MemoryMB: 768})
+	defer inst.Close()
+	controller, ok := inst.(interface{ SetBalloonMB(uint64) error })
+	if !ok {
+		t.Fatal("running Linux VM does not expose dynamic balloon control")
+	}
+	if err := controller.SetBalloonMB(384); err != nil {
+		t.Fatal(err)
+	}
+	shrunk := execInRuntime(t, inst, []string{"sh", "-lc", `
+for attempt in $(seq 1 100); do
+	memory_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	if test "$memory_kb" -lt 600000; then printf '%s\n' "$memory_kb"; exit 0; fi
+	sleep 0.02
+done
+exit 1
+`})
+	if shrunk.ExitCode != 0 {
+		t.Fatalf("guest did not relinquish memory: %s", shrunk.Output)
+	}
+	if err := controller.SetBalloonMB(0); err != nil {
+		t.Fatal(err)
+	}
+	restored := execInRuntime(t, inst, []string{"sh", "-lc", `
+for attempt in $(seq 1 100); do
+	memory_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	if test "$memory_kb" -gt 700000; then printf '%s\n' "$memory_kb"; exit 0; fi
+	sleep 0.02
+done
+exit 1
+`})
+	if restored.ExitCode != 0 {
+		t.Fatalf("guest memory was not restored after pressure: %s", restored.Output)
+	}
+}
+
 func TestRuntimeOneShotReportsNonZeroExitAndStderr(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
@@ -1334,6 +1375,46 @@ func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
 	requireGuestOutput(t, output.String(), "long-running-ready")
 	if strings.Contains(output.String(), "should-not-print") {
 		t.Fatalf("long-running exec continued after cancellation\noutput:\n%s", output.String())
+	}
+}
+
+func TestRuntimePersistentLifecycleRemainsResponsiveDuringBulkOutput(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
+
+	const producers = 8
+	start := make(chan struct{})
+	done := make(chan error, producers)
+	for range producers {
+		go func() {
+			<-start
+			done <- inst.ExecStream(context.Background(), client.ExecRequest{
+				Command: []string{"sh", "-lc", "head -c 4194304 /dev/zero"},
+			}, nil, func(client.ExecEvent) error { return nil })
+		}()
+	}
+	close(start)
+	time.Sleep(25 * time.Millisecond)
+
+	controlCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := inst.Exec(controlCtx, client.ExecRequest{Command: []string{"/bin/true"}})
+	if err != nil {
+		t.Fatalf("control command was starved by bulk output: %v", err)
+	}
+	if response.ExitCode != 0 {
+		t.Fatalf("control command exit = %d", response.ExitCode)
+	}
+	for range producers {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("bulk output command: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("bulk output command did not complete")
+		}
 	}
 }
 

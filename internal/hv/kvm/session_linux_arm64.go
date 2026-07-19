@@ -351,6 +351,12 @@ func (s *ManagedSession) Close() error {
 	if s.done != nil {
 		_ = s.done.wait()
 	}
+	if s.transcript != nil {
+		_ = s.transcript.Close()
+	}
+	if s.serialOut != nil && s.serialOut != s.transcript {
+		_ = s.serialOut.Close()
+	}
 	return nil
 }
 

@@ -104,6 +104,30 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	}
 }
 
+func TestManagerRetargetsRunningGuestBalloon(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "pressure", Image: "alpine", MemoryMB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetInstanceBalloon("pressure", 768); err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	target := inst.balloonTarget
+	inst.mu.Unlock()
+	if target != 768 {
+		t.Fatalf("instance balloon target = %d, want 768", target)
+	}
+	if state := manager.StatusOf("pressure"); state.BalloonMB != 768 {
+		t.Fatalf("reported balloon target = %d, want 768", state.BalloonMB)
+	}
+}
+
 func TestManagerStatusProviderDoesNotBlockManagementAndReconcilesShutdown(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -1109,6 +1133,14 @@ type fakeInstance struct {
 	virtioFSStats  func() []virtio.FSStats
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
 	waitErr        error
+	balloonTarget  uint64
+}
+
+func (i *fakeInstance) SetBalloonMB(target uint64) error {
+	i.mu.Lock()
+	i.balloonTarget = target
+	i.mu.Unlock()
+	return nil
 }
 
 type shutdownTestInstance struct {

@@ -63,6 +63,10 @@ type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
 }
 
+type instanceBalloonController interface {
+	SetBalloonMB(uint64) error
+}
+
 type Manager struct {
 	mu            sync.Mutex
 	host          VMHost
@@ -135,8 +139,10 @@ func NewManagerWithHost(host VMHost) *Manager {
 }
 
 func newManagerBudgets(m *Manager) *Manager {
-	m.maxMemoryMB = hostMemoryMB()
-	m.maxCPUs = runtime.NumCPU()
+	// Guest memory is sparsely committed and vCPUs are scheduler work, so
+	// configured totals are not useful host-capacity ceilings. The vmsh host
+	// observes real memory pressure and dynamically balloons guests instead.
+	// Explicit test/embedding budgets can still set these fields when desired.
 	return m
 }
 
@@ -1038,6 +1044,34 @@ func (m *Manager) resourceUsageLocked() (uint64, int) {
 		cpus += reservation.cpus
 	}
 	return memory, cpus
+}
+
+func (m *Manager) SetInstanceBalloon(id string, targetMB uint64) error {
+	id = strings.TrimSpace(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	if machine == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("VM %q is not running", id)
+	}
+	if targetMB > machine.memoryMB {
+		m.mu.Unlock()
+		return fmt.Errorf("balloon target %d MiB exceeds VM memory %d MiB", targetMB, machine.memoryMB)
+	}
+	controller, ok := machine.instance.(instanceBalloonController)
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("VM %q does not support dynamic ballooning", id)
+	}
+	if err := controller.SetBalloonMB(targetMB); err != nil {
+		return fmt.Errorf("set VM %q balloon target: %w", id, err)
+	}
+	m.mu.Lock()
+	if current := m.running[id]; current == machine {
+		current.balloonMB = targetMB
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {

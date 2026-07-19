@@ -555,6 +555,11 @@ func (f *FS) Close() error {
 			if irq != nil {
 				_ = irq.SetIRQ(f.IRQ, false)
 			}
+			if closedNow {
+				if closer, ok := f.backend.(interface{ Close() error }); ok {
+					return closer.Close()
+				}
+			}
 			return nil
 		}
 	}
@@ -3069,6 +3074,7 @@ type passthroughHandle struct {
 
 type imageFS struct {
 	root       string
+	dataStore  *imageDataStore
 	ownerUID   uint32
 	ownerGID   uint32
 	mapOwner   bool
@@ -3128,53 +3134,79 @@ const (
 // sparseImageData stores only pages which have actually been written. A file's
 // logical size lives on imageNode, so truncate(2) can create holes without
 // committing an equal amount of host memory.
-type sparseImageData map[uint64][]byte
+type sparseImageData map[uint64]uint64
 
-func (d sparseImageData) readAt(dst []byte, off uint64) {
+func (d sparseImageData) readAt(store *imageDataStore, dst []byte, off uint64) error {
 	for len(dst) > 0 {
 		pageIndex := off / imageDataPageSize
 		pageOffset := off % imageDataPageSize
 		n := min(len(dst), int(imageDataPageSize-pageOffset))
-		if page := d[pageIndex]; page != nil {
+		if location, ok := d[pageIndex]; ok {
+			var page [imageDataPageSize]byte
+			if err := store.readPage(location, page[:]); err != nil {
+				return err
+			}
 			copy(dst[:n], page[pageOffset:pageOffset+uint64(n)])
 		}
 		dst = dst[n:]
 		off += uint64(n)
 	}
+	return nil
 }
 
-func (d *sparseImageData) writeAt(src []byte, off uint64) {
+func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64) (int, error) {
 	if *d == nil {
 		*d = sparseImageData{}
 	}
+	written := 0
 	for len(src) > 0 {
 		pageIndex := off / imageDataPageSize
 		pageOffset := off % imageDataPageSize
 		n := min(len(src), int(imageDataPageSize-pageOffset))
-		page := (*d)[pageIndex]
-		if page == nil {
-			page = make([]byte, imageDataPageSize)
-			(*d)[pageIndex] = page
+		location, ok := (*d)[pageIndex]
+		if !ok {
+			var page [imageDataPageSize]byte
+			copy(page[pageOffset:pageOffset+uint64(n)], src[:n])
+			var err error
+			location, err = store.allocatePage(page[:])
+			if err != nil {
+				return written, err
+			}
+			(*d)[pageIndex] = location
+		} else if err := store.writeAt(location, pageOffset, src[:n]); err != nil {
+			return written, err
 		}
-		copy(page[pageOffset:pageOffset+uint64(n)], src[:n])
 		src = src[n:]
 		off += uint64(n)
+		written += n
 	}
+	return written, nil
 }
 
-func (d sparseImageData) truncate(size uint64) {
-	for pageIndex := range d {
+func (d sparseImageData) truncate(store *imageDataStore, size uint64) error {
+	for pageIndex, location := range d {
 		pageStart := pageIndex * imageDataPageSize
 		if pageStart >= size {
 			delete(d, pageIndex)
+			store.releasePage(location)
 		}
 	}
 	if size == 0 || size%imageDataPageSize == 0 {
-		return
+		return nil
 	}
 	pageIndex := size / imageDataPageSize
-	if page := d[pageIndex]; page != nil {
-		clear(page[size%imageDataPageSize:])
+	if location, ok := d[pageIndex]; ok {
+		var zero [imageDataPageSize]byte
+		if err := store.writeAt(location, size%imageDataPageSize, zero[:imageDataPageSize-size%imageDataPageSize]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d sparseImageData) release(store *imageDataStore) {
+	for _, location := range d {
+		store.releasePage(location)
 	}
 }
 
@@ -3231,7 +3263,7 @@ func NewImageFSWithOwner(root imagefs.Directory, statfsPath string, uid, gid uin
 
 func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapOwner bool) FSBackend {
 	imgFS := &imageFS{
-		root:           statfsPath,
+		dataStore:      newImageDataStore(),
 		ownerUID:       uid,
 		ownerGID:       gid,
 		mapOwner:       mapOwner,
@@ -3244,6 +3276,7 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		dirHandles:     map[uint64][]dirEntry{},
 		dirHandleNodes: map[uint64]uint64{},
 	}
+	imgFS.root = imgFS.dataStore.dir
 	if root == nil {
 		root = imagefs.NewHostFS("", nil)
 	}
@@ -4274,6 +4307,7 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 			return 0, errno
 		}
 		if flags&linuxOTRUNC != 0 {
+			node.data.release(p.dataStore)
 			node.data = nil
 			node.size = 0
 			if uid != 0 {
@@ -4317,10 +4351,16 @@ func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
 }
 
 func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
+	if err := p.dataStore.sync(); err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
 func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
+	if err := p.dataStore.sync(); err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
@@ -4342,7 +4382,10 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 			end = node.size
 		}
 		data := make([]byte, end-off)
-		node.data.readAt(data, off)
+		if err := node.data.readAt(p.dataStore, data, off); err != nil {
+			p.mu.Unlock()
+			return nil, errnoFromError(err)
+		}
 		node.atime = time.Now()
 		p.mu.Unlock()
 		return data, 0
@@ -4403,12 +4446,12 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 	switch whence {
 	case 3: // SEEK_DATA
 		page := offset / imageDataPageSize
-		if node.data[page] != nil {
+		if _, ok := node.data[page]; ok {
 			p.mu.Unlock()
 			return offset, 0
 		}
 		for candidate := page + 1; candidate*imageDataPageSize < node.size; candidate++ {
-			if node.data[candidate] != nil {
+			if _, ok := node.data[candidate]; ok {
 				p.mu.Unlock()
 				return candidate * imageDataPageSize, 0
 			}
@@ -4417,12 +4460,12 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 		return 0, -linuxENXIO
 	case 4: // SEEK_HOLE
 		page := offset / imageDataPageSize
-		if node.data[page] == nil {
+		if _, ok := node.data[page]; !ok {
 			p.mu.Unlock()
 			return offset, 0
 		}
 		for candidate := page + 1; candidate*imageDataPageSize < node.size; candidate++ {
-			if node.data[candidate] == nil {
+			if _, ok := node.data[candidate]; !ok {
 				p.mu.Unlock()
 				return candidate * imageDataPageSize, 0
 			}
@@ -4782,6 +4825,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 			}
 			if flags&linuxOTRUNC != 0 {
 				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
+				node.data.release(p.dataStore)
 				node.data = nil
 				node.size = 0
 				if uid != 0 {
@@ -4843,7 +4887,13 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	if end < off || end > uint64(^uint(0)>>1) {
 		return 0, -linuxEFBIG
 	}
-	node.data.writeAt(data, off)
+	written, err := node.data.writeAt(p.dataStore, data, off)
+	if err != nil {
+		if written > 0 && off+uint64(written) > node.size {
+			node.size = off + uint64(written)
+		}
+		return uint32(written), errnoFromError(err)
+	}
 	if end > node.size {
 		node.size = end
 	}
@@ -4889,7 +4939,9 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 		node.gid = gid
 	}
 	if valid&fattrSize != 0 {
-		node.data.truncate(size)
+		if err := node.data.truncate(p.dataStore, size); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
 		node.size = size
 		if callerUID != 0 {
 			node.mode &^= fs.FileMode(0o6000)
@@ -5321,12 +5373,28 @@ func (p *imageFS) touchImageDirectoryLocked(node *imageNode, now time.Time) {
 }
 
 func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
+	// The root has no parent directory entry, so its reference count is always
+	// zero. Releasing an open root directory must never collect it: persistent
+	// guest shells routinely open and close / while resolving paths.
+	if nodeID == 1 {
+		return
+	}
 	if p.imageNodeReferenceCountLocked(nodeID) == 0 && !p.imageNodeHasHandleLocked(nodeID) {
 		if node := p.nodes[nodeID]; node != nil {
 			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
+			node.data.release(p.dataStore)
 		}
 		delete(p.nodes, nodeID)
 	}
+}
+
+func (p *imageFS) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dataStore.close()
 }
 
 func imageNodeXattrBytes(node *imageNode) int {
@@ -5529,8 +5597,13 @@ func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 	if err != nil {
 		return errnoFromError(err)
 	}
-	node.data = nil
-	node.data.writeAt(data, 0)
+	var copied sparseImageData
+	if _, err := copied.writeAt(p.dataStore, data, 0); err != nil {
+		copied.release(p.dataStore)
+		return errnoFromError(err)
+	}
+	node.data.release(p.dataStore)
+	node.data = copied
 	node.size = uint64(len(data))
 	node.mode = mode
 	node.abstractFile = nil

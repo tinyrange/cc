@@ -110,6 +110,14 @@ type RuntimeView interface {
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
+	SetInstanceBalloon(string, uint64) error
+}
+
+func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.SetInstanceBalloon(id, targetMB)
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {

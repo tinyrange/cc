@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"runtime"
 	"sort"
 	"time"
 
@@ -20,10 +21,13 @@ func (p *imageFS) RootSnapshot() (imagefs.Directory, error) {
 	if root == nil || !root.isDir() {
 		return nil, fmt.Errorf("image filesystem root is missing")
 	}
-	return p.snapshotDirLocked(root)
+	store := newImageDataStore()
+	dir, err := p.snapshotDirLocked(root, store)
+	_ = store.close()
+	return dir, err
 }
 
-func (p *imageFS) snapshotDirLocked(node *imageNode) (*snapshotDir, error) {
+func (p *imageFS) snapshotDirLocked(node *imageNode, store *imageDataStore) (*snapshotDir, error) {
 	if node.abstractDir != nil && !node.entriesDone {
 		if _, errno := p.materializeDirEntriesLocked(node); errno != 0 {
 			return nil, fmt.Errorf("materialize %s: errno %d", p.pathForNode(node.id), errno)
@@ -48,7 +52,7 @@ func (p *imageFS) snapshotDirLocked(node *imageNode) (*snapshotDir, error) {
 		if child == nil {
 			continue
 		}
-		entry, err := p.snapshotEntryLocked(child)
+		entry, err := p.snapshotEntryLocked(child, store)
 		if err != nil {
 			return nil, err
 		}
@@ -57,11 +61,11 @@ func (p *imageFS) snapshotDirLocked(node *imageNode) (*snapshotDir, error) {
 	return out, nil
 }
 
-func (p *imageFS) snapshotEntryLocked(node *imageNode) (imagefs.Entry, error) {
+func (p *imageFS) snapshotEntryLocked(node *imageNode, store *imageDataStore) (imagefs.Entry, error) {
 	attr := p.attr(node)
 	switch {
 	case node.isDir():
-		dir, err := p.snapshotDirLocked(node)
+		dir, err := p.snapshotDirLocked(node, store)
 		if err != nil {
 			return imagefs.Entry{}, err
 		}
@@ -81,16 +85,24 @@ func (p *imageFS) snapshotEntryLocked(node *imageNode) (imagefs.Entry, error) {
 		}}, nil
 	default:
 		var source imagefs.File
-		var data sparseImageData
+		var data snapshotSparseData
 		if node.abstractFile != nil {
 			source = node.abstractFile
 		} else {
-			data = make(sparseImageData, len(node.data))
-			for pageIndex, page := range node.data {
-				data[pageIndex] = append([]byte(nil), page...)
+			data = snapshotSparseData{pages: make(map[uint64]uint64, len(node.data)), store: store}
+			for pageIndex, location := range node.data {
+				var page [imageDataPageSize]byte
+				if err := p.dataStore.readPage(location, page[:]); err != nil {
+					return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
+				}
+				snapshotLocation, err := store.allocatePage(page[:])
+				if err != nil {
+					return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
+				}
+				data.pages[pageIndex] = snapshotLocation
 			}
 		}
-		return imagefs.Entry{File: &snapshotFile{
+		file := &snapshotFile{
 			mode:    linuxModeToGo(attr.Mode),
 			uid:     attr.UID,
 			gid:     attr.GID,
@@ -99,7 +111,12 @@ func (p *imageFS) snapshotEntryLocked(node *imageNode) (imagefs.Entry, error) {
 			data:    data,
 			source:  source,
 			modTime: unixAttrModTime(attr),
-		}}, nil
+		}
+		if data.store != nil {
+			data.store.retain()
+			runtime.SetFinalizer(file, (*snapshotFile).releaseStore)
+		}
+		return imagefs.Entry{File: file}, nil
 	}
 }
 
@@ -159,9 +176,40 @@ type snapshotFile struct {
 	gid     uint32
 	rdev    uint32
 	size    uint64
-	data    sparseImageData
+	data    snapshotSparseData
 	source  imagefs.File
 	modTime time.Time
+}
+
+type snapshotSparseData struct {
+	pages map[uint64]uint64
+	store *imageDataStore
+}
+
+func (d snapshotSparseData) readAt(dst []byte, off uint64) error {
+	for len(dst) > 0 {
+		pageIndex := off / imageDataPageSize
+		pageOffset := off % imageDataPageSize
+		n := min(len(dst), int(imageDataPageSize-pageOffset))
+		if location, ok := d.pages[pageIndex]; ok {
+			var page [imageDataPageSize]byte
+			if err := d.store.readPage(location, page[:]); err != nil {
+				return err
+			}
+			copy(dst[:n], page[pageOffset:pageOffset+uint64(n)])
+		}
+		dst = dst[n:]
+		off += uint64(n)
+	}
+	return nil
+}
+
+func (f *snapshotFile) releaseStore() {
+	if f == nil || f.data.store == nil {
+		return
+	}
+	_ = f.data.store.close()
+	f.data.store = nil
 }
 
 func (f *snapshotFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
@@ -180,7 +228,9 @@ func (f *snapshotFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 		return f.source.ReadAt(off, uint32(end-off))
 	}
 	data := make([]byte, end-off)
-	f.data.readAt(data, off)
+	if err := f.data.readAt(data, off); err != nil {
+		return nil, err
+	}
 	return data, nil
 }
 
