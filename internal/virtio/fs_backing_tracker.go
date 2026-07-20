@@ -23,6 +23,8 @@ type FSBackingUsageTracker struct {
 	combinedHighWater  uint64
 	physical           uint64
 	reclaimErr         error
+	stale              bool
+	active             atomic.Uint64
 	sampling           atomic.Bool
 	dirty              atomic.Bool
 }
@@ -77,21 +79,19 @@ func (t *FSBackingUsageTracker) Sample() {
 
 func (t *FSBackingUsageTracker) sampleStable() {
 	t.mutationMu.Lock()
-	if t.activeMutations != 0 {
-		t.mutationMu.Unlock()
-		return
-	}
 	generation := t.mutationGeneration
+	active := t.activeMutations
 	t.mutationMu.Unlock()
 
-	var current, metadata, physical uint64
+	var current, dataPeak, metadata, metadataPeak, physical uint64
 	var errs []error
 	for _, backend := range t.backends {
 		if provider, ok := backend.(interface {
 			BackingUsage() (uint64, uint64, uint64, error)
 		}); ok {
-			value, _, backendPhysical, err := provider.BackingUsage()
+			value, backendPeak, backendPhysical, err := provider.BackingUsage()
 			current += value
+			dataPeak = max(dataPeak, backendPeak)
 			physical += backendPhysical
 			if err != nil {
 				errs = append(errs, err)
@@ -100,27 +100,21 @@ func (t *FSBackingUsageTracker) sampleStable() {
 			current += provider.BackingCurrent()
 		}
 		if provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) }); ok {
-			value, _ := provider.BackingMetadataUsage()
+			value, backendPeak := provider.BackingMetadataUsage()
 			metadata += value
+			metadataPeak = max(metadataPeak, backendPeak)
 		}
 	}
 	t.mutationMu.Lock()
-	stable := t.activeMutations == 0 && t.mutationGeneration == generation
-	if !stable {
-		t.mutationMu.Unlock()
-		return
-	}
+	stale := active != 0 || t.activeMutations != 0 || t.mutationGeneration != generation
 	t.mu.Lock()
 	t.current = current
 	t.metadataCurrent = metadata
 	t.physical = physical
 	t.reclaimErr = errors.Join(errs...)
-	if current > t.highWater {
-		t.highWater = current
-	}
-	if metadata > t.metadataHighWater {
-		t.metadataHighWater = metadata
-	}
+	t.stale = stale
+	t.highWater = max(t.highWater, current, dataPeak)
+	t.metadataHighWater = max(t.metadataHighWater, metadata, metadataPeak)
 	combined := current + metadata
 	if combined < current {
 		combined = ^uint64(0)
@@ -128,6 +122,12 @@ func (t *FSBackingUsageTracker) sampleStable() {
 	if combined > t.combinedHighWater {
 		t.combinedHighWater = combined
 	}
+	// A component's independently recorded peak is a safe lower bound for
+	// aggregate pressure: every other component was non-negative when that
+	// peak occurred. This preserves transient peaks even when overlapping
+	// mutations allocate and release between aggregate samples without
+	// inventing a sum of peaks that may have happened at different times.
+	t.combinedHighWater = max(t.combinedHighWater, dataPeak, metadataPeak)
 	t.mu.Unlock()
 	t.mutationMu.Unlock()
 }
@@ -141,19 +141,19 @@ func (t *FSBackingUsageTracker) TrackMutation() func() {
 	}
 	t.mutationMu.Lock()
 	t.activeMutations++
+	t.active.Store(t.activeMutations)
 	t.mutationGeneration++
 	t.mutationMu.Unlock()
+	t.RequestSample()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			t.mutationMu.Lock()
 			t.activeMutations--
+			t.active.Store(t.activeMutations)
 			t.mutationGeneration++
-			idle := t.activeMutations == 0
 			t.mutationMu.Unlock()
-			if idle {
-				t.RequestSample()
-			}
+			t.RequestSample()
 		})
 	}
 }
@@ -223,6 +223,8 @@ type FSBackingUsageSnapshot struct {
 	CombinedHighWaterBytes uint64
 	PhysicalBytes          uint64
 	ReclaimError           error
+	Stale                  bool
+	ActiveMutations        uint64
 }
 
 func (t *FSBackingUsageTracker) Snapshot() FSBackingUsageSnapshot {
@@ -244,5 +246,7 @@ func (t *FSBackingUsageTracker) Snapshot() FSBackingUsageSnapshot {
 		CombinedHighWaterBytes: t.combinedHighWater,
 		PhysicalBytes:          t.physical,
 		ReclaimError:           t.reclaimErr,
+		Stale:                  t.stale || t.active.Load() != 0 || t.sampling.Load() || t.dirty.Load(),
+		ActiveMutations:        t.active.Load(),
 	}
 }

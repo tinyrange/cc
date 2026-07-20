@@ -3,8 +3,7 @@
 package capturerelay
 
 import (
-	"bufio"
-	"context"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -12,12 +11,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
-	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-const pollInterval = 10 * time.Millisecond
+const captureFinishPrefix = "\x1dvmsh-capture-finish:"
+const captureFinishSuffix = "\x1f\n"
 
 // Run serves a private command-capture control FIFO. One process owns every
 // capture in a persistent shell context; retired streams keep draining guest
@@ -37,11 +37,11 @@ type relay struct {
 	controlPath string
 	shellPath   string
 	maxStored   int64
-	ctx         context.Context
-	cancel      context.CancelFunc
-
-	mu       sync.Mutex
-	captures map[string]*capture
+	captures    map[string]*capture
+	controlBuf  []byte
+	pollFDs     []unix.PollFd
+	pollCapture []*capture
+	pollDirty   bool
 }
 
 type capture struct {
@@ -53,20 +53,21 @@ type capture struct {
 	overflow   string
 	retired    string
 	registered string
+	finished   string
 
-	mu          sync.Mutex
-	spool       *os.File
-	reader      *os.File
-	total       int64
-	stored      int64
-	primaryDone bool
-	isRetired   bool
-	overflowed  bool
+	spool         *os.File
+	reader        *os.File
+	total         int64
+	stored        int64
+	primaryDone   bool
+	isRetired     bool
+	overflowed    bool
+	finishMarker  []byte
+	finishPending []byte
 }
 
 func newRelay(controlPath, shellPath string, maxStored int64) *relay {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &relay{controlPath: controlPath, shellPath: shellPath, maxStored: maxStored, ctx: ctx, cancel: cancel, captures: make(map[string]*capture)}
+	return &relay{controlPath: controlPath, shellPath: shellPath, maxStored: maxStored, captures: make(map[string]*capture), pollDirty: true}
 }
 
 func (r *relay) run() error {
@@ -94,7 +95,7 @@ func (r *relay) run() error {
 			}
 		}
 	}
-	control, err := os.OpenFile(r.controlPath, os.O_RDWR, 0)
+	control, err := os.OpenFile(r.controlPath, os.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return fmt.Errorf("open capture control fifo: %w", err)
 	}
@@ -105,48 +106,125 @@ func (r *relay) run() error {
 	}
 	defer os.Remove(readyPath)
 	fmt.Println("vmsh-capture-relay-ready")
+	defer r.closeCaptures()
+	return r.serve(control)
+}
 
-	scanner := bufio.NewScanner(control)
-	for scanner.Scan() {
-		fields := strings.Split(scanner.Text(), "\t")
+func (r *relay) serve(control *os.File) error {
+	for {
+		if r.pollDirty {
+			r.rebuildPollSet(control)
+		}
+		if _, err := unix.Poll(r.pollFDs, -1); err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return fmt.Errorf("poll capture relay: %w", err)
+		}
+		if r.pollFDs[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0 {
+			stop, err := r.readControl(control)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		for i, capture := range r.pollCapture {
+			if r.pollFDs[i+1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
+				continue
+			}
+			complete, err := capture.drainReady()
+			if err != nil {
+				return fmt.Errorf("drain capture %s: %w", capture.account, err)
+			}
+			if complete {
+				capture.complete()
+				r.remove(capture)
+			}
+		}
+	}
+}
+
+func (r *relay) rebuildPollSet(control *os.File) {
+	r.pollFDs = append(r.pollFDs[:0], unix.PollFd{Fd: int32(control.Fd()), Events: unix.POLLIN})
+	r.pollCapture = r.pollCapture[:0]
+	for _, capture := range r.captures {
+		if capture.reader == nil {
+			continue
+		}
+		r.pollCapture = append(r.pollCapture, capture)
+		r.pollFDs = append(r.pollFDs, unix.PollFd{Fd: int32(capture.reader.Fd()), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR})
+	}
+	r.pollDirty = false
+}
+
+func (r *relay) readControl(control *os.File) (bool, error) {
+	var buf [32 << 10]byte
+	for {
+		n, err := unix.Read(int(control.Fd()), buf[:])
+		if n > 0 {
+			r.controlBuf = append(r.controlBuf, buf[:n]...)
+		}
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				break
+			}
+			return false, fmt.Errorf("read capture control: %w", err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	for {
+		newline := bytes.IndexByte(r.controlBuf, '\n')
+		if newline < 0 {
+			break
+		}
+		line := strings.TrimSuffix(string(r.controlBuf[:newline]), "\r")
+		r.controlBuf = append(r.controlBuf[:0], r.controlBuf[newline+1:]...)
+		fields := strings.Split(line, "\t")
 		switch fields[0] {
 		case "register":
-			if len(fields) != 8 {
-				return fmt.Errorf("invalid capture registration")
+			if len(fields) != 9 {
+				return false, fmt.Errorf("invalid capture registration")
 			}
-			r.register(fields[1:])
+			if err := r.register(fields[1:]); err != nil {
+				return false, err
+			}
 		case "finish":
 			if len(fields) != 2 {
-				return fmt.Errorf("invalid capture finish")
+				return false, fmt.Errorf("invalid capture finish")
 			}
 			if capture := r.capture(fields[1]); capture != nil {
-				capture.finishPrimary()
+				if err := capture.finishPrimary(); err != nil {
+					return false, err
+				}
 			}
 		case "retire":
 			if len(fields) != 2 {
-				return fmt.Errorf("invalid capture retirement")
+				return false, fmt.Errorf("invalid capture retirement")
 			}
 			if capture := r.capture(fields[1]); capture != nil {
-				capture.retire()
+				if err := capture.retire(); err != nil {
+					return false, err
+				}
 			}
 		case "stop":
-			r.cancel()
-			return nil
+			return true, nil
 		default:
-			return fmt.Errorf("unknown capture relay operation %q", fields[0])
+			return false, fmt.Errorf("unknown capture relay operation %q", fields[0])
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read capture control: %w", err)
-	}
-	return io.ErrUnexpectedEOF
+	return false, nil
 }
 
-func (r *relay) register(fields []string) {
+func (r *relay) register(fields []string) error {
 	c := &capture{
 		owner: r, account: fields[0], outputPath: fields[1], fifoPath: fields[2],
-		closedPath: fields[3], overflow: fields[4], retired: fields[5], registered: fields[6],
+		closedPath: fields[3], overflow: fields[4], retired: fields[5], registered: fields[6], finished: fields[7],
 	}
+	c.finishMarker = []byte(captureFinishPrefix + c.account + captureFinishSuffix)
 	var err error
 	c.spool, err = os.OpenFile(c.outputPath, os.O_WRONLY|os.O_TRUNC, 0)
 	if err == nil {
@@ -156,81 +234,107 @@ func (r *relay) register(fields []string) {
 		if c.spool != nil {
 			_ = c.spool.Close()
 		}
-		_ = writeExisting(c.registered, "error: "+err.Error()+"\n")
-		return
+		if publishErr := writeExisting(c.registered, "error: "+err.Error()+"\n"); publishErr != nil {
+			return fmt.Errorf("register capture %s: %w (publish failure: %v)", c.account, err, publishErr)
+		}
+		return nil
 	}
-	r.mu.Lock()
 	if _, exists := r.captures[c.account]; exists {
-		r.mu.Unlock()
 		_ = c.spool.Close()
 		_ = c.reader.Close()
-		_ = writeExisting(c.registered, "error: duplicate account\n")
-		return
+		if err := writeExisting(c.registered, "error: duplicate account\n"); err != nil {
+			return fmt.Errorf("publish duplicate capture registration %s: %w", c.account, err)
+		}
+		return nil
 	}
 	r.captures[c.account] = c
-	r.mu.Unlock()
+	r.pollDirty = true
 	if err := writeExisting(c.registered, "ok\n"); err != nil {
-		c.retire()
-		return
+		c.close()
+		delete(r.captures, c.account)
+		r.pollDirty = true
+		return fmt.Errorf("publish capture registration %s: %w", c.account, err)
 	}
-	go c.drain()
+	return nil
 }
 
 func (r *relay) capture(account string) *capture {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	return r.captures[account]
 }
 
 func (r *relay) remove(c *capture) {
-	r.mu.Lock()
 	if r.captures[c.account] == c {
 		delete(r.captures, c.account)
+		r.pollDirty = true
 	}
-	r.mu.Unlock()
 }
 
-func (c *capture) drain() {
-	defer c.owner.remove(c)
-	defer c.reader.Close()
-	buf := make([]byte, 32<<10)
+func (r *relay) closeCaptures() {
+	for _, capture := range r.captures {
+		capture.close()
+	}
+	clear(r.captures)
+}
+
+func (c *capture) drainReady() (bool, error) {
+	var buf [32 << 10]byte
 	for {
-		n, err := c.reader.Read(buf)
+		n, err := unix.Read(int(c.reader.Fd()), buf[:])
 		if n > 0 {
-			c.consume(buf[:n])
+			if err := c.consume(buf[:n]); err != nil {
+				return false, err
+			}
 			continue
+		}
+		if n == 0 && err == nil {
+			return c.primaryDone, nil
 		}
 		if err == nil || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-			select {
-			case <-c.owner.ctx.Done():
-				return
-			case <-time.After(pollInterval):
-			}
-			continue
+			return false, nil
 		}
 		if errors.Is(err, io.EOF) {
-			c.mu.Lock()
-			done := c.primaryDone
-			c.mu.Unlock()
-			if done {
-				c.complete()
-				return
-			}
-			select {
-			case <-c.owner.ctx.Done():
-				return
-			case <-time.After(pollInterval):
-			}
-			continue
+			return c.primaryDone, nil
 		}
-		c.complete()
-		return
+		return false, err
 	}
 }
 
-func (c *capture) consume(data []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *capture) consume(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	out := make([]byte, 0, len(data))
+	for _, value := range data {
+		if c.primaryDone {
+			out = append(out, value)
+			continue
+		}
+		c.finishPending = append(c.finishPending, value)
+		for len(c.finishPending) > 0 && !bytes.HasPrefix(c.finishMarker, c.finishPending) {
+			out = append(out, c.finishPending[0])
+			c.finishPending = c.finishPending[1:]
+		}
+		if bytes.Equal(c.finishPending, c.finishMarker) {
+			c.finishPending = nil
+			// Publish completion only after every preceding byte from this FIFO
+			// has reached its spool. The guest waits on this acknowledgement
+			// before publishing the command status on the independent control
+			// stream.
+			c.consumeData(out)
+			out = out[:0]
+			if err := c.finishPrimary(); err != nil {
+				return err
+			}
+		}
+	}
+	c.consumeData(out)
+	return nil
+}
+
+func (c *capture) consumeData(data []byte) {
+	if len(data) == 0 {
+		return
+	}
 	c.total += int64(len(data))
 	if c.isRetired || c.spool == nil || c.stored >= c.owner.maxStored {
 		c.markOverflowLocked()
@@ -245,6 +349,8 @@ func (c *capture) consume(data []byte) {
 		c.stored += int64(n)
 		if err != nil || int64(n) != writable {
 			c.markOverflowLocked()
+			_ = c.spool.Close()
+			c.spool = nil
 		}
 	}
 	if writable != int64(len(data)) {
@@ -260,35 +366,44 @@ func (c *capture) markOverflowLocked() {
 	_ = writeExisting(c.overflow, "1\n")
 }
 
-func (c *capture) finishPrimary() {
-	c.mu.Lock()
+func (c *capture) finishPrimary() error {
+	if c.primaryDone {
+		return nil
+	}
+	if err := writeExisting(c.finished, "1\n"); err != nil {
+		return fmt.Errorf("publish capture finish %s: %w", c.account, err)
+	}
 	c.primaryDone = true
-	c.mu.Unlock()
+	return nil
 }
 
-func (c *capture) retire() {
-	c.mu.Lock()
+func (c *capture) retire() error {
 	if !c.isRetired {
 		c.isRetired = true
-		c.markOverflowLocked()
 		if c.spool != nil {
 			_ = c.spool.Close()
 			c.spool = nil
 		}
 	}
-	c.mu.Unlock()
-	_ = writeExisting(c.retired, "1\n")
+	if err := writeExisting(c.retired, "1\n"); err != nil {
+		return fmt.Errorf("publish capture retirement %s: %w", c.account, err)
+	}
+	return nil
 }
 
 func (c *capture) complete() {
-	c.mu.Lock()
+	if len(c.finishPending) != 0 {
+		pending := append([]byte(nil), c.finishPending...)
+		c.finishPending = nil
+		c.consumeData(pending)
+	}
 	if c.spool != nil {
 		_ = c.spool.Close()
 		c.spool = nil
 	}
 	total := c.total
 	retired := c.isRetired
-	c.mu.Unlock()
+	c.close()
 	if !retired {
 		_ = writeExisting(c.closedPath, "1\n")
 	}
@@ -296,6 +411,17 @@ func (c *capture) complete() {
 	if err == nil {
 		_, _ = fmt.Fprintf(control, "\x1dvmsh-capture:%s:%d\x1f\n", c.account, total)
 		_ = control.Close()
+	}
+}
+
+func (c *capture) close() {
+	if c.spool != nil {
+		_ = c.spool.Close()
+		c.spool = nil
+	}
+	if c.reader != nil {
+		_ = c.reader.Close()
+		c.reader = nil
 	}
 }
 

@@ -36,7 +36,7 @@ func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
 	defer control.Close()
 
 	output := filepath.Join(dir, "output")
-	paths := []string{output, output + ".closed", output + ".overflow", output + ".retired", output + ".registered"}
+	paths := []string{output, output + ".closed", output + ".overflow", output + ".retired", output + ".registered", output + ".finished"}
 	for _, path := range paths {
 		if err := os.WriteFile(path, nil, 0o600); err != nil {
 			t.Fatal(err)
@@ -47,7 +47,7 @@ func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	account := "split-output"
-	fmt.Fprintf(control, "register\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", account, output, fifo, output+".closed", output+".overflow", output+".retired", output+".registered")
+	fmt.Fprintf(control, "register\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", account, output, fifo, output+".closed", output+".overflow", output+".retired", output+".registered", output+".finished")
 	waitForFile(t, output+".registered", true)
 
 	writerReady := make(chan struct{})
@@ -63,19 +63,26 @@ func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
 			writerDone <- err
 			return
 		}
+		if _, err := fmt.Fprintf(writer, "%s%s%s", captureFinishPrefix, account, captureFinishSuffix); err != nil {
+			writerDone <- err
+			return
+		}
 		close(writerReady)
 		<-continueWriter
 		_, err = writer.Write([]byte(strings.Repeat("b", 50000)))
 		writerDone <- errors.Join(err, writer.Close())
 	}()
 	<-writerReady
-	fmt.Fprintf(control, "finish\t%s\n", account)
+	waitForFile(t, output+".finished", true)
 	fmt.Fprintf(control, "retire\t%s\n", account)
 	waitForFile(t, output+".retired", true)
 
 	before, err := os.Stat(output)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if before.Size() != 50000 {
+		t.Fatalf("finish acknowledgement published with %d of 50000 foreground bytes stored", before.Size())
 	}
 	close(continueWriter)
 	if err := <-writerDone; err != nil {
@@ -113,6 +120,61 @@ func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
 	fmt.Fprintln(control, "stop")
 	if err := <-relayDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRegistrationAcknowledgementFailureRelinquishesCapture(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(dir, "output")
+	if err := os.WriteFile(output, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fifo := output + ".fifo"
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registered := filepath.Join(dir, "registered-directory")
+	if err := os.Mkdir(registered, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relay := newRelay(filepath.Join(dir, "control"), filepath.Join(dir, "shell"), 65536)
+	err := relay.register([]string{
+		"account", output, fifo, output + ".closed", output + ".overflow",
+		output + ".retired", registered, output + ".finished",
+	})
+	if err == nil {
+		t.Fatal("capture registration succeeded without a deliverable acknowledgement")
+	}
+	if len(relay.captures) != 0 {
+		t.Fatal("failed capture registration remained owned by the relay")
+	}
+	writer, openErr := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if openErr == nil {
+		_ = writer.Close()
+		t.Fatal("failed capture registration left its FIFO reader open")
+	}
+}
+
+func TestSpoolFailureSwitchesToDrainAndDiscard(t *testing.T) {
+	spool, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("host does not provide /dev/full: %v", err)
+	}
+	overflow := filepath.Join(t.TempDir(), "overflow")
+	if err := os.WriteFile(overflow, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	capture := &capture{owner: &relay{maxStored: 65536}, account: "full", spool: spool, overflow: overflow}
+	capture.consumeData([]byte("first"))
+	if capture.spool != nil {
+		t.Fatal("failed spool remained open for repeated writes")
+	}
+	capture.consumeData([]byte("second"))
+	if capture.total != int64(len("firstsecond")) {
+		t.Fatalf("discard mode stopped draining byte accounting at %d", capture.total)
+	}
+	if data, err := os.ReadFile(overflow); err != nil || len(data) == 0 {
+		t.Fatalf("spool failure was not reported as overflow: %q, %v", data, err)
 	}
 }
 

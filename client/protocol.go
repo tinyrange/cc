@@ -409,6 +409,8 @@ type InstanceState struct {
 	BackingMetadataHighWaterBytes uint64 `json:"backing_metadata_high_water_bytes,omitempty"`
 	BackingPhysicalBytes          uint64 `json:"backing_physical_bytes,omitempty"`
 	BackingReclaimError           string `json:"backing_reclaim_error,omitempty"`
+	BackingUsageStale             bool   `json:"backing_usage_stale,omitempty"`
+	BackingActiveMutations        uint64 `json:"backing_active_mutations,omitempty"`
 	Error                         string `json:"error,omitempty"`
 	ExitedAt                      string `json:"exited_at,omitempty"`
 	ExitReason                    string `json:"exit_reason,omitempty"`

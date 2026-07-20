@@ -26,6 +26,20 @@ type retryCloseBackend struct {
 	closes int
 }
 
+type blockingCloseBackend struct {
+	FSBackend
+	started chan struct{}
+	release chan struct{}
+	closes  int
+}
+
+type blockingBeginCloseBackend struct {
+	FSBackend
+	started chan struct{}
+	release chan struct{}
+	closes  int
+}
+
 type nonComparableFSBackend struct {
 	FSBackend
 	state []string
@@ -52,6 +66,23 @@ func (b *retryCloseBackend) Close() error {
 	if b.closes == 1 {
 		return &CloseIncompleteError{Resource: "test backend", Timeout: time.Millisecond}
 	}
+	return nil
+}
+
+func (b *blockingCloseBackend) Close() error {
+	b.closes++
+	close(b.started)
+	<-b.release
+	return nil
+}
+
+func (b *blockingBeginCloseBackend) BeginClose() {
+	close(b.started)
+	<-b.release
+}
+
+func (b *blockingBeginCloseBackend) Close() error {
+	b.closes++
 	return nil
 }
 
@@ -134,6 +165,76 @@ func TestVirtioFSCloseBoundsWorkerWaitAndRetriesBackend(t *testing.T) {
 	}
 	if backend.closes != 2 {
 		t.Fatalf("backend close calls = %d, want two", backend.closes)
+	}
+}
+
+func TestMountedFSCloseBoundsAllBackendsWithOneDeadline(t *testing.T) {
+	root := &blockingCloseBackend{FSBackend: imageBackend(t, nil), started: make(chan struct{}), release: make(chan struct{})}
+	share := &blockingCloseBackend{FSBackend: imageBackend(t, nil), started: make(chan struct{}), release: make(chan struct{})}
+	fsys := NewMountedFS(root, []ShareMount{{GuestPath: "/share", Backend: share}}).(*mountedFS)
+	var incomplete *CloseIncompleteError
+	if err := fsys.closeWithin(20 * time.Millisecond); !errors.As(err, &incomplete) {
+		t.Fatalf("close with blocked backends = %v, want incomplete ownership", err)
+	}
+	for name, started := range map[string]<-chan struct{}{"root": root.started, "share": share.started} {
+		select {
+		case <-started:
+		default:
+			t.Fatalf("%s backend was not closed concurrently", name)
+		}
+	}
+	close(root.release)
+	close(share.release)
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("resume retained backend closes: %v", err)
+	}
+	if root.closes != 1 || share.closes != 1 {
+		t.Fatalf("retained backend close calls root=%d share=%d, want one each", root.closes, share.closes)
+	}
+}
+
+func TestVirtioFSCloseRetainsTimedOutBackendAttempt(t *testing.T) {
+	backend := &blockingCloseBackend{FSBackend: imageBackend(t, nil), started: make(chan struct{}), release: make(chan struct{})}
+	fsys := NewFS(0, 0, 0, "test", backend)
+	var incomplete *CloseIncompleteError
+	if err := fsys.closeWithin(20 * time.Millisecond); !errors.As(err, &incomplete) {
+		t.Fatalf("close with blocked backend = %v, want incomplete ownership", err)
+	}
+	select {
+	case <-backend.started:
+	default:
+		t.Fatal("backend close was not started")
+	}
+	close(backend.release)
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("resume retained backend close: %v", err)
+	}
+	if backend.closes != 1 {
+		t.Fatalf("backend close calls = %d, want retained single attempt", backend.closes)
+	}
+}
+
+func TestVirtioFSCloseBoundsBackendShutdownSignal(t *testing.T) {
+	backend := &blockingBeginCloseBackend{FSBackend: imageBackend(t, nil), started: make(chan struct{}), release: make(chan struct{})}
+	fsys := NewFS(0, 0, 0, "test", backend)
+	var incomplete *CloseIncompleteError
+	if err := fsys.closeWithin(20 * time.Millisecond); !errors.As(err, &incomplete) {
+		t.Fatalf("close with blocked shutdown signal = %v, want incomplete ownership", err)
+	}
+	select {
+	case <-backend.started:
+	default:
+		t.Fatal("backend shutdown signal was not started")
+	}
+	if backend.closes != 0 {
+		t.Fatal("backend close started before its shutdown signal returned")
+	}
+	close(backend.release)
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("resume close after shutdown signal: %v", err)
+	}
+	if backend.closes != 1 {
+		t.Fatalf("backend close calls = %d, want one", backend.closes)
 	}
 }
 

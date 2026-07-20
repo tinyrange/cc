@@ -8,15 +8,16 @@ import (
 
 type blockingUsageBackend struct {
 	FSBackend
-	mu      sync.Mutex
-	current uint64
-	block   chan struct{}
-	started chan struct{}
+	mu        sync.Mutex
+	current   uint64
+	highWater uint64
+	block     chan struct{}
+	started   chan struct{}
 }
 
 func (b *blockingUsageBackend) BackingUsage() (uint64, uint64, uint64, error) {
 	b.mu.Lock()
-	current, block, started := b.current, b.block, b.started
+	current, highWater, block, started := b.current, b.highWater, b.block, b.started
 	b.mu.Unlock()
 	if block != nil {
 		select {
@@ -26,7 +27,7 @@ func (b *blockingUsageBackend) BackingUsage() (uint64, uint64, uint64, error) {
 		}
 		<-block
 	}
-	return current, current, current, nil
+	return current, max(current, highWater), current, nil
 }
 
 func (b *blockingUsageBackend) BackingMetadataUsage() (uint64, uint64) {
@@ -71,7 +72,7 @@ func TestFSBackingTrackerStatusSnapshotDoesNotWaitForSampler(t *testing.T) {
 	}
 }
 
-func TestFSBackingTrackerPublishesOnlyQuiescentMutationSnapshots(t *testing.T) {
+func TestFSBackingTrackerPublishesStaleSnapshotsDuringOverlappingMutations(t *testing.T) {
 	backend := &blockingUsageBackend{current: 11}
 	device := NewFS(0, 0, 0, "root", backend)
 	tracker := AttachFSBackingUsageTracker([]*FS{device})
@@ -81,21 +82,31 @@ func TestFSBackingTrackerPublishesOnlyQuiescentMutationSnapshots(t *testing.T) {
 	backend.mu.Unlock()
 	tracker.RequestSample()
 	deadline := time.Now().Add(time.Second)
-	for tracker.sampling.Load() {
+	for tracker.sampling.Load() || tracker.Snapshot().DataBytes != 23 {
 		if time.Now().After(deadline) {
-			t.Fatal("active-mutation sample did not return")
+			t.Fatal("active-mutation sample was not published")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if snapshot := tracker.Snapshot(); snapshot.DataBytes != 11 {
-		t.Fatalf("active mutation published an intermediate snapshot: %+v", snapshot)
+	if snapshot := tracker.Snapshot(); !snapshot.Stale || snapshot.ActiveMutations != 1 {
+		t.Fatalf("active mutation snapshot did not disclose in-flight state: %+v", snapshot)
 	}
 	doneMutation()
 	deadline = time.Now().Add(time.Second)
-	for tracker.Snapshot().DataBytes != 23 {
+	for snapshot := tracker.Snapshot(); snapshot.Stale || snapshot.ActiveMutations != 0; snapshot = tracker.Snapshot() {
 		if time.Now().After(deadline) {
-			t.Fatal("quiescent mutation snapshot was not published")
+			t.Fatalf("quiescent mutation snapshot was not published: %+v", snapshot)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestFSBackingTrackerRetainsBackendPeakMissedBetweenSamples(t *testing.T) {
+	backend := &blockingUsageBackend{current: 11, highWater: 97}
+	device := NewFS(0, 0, 0, "root", backend)
+	tracker := AttachFSBackingUsageTracker([]*FS{device})
+	snapshot := tracker.Snapshot()
+	if snapshot.DataBytes != 11 || snapshot.DataHighWaterBytes != 97 || snapshot.CombinedHighWaterBytes < 97 {
+		t.Fatalf("transient backend peak was not retained: %+v", snapshot)
 	}
 }

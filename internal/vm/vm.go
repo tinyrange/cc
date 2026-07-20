@@ -1191,6 +1191,8 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 		snapshot.state.BackingMetadataBytes = usage.MetadataBytes
 		snapshot.state.BackingBytes = usage.CombinedBytes
 		snapshot.state.BackingPhysicalBytes = usage.PhysicalBytes
+		snapshot.state.BackingUsageStale = usage.Stale
+		snapshot.state.BackingActiveMutations = usage.ActiveMutations
 		snapshot.machine.backingMu.Lock()
 		snapshot.machine.backingDataHighWater = max(snapshot.machine.backingDataHighWater, usage.DataBytes, usage.DataHighWaterBytes)
 		snapshot.machine.backingMetadataHighWater = max(snapshot.machine.backingMetadataHighWater, usage.MetadataBytes, usage.MetadataHighWaterBytes)

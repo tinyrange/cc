@@ -36,10 +36,12 @@ type mountedFS struct {
 	writebackCache bool
 	debugPaths     []string
 	debugLog       io.Writer
+	closing        bool
 	closeMu        sync.Mutex
+	closeStart     sync.Once
 	closeBackends  []FSBackend
-	closedBackends []bool
-	closeErrors    []error
+	closeStates    []mountedBackendCloseState
+	closeBeginDone chan struct{}
 
 	mu                       sync.RWMutex
 	nextNodeID               uint64
@@ -51,6 +53,12 @@ type mountedFS struct {
 	handles                  map[uint64]*mountedHandle
 	backingDataHighWater     uint64
 	backingMetadataHighWater uint64
+}
+
+type mountedBackendCloseState struct {
+	done   chan struct{}
+	err    error
+	closed bool
 }
 
 func (m *mountedFS) distinctBackends() []FSBackend {
@@ -162,41 +170,103 @@ func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
 // backend. Virtio FS may call this from more than one shutdown path, so the
 // ownership boundary is idempotent.
 func (m *mountedFS) Close() error {
+	return m.closeWithin(2 * time.Second)
+}
+
+func (m *mountedFS) closeWithin(timeout time.Duration) error {
 	if m == nil {
 		return nil
 	}
+	started := time.Now()
 	m.BeginClose()
+	remaining := timeout - time.Since(started)
+	if remaining <= 0 {
+		return &CloseIncompleteError{Resource: "mounted filesystem shutdown signal", Timeout: timeout}
+	}
+	timer := time.NewTimer(remaining)
+	select {
+	case <-m.closeBeginDone:
+		timer.Stop()
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "mounted filesystem shutdown signal", Timeout: timeout}
+	}
+
+	type attempt struct {
+		index int
+		done  chan struct{}
+	}
+	m.closeMu.Lock()
+	attempts := make([]attempt, 0, len(m.closeBackends))
+	for i, backend := range m.closeBackends {
+		state := &m.closeStates[i]
+		if state.closed {
+			continue
+		}
+		if state.done == nil {
+			state.done = make(chan struct{})
+			done := state.done
+			go func(state *mountedBackendCloseState, backend FSBackend) {
+				var err error
+				if closer, ok := backend.(interface{ Close() error }); ok {
+					err = closer.Close()
+				}
+				m.closeMu.Lock()
+				state.err = err
+				m.closeMu.Unlock()
+				close(done)
+			}(state, backend)
+		}
+		attempts = append(attempts, attempt{index: i, done: state.done})
+	}
+	m.closeMu.Unlock()
+
+	deadline := started.Add(timeout)
+	for _, attempt := range attempts {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return &CloseIncompleteError{Resource: "mounted filesystem backends", Timeout: timeout}
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-attempt.done:
+			timer.Stop()
+		case <-timer.C:
+			return &CloseIncompleteError{Resource: "mounted filesystem backends", Timeout: timeout}
+		}
+	}
+
 	m.closeMu.Lock()
 	defer m.closeMu.Unlock()
-	if m.closeBackends == nil {
-		m.closeBackends = m.distinctBackends()
-		m.closedBackends = make([]bool, len(m.closeBackends))
-		m.closeErrors = make([]error, len(m.closeBackends))
-	}
 	var errs []error
-	for i, backend := range m.closeBackends {
-		if m.closedBackends[i] {
-			if m.closeErrors[i] != nil {
-				errs = append(errs, m.closeErrors[i])
+	for i := range m.closeStates {
+		state := &m.closeStates[i]
+		if state.closed {
+			if state.err != nil {
+				errs = append(errs, state.err)
 			}
 			continue
 		}
-		closer, ok := backend.(interface{ Close() error })
-		if !ok {
-			m.closedBackends[i] = true
+		var ownedAttempt chan struct{}
+		for _, attempt := range attempts {
+			if attempt.index == i {
+				ownedAttempt = attempt.done
+				break
+			}
+		}
+		if state.done != ownedAttempt {
+			errs = append(errs, &CloseIncompleteError{Resource: "mounted filesystem backend retry", Timeout: timeout})
 			continue
 		}
-		if err := closer.Close(); err != nil {
-			var incomplete *CloseIncompleteError
-			if errors.As(err, &incomplete) {
-				errs = append(errs, err)
-				continue
-			}
-			m.closeErrors[i] = err
-			m.closedBackends[i] = true
-			errs = append(errs, err)
-		} else {
-			m.closedBackends[i] = true
+		var incomplete *CloseIncompleteError
+		if errors.As(state.err, &incomplete) {
+			errs = append(errs, state.err)
+			state.done = nil
+			state.err = nil
+			continue
+		}
+		state.closed = true
+		if state.err != nil {
+			errs = append(errs, state.err)
 		}
 	}
 	return errors.Join(errs...)
@@ -206,11 +276,30 @@ func (m *mountedFS) BeginClose() {
 	if m == nil {
 		return
 	}
-	for _, backend := range m.distinctBackends() {
-		if starter, ok := backend.(interface{ BeginClose() }); ok {
-			starter.BeginClose()
+	m.closeStart.Do(func() {
+		m.mu.Lock()
+		m.closing = true
+		m.mu.Unlock()
+		m.closeBackends = m.distinctBackends()
+		m.closeStates = make([]mountedBackendCloseState, len(m.closeBackends))
+		m.closeBeginDone = make(chan struct{})
+		var wg sync.WaitGroup
+		for _, backend := range m.closeBackends {
+			starter, ok := backend.(interface{ BeginClose() })
+			if !ok {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				starter.BeginClose()
+			}()
 		}
-	}
+		go func() {
+			wg.Wait()
+			close(m.closeBeginDone)
+		}()
+	})
 }
 
 type shareMount struct {
@@ -381,6 +470,9 @@ func (m *mountedFS) AddShares(shares []ShareMount) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return fmt.Errorf("mounted filesystem is closing; share ownership remains with the caller")
+	}
 	combined := append(append([]shareMount(nil), m.mounts...), prepared...)
 	seen := make(map[string]shareMount, len(combined))
 	for _, mount := range combined {

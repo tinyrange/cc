@@ -358,6 +358,8 @@ type FS struct {
 	closeMu             sync.Mutex
 	backendClosed       bool
 	backendCloseErr     error
+	backendCloseDone    chan struct{}
+	beginCloseDone      chan struct{}
 	closed              chan struct{}
 	workersDone         chan struct{}
 	workerWG            sync.WaitGroup
@@ -551,6 +553,7 @@ func (f *FS) closeWithin(timeout time.Duration) error {
 	if f == nil {
 		return nil
 	}
+	started := time.Now()
 	f.closeStart.Do(func() {
 		close(f.closed)
 		// Prevent a concurrent enqueue from adding workers after the wait starts.
@@ -560,9 +563,13 @@ func (f *FS) closeWithin(timeout time.Duration) error {
 		f.kickPollActive = false
 		f.configGeneration++
 		f.mu.Unlock()
-		if starter, ok := f.backend.(interface{ BeginClose() }); ok {
-			starter.BeginClose()
-		}
+		f.beginCloseDone = make(chan struct{})
+		go func() {
+			if starter, ok := f.backend.(interface{ BeginClose() }); ok {
+				starter.BeginClose()
+			}
+			close(f.beginCloseDone)
+		}()
 		f.workersDone = make(chan struct{})
 		go func() {
 			f.workerWG.Wait()
@@ -570,12 +577,25 @@ func (f *FS) closeWithin(timeout time.Duration) error {
 			close(f.workersDone)
 		}()
 	})
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-f.workersDone:
-	case <-timer.C:
-		return &CloseIncompleteError{Resource: "virtio-fs workers", Timeout: timeout}
+	waitWithin := func(done <-chan struct{}, resource string) error {
+		remaining := timeout - time.Since(started)
+		if remaining <= 0 {
+			return &CloseIncompleteError{Resource: resource, Timeout: timeout}
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return nil
+		case <-timer.C:
+			return &CloseIncompleteError{Resource: resource, Timeout: timeout}
+		}
+	}
+	if err := waitWithin(f.beginCloseDone, "virtio-fs backend shutdown signal"); err != nil {
+		return err
+	}
+	if err := waitWithin(f.workersDone, "virtio-fs workers"); err != nil {
+		return err
 	}
 	f.cleanupOnce.Do(func() {
 		for {
@@ -598,22 +618,58 @@ func (f *FS) closeWithin(timeout time.Duration) error {
 			}
 		}
 	})
+	remaining := timeout - time.Since(started)
+	if remaining <= 0 {
+		return &CloseIncompleteError{Resource: "virtio-fs backend", Timeout: timeout}
+	}
+	return f.closeBackendWithin(remaining)
+}
+
+func (f *FS) closeBackendWithin(timeout time.Duration) error {
 	f.closeMu.Lock()
-	defer f.closeMu.Unlock()
 	if f.backendClosed {
-		return f.backendCloseErr
+		err := f.backendCloseErr
+		f.closeMu.Unlock()
+		return err
 	}
-	if closer, ok := f.backend.(interface{ Close() error }); ok {
-		if err := closer.Close(); err != nil {
-			var incomplete *CloseIncompleteError
-			if errors.As(err, &incomplete) {
-				return err
+	if f.backendCloseDone == nil {
+		f.backendCloseDone = make(chan struct{})
+		done := f.backendCloseDone
+		go func() {
+			var err error
+			if closer, ok := f.backend.(interface{ Close() error }); ok {
+				err = closer.Close()
 			}
+			f.closeMu.Lock()
 			f.backendCloseErr = err
-		}
+			f.closeMu.Unlock()
+			close(done)
+		}()
 	}
-	f.backendClosed = true
-	return f.backendCloseErr
+	done := f.backendCloseDone
+	f.closeMu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		f.closeMu.Lock()
+		if f.backendCloseDone != done {
+			f.closeMu.Unlock()
+			return &CloseIncompleteError{Resource: "virtio-fs backend retry", Timeout: timeout}
+		}
+		err := f.backendCloseErr
+		var incomplete *CloseIncompleteError
+		if errors.As(err, &incomplete) {
+			f.backendCloseDone = nil
+			f.backendCloseErr = nil
+		} else {
+			f.backendClosed = true
+		}
+		f.closeMu.Unlock()
+		return err
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "virtio-fs backend", Timeout: timeout}
+	}
 }
 
 func resolveVirtioFSKickPoll() bool {

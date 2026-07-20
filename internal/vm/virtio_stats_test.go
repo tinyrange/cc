@@ -38,7 +38,7 @@ func TestVirtioFSBackingUsageTracksAggregateMutationPeaks(t *testing.T) {
 	one.metadata, two.metadata = 7, 11
 	tracker.Sample()
 	current, highWater, _, err := virtioFSBackingUsage(devices)
-	if err != nil || current != 5 || highWater != 130 {
+	if err != nil || current != 5 || highWater != 200 {
 		t.Fatalf("aggregate data usage current=%d high-water=%d err=%v", current, highWater, err)
 	}
 	metadata, metadataHighWater := virtioFSBackingMetadataUsage(devices)
