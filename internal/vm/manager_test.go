@@ -269,11 +269,13 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
 	inst := &backingUsageTestInstance{
-		fakeInstance: newFakeInstance(),
-		current:      3 << 20,
-		highWater:    9 << 20,
-		physical:     5 << 20,
-		reclaimErr:   errors.New("backing filesystem refused reclamation"),
+		fakeInstance:      newFakeInstance(),
+		current:           3 << 20,
+		highWater:         9 << 20,
+		metadata:          2 << 20,
+		metadataHighWater: 7 << 20,
+		physical:          5 << 20,
+		reclaimErr:        errors.New("backing filesystem refused reclamation"),
 	}
 	host.queueInstance(inst)
 	manager := testManager(host)
@@ -282,7 +284,7 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := manager.StatusOf("backing")
-	if state.MemoryMB != 512 || state.BackingBytes != 3<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
+	if state.MemoryMB != 512 || state.BackingBytes != 5<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingDataBytes != 3<<20 || state.BackingDataHighWaterBytes != 9<<20 || state.BackingMetadataBytes != 2<<20 || state.BackingMetadataHighWaterBytes != 7<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
 		t.Fatalf("reported state = %+v", state)
 	}
 }
@@ -1108,6 +1110,35 @@ func TestManagerSnapshotConsoleForwardAndStats(t *testing.T) {
 	}
 }
 
+func TestManagerStopCancelsActiveRootSnapshot(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingSnapshotInstance{fakeInstance: newFakeInstance(), started: make(chan struct{})}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "snapshot", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, _, err := manager.SnapshotRootFS(ctx, "snapshot", "")
+		snapshotDone <- err
+	}()
+	select {
+	case <-inst.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not start")
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.ShutdownInstance(stopCtx, "snapshot"); err != nil {
+		t.Fatalf("stop waited behind snapshot: %v", err)
+	}
+	if err := <-snapshotDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot error = %v, want cancellation", err)
+	}
+}
+
 type fakeHost struct {
 	mu                sync.Mutex
 	caps              VMHostCapabilities
@@ -1351,6 +1382,7 @@ type fakeInstance struct {
 type backingUsageTestInstance struct {
 	*fakeInstance
 	current, highWater, physical uint64
+	metadata, metadataHighWater  uint64
 	reclaimErr                   error
 }
 
@@ -1367,6 +1399,17 @@ type blockingShareInstance struct {
 	shareStarted chan struct{}
 	releaseShare chan struct{}
 	closeStarted chan struct{}
+}
+
+type blockingSnapshotInstance struct {
+	*fakeInstance
+	started chan struct{}
+}
+
+func (i *blockingSnapshotInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	close(i.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func (i *blockingShareInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -1396,6 +1439,10 @@ func (i *blockingBalloonInstance) Close() error {
 
 func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	return i.current, i.highWater, i.physical, i.reclaimErr
+}
+
+func (i *backingUsageTestInstance) BackingMetadataUsage() (uint64, uint64) {
+	return i.metadata, i.metadataHighWater
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

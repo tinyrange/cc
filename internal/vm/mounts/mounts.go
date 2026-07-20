@@ -25,6 +25,10 @@ type RuntimeShareAdder interface {
 	AddShare(context.Context, client.ShareMount) error
 }
 
+type RuntimeShareBatchAdder interface {
+	AddShares(context.Context, []client.ShareMount) error
+}
+
 type State struct {
 	mu          sync.Mutex
 	shares      map[string]client.ShareMount
@@ -42,10 +46,67 @@ func NewState(shares []client.ShareMount) State {
 }
 
 func (s *State) AddShare(rootFS virtio.ShareMounter, share client.ShareMount, unsupportedFeature string, build func(client.ShareMount) (virtio.ShareMount, error)) error {
+	return s.AddShares(rootFS, []client.ShareMount{share}, unsupportedFeature, build)
+}
+
+func (s *State) AddShares(rootFS virtio.ShareMounter, requested []client.ShareMount, unsupportedFeature string, build func(client.ShareMount) (virtio.ShareMount, error)) error {
 	if s == nil {
-		return AddRuntimeShareMount(rootFS, nil, nil, share, unsupportedFeature, build)
+		if len(requested) == 1 {
+			return AddRuntimeShareMount(rootFS, nil, nil, requested[0], unsupportedFeature, build)
+		}
+		return fmt.Errorf("instance mount state is unavailable for atomic multi-share mutation")
 	}
-	return AddRuntimeShareMount(rootFS, &s.mu, &s.shares, share, unsupportedFeature, build)
+	if rootFS == nil {
+		return fmt.Errorf("instance rootfs does not support %s", firstNonEmptyMountFeature(unsupportedFeature))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prospective := make(map[string]client.ShareMount, len(s.shares)+len(requested))
+	for key, share := range s.shares {
+		prospective[key] = share
+	}
+	var mountsToAdd []virtio.ShareMount
+	var sharesToAdd []client.ShareMount
+	for _, share := range requested {
+		key := strings.TrimSpace(share.Mount)
+		if key == "" {
+			return fmt.Errorf("share mount path is required")
+		}
+		if existing, ok := prospective[key]; ok {
+			if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
+				continue
+			}
+			return fmt.Errorf("share mount %q already exists", key)
+		}
+		mount, err := build(share)
+		if err != nil {
+			return err
+		}
+		prospective[key] = share
+		sharesToAdd = append(sharesToAdd, share)
+		mountsToAdd = append(mountsToAdd, mount)
+	}
+	if len(mountsToAdd) == 0 {
+		return nil
+	}
+	batch, ok := rootFS.(virtio.ShareBatchMounter)
+	if !ok && len(mountsToAdd) > 1 {
+		return fmt.Errorf("instance rootfs does not support atomic multi-share mutation")
+	}
+	if ok {
+		if err := batch.AddShares(mountsToAdd); err != nil {
+			return err
+		}
+	} else if err := rootFS.AddShare(mountsToAdd[0]); err != nil {
+		return err
+	}
+	if s.shares == nil {
+		s.shares = make(map[string]client.ShareMount)
+	}
+	for _, share := range sharesToAdd {
+		s.shares[strings.TrimSpace(share.Mount)] = share
+	}
+	return nil
 }
 
 func (s *State) AddImage(rootFS virtio.ShareMounter, mountPath string, image *oci.Image, backend virtio.FSBackend) error {
@@ -56,12 +117,26 @@ func (s *State) AddImage(rootFS virtio.ShareMounter, mountPath string, image *oc
 }
 
 func AddRuntimeShares(ctx context.Context, inst RuntimeShareAdder, shares []client.ShareMount) error {
+	if len(shares) > 1 {
+		batch, ok := inst.(RuntimeShareBatchAdder)
+		if !ok {
+			return fmt.Errorf("instance does not support atomic multi-share mutation")
+		}
+		return batch.AddShares(ctx, shares)
+	}
 	for _, share := range shares {
 		if err := inst.AddShare(ctx, share); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func firstNonEmptyMountFeature(feature string) string {
+	if feature = strings.TrimSpace(feature); feature != "" {
+		return feature
+	}
+	return "shares"
 }
 
 func AddDelegatedRuntimeShare(ctx context.Context, delegate DelegatedShareMounter, share client.ShareMount, unsupportedFeature string) error {

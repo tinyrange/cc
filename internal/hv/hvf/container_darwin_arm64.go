@@ -342,44 +342,62 @@ func (s *ContainerSession) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount) error {
+	return s.AddShares(ctx, []client.ShareMount{share})
+}
+
+func (s *ContainerSession) AddShares(ctx context.Context, requested []client.ShareMount) error {
 	_ = ctx
 	if s.rootFS == nil {
 		return fmt.Errorf("root filesystem does not support runtime shares")
 	}
-	key := strings.TrimSpace(share.Mount)
-	if key == "" {
-		return fmt.Errorf("share mount path is required")
-	}
 	s.shareMu.Lock()
-	if existing, ok := s.shares[key]; ok {
-		s.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
-			return nil
+	defer s.shareMu.Unlock()
+	prospective := make(map[string]client.ShareMount, len(s.shares)+len(requested))
+	for key, share := range s.shares {
+		prospective[key] = share
+	}
+	var mountsToAdd []virtio.ShareMount
+	var sharesToAdd []client.ShareMount
+	for _, share := range requested {
+		key := strings.TrimSpace(share.Mount)
+		if key == "" {
+			return fmt.Errorf("share mount path is required")
 		}
-		return fmt.Errorf("share mount %q already exists", key)
+		if existing, ok := prospective[key]; ok {
+			if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
+				continue
+			}
+			return fmt.Errorf("share mount %q already exists", key)
+		}
+		mount, err := arm64vm.BuildShareMount(0, DirectoryShare{
+			Source: share.Source, Mount: share.Mount, Writable: share.Writable, MapOwner: share.MapOwner,
+			OwnerUID: share.OwnerUID, OwnerGID: share.OwnerGID, Cache: share.Cache,
+		})
+		if err != nil {
+			return err
+		}
+		prospective[key] = share
+		mountsToAdd = append(mountsToAdd, mount)
+		sharesToAdd = append(sharesToAdd, share)
 	}
-	s.shareMu.Unlock()
-	mount, err := arm64vm.BuildShareMount(0, DirectoryShare{
-		Source:   share.Source,
-		Mount:    share.Mount,
-		Writable: share.Writable,
-		MapOwner: share.MapOwner,
-		OwnerUID: share.OwnerUID,
-		OwnerGID: share.OwnerGID,
-		Cache:    share.Cache,
-	})
-	if err != nil {
+	if len(mountsToAdd) == 0 {
+		return nil
+	}
+	if batch, ok := s.rootFS.(virtio.ShareBatchMounter); ok {
+		if err := batch.AddShares(mountsToAdd); err != nil {
+			return err
+		}
+	} else if len(mountsToAdd) > 1 {
+		return fmt.Errorf("root filesystem does not support atomic multi-share mutation")
+	} else if err := s.rootFS.AddShare(mountsToAdd[0]); err != nil {
 		return err
 	}
-	if err := s.rootFS.AddShare(mount); err != nil {
-		return err
-	}
-	s.shareMu.Lock()
 	if s.shares == nil {
 		s.shares = make(map[string]client.ShareMount)
 	}
-	s.shares[key] = share
-	s.shareMu.Unlock()
+	for _, share := range sharesToAdd {
+		s.shares[strings.TrimSpace(share.Mount)] = share
+	}
 	return nil
 }
 
@@ -415,6 +433,21 @@ func (s *ContainerSession) BackingUsage() (current, highWater, physical uint64, 
 		}
 	}
 	return current, highWater, physical, errors.Join(errs...)
+}
+
+func (s *ContainerSession) BackingMetadataUsage() (current, highWater uint64) {
+	if s == nil {
+		return 0, 0
+	}
+	for _, fsdev := range s.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		deviceCurrent, deviceHighWater := fsdev.BackingMetadataUsage()
+		current += deviceCurrent
+		highWater += deviceHighWater
+	}
+	return current, highWater
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -624,10 +657,18 @@ func (s *ContainerSession) Flush(ctx context.Context) error {
 }
 
 func (s *ContainerSession) RootSnapshot() (imagefs.Directory, error) {
-	return s.RootSnapshotAt("/")
+	return s.RootSnapshotContext(context.Background())
 }
 
 func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
+	return s.RootSnapshotAtContext(context.Background(), guestPath)
+}
+
+func (s *ContainerSession) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	return s.RootSnapshotAtContext(ctx, "/")
+}
+
+func (s *ContainerSession) RootSnapshotAtContext(ctx context.Context, guestPath string) (imagefs.Directory, error) {
 	if s == nil || s.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
@@ -635,6 +676,11 @@ func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, 
 		guestPath = "/"
 	}
 	if guestPath == "/" {
+		if snapshotter, ok := s.rootFS.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
+		}); ok {
+			return snapshotter.RootSnapshotContext(ctx)
+		}
 		snapshotter, ok := s.rootFS.(interface {
 			RootSnapshot() (imagefs.Directory, error)
 		})
@@ -642,6 +688,11 @@ func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, 
 			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 		}
 		return snapshotter.RootSnapshot()
+	}
+	if snapshotter, ok := s.rootFS.(interface {
+		RootSnapshotAtContext(context.Context, string) (imagefs.Directory, error)
+	}); ok {
+		return snapshotter.RootSnapshotAtContext(ctx, guestPath)
 	}
 	snapshotter, ok := s.rootFS.(interface {
 		RootSnapshotAt(string) (imagefs.Directory, error)

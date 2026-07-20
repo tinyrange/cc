@@ -1,6 +1,7 @@
 package mounts
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -16,16 +17,34 @@ type RootSnapshotAtter interface {
 	RootSnapshotAt(string) (imagefs.Directory, error)
 }
 
+type RootSnapshotContextProvider interface {
+	RootSnapshotContext(context.Context) (imagefs.Directory, error)
+}
+
+type RootSnapshotAtContextProvider interface {
+	RootSnapshotAtContext(context.Context, string) (imagefs.Directory, error)
+}
+
 func RootSnapshot(rootFS any, rootDir string) (imagefs.Directory, error) {
+	return RootSnapshotContext(context.Background(), rootFS, rootDir)
+}
+
+func RootSnapshotContext(ctx context.Context, rootFS any, rootDir string) (imagefs.Directory, error) {
 	if rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
 	if rootDir != "" {
+		if snapshotter, ok := rootFS.(RootSnapshotAtContextProvider); ok {
+			return snapshotter.RootSnapshotAtContext(ctx, rootDir)
+		}
 		snapshotter, ok := rootFS.(RootSnapshotAtter)
 		if !ok {
 			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 		}
 		return snapshotter.RootSnapshotAt(rootDir)
+	}
+	if snapshotter, ok := rootFS.(RootSnapshotContextProvider); ok {
+		return snapshotter.RootSnapshotContext(ctx)
 	}
 	snapshotter, ok := rootFS.(RootSnapshotter)
 	if !ok {

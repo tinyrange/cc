@@ -91,6 +91,13 @@ func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) 
 	return mounts.AddDelegatedRuntimeShare(ctx, i.session, share, "runtime shares")
 }
 
+func (i *darwinInstance) AddShares(ctx context.Context, shares []client.ShareMount) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance does not support atomic multi-share mutation")
+	}
+	return i.session.AddShares(ctx, shares)
+}
+
 func (i *darwinInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	if i == nil {
 		return mounts.AddDelegatedRuntimeImage(ctx, nil, mountPath, image)
@@ -130,6 +137,13 @@ func (i *darwinInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	return i.session.BackingUsage()
 }
 
+func (i *darwinInstance) BackingMetadataUsage() (uint64, uint64) {
+	if i == nil || i.session == nil {
+		return 0, 0
+	}
+	return i.session.BackingMetadataUsage()
+}
+
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.managedCore().Exec(ctx, req)
 }
@@ -152,10 +166,17 @@ func (i *darwinInstance) ConsoleHistory(ctx context.Context) (string, error) {
 }
 
 func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *darwinInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
-	return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
+	if !i.ManagedCapabilities().RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
+	}
+	return i.session.RootSnapshotContext(ctx)
 }
 
 func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {

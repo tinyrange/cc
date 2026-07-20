@@ -20,13 +20,20 @@ func (i *linuxInstance) Flush(ctx context.Context) error {
 }
 
 func (i *linuxInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *linuxInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
 	if i.managedInstance == nil {
 		return nil, fmt.Errorf("instance is not running")
 	}
-	return mounts.RootSnapshotWithCapabilities("Linux", i.caps, i.rootFS, i.defaultRootDir)
+	if !i.caps.RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("Linux", i.caps, i.rootFS, i.defaultRootDir)
+	}
+	return mounts.RootSnapshotContext(ctx, i.rootFS, i.defaultRootDir)
 }
 
 func (i *linuxInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {

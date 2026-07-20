@@ -2,6 +2,7 @@ package mounts
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -271,6 +272,28 @@ func TestManagedMountStateIncludesStartupShares(t *testing.T) {
 	}
 	if err := state.AddShare(root, client.ShareMount{Source: "/other", Mount: "/data"}, "shares", build); err == nil {
 		t.Fatal("conflicting startup share unexpectedly succeeded")
+	}
+}
+
+func TestManagedMountStateBuildsWholeShareBatchBeforeMutation(t *testing.T) {
+	state := NewState(nil)
+	root := &recordingShareMounter{}
+	builds := 0
+	err := state.AddShares(root, []client.ShareMount{
+		{Source: "/host/one", Mount: "/one"},
+		{Source: "/host/two", Mount: "/two"},
+	}, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+		builds++
+		if builds == 2 {
+			return virtio.ShareMount{}, errors.New("injected second build failure")
+		}
+		return virtio.ShareMount{GuestPath: share.Mount}, nil
+	})
+	if err == nil {
+		t.Fatal("share batch unexpectedly succeeded")
+	}
+	if len(root.shares) != 0 || len(state.shares) != 0 {
+		t.Fatalf("failed share batch mutated root/state: root=%+v state=%+v", root.shares, state.shares)
 	}
 }
 

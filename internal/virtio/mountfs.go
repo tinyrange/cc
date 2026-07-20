@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -104,6 +105,23 @@ func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaim
 	return current, highWater, physical, errors.Join(errs...)
 }
 
+// BackingMetadataUsage forwards metadata telemetry independently from backing
+// data. Keeping the two peaks separate matters: their maxima need not occur at
+// the same time, so adding them invents a combined high-water value that was
+// never observed.
+func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
+	for _, backend := range m.distinctBackends() {
+		provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) })
+		if !ok {
+			continue
+		}
+		backendCurrent, backendHighWater := provider.BackingMetadataUsage()
+		current += backendCurrent
+		highWater += backendHighWater
+	}
+	return current, highWater
+}
+
 // Close deterministically releases the root and every distinct mounted
 // backend. Virtio FS may call this from more than one shutdown path, so the
 // ownership boundary is idempotent.
@@ -195,13 +213,30 @@ type ShareMounter interface {
 	AddShare(ShareMount) error
 }
 
+type ShareBatchMounter interface {
+	AddShares([]ShareMount) error
+}
+
 func (m *mountedFS) RootSnapshot() (imagefs.Directory, error) {
 	return m.RootSnapshotAt("/")
 }
 
+func (m *mountedFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	return m.RootSnapshotAtContext(ctx, "/")
+}
+
 func (m *mountedFS) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
+	return m.RootSnapshotAtContext(context.Background(), guestPath)
+}
+
+func (m *mountedFS) RootSnapshotAtContext(ctx context.Context, guestPath string) (imagefs.Directory, error) {
 	guestPath = cleanMountPath(guestPath)
 	if guestPath == "/" {
+		if snap, ok := m.root.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
+		}); ok {
+			return snap.RootSnapshotContext(ctx)
+		}
 		if snap, ok := m.root.(interface {
 			RootSnapshot() (imagefs.Directory, error)
 		}); ok {
@@ -227,51 +262,56 @@ func (m *mountedFS) RootSnapshotAt(guestPath string) (imagefs.Directory, error) 
 }
 
 func (m *mountedFS) AddShare(share ShareMount) error {
-	mountPath := cleanMountPath(share.GuestPath)
-	if mountPath == "/" {
-		return nil
-	}
-	if share.Backend == nil {
-		return nil
-	}
+	return m.AddShares([]ShareMount{share})
+}
+
+func (m *mountedFS) AddShares(shares []ShareMount) error {
 	m.mu.RLock()
 	writebackCache := m.writebackCache
 	m.mu.RUnlock()
-	if be, ok := share.Backend.(fsWritebackCacheBackend); ok {
-		be.SetWritebackCache(writebackCache)
+	prepared := make([]shareMount, 0, len(shares))
+	for _, share := range shares {
+		mountPath := cleanMountPath(share.GuestPath)
+		if mountPath == "/" || share.Backend == nil {
+			continue
+		}
+		if be, ok := share.Backend.(fsWritebackCacheBackend); ok {
+			be.SetWritebackCache(writebackCache)
+		}
+		prepared = append(prepared, shareMount{path: mountPath, backend: share.Backend, writable: share.Writable, cache: normalizeMountCacheMode(share.CacheMode)})
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	for _, existing := range m.mounts {
-		if existing.path != mountPath {
+	combined := append(append([]shareMount(nil), m.mounts...), prepared...)
+	seen := make(map[string]shareMount, len(combined))
+	for _, mount := range combined {
+		if existing, ok := seen[mount.path]; ok {
+			if existing.writable != mount.writable || !sameFSBackend(existing.backend, mount.backend) || existing.cache != mount.cache {
+				return fmt.Errorf("mount path %q is already in use", mount.path)
+			}
 			continue
 		}
-		if existing.writable != share.Writable || existing.backend != share.Backend || existing.cache != normalizeMountCacheMode(share.CacheMode) {
-			return fmt.Errorf("mount path %q is already in use", mountPath)
-		}
-		return nil
+		seen[mount.path] = mount
 	}
-
-	m.mounts = append(m.mounts, shareMount{
-		path:     mountPath,
-		backend:  share.Backend,
-		writable: share.Writable,
-		cache:    normalizeMountCacheMode(share.CacheMode),
-	})
+	m.mounts = m.mounts[:0]
+	for _, mount := range seen {
+		m.mounts = append(m.mounts, mount)
+	}
 	sort.Slice(m.mounts, func(i, j int) bool {
 		if len(m.mounts[i].path) == len(m.mounts[j].path) {
 			return m.mounts[i].path < m.mounts[j].path
 		}
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
-	for existingPath, id := range m.pathToNode {
-		if existingPath != mountPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(mountPath, "/")+"/") {
-			continue
+	for _, mount := range prepared {
+		for existingPath, id := range m.pathToNode {
+			if existingPath != mount.path && !strings.HasPrefix(existingPath, strings.TrimSuffix(mount.path, "/")+"/") {
+				continue
+			}
+			delete(m.pathToNode, existingPath)
+			delete(m.nodes, id)
 		}
-		delete(m.pathToNode, existingPath)
-		delete(m.nodes, id)
 	}
 	return nil
 }

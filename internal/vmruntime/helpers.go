@@ -63,7 +63,14 @@ const (
 	serialTranscriptWaitBytes    = 1 << 20
 	serialTranscriptReclaimBytes = 8 << 20
 	serialTranscriptSegmentBytes = 8 << 20
+	// The legacy one-shot APIs must return a contiguous Go string. Commands are
+	// unrestricted and remain spill-backed while running, but materializing a
+	// larger compatibility response risks killing the host before Go can return
+	// an allocation error. Streaming exec has no such response boundary.
+	serialTranscriptCompatibilityBytes = 64 << 20
 )
+
+var ErrCommandOutputRequiresStreaming = errors.New("command output requires the streaming exec API")
 
 type TranscriptReader interface {
 	Advance(int)
@@ -558,10 +565,18 @@ func commandRecord(line []byte, id string) ([]byte, bool) {
 }
 
 func (s *SerialTranscript) materializeString() (string, error) {
+	return s.materializeStringLimit(serialTranscriptCompatibilityBytes)
+}
+
+func (s *SerialTranscript) materializeStringLimit(limit int) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	size := s.size - s.base
+	if limit >= 0 && size > limit {
+		return "", fmt.Errorf("%w: spill-backed compatibility transcript is %d bytes (one-shot limit %d bytes)", ErrCommandOutputRequiresStreaming, size, limit)
+	}
 	var out strings.Builder
-	out.Grow(s.size - s.base)
+	out.Grow(size)
 	for offset := s.base; offset < s.size; {
 		next := min(s.size, offset+serialTranscriptReadBytes)
 		data, err := s.readLocked(offset, next)

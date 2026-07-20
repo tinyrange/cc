@@ -3137,15 +3137,20 @@ type imageFS struct {
 	debugPaths []string
 	debugLog   io.Writer
 
-	mu                sync.Mutex
-	nextNodeID        uint64
-	nextHandle        uint64
-	nodes             map[uint64]*imageNode
-	handles           map[uint64]imageHandle
-	dirHandles        map[uint64][]dirEntry
-	dirHandleNodes    map[uint64]uint64
-	xattrBytes        uint64
-	metadataHighWater uint64
+	mu                 sync.Mutex
+	nextNodeID         uint64
+	nextHandle         uint64
+	nodes              map[uint64]*imageNode
+	handles            map[uint64]imageHandle
+	dirHandles         map[uint64][]dirEntry
+	dirHandleNodes     map[uint64]uint64
+	xattrBytes         uint64
+	metadataHighWater  uint64
+	retainedNodes      int
+	retainedHandles    int
+	retainedDirHandles int
+	retainedEntries    int
+	retainedWhiteouts  int
 }
 
 type imageHandle struct {
@@ -3155,29 +3160,36 @@ type imageHandle struct {
 }
 
 type imageNode struct {
-	id            uint64
-	inode         uint64
-	parent        uint64
-	name          string
-	mode          fs.FileMode
-	rawMode       uint32
-	uid           uint32
-	gid           uint32
-	rdev          uint32
-	size          uint64
-	nlink         uint32
-	data          sparseImageData
-	symlinkTarget string
-	entries       map[string]uint64
-	whiteouts     map[string]bool
-	entriesDone   bool
-	atime         time.Time
-	modTime       time.Time
-	ctime         time.Time
-	xattrs        map[string][]byte
-	abstractFile  imagefs.File
-	abstractDir   imagefs.Directory
-	abstractLink  imagefs.Symlink
+	id                uint64
+	inode             uint64
+	parent            uint64
+	name              string
+	mode              fs.FileMode
+	rawMode           uint32
+	uid               uint32
+	gid               uint32
+	rdev              uint32
+	size              uint64
+	nlink             uint32
+	data              sparseImageData
+	symlinkTarget     string
+	entries           map[string]uint64
+	whiteouts         map[string]bool
+	retainedEntries   int
+	retainedWhiteouts int
+	entriesDone       bool
+	atime             time.Time
+	modTime           time.Time
+	ctime             time.Time
+	xattrs            map[string][]byte
+	abstractFile      imagefs.File
+	// lowerFile remains immutable after the first writable operation. data is
+	// a page overlay, so metadata changes and small writes do not eagerly copy
+	// the lower file or expand its sparse holes.
+	lowerFile    imagefs.File
+	lowerSize    uint64
+	abstractDir  imagefs.Directory
+	abstractLink imagefs.Symlink
 }
 
 const imageDataPageSize = uint64(4096)
@@ -3260,6 +3272,27 @@ func (d *sparseImageData) insert(page, location uint64) {
 	d.extents[i] = imageDataExtent{page: page, location: location, count: 1}
 }
 
+func (d *sparseImageData) replace(page, location uint64) {
+	for i, extent := range d.extents {
+		if page < extent.page || page >= extent.page+extent.count {
+			continue
+		}
+		rebuilt := make([]imageDataExtent, 0, len(d.extents)+1)
+		rebuilt = append(rebuilt, d.extents[:i]...)
+		if left := page - extent.page; left != 0 {
+			rebuilt = append(rebuilt, imageDataExtent{page: extent.page, location: extent.location, count: left})
+		}
+		if right := extent.page + extent.count - page - 1; right != 0 {
+			rebuilt = append(rebuilt, imageDataExtent{page: page + 1, location: extent.location + (page - extent.page) + 1, count: right})
+		}
+		rebuilt = append(rebuilt, d.extents[i+1:]...)
+		d.extents = rebuilt
+		d.insert(page, location)
+		return
+	}
+	d.insert(page, location)
+}
+
 func (d sparseImageData) readAt(store *imageDataStore, dst []byte, off uint64) error {
 	for len(dst) > 0 {
 		pageIndex := off / imageDataPageSize
@@ -3294,8 +3327,14 @@ func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64)
 				return written, err
 			}
 			d.insert(pageIndex, location)
-		} else if err := store.writeAt(location, pageOffset, src[:n]); err != nil {
-			return written, err
+		} else {
+			newLocation, err := store.writeAtCOW(location, pageOffset, src[:n])
+			if err != nil {
+				return written, err
+			}
+			if newLocation != location {
+				d.replace(pageIndex, newLocation)
+			}
 		}
 		src = src[n:]
 		off += uint64(n)
@@ -3330,8 +3369,12 @@ func (d *sparseImageData) truncate(store *imageDataStore, size uint64) error {
 	pageIndex := size / imageDataPageSize
 	if location, ok := d.location(pageIndex); ok {
 		var zero [imageDataPageSize]byte
-		if err := store.writeAt(location, size%imageDataPageSize, zero[:imageDataPageSize-size%imageDataPageSize]); err != nil {
+		newLocation, err := store.writeAtCOW(location, size%imageDataPageSize, zero[:imageDataPageSize-size%imageDataPageSize])
+		if err != nil {
 			return err
+		}
+		if newLocation != location {
+			d.replace(pageIndex, newLocation)
 		}
 	}
 	return nil
@@ -3347,13 +3390,15 @@ func (d sparseImageData) release(store *imageDataStore) {
 
 func (d sparseImageData) allocatedBytes(size uint64) uint64 {
 	var allocated uint64
+	fullPages := size / imageDataPageSize
+	partialBytes := size % imageDataPageSize
 	for _, extent := range d.extents {
-		for page := uint64(0); page < extent.count; page++ {
-			pageStart := (extent.page + page) * imageDataPageSize
-			if pageStart >= size {
-				break
-			}
-			allocated += min(imageDataPageSize, size-pageStart)
+		if extent.page < fullPages {
+			pages := min(extent.count, fullPages-extent.page)
+			allocated += pages * imageDataPageSize
+		}
+		if partialBytes != 0 && extent.page <= fullPages && fullPages-extent.page < extent.count {
+			allocated += partialBytes
 		}
 	}
 	return allocated
@@ -3412,6 +3457,7 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		handles:        map[uint64]imageHandle{},
 		dirHandles:     map[uint64][]dirEntry{},
 		dirHandleNodes: map[uint64]uint64{},
+		retainedNodes:  1,
 	}
 	imgFS.root = imgFS.dataStore.dir
 	if root == nil {
@@ -4446,6 +4492,8 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 		if flags&linuxOTRUNC != 0 {
 			node.data.release(p.dataStore)
 			node.data = sparseImageData{}
+			node.lowerFile = nil
+			node.lowerSize = 0
 			node.size = 0
 			if uid != 0 {
 				node.mode &^= fs.FileMode(0o6000)
@@ -4458,7 +4506,11 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 	fh := p.nextHandle
 	p.nextHandle++
 	handle := imageHandle{nodeID: nodeID}
-	if openable, ok := node.abstractFile.(imagefs.OpenReaderFile); ok {
+	readerFile := node.abstractFile
+	if readerFile == nil {
+		readerFile = node.lowerFile
+	}
+	if openable, ok := readerFile.(imagefs.OpenReaderFile); ok {
 		reader, closer, err := openable.OpenReader()
 		if err != nil {
 			return 0, errnoFromError(err)
@@ -4467,6 +4519,7 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 		handle.closer = closer
 	}
 	p.handles[fh] = handle
+	p.noteImageHandleAddedLocked()
 	return fh, 0
 }
 
@@ -4519,6 +4572,34 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 			end = node.size
 		}
 		data := make([]byte, end-off)
+		if node.lowerFile != nil && off < node.lowerSize {
+			lowerEnd := min(end, node.lowerSize)
+			var err error
+			if handle.reader != nil {
+				var n int
+				n, err = handle.reader.ReadAt(data[:lowerEnd-off], int64(off))
+				if err != nil && err != io.EOF {
+					p.mu.Unlock()
+					return nil, errnoFromError(err)
+				}
+				if uint64(n) != lowerEnd-off {
+					p.mu.Unlock()
+					return nil, -linuxEIO
+				}
+			} else {
+				var lower []byte
+				lower, err = node.lowerFile.ReadAt(off, uint32(lowerEnd-off))
+				if err != nil {
+					p.mu.Unlock()
+					return nil, errnoFromError(err)
+				}
+				if uint64(len(lower)) != lowerEnd-off {
+					p.mu.Unlock()
+					return nil, -linuxEIO
+				}
+				copy(data, lower)
+			}
+		}
 		if err := node.data.readAt(p.dataStore, data, off); err != nil {
 			p.mu.Unlock()
 			return nil, errnoFromError(err)
@@ -4569,16 +4650,22 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 		p.mu.Unlock()
 		return 0, -linuxENXIO
 	}
-	if node.abstractFile != nil {
+	if node.abstractFile != nil || node.lowerFile != nil && offset < node.lowerSize {
 		size := node.size
-		p.mu.Unlock()
-		if whence == 3 {
-			return offset, 0
+		lowerSize := node.lowerSize
+		if node.abstractFile != nil {
+			lowerSize = size
 		}
-		if whence == 4 {
-			return size, 0
+		if offset < lowerSize {
+			p.mu.Unlock()
+			if whence == 3 {
+				return offset, 0
+			}
+			if whence == 4 {
+				return lowerSize, 0
+			}
+			return 0, -linuxEINVAL
 		}
-		return 0, -linuxEINVAL
 	}
 	switch whence {
 	case 3: // SEEK_DATA
@@ -4642,6 +4729,7 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.nextHandle++
 	p.dirHandles[fh] = entries
 	p.dirHandleNodes[fh] = nodeID
+	p.noteImageDirHandleAddedLocked()
 	return fh, 0
 }
 
@@ -4737,8 +4825,10 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked()
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
@@ -4792,8 +4882,10 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked()
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
@@ -4832,7 +4924,9 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked()
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
@@ -4870,6 +4964,7 @@ func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string,
 		}
 	}
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
 	now := time.Now()
 	node.ctime = now
 	p.touchImageDirectoryLocked(parentNode, now)
@@ -4913,9 +5008,11 @@ func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uin
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	p.collectImageNodeLocked(childID)
 	p.touchImageDirectoryLocked(parentNode, time.Now())
+	p.compactImageNodeMapsLocked(parentNode)
 	return 0
 }
 
@@ -4960,6 +5057,8 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
 				node.data.release(p.dataStore)
 				node.data = sparseImageData{}
+				node.lowerFile = nil
+				node.lowerSize = 0
 				node.size = 0
 				if uid != 0 {
 					node.mode &^= fs.FileMode(0o6000)
@@ -4972,6 +5071,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 		fh := p.nextHandle
 		p.nextHandle++
 		p.handles[fh] = imageHandle{nodeID: node.id}
+		p.noteImageHandleAddedLocked()
 		return node.id, fh, p.attr(node), 0
 	}
 	mode, gid = p.inheritImageCreateLocked(parentNode, mode, gid, false)
@@ -4992,12 +5092,15 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked()
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
 	fh := p.nextHandle
 	p.nextHandle++
 	p.handles[fh] = imageHandle{nodeID: node.id}
+	p.noteImageHandleAddedLocked()
 	return node.id, fh, p.attr(node), 0
 }
 
@@ -5019,6 +5122,9 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	end := off + uint64(len(data))
 	if end < off || end > uint64(^uint(0)>>1) {
 		return 0, -linuxEFBIG
+	}
+	if errno := p.prepareImageOverlayWriteLocked(node, off, uint64(len(data))); errno != 0 {
+		return 0, errno
 	}
 	written, err := node.data.writeAt(p.dataStore, data, off)
 	if err != nil {
@@ -5074,6 +5180,9 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 	if valid&fattrSize != 0 {
 		if err := node.data.truncate(p.dataStore, size); err != nil {
 			return FuseAttr{}, errnoFromError(err)
+		}
+		if size < node.lowerSize {
+			node.lowerSize = size
 		}
 		node.size = size
 		if callerUID != 0 {
@@ -5137,6 +5246,7 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	child.ctime = time.Now()
 	p.touchImageDirectoryLocked(parentNode, child.ctime)
@@ -5145,6 +5255,7 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 	} else {
 		p.refreshImageNodeLinksLocked(child)
 	}
+	p.compactImageNodeMapsLocked(parentNode)
 	return 0
 }
 
@@ -5233,11 +5344,13 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	if newParentNode.whiteouts != nil {
 		delete(newParentNode.whiteouts, newName)
 	}
 	newParentNode.entries[newName] = childID
+	p.noteImageEntryAddedLocked(newParentNode)
 	child.parent = newParent
 	child.name = newName
 	now := time.Now()
@@ -5252,6 +5365,10 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		}
 	}
 	p.refreshImageNodeLinksLocked(child)
+	p.compactImageNodeMapsLocked(parentNode)
+	if newParentNode != parentNode {
+		p.compactImageNodeMapsLocked(newParentNode)
+	}
 	return 0
 }
 
@@ -5406,7 +5523,7 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 		ctime = modTime
 	}
 	allocatedBytes := node.data.allocatedBytes(size)
-	if node.abstractFile != nil {
+	if node.abstractFile != nil || node.lowerFile != nil {
 		allocatedBytes = size
 	}
 	return FuseAttr{
@@ -5515,9 +5632,12 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	if p.imageNodeReferenceCountLocked(nodeID) == 0 && !p.imageNodeHasHandleLocked(nodeID) {
 		if node := p.nodes[nodeID]; node != nil {
 			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
+			p.retainedEntries -= node.retainedEntries
+			p.retainedWhiteouts -= node.retainedWhiteouts
 			node.data.release(p.dataStore)
 		}
 		delete(p.nodes, nodeID)
+		p.compactImageNodesLocked()
 	}
 }
 
@@ -5546,15 +5666,95 @@ func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
 	// This is deliberately accounting, not a guest quota. Empty files and page
 	// indexes consume host heap even when no backing blocks are allocated; make
 	// that pressure visible to the same host recovery telemetry as file data.
-	metadata := uint64(len(p.nodes))*256 + uint64(len(p.handles))*64 + uint64(len(p.dirHandles))*64 + p.xattrBytes
+	metadata := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles)*64 + uint64(p.retainedDirHandles)*64 + p.xattrBytes
+	metadata += uint64(p.retainedEntries+p.retainedWhiteouts) * 64
 	for _, node := range p.nodes {
-		metadata += uint64(len(node.name)+len(node.symlinkTarget)) + uint64(len(node.entries)+len(node.whiteouts))*64 + uint64(len(node.data.extents))*32
+		metadata += uint64(len(node.name)+len(node.symlinkTarget)) + uint64(cap(node.data.extents))*32
+		for _, value := range node.xattrs {
+			metadata += uint64(cap(value) - len(value))
+		}
 	}
 	metadata += p.dataStore.metadataUsage()
 	if metadata > p.metadataHighWater {
 		p.metadataHighWater = metadata
 	}
 	return metadata, p.metadataHighWater
+}
+
+func (p *imageFS) noteImageNodeAddedLocked() {
+	p.retainedNodes = max(p.retainedNodes, len(p.nodes))
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageHandleAddedLocked() {
+	p.retainedHandles = max(p.retainedHandles, len(p.handles))
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageDirHandleAddedLocked() {
+	p.retainedDirHandles = max(p.retainedDirHandles, len(p.dirHandles))
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageEntryAddedLocked(node *imageNode) {
+	if node == nil || len(node.entries) <= node.retainedEntries {
+		return
+	}
+	p.retainedEntries += len(node.entries) - node.retainedEntries
+	node.retainedEntries = len(node.entries)
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageWhiteoutAddedLocked(node *imageNode) {
+	if node == nil || len(node.whiteouts) <= node.retainedWhiteouts {
+		return
+	}
+	p.retainedWhiteouts += len(node.whiteouts) - node.retainedWhiteouts
+	node.retainedWhiteouts = len(node.whiteouts)
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) compactImageNodeMapsLocked(node *imageNode) {
+	if node == nil {
+		return
+	}
+	if len(node.entries)*4 < node.retainedEntries && (node.retainedEntries >= 64 || len(node.entries) <= 4) {
+		rebuilt := make(map[string]uint64, len(node.entries))
+		for name, id := range node.entries {
+			rebuilt[name] = id
+		}
+		p.retainedEntries -= node.retainedEntries - len(rebuilt)
+		node.retainedEntries = len(rebuilt)
+		node.entries = rebuilt
+	}
+	if len(node.whiteouts)*4 < node.retainedWhiteouts && (node.retainedWhiteouts >= 64 || len(node.whiteouts) <= 4) {
+		rebuilt := make(map[string]bool, len(node.whiteouts))
+		for name, present := range node.whiteouts {
+			rebuilt[name] = present
+		}
+		p.retainedWhiteouts -= node.retainedWhiteouts - len(rebuilt)
+		node.retainedWhiteouts = len(rebuilt)
+		node.whiteouts = rebuilt
+	}
+}
+
+func (p *imageFS) compactImageNodesLocked() {
+	if len(p.nodes)*4 >= p.retainedNodes || p.retainedNodes < 64 && len(p.nodes) > 4 {
+		return
+	}
+	rebuilt := make(map[uint64]*imageNode, len(p.nodes))
+	for id, node := range p.nodes {
+		rebuilt[id] = node
+	}
+	p.nodes = rebuilt
+	p.retainedNodes = len(rebuilt)
+}
+
+func (p *imageFS) bumpImageMetadataFloorLocked() {
+	floor := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles+p.retainedDirHandles+p.retainedEntries+p.retainedWhiteouts)*64 + p.xattrBytes
+	if floor > p.metadataHighWater {
+		p.metadataHighWater = floor
+	}
 }
 
 func imageNodeXattrBytes(node *imageNode) int {
@@ -5637,8 +5837,10 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 		node.modTime = time.Unix(0, 0)
 	}
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked()
 	p.registerImageNodeLinkLocked(node)
 	parent.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parent)
 	return node, 0
 }
 
@@ -5753,35 +5955,53 @@ func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 		return 0
 	}
 	size, mode := node.abstractFile.Stat()
-	var copied sparseImageData
-	const copyChunk = uint32(1 << 20)
-	for offset := uint64(0); offset < size; {
-		want := uint64(copyChunk)
-		if remaining := size - offset; remaining < want {
-			want = remaining
-		}
-		data, err := node.abstractFile.ReadAt(offset, uint32(want))
-		if err != nil {
-			copied.release(p.dataStore)
-			return errnoFromError(err)
-		}
-		if uint64(len(data)) != want {
-			copied.release(p.dataStore)
-			return -linuxEIO
-		}
-		if _, err := copied.writeAt(p.dataStore, data, offset); err != nil {
-			copied.release(p.dataStore)
-			return errnoFromError(err)
-		}
-		offset += want
-	}
-	node.data.release(p.dataStore)
-	node.data = copied
 	node.size = size
 	node.mode = mode
+	node.lowerFile = node.abstractFile
+	node.lowerSize = size
 	node.abstractFile = nil
 	if node.modTime.IsZero() {
 		node.modTime = time.Now()
+	}
+	return 0
+}
+
+// prepareImageOverlayWriteLocked materializes only partially overwritten lower
+// pages. Complete pages can be created directly from the write payload. This is
+// the page-level COW boundary that prevents a one-byte change from copying an
+// entire lower file (and from expanding sparse lower files).
+func (p *imageFS) prepareImageOverlayWriteLocked(node *imageNode, off, length uint64) int32 {
+	if node == nil || node.lowerFile == nil || length == 0 {
+		return 0
+	}
+	end := off + length
+	if end < off {
+		return -linuxEFBIG
+	}
+	for cursor := off; cursor < end; {
+		page := cursor / imageDataPageSize
+		pageStart := page * imageDataPageSize
+		pageEnd := pageStart + imageDataPageSize
+		writeEnd := min(end, pageEnd)
+		fullPage := cursor == pageStart && writeEnd == pageEnd
+		if !fullPage {
+			if _, exists := node.data.location(page); !exists && pageStart < node.lowerSize {
+				visible := min(imageDataPageSize, node.lowerSize-pageStart)
+				data, err := node.lowerFile.ReadAt(pageStart, uint32(visible))
+				if err != nil {
+					return errnoFromError(err)
+				}
+				if uint64(len(data)) != visible {
+					return -linuxEIO
+				}
+				location, err := p.dataStore.allocatePage(data)
+				if err != nil {
+					return errnoFromError(err)
+				}
+				node.data.insert(page, location)
+			}
+		}
+		cursor = writeEnd
 	}
 	return 0
 }

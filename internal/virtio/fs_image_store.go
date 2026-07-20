@@ -26,11 +26,15 @@ type imageDataStore struct {
 	// offset+1 (zero means released). Tokens are dense and monotonic, so a map
 	// added substantial per-page heap overhead without buying sparsity.
 	locations               []uint64
+	locationRefs            []uint32
 	liveLocations           int
 	freeLocations           []uint64
 	free                    []uint64
 	freeSet                 map[uint64]struct{}
 	pendingReclaim          map[uint64]struct{}
+	retainedFreeSet         int
+	retainedPendingReclaim  int
+	metadataHighWater       uint64
 	current                 uint64
 	highWater               uint64
 	reclaimErr              error
@@ -98,7 +102,7 @@ func newImageDataStore() *imageDataStore {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		dir = os.TempDir()
 	}
-	return &imageDataStore{dir: dir, refs: 1, locations: []uint64{0}, freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
+	return &imageDataStore{dir: dir, refs: 1, locations: []uint64{0}, locationRefs: []uint32{0}, freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
 }
 
 func (s *imageDataStore) retain() {
@@ -137,6 +141,10 @@ func (s *imageDataStore) ensureFileLocked() error {
 func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.allocatePageLocked(data)
+}
+
+func (s *imageDataStore) allocatePageLocked(data []byte) (uint64, error) {
 	if err := s.ensureFileLocked(); err != nil {
 		return 0, err
 	}
@@ -161,6 +169,7 @@ func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 	if _, err := s.file.WriteAt(page[:], int64(offset)); err != nil {
 		s.free = append(s.free, offset)
 		s.freeSet[offset] = struct{}{}
+		s.noteMetadataLocked()
 		return 0, err
 	}
 	s.current += imageDataPageSize
@@ -172,13 +181,29 @@ func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 		location = s.freeLocations[len(s.freeLocations)-1]
 		s.freeLocations = s.freeLocations[:len(s.freeLocations)-1]
 		s.locations[location] = offset + 1
+		s.locationRefs[location] = 1
 	} else {
 		s.nextLocation++
 		location = s.nextLocation
 		s.locations = append(s.locations, offset+1)
+		s.locationRefs = append(s.locationRefs, 1)
 	}
 	s.liveLocations++
+	s.noteMetadataLocked()
 	return location, nil
+}
+
+func (s *imageDataStore) retainPage(location uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.locationOffsetLocked(location); !ok || location >= uint64(len(s.locationRefs)) || s.locationRefs[location] == 0 {
+		return os.ErrNotExist
+	}
+	if s.locationRefs[location] == ^uint32(0) {
+		return fmt.Errorf("image page reference count overflow")
+	}
+	s.locationRefs[location]++
+	return nil
 }
 
 func (s *imageDataStore) locationOffsetLocked(location uint64) (uint64, bool) {
@@ -206,18 +231,35 @@ func (s *imageDataStore) readPage(location uint64, dst []byte) error {
 	return err
 }
 
-func (s *imageDataStore) writeAt(location, pageOffset uint64, data []byte) error {
+func (s *imageDataStore) writeAtCOW(location, pageOffset uint64, data []byte) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.file == nil {
-		return os.ErrNotExist
+		return 0, os.ErrNotExist
 	}
 	offset, ok := s.locationOffsetLocked(location)
 	if !ok {
-		return os.ErrNotExist
+		return 0, os.ErrNotExist
 	}
-	_, err := s.file.WriteAt(data, int64(offset+pageOffset))
-	return err
+	if location >= uint64(len(s.locationRefs)) || s.locationRefs[location] == 0 {
+		return 0, os.ErrNotExist
+	}
+	if s.locationRefs[location] == 1 {
+		_, err := s.file.WriteAt(data, int64(offset+pageOffset))
+		return location, err
+	}
+	var page [imageDataPageSize]byte
+	n, err := s.file.ReadAt(page[:], int64(offset))
+	if err != nil && !(errors.Is(err, io.EOF) && n == len(page)) {
+		return 0, err
+	}
+	copy(page[pageOffset:pageOffset+uint64(len(data))], data)
+	newLocation, err := s.allocatePageLocked(page[:])
+	if err != nil {
+		return 0, err
+	}
+	s.locationRefs[location]--
+	return newLocation, nil
 }
 
 func (s *imageDataStore) releasePage(location uint64) {
@@ -231,13 +273,20 @@ func (s *imageDataStore) releasePage(location uint64) {
 		s.mu.Unlock()
 		return
 	}
+	if location < uint64(len(s.locationRefs)) && s.locationRefs[location] > 1 {
+		s.locationRefs[location]--
+		s.mu.Unlock()
+		return
+	}
 	s.locations[location] = 0
+	s.locationRefs[location] = 0
 	s.liveLocations--
 	s.freeLocations = append(s.freeLocations, location)
 	s.free = append(s.free, offset)
 	s.freeSet[offset] = struct{}{}
 	scheduleReclaim := len(s.pendingReclaim) == 0
 	s.pendingReclaim[offset] = struct{}{}
+	s.noteMetadataLocked()
 	if s.current >= imageDataPageSize {
 		s.current -= imageDataPageSize
 	}
@@ -358,6 +407,8 @@ func (s *imageDataStore) compactLocked() error {
 	s.free = nil
 	s.freeSet = make(map[uint64]struct{})
 	s.pendingReclaim = make(map[uint64]struct{})
+	s.retainedFreeSet = 0
+	s.retainedPendingReclaim = 0
 	// The replacement is live, but cleanup ownership for the old file must not
 	// disappear if Windows or an external scanner makes close/removal fail
 	// transiently. Retain it for later sync/usage/close retries and report the
@@ -409,7 +460,26 @@ func (s *imageDataStore) metadataUsage() uint64 {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return uint64(cap(s.locations))*8 + uint64(cap(s.freeLocations)+len(s.freeSet)+len(s.pendingReclaim))*16
+	return s.metadataUsageLocked()
+}
+
+func (s *imageDataStore) metadataUsageLocked() uint64 {
+	usage := uint64(cap(s.locations)+cap(s.freeLocations)+cap(s.free))*8 + uint64(cap(s.locationRefs))*4
+	usage += uint64(s.retainedFreeSet+s.retainedPendingReclaim) * 16
+	usage += uint64(cap(s.stale)) * 32
+	for _, stale := range s.stale {
+		usage += uint64(len(stale.path))
+	}
+	if usage > s.metadataHighWater {
+		s.metadataHighWater = usage
+	}
+	return usage
+}
+
+func (s *imageDataStore) noteMetadataLocked() {
+	s.retainedFreeSet = max(s.retainedFreeSet, len(s.freeSet))
+	s.retainedPendingReclaim = max(s.retainedPendingReclaim, len(s.pendingReclaim))
+	s.metadataUsageLocked()
 }
 
 func (s *imageDataStore) sync() error {
@@ -441,7 +511,7 @@ func (s *imageDataStore) close() error {
 	s.closed = true
 	s.flushReclaimLocked()
 	f, path, stale := s.file, s.path, s.stale
-	s.file, s.path, s.locations, s.freeLocations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil, nil
+	s.file, s.path, s.locations, s.locationRefs, s.freeLocations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {

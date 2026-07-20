@@ -413,6 +413,14 @@ func (i *hostedInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	return provider.BackingUsage()
 }
 
+func (i *hostedInstance) BackingMetadataUsage() (uint64, uint64) {
+	provider, ok := i.Instance.(interface{ BackingMetadataUsage() (uint64, uint64) })
+	if !ok {
+		return 0, 0
+	}
+	return provider.BackingMetadataUsage()
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil

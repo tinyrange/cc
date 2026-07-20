@@ -1,7 +1,9 @@
 package virtio
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"runtime"
@@ -12,8 +14,18 @@ import (
 )
 
 func (p *imageFS) RootSnapshot() (imagefs.Directory, error) {
+	return p.RootSnapshotContext(context.Background())
+}
+
+func (p *imageFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if p == nil {
 		return nil, fmt.Errorf("image filesystem is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -21,13 +33,13 @@ func (p *imageFS) RootSnapshot() (imagefs.Directory, error) {
 	if root == nil || !root.isDir() {
 		return nil, fmt.Errorf("image filesystem root is missing")
 	}
-	store := newImageDataStore()
-	dir, err := p.snapshotDirLocked(root, store)
-	_ = store.close()
-	return dir, err
+	return p.snapshotDirLocked(ctx, root, p.dataStore)
 }
 
-func (p *imageFS) snapshotDirLocked(node *imageNode, store *imageDataStore) (*snapshotDir, error) {
+func (p *imageFS) snapshotDirLocked(ctx context.Context, node *imageNode, store *imageDataStore) (*snapshotDir, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if node.abstractDir != nil && !node.entriesDone {
 		if _, errno := p.materializeDirEntriesLocked(node); errno != 0 {
 			return nil, fmt.Errorf("materialize %s: errno %d", p.pathForNode(node.id), errno)
@@ -52,8 +64,9 @@ func (p *imageFS) snapshotDirLocked(node *imageNode, store *imageDataStore) (*sn
 		if child == nil {
 			continue
 		}
-		entry, err := p.snapshotEntryLocked(child, store)
+		entry, err := p.snapshotEntryLocked(ctx, child, store)
 		if err != nil {
+			releaseSnapshotDir(out)
 			return nil, err
 		}
 		out.entries[name] = entry
@@ -61,11 +74,14 @@ func (p *imageFS) snapshotDirLocked(node *imageNode, store *imageDataStore) (*sn
 	return out, nil
 }
 
-func (p *imageFS) snapshotEntryLocked(node *imageNode, store *imageDataStore) (imagefs.Entry, error) {
+func (p *imageFS) snapshotEntryLocked(ctx context.Context, node *imageNode, store *imageDataStore) (imagefs.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return imagefs.Entry{}, err
+	}
 	attr := p.attr(node)
 	switch {
 	case node.isDir():
-		dir, err := p.snapshotDirLocked(node, store)
+		dir, err := p.snapshotDirLocked(ctx, node, store)
 		if err != nil {
 			return imagefs.Entry{}, err
 		}
@@ -89,29 +105,39 @@ func (p *imageFS) snapshotEntryLocked(node *imageNode, store *imageDataStore) (i
 		if node.abstractFile != nil {
 			source = node.abstractFile
 		} else {
-			data = snapshotSparseData{pages: make(map[uint64]uint64), store: store}
+			source = node.lowerFile
+		}
+		if len(node.data.extents) != 0 {
+			data = snapshotSparseData{store: store}
 			for _, extent := range node.data.extents {
 				for pageOffset := uint64(0); pageOffset < extent.count; pageOffset++ {
-					var page [imageDataPageSize]byte
-					if err := p.dataStore.readPage(extent.location+pageOffset, page[:]); err != nil {
+					if err := ctx.Err(); err != nil {
+						data.data.release(store)
+						return imagefs.Entry{}, err
+					}
+					snapshotLocation := extent.location + pageOffset
+					if err := store.retainPage(snapshotLocation); err != nil {
+						data.data.release(store)
 						return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
 					}
-					snapshotLocation, err := store.allocatePage(page[:])
-					if err != nil {
-						return imagefs.Entry{}, fmt.Errorf("snapshot file %s: %w", p.pathForNode(node.id), err)
-					}
-					data.pages[extent.page+pageOffset] = snapshotLocation
+					data.data.insert(extent.page+pageOffset, snapshotLocation)
 				}
 			}
 		}
 		file := &snapshotFile{
-			mode:    linuxModeToGo(attr.Mode),
-			uid:     attr.UID,
-			gid:     attr.GID,
-			rdev:    attr.RDev,
-			size:    attr.Size,
-			data:    data,
-			source:  source,
+			mode:   linuxModeToGo(attr.Mode),
+			uid:    attr.UID,
+			gid:    attr.GID,
+			rdev:   attr.RDev,
+			size:   attr.Size,
+			data:   data,
+			source: source,
+			sourceSize: func() uint64 {
+				if node.abstractFile != nil {
+					return attr.Size
+				}
+				return node.lowerSize
+			}(),
 			modTime: unixAttrModTime(attr),
 		}
 		if data.store != nil {
@@ -173,43 +199,34 @@ func (d *snapshotDir) Lookup(name string) (imagefs.Entry, error) {
 }
 
 type snapshotFile struct {
-	mode    fs.FileMode
-	uid     uint32
-	gid     uint32
-	rdev    uint32
-	size    uint64
-	data    snapshotSparseData
-	source  imagefs.File
-	modTime time.Time
+	mode       fs.FileMode
+	uid        uint32
+	gid        uint32
+	rdev       uint32
+	size       uint64
+	data       snapshotSparseData
+	source     imagefs.File
+	sourceSize uint64
+	modTime    time.Time
 }
 
 type snapshotSparseData struct {
-	pages map[uint64]uint64
+	data  sparseImageData
 	store *imageDataStore
 }
 
 func (d snapshotSparseData) readAt(dst []byte, off uint64) error {
-	for len(dst) > 0 {
-		pageIndex := off / imageDataPageSize
-		pageOffset := off % imageDataPageSize
-		n := min(len(dst), int(imageDataPageSize-pageOffset))
-		if location, ok := d.pages[pageIndex]; ok {
-			var page [imageDataPageSize]byte
-			if err := d.store.readPage(location, page[:]); err != nil {
-				return err
-			}
-			copy(dst[:n], page[pageOffset:pageOffset+uint64(n)])
-		}
-		dst = dst[n:]
-		off += uint64(n)
+	if d.store == nil {
+		return nil
 	}
-	return nil
+	return d.data.readAt(d.store, dst, off)
 }
 
 func (f *snapshotFile) releaseStore() {
 	if f == nil || f.data.store == nil {
 		return
 	}
+	f.data.data.release(f.data.store)
 	_ = f.data.store.close()
 	f.data.store = nil
 }
@@ -226,14 +243,41 @@ func (f *snapshotFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	if end > f.size {
 		end = f.size
 	}
-	if f.source != nil {
-		return f.source.ReadAt(off, uint32(end-off))
-	}
 	data := make([]byte, end-off)
+	if f.source != nil && off < f.sourceSize {
+		sourceEnd := min(end, f.sourceSize)
+		lower, err := f.source.ReadAt(off, uint32(sourceEnd-off))
+		if err != nil {
+			return nil, err
+		}
+		if uint64(len(lower)) != sourceEnd-off {
+			return nil, io.ErrUnexpectedEOF
+		}
+		copy(data, lower)
+	}
 	if err := f.data.readAt(data, off); err != nil {
 		return nil, err
 	}
 	return data, nil
+}
+
+func releaseSnapshotDir(dir *snapshotDir) {
+	if dir == nil {
+		return
+	}
+	for _, entry := range dir.entries {
+		switch {
+		case entry.Dir != nil:
+			if child, ok := entry.Dir.(*snapshotDir); ok {
+				releaseSnapshotDir(child)
+			}
+		case entry.File != nil:
+			if file, ok := entry.File.(*snapshotFile); ok {
+				runtime.SetFinalizer(file, nil)
+				file.releaseStore()
+			}
+		}
+	}
 }
 
 type snapshotSymlink struct {

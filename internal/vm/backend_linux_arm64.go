@@ -584,6 +584,13 @@ func (i *linuxInstance) BackingUsage() (uint64, uint64, uint64, error) {
 	return virtioFSBackingUsage(i.fsdevs)
 }
 
+func (i *linuxInstance) BackingMetadataUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingMetadataUsage(i.fsdevs)
+}
+
 func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil {
 		return client.ExecRequest{}, fmt.Errorf("instance is not running")
@@ -592,11 +599,15 @@ func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecR
 }
 
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	return i.AddShares(ctx, []client.ShareMount{share})
+}
+
+func (i *linuxInstance) AddShares(ctx context.Context, shares []client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "shares", nil)
+		return mounts.AddRuntimeShareMount(nil, nil, nil, client.ShareMount{}, "shares", nil)
 	}
-	return i.mounts.AddShare(i.rootFS, share, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+	return i.mounts.AddShares(i.rootFS, shares, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
 		return mounts.BuildRuntimeDirectoryShare(share, arm64vm.BuildShareMount)
 	})
 }

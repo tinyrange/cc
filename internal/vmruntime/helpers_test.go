@@ -89,6 +89,20 @@ func TestSerialTranscriptReadErrorNeverAdvancesPastDeliveredBytes(t *testing.T) 
 	}
 }
 
+func TestSerialTranscriptCompatibilityMaterializationFailsExplicitly(t *testing.T) {
+	transcript := NewSerialTranscript()
+	defer transcript.Close()
+	if _, err := transcript.Write(bytes.Repeat([]byte("x"), 4097)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transcript.materializeStringLimit(4096); !errors.Is(err, ErrCommandOutputRequiresStreaming) {
+		t.Fatalf("materialization error = %v", err)
+	}
+	if got, err := transcript.materializeStringLimit(4097); err != nil || len(got) != 4097 {
+		t.Fatalf("boundary materialization bytes=%d err=%v", len(got), err)
+	}
+}
+
 func TestSerialTranscriptReclaimsReleasedReaderStorage(t *testing.T) {
 	transcript := NewSerialTranscript()
 	start := transcript.Len()

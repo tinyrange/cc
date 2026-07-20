@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -92,21 +93,86 @@ func TestImageFSOpenHandleSurvivesUnlinkAndReplacement(t *testing.T) {
 	}
 }
 
-func TestImageFSCopyUpStreamsLargeLowerFileAndPreservesSourceOnFailure(t *testing.T) {
+func TestImageFSCopyUpKeepsLargeLowerFileAsPageOverlay(t *testing.T) {
 	backend := newEmptyImageFS(t)
 	probe := &copyUpProbeFile{}
 	node := &imageNode{abstractFile: probe}
-	if errno := backend.copyUpFileLocked(node); errno == 0 {
-		t.Fatal("copy-up unexpectedly succeeded after injected read failure")
+	if errno := backend.copyUpFileLocked(node); errno != 0 {
+		t.Fatalf("copy-up: errno %d", errno)
 	}
-	if len(probe.calls) != 2 || probe.calls[0] != [2]uint64{0, 1 << 20} || probe.calls[1] != [2]uint64{1 << 20, 1 << 20} {
-		t.Fatalf("copy-up reads = %#v, want bounded sequential chunks", probe.calls)
+	if len(probe.calls) != 0 {
+		t.Fatalf("metadata copy-up read the lower file: %#v", probe.calls)
 	}
-	if node.abstractFile != probe || node.size != 0 || len(node.data.extents) != 0 {
-		t.Fatalf("failed copy-up replaced lower file: node=%+v", node)
+	if node.abstractFile != nil || node.lowerFile != probe || node.size != (uint64(4)<<30)+7 || len(node.data.extents) != 0 {
+		t.Fatalf("lazy copy-up state: node=%+v", node)
 	}
-	if current, _, _, _ := backend.dataStore.usage(); current != 0 {
-		t.Fatalf("failed copy-up retained %d backing bytes", current)
+	if errno := backend.prepareImageOverlayWriteLocked(node, 1, 1); errno != 0 {
+		t.Fatalf("prepare partial page: errno %d", errno)
+	}
+	if len(probe.calls) != 1 || probe.calls[0] != [2]uint64{0, imageDataPageSize} {
+		t.Fatalf("partial write lower reads = %#v, want one page", probe.calls)
+	}
+	if current, _, _, _ := backend.dataStore.usage(); current != imageDataPageSize {
+		t.Fatalf("partial write retained %d backing bytes, want one page", current)
+	}
+}
+
+func TestImageFSPageOverlayPreservesLowerBytesAndSnapshots(t *testing.T) {
+	want := make([]byte, 3*imageDataPageSize)
+	for i := range want {
+		want[i] = byte(i % 251)
+	}
+	backend := imageBackend(t, map[string]string{"/lower": string(want)}).(*imageFS)
+	nodeID, _, errno := backend.Lookup(1, "lower")
+	if errno != 0 {
+		t.Fatalf("lookup lower: errno %d", errno)
+	}
+	fh, errno := backend.Open(nodeID, linuxORDWR)
+	if errno != 0 {
+		t.Fatalf("open lower: errno %d", errno)
+	}
+	want[imageDataPageSize+17] = 0xfe
+	if _, errno := backend.Write(nodeID, fh, imageDataPageSize+17, []byte{0xfe}, 0); errno != 0 {
+		t.Fatalf("write overlay: errno %d", errno)
+	}
+	got, errno := backend.Read(nodeID, fh, 0, uint32(len(want)))
+	if errno != 0 || !bytes.Equal(got, want) {
+		t.Fatalf("overlay read errno=%d equal=%v", errno, bytes.Equal(got, want))
+	}
+	if current, _, _, _ := backend.dataStore.usage(); current != imageDataPageSize {
+		t.Fatalf("one-byte overlay allocated %d bytes, want one page", current)
+	}
+	snapshot, err := backend.RootSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	entry, err := snapshot.Lookup("lower")
+	if err != nil {
+		t.Fatalf("snapshot lookup: %v", err)
+	}
+	snapshotData, err := entry.File.ReadAt(0, uint32(len(want)))
+	if err != nil || !bytes.Equal(snapshotData, want) {
+		t.Fatalf("snapshot overlay read err=%v equal=%v", err, bytes.Equal(snapshotData, want))
+	}
+	if current, _, _, _ := backend.dataStore.usage(); current != imageDataPageSize {
+		t.Fatalf("snapshot duplicated backing pages: %d", current)
+	}
+	want[imageDataPageSize+17] = 0xfd
+	if _, errno := backend.Write(nodeID, fh, imageDataPageSize+17, []byte{0xfd}, 0); errno != 0 {
+		t.Fatalf("write after snapshot: errno %d", errno)
+	}
+	if current, _, _, _ := backend.dataStore.usage(); current != 2*imageDataPageSize {
+		t.Fatalf("post-snapshot COW backing = %d, want two versions of one page", current)
+	}
+	snapshotData, err = entry.File.ReadAt(0, uint32(len(want)))
+	if err != nil || snapshotData[imageDataPageSize+17] != 0xfe {
+		t.Fatalf("snapshot changed after live write: byte=%#x err=%v", snapshotData[imageDataPageSize+17], err)
+	}
+	snapshotFile := entry.File.(*snapshotFile)
+	runtime.SetFinalizer(snapshotFile, nil)
+	snapshotFile.releaseStore()
+	if current, _, _, _ := backend.dataStore.usage(); current != imageDataPageSize {
+		t.Fatalf("released snapshot retained old COW page: %d", current)
 	}
 }
 
@@ -440,5 +506,39 @@ func TestImageFSBoundsAggregateExtendedAttributeMemory(t *testing.T) {
 	}
 	if errno := backend.SetXattr(nodeID, "user.replacement", value, 0); errno != 0 {
 		t.Fatalf("released xattr budget was not reusable: errno %d", errno)
+	}
+}
+
+func TestSparseImageAllocatedBytesUsesCompactExtents(t *testing.T) {
+	const pages = uint64(1 << 28)
+	data := sparseImageData{extents: []imageDataExtent{{page: 0, count: pages}}}
+	if got, want := data.allocatedBytes(pages*imageDataPageSize-17), pages*imageDataPageSize-17; got != want {
+		t.Fatalf("allocated bytes = %d, want %d", got, want)
+	}
+	data.extents = []imageDataExtent{{page: 7, count: 3}}
+	if got, want := data.allocatedBytes(9*imageDataPageSize+23), 2*imageDataPageSize+23; got != want {
+		t.Fatalf("partial allocated bytes = %d, want %d", got, want)
+	}
+}
+
+func TestImageFSMetadataHighWaterSurvivesUnpolledChurnAndCompacts(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	before, _ := backend.BackingMetadataUsage()
+	for i := 0; i < 128; i++ {
+		name := fmt.Sprintf("entry-%03d", i)
+		nodeID, fh := createImageFile(t, backend, name, "")
+		backend.Release(nodeID, fh)
+	}
+	for i := 0; i < 128; i++ {
+		if errno := backend.Unlink(1, fmt.Sprintf("entry-%03d", i)); errno != 0 {
+			t.Fatalf("unlink %d: errno %d", i, errno)
+		}
+	}
+	after, highWater := backend.BackingMetadataUsage()
+	if highWater <= after || highWater <= before {
+		t.Fatalf("metadata churn current=%d high-water=%d before=%d", after, highWater, before)
+	}
+	if after > before+16<<10 {
+		t.Fatalf("metadata maps did not compact after churn: before=%d after=%d", before, after)
 	}
 }

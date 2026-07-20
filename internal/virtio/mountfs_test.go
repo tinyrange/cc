@@ -15,6 +15,7 @@ import (
 type mountedLifecycleBackend struct {
 	FSBackend
 	current, highWater, physical uint64
+	metadata, metadataHighWater  uint64
 	usageErr                     error
 	closes                       int
 	closeErr                     error
@@ -22,6 +23,10 @@ type mountedLifecycleBackend struct {
 
 func (b *mountedLifecycleBackend) BackingUsage() (uint64, uint64, uint64, error) {
 	return b.current, b.highWater, b.physical, b.usageErr
+}
+
+func (b *mountedLifecycleBackend) BackingMetadataUsage() (uint64, uint64) {
+	return b.metadata, b.metadataHighWater
 }
 
 func (b *mountedLifecycleBackend) Close() error {
@@ -32,8 +37,8 @@ func (b *mountedLifecycleBackend) Close() error {
 func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 	rootErr := errors.New("root reclaim degraded")
 	closeErr := errors.New("share close failed")
-	root := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 10, highWater: 20, usageErr: rootErr}
-	share := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 30, highWater: 40, closeErr: closeErr}
+	root := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 10, highWater: 20, metadata: 3, metadataHighWater: 8, usageErr: rootErr}
+	share := &mountedLifecycleBackend{FSBackend: imageBackend(t, nil), current: 30, highWater: 40, metadata: 5, metadataHighWater: 9, closeErr: closeErr}
 	fsys := NewMountedFS(root, []ShareMount{
 		{GuestPath: "/one", Backend: share},
 		{GuestPath: "/two", Backend: share},
@@ -42,6 +47,9 @@ func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 	current, highWater, _, err := fsys.BackingUsage()
 	if current != 40 || highWater != 60 || !errors.Is(err, rootErr) {
 		t.Fatalf("backing usage = %d, %d, %v", current, highWater, err)
+	}
+	if current, highWater := fsys.BackingMetadataUsage(); current != 8 || highWater != 17 {
+		t.Fatalf("metadata usage = %d, %d", current, highWater)
 	}
 	if err := fsys.Close(); !errors.Is(err, closeErr) {
 		t.Fatalf("close error = %v", err)
@@ -103,6 +111,23 @@ func TestMountedFSAddShareSnapshotsAndConflicts(t *testing.T) {
 
 	if _, err := fsys.RootSnapshotAt("/missing"); err == nil {
 		t.Fatalf("missing mount snapshot error = %v", err)
+	}
+}
+
+func TestMountedFSRejectsConflictingShareBatchWithoutMutation(t *testing.T) {
+	root := imageBackend(t, nil)
+	one := imageBackend(t, map[string]string{"/one": "one"})
+	two := imageBackend(t, map[string]string{"/two": "two"})
+	fsys := NewMountedFS(root, nil).(*mountedFS)
+	err := fsys.AddShares([]ShareMount{
+		{GuestPath: "/data", Backend: one},
+		{GuestPath: "/data", Backend: two},
+	})
+	if err == nil {
+		t.Fatal("conflicting share batch succeeded")
+	}
+	if len(fsys.mounts) != 0 {
+		t.Fatalf("failed share batch left mounts: %+v", fsys.mounts)
 	}
 }
 

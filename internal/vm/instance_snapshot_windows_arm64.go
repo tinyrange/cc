@@ -14,10 +14,17 @@ func (i *windowsInstance) Flush(ctx context.Context) error {
 }
 
 func (i *windowsInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *windowsInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
-	return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, "")
+	if !i.ManagedCapabilities().RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, "")
+	}
+	return mounts.RootSnapshotContext(ctx, i.rootFS, "")
 }
 
 func (i *windowsInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
