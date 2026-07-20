@@ -565,7 +565,7 @@ type linuxInstance struct {
 	rootFS virtio.ShareMounter
 	fsdevs []*virtio.FS
 	dmesg  bool
-	mounts mounts.State
+	mounts *mounts.State
 }
 
 func linuxARM64Capabilities() guestCapabilities {

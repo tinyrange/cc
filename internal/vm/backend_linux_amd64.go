@@ -655,7 +655,7 @@ type linuxInstance struct {
 	fsdevs         []*virtio.FS
 	network        *linuxNetworkRuntime
 	dmesg          bool
-	mounts         mounts.State
+	mounts         *mounts.State
 }
 
 func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {

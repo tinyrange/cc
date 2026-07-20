@@ -36,16 +36,16 @@ type State struct {
 	imageMounts map[string]string
 }
 
-func NewState(shares []client.ShareMount) (State, error) {
+func NewState(shares []client.ShareMount) (*State, error) {
 	tracked := make(map[string]client.ShareMount, len(shares))
 	for _, share := range shares {
 		canonical, err := CanonicalRuntimeShare(share)
 		if err != nil {
-			return State{}, err
+			return nil, err
 		}
 		tracked[canonical.Mount] = canonical
 	}
-	return State{shares: tracked}, nil
+	return &State{shares: tracked}, nil
 }
 
 func (s *State) AddShare(rootFS virtio.ShareMounter, share client.ShareMount, unsupportedFeature string, build func(client.ShareMount) (virtio.ShareMount, error)) error {

@@ -587,7 +587,7 @@ type windowsInstance struct {
 	fsdevs  []*virtio.FS
 	dmesg   bool
 	network *windowsNetworkRuntime
-	mounts  mounts.State
+	mounts  *mounts.State
 }
 
 func (i *windowsInstance) ManagedCapabilities() guestCapabilities {

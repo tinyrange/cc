@@ -99,6 +99,10 @@ func (h *sidecarVMHost) Start(ctx context.Context, req client.CreateInstanceRequ
 }
 
 func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := h.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -117,7 +121,7 @@ func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstan
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), nil
 }
 
 func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
@@ -125,6 +129,10 @@ func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstance
 }
 
 func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := h.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -143,7 +151,7 @@ func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartIn
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), nil
 }
 
 func (h *sidecarVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -524,13 +532,13 @@ type sidecarInstance struct {
 	rootFS       sidecarRootFS
 	imageName    string
 	resolver     *sidecarCommandResolver
-	mounts       mounts.State
+	mounts       *mounts.State
 	networkIPv4  string
 	network      *networkRuntime
 	hasImageRoot bool
 }
 
-func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string, resources sidecarStartResources) *sidecarInstance {
+func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string, mountState *mounts.State, resources sidecarStartResources) *sidecarInstance {
 	inst := &sidecarInstance{
 		id:           id,
 		sidecar:      sidecar,
@@ -539,6 +547,7 @@ func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string,
 		resolver:     resources.resolver,
 		networkIPv4:  resources.networkIPv4,
 		network:      resources.network,
+		mounts:       mountState,
 		hasImageRoot: resources.resolver != nil,
 	}
 	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources)
