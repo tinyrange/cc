@@ -26,6 +26,47 @@ type retryLookupDirectory struct {
 	failures int
 }
 
+type legacyBlockingSnapshotDirectory struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *legacyBlockingSnapshotDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
+func (d *legacyBlockingSnapshotDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
+func (d *legacyBlockingSnapshotDirectory) Owner() (uint32, uint32) { return 0, 0 }
+func (d *legacyBlockingSnapshotDirectory) RDev() uint32            { return 0 }
+func (d *legacyBlockingSnapshotDirectory) ReadDir() ([]imagefs.DirEnt, error) {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return nil, nil
+}
+func (d *legacyBlockingSnapshotDirectory) Lookup(string) (imagefs.Entry, error) {
+	return imagefs.Entry{}, os.ErrNotExist
+}
+
+type nonComparableDirectory struct {
+	state []string
+	err   error
+}
+
+func (d nonComparableDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
+func (d nonComparableDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
+func (d nonComparableDirectory) Owner() (uint32, uint32) { return 0, 0 }
+func (d nonComparableDirectory) RDev() uint32            { return 0 }
+func (d nonComparableDirectory) ReadDir() ([]imagefs.DirEnt, error) {
+	if d.err != nil {
+		return nil, d.err
+	}
+	return []imagefs.DirEnt{{Name: "entry", Mode: 0o644}}, nil
+}
+func (d nonComparableDirectory) Lookup(string) (imagefs.Entry, error) {
+	if d.err != nil {
+		return imagefs.Entry{}, d.err
+	}
+	return imagefs.Entry{File: &snapshotFile{mode: 0o644, modTime: time.Unix(0, 0)}}, nil
+}
+
 func (d *retryLookupDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
 func (d *retryLookupDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
 func (d *retryLookupDirectory) Owner() (uint32, uint32) { return 0, 0 }
@@ -151,6 +192,86 @@ func TestImageFSSnapshotCancellationDoesNotHoldFilesystemLock(t *testing.T) {
 		t.Fatalf("filesystem mutation after canceled snapshot: errno %d", errno)
 	}
 	close(lower.release)
+}
+
+func TestImageFSSnapshotCancellationDoesNotCancelSharedMaterialization(t *testing.T) {
+	lower := &blockingSnapshotDirectory{started: make(chan struct{}), release: make(chan struct{})}
+	backend := NewImageFS(lower, "").(*imageFS)
+	defer backend.Close()
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() {
+		_, err := backend.RootSnapshotContext(firstCtx)
+		first <- err
+	}()
+	<-lower.started
+	go func() {
+		_, err := backend.RootSnapshotContext(t.Context())
+		second <- err
+	}()
+	cancelFirst()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled snapshot error = %v", err)
+	}
+	select {
+	case err := <-second:
+		t.Fatalf("shared snapshot returned before lower operation completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(lower.release)
+	if err := <-second; err != nil {
+		t.Fatalf("live snapshot failed after another waiter canceled: %v", err)
+	}
+}
+
+func TestImageFSCloseQuarantinesBlockingLegacyMaterialization(t *testing.T) {
+	lower := &legacyBlockingSnapshotDirectory{started: make(chan struct{}), release: make(chan struct{})}
+	backend := NewImageFS(lower, "").(*imageFS)
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, err := backend.RootSnapshotContext(context.Background())
+		snapshotDone <- err
+	}()
+	<-lower.started
+	if err := backend.closeWithin(20 * time.Millisecond); err == nil {
+		t.Fatal("close silently returned while a lower filesystem operation remained live")
+	}
+	backend.dataStore.mu.Lock()
+	closed := backend.dataStore.closed
+	backend.dataStore.mu.Unlock()
+	if closed {
+		t.Fatal("backing store closed while the owned lower operation was still live")
+	}
+	close(lower.release)
+	if err := <-snapshotDone; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot after close = %v", err)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("close after lower operation exited: %v", err)
+	}
+}
+
+func TestImageFSHandlesNonComparableLowerDirectoryAndPreservesErrors(t *testing.T) {
+	backend := NewImageFS(nonComparableDirectory{state: []string{"valid"}}, "").(*imageFS)
+	if _, _, errno := backend.Lookup(1, "entry"); errno != 0 {
+		t.Fatalf("lookup through non-comparable directory: errno %d", errno)
+	}
+	if _, err := backend.RootSnapshotContext(t.Context()); err != nil {
+		t.Fatalf("snapshot through non-comparable directory: %v", err)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	denied := NewImageFS(nonComparableDirectory{state: []string{"valid"}, err: fs.ErrPermission}, "").(*imageFS)
+	defer denied.Close()
+	if _, _, errno := denied.Lookup(1, "entry"); errno != -linuxEPERM {
+		t.Fatalf("permission lookup errno = %d, want %d", errno, -linuxEPERM)
+	}
+	if _, errno := denied.OpenDir(1, 0); errno != -linuxEPERM {
+		t.Fatalf("permission readdir errno = %d, want %d", errno, -linuxEPERM)
+	}
 }
 
 func TestImageFSSnapshotRetriesTransientLowerLookupFailure(t *testing.T) {

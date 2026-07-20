@@ -573,6 +573,13 @@ func (i *windowsInstance) BackingMetadataUsage() (uint64, uint64) {
 	return virtioFSBackingMetadataUsage(i.fsdevs)
 }
 
+func (i *windowsInstance) BackingCombinedUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingCombinedUsage(i.fsdevs)
+}
+
 func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.core().Exec(ctx, req)
 }

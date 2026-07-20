@@ -1528,10 +1528,10 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		return fsReply{}, fmt.Errorf("virtio-fs short request: %d", len(req))
 	}
 	opcode := binary.LittleEndian.Uint32(req[4:8])
-	defer func() {
-		tracker := f.backingUsageTracker
-		tracker.Sample()
-	}()
+	tracker := f.backingUsageTracker
+	if fuseMayChangeBacking(opcode) {
+		defer tracker.TrackMutation()()
+	}
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
 	callerUID := binary.LittleEndian.Uint32(req[24:28])
@@ -2195,6 +2195,18 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		return reply(-linuxENOSYS, nil), nil
 	default:
 		return reply(-linuxENOSYS, nil), nil
+	}
+}
+
+func fuseMayChangeBacking(opcode uint32) bool {
+	switch opcode {
+	case fuseLookup, fuseForget, fuseSetAttr, fuseSymlink, fuseMknod, fuseMkdir,
+		fuseUnlink, fuseRmDir, fuseRename, fuseRename2, fuseLink, fuseOpen,
+		fuseWrite, fuseRelease, fuseSetXattr, fuseRemoveXattr, fuseOpenDir,
+		fuseReleaseDir, fuseCreate, fuseTmpfile, fuseDestroy:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -3166,10 +3178,14 @@ type imageFS struct {
 	retainedDirHandles    int
 	retainedEntries       int
 	retainedWhiteouts     int
+	dynamicMetadata       uint64
 	materializations      map[uint64]*imageDirMaterialization
 	materializationCtx    context.Context
 	materializationCancel context.CancelFunc
 	materializationWG     sync.WaitGroup
+	closeStart            sync.Once
+	closeDone             chan struct{}
+	closeErr              error
 	closed                bool
 }
 
@@ -3197,6 +3213,7 @@ type imageNode struct {
 	whiteouts         map[string]bool
 	retainedEntries   int
 	retainedWhiteouts int
+	accountedMetadata uint64
 	entriesDone       bool
 	atime             time.Time
 	modTime           time.Time
@@ -3505,6 +3522,7 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		modTime:     rootModTime,
 		abstractDir: root,
 	}
+	imgFS.refreshImageNodeMetadataLocked(imgFS.nodes[1])
 	return imgFS
 }
 
@@ -4434,13 +4452,15 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		lowerDir := parentNode.abstractDir
+		lowerParent := parentNode
 		p.mu.Unlock()
 		entry, err := lowerDir.Lookup(name)
 		if err != nil {
+			errno := errnoFromError(err)
 			p.mu.Lock()
-			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.debugChildfLocked("lookup-lower-error", parent, name, "errno=%d", errno)
 			p.mu.Unlock()
-			return 0, FuseAttr{}, -linuxENOENT
+			return 0, FuseAttr{}, errno
 		}
 		p.mu.Lock()
 		parentNode = p.nodes[parent]
@@ -4465,7 +4485,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			p.mu.Unlock()
 			return child.id, attr, 0
 		}
-		if parentNode.abstractDir != lowerDir {
+		if parentNode != lowerParent {
 			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
 			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
@@ -4524,6 +4544,7 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 			now := time.Now()
 			node.modTime = now
 			node.ctime = now
+			p.refreshImageNodeMetadataLocked(node)
 		}
 	}
 	fh := p.nextHandle
@@ -4850,7 +4871,7 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
-	p.noteImageNodeAddedLocked()
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parentNode)
@@ -4907,7 +4928,7 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
-	p.noteImageNodeAddedLocked()
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parentNode)
@@ -4949,7 +4970,7 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
-	p.noteImageNodeAddedLocked()
+	p.noteImageNodeAddedLocked(node)
 	parentNode.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
@@ -5091,6 +5112,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 				now := time.Now()
 				node.modTime = now
 				node.ctime = now
+				p.refreshImageNodeMetadataLocked(node)
 			}
 		}
 		fh := p.nextHandle
@@ -5117,7 +5139,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
-	p.noteImageNodeAddedLocked()
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parentNode)
@@ -5152,6 +5174,7 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 		return 0, errno
 	}
 	written, err := node.data.writeAt(p.dataStore, data, off)
+	p.refreshImageNodeMetadataLocked(node)
 	if err != nil {
 		if written > 0 && off+uint64(written) > node.size {
 			node.size = off + uint64(written)
@@ -5210,6 +5233,7 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 			node.lowerSize = size
 		}
 		node.size = size
+		p.refreshImageNodeMetadataLocked(node)
 		if callerUID != 0 {
 			node.mode &^= fs.FileMode(0o6000)
 		}
@@ -5339,6 +5363,8 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		newParentNode.entries[newName] = childID
 		child.parent, child.name = newParent, newName
 		other.parent, other.name = parent, name
+		p.refreshImageNodeMetadataLocked(child)
+		p.refreshImageNodeMetadataLocked(other)
 		now := time.Now()
 		child.ctime, other.ctime = now, now
 		parentNode.modTime, parentNode.ctime = now, now
@@ -5378,6 +5404,7 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	p.noteImageEntryAddedLocked(newParentNode)
 	child.parent = newParent
 	child.name = newName
+	p.refreshImageNodeMetadataLocked(child)
 	now := time.Now()
 	child.ctime = now
 	parentNode.modTime, parentNode.ctime = now, now
@@ -5469,6 +5496,7 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	}
 	node.xattrs[name] = append([]byte(nil), value...)
 	p.xattrBytes = uint64(int64(p.xattrBytes) - int64(oldBytes) + int64(newBytes))
+	p.refreshImageNodeMetadataLocked(node)
 	node.ctime = time.Now()
 	return 0
 }
@@ -5485,6 +5513,7 @@ func (p *imageFS) RemoveXattr(nodeID uint64, name string) int32 {
 	}
 	p.xattrBytes -= uint64(len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead)
 	delete(node.xattrs, name)
+	p.refreshImageNodeMetadataLocked(node)
 	node.ctime = time.Now()
 	return 0
 }
@@ -5660,6 +5689,7 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 			p.retainedEntries -= node.retainedEntries
 			p.retainedWhiteouts -= node.retainedWhiteouts
 			node.data.release(p.dataStore)
+			p.dynamicMetadata -= node.accountedMetadata
 		}
 		delete(p.nodes, nodeID)
 		p.compactImageNodesLocked()
@@ -5667,20 +5697,43 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 }
 
 func (p *imageFS) Close() error {
+	return p.closeWithin(2 * time.Second)
+}
+
+func (p *imageFS) closeWithin(timeout time.Duration) error {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	if !p.closed {
+	p.closeStart.Do(func() {
+		p.mu.Lock()
 		p.closed = true
 		p.materializationCancel()
 		for _, materialization := range p.materializations {
 			materialization.cancel()
 		}
-	}
+		p.closeDone = make(chan struct{})
+		done := p.closeDone
+		p.mu.Unlock()
+		// Legacy lower filesystems cannot always interrupt an in-flight host I/O
+		// operation. Keep ownership of both the worker and backing store until it
+		// actually returns, but do not make VM teardown wait without a bound.
+		go func() {
+			p.materializationWG.Wait()
+			p.closeErr = p.dataStore.close()
+			close(done)
+		}()
+	})
+	p.mu.Lock()
+	done := p.closeDone
 	p.mu.Unlock()
-	p.materializationWG.Wait()
-	return p.dataStore.close()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return p.closeErr
+	case <-timer.C:
+		return fmt.Errorf("close image filesystem: lower filesystem operation did not stop within %s; backing storage remains quarantined until it exits", timeout)
+	}
 }
 
 func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
@@ -5711,12 +5764,7 @@ func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
 	metadata := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles)*64 + uint64(p.retainedDirHandles)*64 + p.xattrBytes
 	metadata += uint64(p.retainedEntries+p.retainedWhiteouts) * 64
 	metadata += uint64(len(p.materializations)) * 128
-	for _, node := range p.nodes {
-		metadata += uint64(len(node.name)+len(node.symlinkTarget)) + uint64(cap(node.data.extents))*32
-		for _, value := range node.xattrs {
-			metadata += uint64(cap(value) - len(value))
-		}
-	}
+	metadata += p.dynamicMetadata
 	metadata += p.dataStore.metadataUsage()
 	if metadata > p.metadataHighWater {
 		p.metadataHighWater = metadata
@@ -5724,9 +5772,26 @@ func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
 	return metadata, p.metadataHighWater
 }
 
-func (p *imageFS) noteImageNodeAddedLocked() {
+func (p *imageFS) noteImageNodeAddedLocked(node *imageNode) {
 	p.retainedNodes = max(p.retainedNodes, len(p.nodes))
+	p.refreshImageNodeMetadataLocked(node)
 	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) refreshImageNodeMetadataLocked(node *imageNode) {
+	if node == nil {
+		return
+	}
+	current := uint64(len(node.name)+len(node.symlinkTarget)) + uint64(cap(node.data.extents))*32
+	for _, value := range node.xattrs {
+		current += uint64(cap(value) - len(value))
+	}
+	if current >= node.accountedMetadata {
+		p.dynamicMetadata += current - node.accountedMetadata
+	} else {
+		p.dynamicMetadata -= node.accountedMetadata - current
+	}
+	node.accountedMetadata = current
 }
 
 func (p *imageFS) noteImageHandleAddedLocked() {
@@ -5909,7 +5974,7 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 		node.modTime = time.Unix(0, 0)
 	}
 	p.nodes[node.id] = node
-	p.noteImageNodeAddedLocked()
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parent.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parent)
@@ -5922,7 +5987,7 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 	}
 	ents, err := node.abstractDir.ReadDir()
 	if err != nil {
-		return nil, -linuxENOENT
+		return nil, errnoFromError(err)
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	for _, ent := range ents {
@@ -5959,6 +6024,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 		return -linuxENOTDIR
 	}
 	lowerDir := node.abstractDir
+	lowerNode := node
 	if lowerDir == nil || node.entriesDone {
 		p.mu.Unlock()
 		return 0
@@ -5967,7 +6033,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 
 	ents, err := lowerDir.ReadDir()
 	if err != nil {
-		return -linuxENOENT
+		return errnoFromError(err)
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	type lowerEntry struct {
@@ -5981,7 +6047,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 		}
 		entry, err := lowerDir.Lookup(ent.Name)
 		if err != nil {
-			return -linuxEIO
+			return errnoFromError(err)
 		}
 		lowerEntries = append(lowerEntries, lowerEntry{name: ent.Name, entry: entry})
 	}
@@ -5992,7 +6058,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 	if node == nil {
 		return -linuxENOENT
 	}
-	if node.abstractDir != lowerDir {
+	if node != lowerNode {
 		return 0
 	}
 	if node.entriesDone {
@@ -6021,6 +6087,7 @@ type imageLowerEntry struct {
 type imageDirMaterialization struct {
 	done   chan struct{}
 	cancel context.CancelFunc
+	node   *imageNode
 	err    error
 }
 
@@ -6078,7 +6145,7 @@ func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint6
 			p.materializations = make(map[uint64]*imageDirMaterialization)
 		}
 		materializationCtx, cancel := context.WithCancel(p.materializationCtx)
-		materialization = &imageDirMaterialization{done: make(chan struct{}), cancel: cancel}
+		materialization = &imageDirMaterialization{done: make(chan struct{}), cancel: cancel, node: node}
 		p.materializations[nodeID] = materialization
 		p.materializationWG.Add(1)
 		go p.finishDirMaterialization(materializationCtx, nodeID, lowerDir, materialization)
@@ -6086,7 +6153,6 @@ func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint6
 	p.mu.Unlock()
 	select {
 	case <-ctx.Done():
-		materialization.cancel()
 		return ctx.Err()
 	case <-materialization.done:
 		return materialization.err
@@ -6100,7 +6166,7 @@ func (p *imageFS) finishDirMaterialization(ctx context.Context, nodeID uint64, l
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
-	if err == nil && node != nil && node.abstractDir == lowerDir && !node.entriesDone {
+	if err == nil && node == materialization.node && !node.entriesDone {
 		for _, ent := range entries {
 			if node.whiteouts[ent.name] {
 				continue
@@ -6159,6 +6225,7 @@ func (p *imageFS) prepareImageOverlayWriteLocked(node *imageNode, off, length ui
 	if node == nil || node.lowerFile == nil || length == 0 {
 		return 0
 	}
+	defer p.refreshImageNodeMetadataLocked(node)
 	end := off + length
 	if end < off {
 		return -linuxEFBIG

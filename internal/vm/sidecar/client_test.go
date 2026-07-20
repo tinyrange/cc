@@ -60,10 +60,7 @@ func TestCancelDeliveryFailureQuarantinesMultiplexedConnection(t *testing.T) {
 	conn := &closeProbeConn{}
 	worker := &Client{conn: conn, codec: NewWorkerCodec(conn)}
 	worker.codec.send <- struct{}{}
-	ctx, cancel := context.WithCancel(t.Context())
-	stop := worker.watchCancellation(ctx, 42)
-	cancel()
-	err := stop()
+	err := worker.abortRequest(42, context.Canceled)
 	var terminationErr *TerminationUnconfirmedError
 	if !errors.As(err, &terminationErr) || terminationErr.RequestID != 42 {
 		t.Fatalf("cancel error = %v, want request-scoped termination uncertainty", err)
@@ -418,6 +415,61 @@ func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWorkerCallbackFailureCancelsRequest(t *testing.T) {
+	ln, endpoint := listenWorkerUnix(t)
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		codec := NewWorkerCodec(conn)
+		defer codec.Close()
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion})); err != nil {
+			serverErr <- err
+			return
+		}
+		execFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if err := codec.Send(mustWorkerFrame(execFrame.ID, WorkerFrameEvent, client.ExecEvent{Kind: "stdout", Output: "event"})); err != nil {
+			serverErr <- err
+			return
+		}
+		cancelFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if cancelFrame.Type != WorkerFrameCancel || cancelFrame.ID != execFrame.ID {
+			serverErr <- fmt.Errorf("callback abort frame = %+v", cancelFrame)
+			return
+		}
+		serverErr <- nil
+	}()
+
+	worker, err := DialWorker(t.Context(), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	callbackErr := errors.New("observer stopped")
+	err = worker.ExecStream(t.Context(), "vm", client.ExecRequest{Command: []string{"command"}}, nil, func(client.ExecEvent) error {
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("ExecStream error = %v, want callback error", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }
 

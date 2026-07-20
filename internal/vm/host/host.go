@@ -445,6 +445,20 @@ func (i *hostedInstance) BackingMetadataUsage() (uint64, uint64) {
 	return provider.BackingMetadataUsage()
 }
 
+func (i *hostedInstance) BackingCombinedUsage() (uint64, uint64) {
+	provider, ok := i.Instance.(interface{ BackingCombinedUsage() (uint64, uint64) })
+	if ok {
+		return provider.BackingCombinedUsage()
+	}
+	data, dataHigh, _, _ := i.BackingUsage()
+	metadata, metadataHigh := i.BackingMetadataUsage()
+	current := data + metadata
+	if current < data {
+		current = ^uint64(0)
+	}
+	return current, max(current, dataHigh, metadataHigh)
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil

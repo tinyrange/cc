@@ -45,6 +45,8 @@ type workerCall struct {
 	frames   chan WorkerFrame
 	done     chan error
 	inputAck chan struct{}
+	abort    sync.Once
+	aborting chan struct{}
 }
 
 type WorkerRequirements struct {
@@ -74,6 +76,7 @@ func newWorkerCall() *workerCall {
 		frames:   make(chan WorkerFrame, 256),
 		done:     make(chan error, 1),
 		inputAck: make(chan struct{}, 1),
+		aborting: make(chan struct{}),
 	}
 }
 
@@ -310,9 +313,9 @@ func (c *Client) receiveLoop() {
 		case call.frames <- frame:
 		default:
 			err := fmt.Errorf("%w for request %d", ErrWorkerCallOverflow, frame.ID)
-			if c.failCall(frame.ID, call, err) {
-				id := frame.ID
-				go func() { _ = c.sendCancel(id) }()
+			id := frame.ID
+			if call.beginAbort() {
+				go c.finishAbortLiveCall(id, call, err)
 			}
 		}
 	}
@@ -454,7 +457,7 @@ func (c *Client) Exec(ctx context.Context, id string, req client.ExecRequest) ([
 	return events, err
 }
 
-func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) (retErr error) {
+func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
@@ -480,19 +483,20 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 		return err
 	}
 
-	var stopInputs chan struct{}
+	var stopInputs context.CancelFunc
 	if inputs != nil {
-		stopInputs = make(chan struct{})
-		defer close(stopInputs)
-		go c.forwardExecInputs(requestID, call, inputs, stopInputs)
+		var inputCtx context.Context
+		inputCtx, stopInputs = context.WithCancel(ctx)
+		defer stopInputs()
+		go c.forwardExecInputs(inputCtx, requestID, call, inputs)
 	}
-
-	stopCancellationWatch := c.watchCancellation(ctx, requestID)
-	defer func() { retErr = errors.Join(retErr, stopCancellationWatch()) }()
 
 	for {
 		got, err := c.nextFrame(ctx, call)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.abortRequest(requestID, ctx.Err())
+			}
 			return err
 		}
 		switch got.Type {
@@ -501,30 +505,24 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 			if err := got.DecodePayload(&workerErr); err != nil {
 				return err
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			return fmt.Errorf("%s", workerErr.Error)
 		case WorkerFrameDone:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			return nil
 		case WorkerFrameEvent:
 			var event client.ExecEvent
 			if err := got.DecodePayload(&event); err != nil {
-				return err
+				return c.abortRequest(requestID, err)
 			}
 			if onEvent != nil {
 				if err := onEvent(event); err != nil {
-					return err
+					return c.abortRequest(requestID, err)
 				}
 			}
 		}
 	}
 }
 
-func (c *Client) call(ctx context.Context, frameType string, payload any, onFrame func(WorkerFrame) error, out any) (retErr error) {
+func (c *Client) call(ctx context.Context, frameType string, payload any, onFrame func(WorkerFrame) error, out any) error {
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
@@ -538,8 +536,6 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	}
 	defer c.unregisterCall(id)
 
-	stopCancellationWatch := c.watchCancellation(ctx, id)
-	defer func() { retErr = errors.Join(retErr, stopCancellationWatch()) }()
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {
 		return err
@@ -550,6 +546,9 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	for {
 		got, err := c.nextFrame(ctx, call)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.abortRequest(id, ctx.Err())
+			}
 			return err
 		}
 		switch got.Type {
@@ -567,7 +566,7 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 		default:
 			if onFrame != nil {
 				if err := onFrame(got); err != nil {
-					return err
+					return c.abortRequest(id, err)
 				}
 			}
 		}
@@ -579,17 +578,21 @@ func (c *Client) nextFrame(ctx context.Context, call *workerCall) (WorkerFrame, 
 		ctx = context.Background()
 	}
 	select {
+	case <-call.aborting:
+		return WorkerFrame{}, <-call.done
+	default:
+	}
+	select {
 	case err := <-call.done:
 		return WorkerFrame{}, err
 	default:
 	}
 	select {
+	case <-call.aborting:
+		return WorkerFrame{}, <-call.done
 	case <-ctx.Done():
 		return WorkerFrame{}, ctx.Err()
 	case err := <-call.done:
-		if ctx.Err() != nil {
-			return WorkerFrame{}, ctx.Err()
-		}
 		return WorkerFrame{}, err
 	case frame := <-call.frames:
 		return frame, nil
@@ -603,40 +606,52 @@ func (c *Client) nextID() uint64 {
 	return c.next
 }
 
-func (c *Client) forwardExecInputs(id uint64, call *workerCall, inputs <-chan client.ExecInput, stop <-chan struct{}) {
+func (c *Client) forwardExecInputs(ctx context.Context, id uint64, call *workerCall, inputs <-chan client.ExecInput) {
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			return
 		case input, ok := <-inputs:
 			if !ok {
 				frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Closed: true})
-				if err == nil {
-					if c.codec.Send(frame) == nil {
-						c.waitExecInputAck(call, stop)
-					}
+				if err != nil {
+					c.abortLiveCall(id, call, err)
+					return
 				}
+				if err := c.codec.SendContext(ctx, frame); err != nil {
+					if ctx.Err() == nil {
+						c.abortLiveCall(id, call, err)
+					}
+					return
+				}
+				c.waitExecInputAck(ctx, call)
 				return
 			}
 			frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Input: input})
 			if err != nil {
+				c.abortLiveCall(id, call, err)
 				return
 			}
-			if err := c.codec.Send(frame); err != nil {
+			if err := c.codec.SendContext(ctx, frame); err != nil {
+				if ctx.Err() == nil {
+					c.abortLiveCall(id, call, err)
+				}
 				return
 			}
-			if !c.waitExecInputAck(call, stop) {
+			if !c.waitExecInputAck(ctx, call) {
 				return
 			}
 		}
 	}
 }
 
-func (c *Client) waitExecInputAck(call *workerCall, stop <-chan struct{}) bool {
+func (c *Client) waitExecInputAck(ctx context.Context, call *workerCall) bool {
 	select {
 	case <-call.inputAck:
 		return true
-	case <-stop:
+	case <-ctx.Done():
+		return false
+	case <-call.done:
 		return false
 	}
 }
@@ -662,35 +677,32 @@ func (c *Client) quarantineCancellation(id uint64, cause error) error {
 	return err
 }
 
-// watchCancellation returns an explicit recovery error if the cancel frame is
-// not delivered. Once delivery is uncertain the multiplexed stream is no
-// longer reusable: the worker may still mutate its VM and a failed write may
-// have left a partial JSON frame. Quarantining the connection makes that
-// instance-level transition visible to every in-flight caller.
-func (c *Client) watchCancellation(ctx context.Context, id uint64) func() error {
-	stop := make(chan struct{})
-	type cancellationResult struct {
-		sent bool
-		err  error
+// abortRequest is the single ownership transition for every local request
+// failure. Once cancel delivery is uncertain, the worker may still be mutating
+// a VM and the multiplexed stream is no longer safe to reuse.
+func (c *Client) abortRequest(id uint64, cause error) error {
+	if err := c.sendCancel(id); err != nil {
+		return errors.Join(cause, c.quarantineCancellation(id, err))
 	}
-	result := make(chan cancellationResult, 1)
-	go func() {
-		select {
-		case <-ctx.Done():
-			result <- cancellationResult{sent: true, err: c.sendCancel(id)}
-		case <-stop:
-			result <- cancellationResult{}
-		}
-	}()
-	return func() error {
-		close(stop)
-		result := <-result
-		if ctx.Err() != nil && !result.sent {
-			result.err = c.sendCancel(id)
-		}
-		if result.err != nil {
-			return c.quarantineCancellation(id, result.err)
-		}
-		return nil
+	return cause
+}
+
+func (c *Client) abortLiveCall(id uint64, call *workerCall, cause error) {
+	if call.beginAbort() {
+		c.finishAbortLiveCall(id, call, cause)
 	}
+}
+
+func (c *workerCall) beginAbort() bool {
+	started := false
+	c.abort.Do(func() {
+		close(c.aborting)
+		started = true
+	})
+	return started
+}
+
+func (c *Client) finishAbortLiveCall(id uint64, call *workerCall, cause error) {
+	err := c.abortRequest(id, cause)
+	c.failCall(id, call, err)
 }

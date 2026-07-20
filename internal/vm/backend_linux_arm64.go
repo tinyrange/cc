@@ -595,6 +595,13 @@ func (i *linuxInstance) BackingMetadataUsage() (uint64, uint64) {
 	return virtioFSBackingMetadataUsage(i.fsdevs)
 }
 
+func (i *linuxInstance) BackingCombinedUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingCombinedUsage(i.fsdevs)
+}
+
 func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil {
 		return client.ExecRequest{}, fmt.Errorf("instance is not running")

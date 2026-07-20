@@ -1,6 +1,7 @@
 package imagefs
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -188,9 +189,13 @@ func (d *overlayDir) RDev() uint32 {
 }
 
 func (d *overlayDir) ReadDir() ([]DirEnt, error) {
+	return d.ReadDirContext(context.Background())
+}
+
+func (d *overlayDir) ReadDirContext(ctx context.Context) ([]DirEnt, error) {
 	merged := map[string]fs.FileMode{}
 	if d.base != nil {
-		baseEntries, err := d.base.ReadDir()
+		baseEntries, err := ReadDirContext(ctx, d.base)
 		if err != nil {
 			return nil, err
 		}
@@ -218,13 +223,17 @@ func (d *overlayDir) ReadDir() ([]DirEnt, error) {
 }
 
 func (d *overlayDir) Lookup(name string) (Entry, error) {
+	return d.LookupContext(context.Background(), name)
+}
+
+func (d *overlayDir) LookupContext(ctx context.Context, name string) (Entry, error) {
 	if entry, ok := d.overrides[name]; ok {
 		return entry, nil
 	}
 	if d.base == nil {
 		return Entry{}, os.ErrNotExist
 	}
-	return d.base.Lookup(name)
+	return LookupContext(ctx, d.base, name)
 }
 
 type overlayFile struct {

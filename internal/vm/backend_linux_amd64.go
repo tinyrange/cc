@@ -679,6 +679,13 @@ func (i *linuxInstance) BackingMetadataUsage() (uint64, uint64) {
 	return virtioFSBackingMetadataUsage(i.fsdevs)
 }
 
+func (i *linuxInstance) BackingCombinedUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingCombinedUsage(i.fsdevs)
+}
+
 func (i *linuxInstance) SetBalloonMB(target uint64) error {
 	if i == nil || i.session == nil {
 		return fmt.Errorf("running instance has no managed session")

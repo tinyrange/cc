@@ -58,14 +58,56 @@ func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uin
 }
 
 func virtioFSBackingMetadataUsage(fsdevs []*virtio.FS) (current, highWater uint64) {
+	var tracker *virtio.FSBackingUsageTracker
+	sharedTracker := true
+	devices := 0
 	for _, fsdev := range fsdevs {
 		if fsdev == nil {
 			continue
+		}
+		devices++
+		deviceTracker := fsdev.BackingUsageTracker()
+		if deviceTracker == nil {
+			sharedTracker = false
+		} else if tracker == nil {
+			tracker = deviceTracker
+		} else if deviceTracker != tracker {
+			sharedTracker = false
 		}
 		deviceCurrent, deviceHighWater := fsdev.BackingMetadataUsage()
 		current += deviceCurrent
 		highWater = max(highWater, deviceHighWater)
 	}
+	if devices != 0 && tracker != nil && sharedTracker {
+		return tracker.MetadataUsage()
+	}
 	highWater = max(highWater, current)
 	return current, highWater
+}
+
+func virtioFSBackingCombinedUsage(fsdevs []*virtio.FS) (current, highWater uint64) {
+	var tracker *virtio.FSBackingUsageTracker
+	sharedTracker := true
+	devices := 0
+	for _, fsdev := range fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		devices++
+		deviceTracker := fsdev.BackingUsageTracker()
+		if deviceTracker == nil {
+			sharedTracker = false
+		} else if tracker == nil {
+			tracker = deviceTracker
+		} else if deviceTracker != tracker {
+			sharedTracker = false
+		}
+	}
+	if devices != 0 && tracker != nil && sharedTracker {
+		return tracker.CombinedUsage()
+	}
+	data, dataHigh, _, _ := virtioFSBackingUsage(fsdevs)
+	metadata, metadataHigh := virtioFSBackingMetadataUsage(fsdevs)
+	current = saturatingUint64Add(data, metadata)
+	return current, max(current, dataHigh, metadataHigh)
 }

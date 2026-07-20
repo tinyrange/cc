@@ -298,6 +298,8 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		highWater:         9 << 20,
 		metadata:          2 << 20,
 		metadataHighWater: 7 << 20,
+		combined:          5 << 20,
+		combinedHighWater: 11 << 20,
 		physical:          5 << 20,
 		reclaimErr:        errors.New("backing filesystem refused reclamation"),
 	}
@@ -308,7 +310,7 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := manager.StatusOf("backing")
-	if state.MemoryMB != 512 || state.BackingBytes != 5<<20 || state.BackingHighWaterBytes != 9<<20 || state.BackingDataBytes != 3<<20 || state.BackingDataHighWaterBytes != 9<<20 || state.BackingMetadataBytes != 2<<20 || state.BackingMetadataHighWaterBytes != 7<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
+	if state.MemoryMB != 512 || state.BackingBytes != 5<<20 || state.BackingHighWaterBytes != 11<<20 || state.BackingDataBytes != 3<<20 || state.BackingDataHighWaterBytes != 9<<20 || state.BackingMetadataBytes != 2<<20 || state.BackingMetadataHighWaterBytes != 7<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
 		t.Fatalf("reported state = %+v", state)
 	}
 }
@@ -1436,6 +1438,7 @@ type backingUsageTestInstance struct {
 	*fakeInstance
 	current, highWater, physical uint64
 	metadata, metadataHighWater  uint64
+	combined, combinedHighWater  uint64
 	reclaimErr                   error
 }
 
@@ -1507,6 +1510,10 @@ func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, uint64, error
 
 func (i *backingUsageTestInstance) BackingMetadataUsage() (uint64, uint64) {
 	return i.metadata, i.metadataHighWater
+}
+
+func (i *backingUsageTestInstance) BackingCombinedUsage() (uint64, uint64) {
+	return i.combined, i.combinedHighWater
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

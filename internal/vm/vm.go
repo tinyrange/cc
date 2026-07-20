@@ -89,6 +89,10 @@ type instanceBackingMetadataUsageProvider interface {
 	BackingMetadataUsage() (uint64, uint64)
 }
 
+type instanceBackingCombinedUsageProvider interface {
+	BackingCombinedUsage() (uint64, uint64)
+}
+
 type Manager struct {
 	mu            sync.Mutex
 	host          VMHost
@@ -1066,6 +1070,7 @@ type managerStatusSnapshot struct {
 	provider                networkIPv4Provider
 	backingProvider         instanceBackingUsageProvider
 	backingMetadataProvider instanceBackingMetadataUsageProvider
+	backingCombinedProvider instanceBackingCombinedUsageProvider
 	balloonProvider         instanceBalloonStateProvider
 }
 
@@ -1112,6 +1117,9 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	if provider, ok := machine.instance.(instanceBackingMetadataUsageProvider); ok {
 		snapshot.backingMetadataProvider = provider
 	}
+	if provider, ok := machine.instance.(instanceBackingCombinedUsageProvider); ok {
+		snapshot.backingCombinedProvider = provider
+	}
 	if provider, ok := machine.instance.(instanceBalloonStateProvider); ok {
 		snapshot.balloonProvider = provider
 	} else {
@@ -1122,7 +1130,7 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.balloonProvider == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.balloonProvider == nil {
 		return snapshot.state
 	}
 	if snapshot.provider != nil {
@@ -1158,6 +1166,14 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 		if observedHighWater > snapshot.machine.backingHighWater {
 			snapshot.machine.backingHighWater = observedHighWater
 		}
+		snapshot.state.BackingHighWaterBytes = snapshot.machine.backingHighWater
+		snapshot.machine.backingMu.Unlock()
+	}
+	if snapshot.backingCombinedProvider != nil {
+		current, highWater := snapshot.backingCombinedProvider.BackingCombinedUsage()
+		snapshot.state.BackingBytes = current
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingHighWater = max(snapshot.machine.backingHighWater, current, highWater)
 		snapshot.state.BackingHighWaterBytes = snapshot.machine.backingHighWater
 		snapshot.machine.backingMu.Unlock()
 	}
