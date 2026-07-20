@@ -2,15 +2,37 @@ package virtio
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"j5.nz/cc/internal/imagefs"
 )
+
+type blockingSnapshotDirectory struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingSnapshotDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
+func (d *blockingSnapshotDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
+func (d *blockingSnapshotDirectory) Owner() (uint32, uint32) { return 0, 0 }
+func (d *blockingSnapshotDirectory) RDev() uint32            { return 0 }
+func (d *blockingSnapshotDirectory) ReadDir() ([]imagefs.DirEnt, error) {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return nil, nil
+}
+func (d *blockingSnapshotDirectory) Lookup(string) (imagefs.Entry, error) {
+	return imagefs.Entry{}, os.ErrNotExist
+}
 
 type copyUpProbeFile struct {
 	calls [][2]uint64
@@ -59,6 +81,39 @@ func readImageHandle(t *testing.T, backend *imageFS, nodeID, fh uint64) string {
 		t.Fatalf("read node %d handle %d: errno %d", nodeID, fh, errno)
 	}
 	return string(data)
+}
+
+func TestImageFSSnapshotCancellationDoesNotHoldFilesystemLock(t *testing.T) {
+	lower := &blockingSnapshotDirectory{started: make(chan struct{}), release: make(chan struct{})}
+	backend, ok := NewImageFS(lower, "").(*imageFS)
+	if !ok {
+		t.Fatal("NewImageFS did not return an image filesystem")
+	}
+	defer backend.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := backend.RootSnapshotContext(ctx)
+		done <- err
+	}()
+	select {
+	case <-lower.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not begin lower directory materialization")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("snapshot error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("snapshot cancellation waited for lower directory materialization")
+	}
+	if _, _, errno := backend.Mkdir(1, "after-cancel", 0o755, 0, 0); errno != 0 {
+		t.Fatalf("filesystem mutation after canceled snapshot: errno %d", errno)
+	}
+	close(lower.release)
 }
 
 func TestImageFSOpenHandleSurvivesUnlinkAndReplacement(t *testing.T) {

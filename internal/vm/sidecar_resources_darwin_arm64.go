@@ -70,13 +70,26 @@ func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req cl
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
+	bootOwned := true
+	defer func() {
+		if bootOwned {
+			bootResources.closeAll()
+		}
+	}()
 	root := virtio.NewImageFS(image.RootFS, image.RootFSDir)
 	shares, err := sidecarShareMounts(req.Shares)
 	if err != nil {
+		if closer, ok := root.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
+	mounted := virtio.NewMountedFS(root, shares)
+	rootFS, err := sidecarSnapshotRoot(mounted)
 	if err != nil {
+		if closer, ok := mounted.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
@@ -87,9 +100,9 @@ func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req cl
 	netResources, err := prepareSidecarNetResources(h.cacheDir, req.ID, req.Network)
 	if err != nil {
 		fsResources.closeAll()
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
+	bootOwned = false
 	return combineSidecarResources(fsResources, bootResources, netResources), nil
 }
 
@@ -118,10 +131,17 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	}
 	shares, err := sidecarShareMounts(req.Shares)
 	if err != nil {
+		if closer, ok := root.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
+	mounted := virtio.NewMountedFS(root, shares)
+	rootFS, err := sidecarSnapshotRoot(mounted)
 	if err != nil {
+		if closer, ok := mounted.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
@@ -294,11 +314,19 @@ func serveSidecarFS(cacheDir string, backend sidecarRootFS) (sidecarStartResourc
 		return virtio.ServeFSBackend(conn, backend)
 	})
 	if err != nil {
+		if closer, ok := backend.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	return sidecarStartResources{
-		env:    []string{sidecarFSSocketEnv + "=" + socketPath},
-		close:  closeFn,
+		env: []string{sidecarFSSocketEnv + "=" + socketPath},
+		close: func() {
+			closeFn()
+			if closer, ok := backend.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		},
 		remote: true,
 		rootFS: backend,
 	}, nil
@@ -685,6 +713,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 	for i, share := range mounts.ConvertShareMounts(shares) {
 		mount, err := arm64ShareMount(share)
 		if err != nil {
+			_ = vmruntime.CloseShareMounts(out)
 			return nil, fmt.Errorf("share %d: %w", i, err)
 		}
 		out = append(out, mount)
@@ -701,6 +730,11 @@ func sidecarRuntimeShareMount(share client.ShareMount) (virtio.ShareMount, error
 }
 
 func arm64ShareMount(share vmruntime.DirectoryShare) (virtio.ShareMount, error) {
+	canonical, err := vmruntime.CanonicalDirectoryShare(share)
+	if err != nil {
+		return virtio.ShareMount{}, err
+	}
+	share = canonical
 	_, backend, err := buildDarwinShareBackend(share)
 	if err != nil {
 		return virtio.ShareMount{}, err

@@ -1,6 +1,11 @@
 package vmruntime
 
 import (
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
@@ -26,6 +31,39 @@ type DirectoryShare struct {
 	OwnerUID uint32
 	OwnerGID uint32
 	Cache    string
+}
+
+func CanonicalDirectoryShare(share DirectoryShare) (DirectoryShare, error) {
+	mount := strings.TrimSpace(share.Mount)
+	if mount == "" {
+		return DirectoryShare{}, fmt.Errorf("share mount path is required")
+	}
+	if !strings.HasPrefix(mount, "/") {
+		return DirectoryShare{}, fmt.Errorf("share mount path %q must be absolute", mount)
+	}
+	mount = path.Clean(mount)
+	if mount == "/" {
+		return DirectoryShare{}, fmt.Errorf("share mount path / cannot replace the VM root filesystem")
+	}
+	share.Mount = mount
+	return share, nil
+}
+
+func CloseShareMounts(shares []virtio.ShareMount) error {
+	var errs []error
+	for _, share := range shares {
+		if closer, ok := share.Backend.(interface{ Close() error }); ok {
+			errs = append(errs, closer.Close())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func CloseFSBackend(backend virtio.FSBackend) error {
+	if closer, ok := backend.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // RunRequest is the backend-neutral request shape for the managed guest runtime.

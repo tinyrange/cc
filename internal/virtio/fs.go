@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -3151,6 +3152,7 @@ type imageFS struct {
 	retainedDirHandles int
 	retainedEntries    int
 	retainedWhiteouts  int
+	materializations   map[uint64]*imageDirMaterialization
 }
 
 type imageHandle struct {
@@ -5670,6 +5672,7 @@ func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
 	// that pressure visible to the same host recovery telemetry as file data.
 	metadata := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles)*64 + uint64(p.retainedDirHandles)*64 + p.xattrBytes
 	metadata += uint64(p.retainedEntries+p.retainedWhiteouts) * 64
+	metadata += uint64(len(p.materializations)) * 128
 	for _, node := range p.nodes {
 		metadata += uint64(len(node.name)+len(node.symlinkTarget)) + uint64(cap(node.data.extents))*32
 		for _, value := range node.xattrs {
@@ -5970,6 +5973,109 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 	}
 	node.entriesDone = true
 	return 0
+}
+
+type imageLowerEntry struct {
+	name  string
+	entry imagefs.Entry
+}
+
+type imageDirMaterialization struct {
+	done chan struct{}
+	err  error
+}
+
+func readImageLowerEntries(lowerDir imagefs.Directory) ([]imageLowerEntry, error) {
+	ents, err := lowerDir.ReadDir()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
+	entries := make([]imageLowerEntry, 0, len(ents))
+	for _, ent := range ents {
+		if ent.Name == "." || ent.Name == ".." {
+			continue
+		}
+		entry, err := lowerDir.Lookup(ent.Name)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, imageLowerEntry{name: ent.Name, entry: entry})
+	}
+	return entries, nil
+}
+
+// materializeDirEntriesContext keeps potentially blocking lower-filesystem I/O
+// outside imageFS.mu. Legacy imagefs implementations do not accept a context,
+// so one background read may outlive a canceled caller. The in-flight record
+// prevents repeated cancellations from creating unbounded readers for the same
+// directory, and the eventual result is committed or discarded under the lock.
+func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		p.mu.Unlock()
+		return os.ErrNotExist
+	}
+	if !node.isDir() {
+		p.mu.Unlock()
+		return fmt.Errorf("%s is not a directory", p.pathForNode(nodeID))
+	}
+	lowerDir := node.abstractDir
+	if lowerDir == nil || node.entriesDone {
+		p.mu.Unlock()
+		return nil
+	}
+	materialization := p.materializations[nodeID]
+	if materialization == nil {
+		if p.materializations == nil {
+			p.materializations = make(map[uint64]*imageDirMaterialization)
+		}
+		materialization = &imageDirMaterialization{done: make(chan struct{})}
+		p.materializations[nodeID] = materialization
+		go p.finishDirMaterialization(nodeID, lowerDir, materialization)
+	}
+	p.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-materialization.done:
+		return materialization.err
+	}
+}
+
+func (p *imageFS) finishDirMaterialization(nodeID uint64, lowerDir imagefs.Directory, materialization *imageDirMaterialization) {
+	entries, err := readImageLowerEntries(lowerDir)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if err == nil && node != nil && node.abstractDir == lowerDir && !node.entriesDone {
+		for _, ent := range entries {
+			if node.whiteouts[ent.name] {
+				continue
+			}
+			if _, ok := node.entries[ent.name]; ok {
+				continue
+			}
+			if _, errno := p.createAbstractNode(node, ent.name, ent.entry); errno != 0 {
+				err = fmt.Errorf("materialize %s: errno %d", p.pathForNode(nodeID), errno)
+				break
+			}
+		}
+		if err == nil {
+			node.entriesDone = true
+		}
+	} else if err == nil && node == nil {
+		err = os.ErrNotExist
+	}
+	materialization.err = err
+	if p.materializations[nodeID] == materialization {
+		delete(p.materializations, nodeID)
+	}
+	close(materialization.done)
 }
 
 func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {

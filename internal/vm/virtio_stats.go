@@ -23,20 +23,28 @@ func virtioFSStats(fsdevs []*virtio.FS) []virtio.FSStats {
 
 func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uint64, err error) {
 	var errs []error
+	providers := 0
 	for i, fsdev := range fsdevs {
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, _, devicePhysical, deviceErr := fsdev.BackingUsage()
+		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
+		providers++
 		current += deviceCurrent
+		highWater = max(highWater, deviceHighWater)
 		physical += devicePhysical
 		if deviceErr != nil {
 			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
 		}
 	}
-	// A sum of independent device peaks describes a state that may never have
-	// existed. The manager retains the high-water mark of this aggregate sample.
-	highWater = current
+	// One device has an exact internally observed peak. For multiple devices,
+	// the maximum component peak is a conservative lower bound; summing their
+	// independent peaks would invent a state which may never have existed.
+	if providers == 0 {
+		highWater = 0
+	} else {
+		highWater = max(highWater, current)
+	}
 	return current, highWater, physical, errors.Join(errs...)
 }
 
@@ -45,9 +53,10 @@ func virtioFSBackingMetadataUsage(fsdevs []*virtio.FS) (current, highWater uint6
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, _ := fsdev.BackingMetadataUsage()
+		deviceCurrent, deviceHighWater := fsdev.BackingMetadataUsage()
 		current += deviceCurrent
+		highWater = max(highWater, deviceHighWater)
 	}
-	highWater = current
+	highWater = max(highWater, current)
 	return current, highWater
 }

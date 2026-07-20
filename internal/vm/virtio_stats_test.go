@@ -28,11 +28,11 @@ func TestVirtioFSBackingUsageDoesNotSumIndependentDevicePeaks(t *testing.T) {
 		virtio.NewFS(0, 0, 0, "two", two),
 	}
 	current, highWater, _, err := virtioFSBackingUsage(devices)
-	if err != nil || current != 5 || highWater != 5 {
+	if err != nil || current != 5 || highWater != 200 {
 		t.Fatalf("aggregate data usage current=%d high-water=%d err=%v", current, highWater, err)
 	}
 	metadata, metadataHighWater := virtioFSBackingMetadataUsage(devices)
-	if metadata != 18 || metadataHighWater != 18 {
+	if metadata != 18 || metadataHighWater != 110 {
 		t.Fatalf("aggregate metadata usage current=%d high-water=%d", metadata, metadataHighWater)
 	}
 }

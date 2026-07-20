@@ -273,6 +273,11 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
 	}
+	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Shares = canonicalShares
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -385,6 +390,11 @@ func (m *Manager) StartBlankInstanceStream(
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
 	}
+	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Shares = canonicalShares
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}

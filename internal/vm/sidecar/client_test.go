@@ -15,6 +15,22 @@ import (
 	"j5.nz/cc/client"
 )
 
+type closeProbeConn struct {
+	closed bool
+}
+
+func (*closeProbeConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*closeProbeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *closeProbeConn) Close() error {
+	c.closed = true
+	return nil
+}
+func (*closeProbeConn) LocalAddr() net.Addr              { return nil }
+func (*closeProbeConn) RemoteAddr() net.Addr             { return nil }
+func (*closeProbeConn) SetDeadline(time.Time) error      { return nil }
+func (*closeProbeConn) SetReadDeadline(time.Time) error  { return nil }
+func (*closeProbeConn) SetWriteDeadline(time.Time) error { return nil }
+
 func TestWorkerDialTarget(t *testing.T) {
 	_, err := workerDialTarget("tcp://127.0.0.1:1234")
 	var securityErr *WorkerSecurityError
@@ -38,6 +54,20 @@ func TestWorkerDialTarget(t *testing.T) {
 	if target.network != "unix" || target.address != "/tmp/worker.sock" || target.secure {
 		t.Fatalf("Unix target = %+v", target)
 	}
+}
+
+func TestCancelDeliveryFailureDoesNotCloseMultiplexedConnection(t *testing.T) {
+	conn := &closeProbeConn{}
+	worker := &Client{conn: conn, codec: NewWorkerCodec(conn)}
+	worker.codec.send <- struct{}{}
+	ctx, cancel := context.WithCancel(t.Context())
+	stop := worker.watchCancellation(ctx, 42)
+	cancel()
+	stop()
+	if conn.closed {
+		t.Fatal("failed request cancellation closed the multiplexed worker connection")
+	}
+	<-worker.codec.send
 }
 
 func TestDialWorkerConnectionUsesContextForUnixAndTCP(t *testing.T) {

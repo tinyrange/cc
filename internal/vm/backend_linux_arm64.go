@@ -48,6 +48,10 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	totalStart := time.Now()
 	defer func() { timing.Since(ctx, "startup.total_ready", totalStart) }()
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
@@ -144,7 +148,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		rootFS: rootFS,
 		fsdevs: fsdevs,
 		dmesg:  req.Dmesg,
-		mounts: mounts.NewState(req.Shares),
+		mounts: mountState,
 	}, nil
 }
 

@@ -48,7 +48,7 @@ func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 	if current != 40 || highWater != 40 || !errors.Is(err, rootErr) {
 		t.Fatalf("backing usage = %d, %d, %v", current, highWater, err)
 	}
-	if current, highWater := fsys.BackingMetadataUsage(); current != 8 || highWater != 8 {
+	if current, highWater := fsys.BackingMetadataUsage(); current != 8 || highWater != 9 {
 		t.Fatalf("metadata usage = %d, %d", current, highWater)
 	}
 	if err := fsys.Close(); !errors.Is(err, closeErr) {

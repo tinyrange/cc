@@ -28,23 +28,88 @@ func (p *imageFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	root := p.nodes[1]
-	if root == nil || !root.isDir() {
-		return nil, fmt.Errorf("image filesystem root is missing")
+	if err := p.materializeSnapshotTreeContext(ctx, 1); err != nil {
+		return nil, err
 	}
-	return p.snapshotDirLocked(ctx, root, p.dataStore)
+	for {
+		p.mu.Lock()
+		root := p.nodes[1]
+		if root == nil || !root.isDir() {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("image filesystem root is missing")
+		}
+		pending := p.firstUnmaterializedSnapshotDirLocked(1)
+		if pending == 0 {
+			out, err := p.snapshotDirLocked(ctx, root, p.dataStore)
+			p.mu.Unlock()
+			return out, err
+		}
+		p.mu.Unlock()
+		if err := p.materializeSnapshotTreeContext(ctx, pending); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (p *imageFS) materializeSnapshotTreeContext(ctx context.Context, rootID uint64) error {
+	queue := []uint64{rootID}
+	seen := make(map[uint64]struct{})
+	for len(queue) != 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		nodeID := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		if err := p.materializeDirEntriesContext(ctx, nodeID); err != nil {
+			return fmt.Errorf("materialize snapshot directory: %w", err)
+		}
+		p.mu.Lock()
+		node := p.nodes[nodeID]
+		if node == nil {
+			p.mu.Unlock()
+			continue
+		}
+		for _, childID := range node.entries {
+			if child := p.nodes[childID]; child != nil && child.isDir() {
+				queue = append(queue, childID)
+			}
+		}
+		p.mu.Unlock()
+	}
+	return nil
+}
+
+func (p *imageFS) firstUnmaterializedSnapshotDirLocked(rootID uint64) uint64 {
+	queue := []uint64{rootID}
+	seen := make(map[uint64]struct{})
+	for len(queue) != 0 {
+		nodeID := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		node := p.nodes[nodeID]
+		if node == nil || !node.isDir() {
+			continue
+		}
+		if node.abstractDir != nil && !node.entriesDone {
+			return nodeID
+		}
+		for _, childID := range node.entries {
+			queue = append(queue, childID)
+		}
+	}
+	return 0
 }
 
 func (p *imageFS) snapshotDirLocked(ctx context.Context, node *imageNode, store *imageDataStore) (*snapshotDir, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-	if node.abstractDir != nil && !node.entriesDone {
-		if _, errno := p.materializeDirEntriesLocked(node); errno != 0 {
-			return nil, fmt.Errorf("materialize %s: errno %d", p.pathForNode(node.id), errno)
-		}
 	}
 	attr := p.attr(node)
 	out := &snapshotDir{

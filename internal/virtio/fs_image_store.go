@@ -22,13 +22,12 @@ type imageDataStore struct {
 	path         string
 	next         uint64
 	nextLocation uint64
-	// locations uses the stable allocation token as a slice index and stores
-	// offset+1 (zero means released). Tokens are dense and monotonic, so a map
-	// added substantial per-page heap overhead without buying sparsity.
-	locations               []uint64
-	locationRefs            []uint32
+	// Stable page tokens are split into independently reclaimable chunks. A
+	// high-numbered live token therefore retains one small chunk rather than
+	// dense indexes for every earlier, released token.
+	locationChunks          map[uint64]*imageLocationChunk
+	retainedLocationChunks  int
 	liveLocations           int
-	freeLocations           []uint64
 	free                    []uint64
 	freeSet                 map[uint64]struct{}
 	pendingReclaim          map[uint64]struct{}
@@ -43,6 +42,16 @@ type imageDataStore struct {
 	closed                  bool
 	refs                    int
 	stale                   []imageDataStaleFile
+}
+
+const imageLocationChunkBits = 8
+const imageLocationChunkSize = 1 << imageLocationChunkBits
+const imageLocationChunkMask = imageLocationChunkSize - 1
+
+type imageLocationChunk struct {
+	offsets [imageLocationChunkSize]uint64
+	refs    [imageLocationChunkSize]uint32
+	live    uint16
 }
 
 type imageDataStaleFile struct {
@@ -102,7 +111,7 @@ func newImageDataStore() *imageDataStore {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		dir = os.TempDir()
 	}
-	return &imageDataStore{dir: dir, refs: 1, locations: []uint64{0}, locationRefs: []uint32{0}, freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
+	return &imageDataStore{dir: dir, refs: 1, locationChunks: make(map[uint64]*imageLocationChunk), freeSet: make(map[uint64]struct{}), pendingReclaim: make(map[uint64]struct{})}
 }
 
 func (s *imageDataStore) retain() {
@@ -145,6 +154,9 @@ func (s *imageDataStore) allocatePage(data []byte) (uint64, error) {
 }
 
 func (s *imageDataStore) allocatePageLocked(data []byte) (uint64, error) {
+	if s.nextLocation == ^uint64(0) {
+		return 0, fmt.Errorf("image page token space exhausted")
+	}
 	if err := s.ensureFileLocked(); err != nil {
 		return 0, err
 	}
@@ -176,18 +188,18 @@ func (s *imageDataStore) allocatePageLocked(data []byte) (uint64, error) {
 	if s.current > s.highWater {
 		s.highWater = s.current
 	}
-	var location uint64
-	if len(s.freeLocations) != 0 {
-		location = s.freeLocations[len(s.freeLocations)-1]
-		s.freeLocations = s.freeLocations[:len(s.freeLocations)-1]
-		s.locations[location] = offset + 1
-		s.locationRefs[location] = 1
-	} else {
-		s.nextLocation++
-		location = s.nextLocation
-		s.locations = append(s.locations, offset+1)
-		s.locationRefs = append(s.locationRefs, 1)
+	s.nextLocation++
+	location := s.nextLocation
+	chunkID, slot := imageLocationIndex(location)
+	chunk := s.locationChunks[chunkID]
+	if chunk == nil {
+		chunk = &imageLocationChunk{}
+		s.locationChunks[chunkID] = chunk
+		s.retainedLocationChunks = max(s.retainedLocationChunks, len(s.locationChunks))
 	}
+	chunk.offsets[slot] = offset + 1
+	chunk.refs[slot] = 1
+	chunk.live++
 	s.liveLocations++
 	s.noteMetadataLocked()
 	return location, nil
@@ -196,21 +208,36 @@ func (s *imageDataStore) allocatePageLocked(data []byte) (uint64, error) {
 func (s *imageDataStore) retainPage(location uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.locationOffsetLocked(location); !ok || location >= uint64(len(s.locationRefs)) || s.locationRefs[location] == 0 {
+	chunk, slot, ok := s.locationEntryLocked(location)
+	if !ok || chunk.refs[slot] == 0 {
 		return os.ErrNotExist
 	}
-	if s.locationRefs[location] == ^uint32(0) {
+	if chunk.refs[slot] == ^uint32(0) {
 		return fmt.Errorf("image page reference count overflow")
 	}
-	s.locationRefs[location]++
+	chunk.refs[slot]++
 	return nil
 }
 
 func (s *imageDataStore) locationOffsetLocked(location uint64) (uint64, bool) {
-	if location == 0 || location >= uint64(len(s.locations)) || s.locations[location] == 0 {
+	chunk, slot, ok := s.locationEntryLocked(location)
+	if !ok || chunk.offsets[slot] == 0 {
 		return 0, false
 	}
-	return s.locations[location] - 1, true
+	return chunk.offsets[slot] - 1, true
+}
+
+func imageLocationIndex(location uint64) (uint64, uint64) {
+	return location >> imageLocationChunkBits, location & imageLocationChunkMask
+}
+
+func (s *imageDataStore) locationEntryLocked(location uint64) (*imageLocationChunk, uint64, bool) {
+	if location == 0 {
+		return nil, 0, false
+	}
+	chunkID, slot := imageLocationIndex(location)
+	chunk := s.locationChunks[chunkID]
+	return chunk, slot, chunk != nil
 }
 
 func (s *imageDataStore) readPage(location uint64, dst []byte) error {
@@ -241,10 +268,11 @@ func (s *imageDataStore) writeAtCOW(location, pageOffset uint64, data []byte) (u
 	if !ok {
 		return 0, os.ErrNotExist
 	}
-	if location >= uint64(len(s.locationRefs)) || s.locationRefs[location] == 0 {
+	chunk, slot, exists := s.locationEntryLocked(location)
+	if !exists || chunk.refs[slot] == 0 {
 		return 0, os.ErrNotExist
 	}
-	if s.locationRefs[location] == 1 {
+	if chunk.refs[slot] == 1 {
 		_, err := s.file.WriteAt(data, int64(offset+pageOffset))
 		return location, err
 	}
@@ -258,7 +286,7 @@ func (s *imageDataStore) writeAtCOW(location, pageOffset uint64, data []byte) (u
 	if err != nil {
 		return 0, err
 	}
-	s.locationRefs[location]--
+	chunk.refs[slot]--
 	return newLocation, nil
 }
 
@@ -273,16 +301,25 @@ func (s *imageDataStore) releasePage(location uint64) {
 		s.mu.Unlock()
 		return
 	}
-	if location < uint64(len(s.locationRefs)) && s.locationRefs[location] > 1 {
-		s.locationRefs[location]--
+	chunk, slot, exists := s.locationEntryLocked(location)
+	if !exists {
 		s.mu.Unlock()
 		return
 	}
-	s.locations[location] = 0
-	s.locationRefs[location] = 0
+	if chunk.refs[slot] > 1 {
+		chunk.refs[slot]--
+		s.mu.Unlock()
+		return
+	}
+	chunk.offsets[slot] = 0
+	chunk.refs[slot] = 0
+	chunk.live--
 	s.liveLocations--
-	s.freeLocations = append(s.freeLocations, location)
-	s.compactReleasedLocationsLocked(location)
+	if chunk.live == 0 {
+		chunkID, _ := imageLocationIndex(location)
+		delete(s.locationChunks, chunkID)
+		s.compactLocationChunksLocked()
+	}
 	s.free = append(s.free, offset)
 	s.freeSet[offset] = struct{}{}
 	scheduleReclaim := len(s.pendingReclaim) == 0
@@ -297,37 +334,16 @@ func (s *imageDataStore) releasePage(location uint64) {
 	}
 }
 
-// compactReleasedLocationsLocked returns trailing, no-longer-referenced
-// allocation tokens to the Go allocator. Tokens remain stable while any live
-// filesystem or snapshot references them; only the dead suffix is renumbered.
-func (s *imageDataStore) compactReleasedLocationsLocked(released uint64) {
-	if released+1 != uint64(len(s.locations)) {
+func (s *imageDataStore) compactLocationChunksLocked() {
+	if len(s.locationChunks)*4 >= s.retainedLocationChunks || s.retainedLocationChunks < 16 && len(s.locationChunks) != 0 {
 		return
 	}
-	newLen := len(s.locations)
-	for newLen > 1 && s.locations[newLen-1] == 0 && s.locationRefs[newLen-1] == 0 {
-		newLen--
+	rebuilt := make(map[uint64]*imageLocationChunk, len(s.locationChunks))
+	for id, chunk := range s.locationChunks {
+		rebuilt[id] = chunk
 	}
-	if newLen == len(s.locations) {
-		return
-	}
-	filtered := s.freeLocations[:0]
-	for _, location := range s.freeLocations {
-		if location < uint64(newLen) {
-			filtered = append(filtered, location)
-		}
-	}
-	s.freeLocations = filtered
-	s.locations = s.locations[:newLen]
-	s.locationRefs = s.locationRefs[:newLen]
-	s.nextLocation = uint64(newLen - 1)
-	if cap(s.locations) >= 64 && newLen*4 <= cap(s.locations) {
-		s.locations = append([]uint64(nil), s.locations...)
-		s.locationRefs = append([]uint32(nil), s.locationRefs...)
-	}
-	if cap(s.freeLocations) >= 64 && len(s.freeLocations)*4 <= cap(s.freeLocations) {
-		s.freeLocations = append([]uint64(nil), s.freeLocations...)
-	}
+	s.locationChunks = rebuilt
+	s.retainedLocationChunks = len(rebuilt)
 }
 
 func (s *imageDataStore) flushReclaimLocked() {
@@ -358,7 +374,6 @@ func (s *imageDataStore) flushReclaimLocked() {
 	}
 
 	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
-	unsupported := false
 	for i := 0; i < len(offsets); {
 		start := offsets[i]
 		if start >= s.next {
@@ -373,7 +388,6 @@ func (s *imageDataStore) flushReclaimLocked() {
 		}
 		err := reclaimFileRange(s.file, int64(start), int64(end-start))
 		if errors.Is(err, errRangeReclaimUnsupported) {
-			unsupported = true
 			s.rangeReclaimUnsupported = true
 			break
 		}
@@ -381,7 +395,10 @@ func (s *imageDataStore) flushReclaimLocked() {
 			s.reclaimErr = err
 		}
 	}
-	if (unsupported || s.rangeReclaimUnsupported) && shouldCompactPortableImageStore(s.current, s.next) {
+	// Once holes dominate the store, rewrite the live pages even on hosts which
+	// support punching. This both bounds logical-file amplification and releases
+	// the per-hole allocator metadata which a high live page would otherwise pin.
+	if shouldCompactPortableImageStore(s.current, s.next) {
 		if err := s.compactLocked(); err != nil && s.reclaimErr == nil {
 			s.reclaimErr = err
 		}
@@ -439,28 +456,29 @@ func (s *imageDataStore) compactLocked() error {
 			_ = os.Remove(path)
 		}
 	}
-	newLocations := make([]uint64, len(s.locations))
 	var page [imageDataPageSize]byte
 	var next uint64
-	for location, encodedOffset := range s.locations {
-		if encodedOffset == 0 {
-			continue
+	for _, chunk := range s.locationChunks {
+		for slot, encodedOffset := range chunk.offsets {
+			if encodedOffset == 0 {
+				continue
+			}
+			oldOffset := encodedOffset - 1
+			n, readErr := s.file.ReadAt(page[:], int64(oldOffset))
+			if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(page)) {
+				cleanup()
+				return readErr
+			}
+			if _, err := f.WriteAt(page[:], int64(next)); err != nil {
+				cleanup()
+				return err
+			}
+			chunk.offsets[slot] = next + 1
+			next += imageDataPageSize
 		}
-		oldOffset := encodedOffset - 1
-		n, readErr := s.file.ReadAt(page[:], int64(oldOffset))
-		if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(page)) {
-			cleanup()
-			return readErr
-		}
-		if _, err := f.WriteAt(page[:], int64(next)); err != nil {
-			cleanup()
-			return err
-		}
-		newLocations[location] = next + 1
-		next += imageDataPageSize
 	}
 	oldFile, oldPath := s.file, s.path
-	s.file, s.path, s.locations, s.next = f, path, newLocations, next
+	s.file, s.path, s.next = f, path, next
 	s.free = nil
 	s.freeSet = make(map[uint64]struct{})
 	s.pendingReclaim = make(map[uint64]struct{})
@@ -521,7 +539,8 @@ func (s *imageDataStore) metadataUsage() uint64 {
 }
 
 func (s *imageDataStore) metadataUsageLocked() uint64 {
-	usage := uint64(cap(s.locations)+cap(s.freeLocations)+cap(s.free))*8 + uint64(cap(s.locationRefs))*4
+	usage := uint64(len(s.locationChunks))*uint64(imageLocationChunkSize)*(8+4) + uint64(cap(s.free))*8
+	usage += uint64(s.retainedLocationChunks) * 32
 	usage += uint64(s.retainedFreeSet+s.retainedPendingReclaim) * 16
 	usage += uint64(cap(s.stale)) * 32
 	for _, stale := range s.stale {
@@ -568,7 +587,7 @@ func (s *imageDataStore) close() error {
 	s.closed = true
 	s.flushReclaimLocked()
 	f, path, stale := s.file, s.path, s.stale
-	s.file, s.path, s.locations, s.locationRefs, s.freeLocations, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil, nil, nil
+	s.file, s.path, s.locationChunks, s.free, s.freeSet, s.pendingReclaim, s.stale = nil, "", nil, nil, nil, nil, nil
 	s.mu.Unlock()
 	var errs []error
 	if f != nil {

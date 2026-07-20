@@ -36,14 +36,16 @@ type State struct {
 	imageMounts map[string]string
 }
 
-func NewState(shares []client.ShareMount) State {
+func NewState(shares []client.ShareMount) (State, error) {
 	tracked := make(map[string]client.ShareMount, len(shares))
 	for _, share := range shares {
-		if canonical, err := CanonicalRuntimeShare(share); err == nil {
-			tracked[canonical.Mount] = canonical
+		canonical, err := CanonicalRuntimeShare(share)
+		if err != nil {
+			return State{}, err
 		}
+		tracked[canonical.Mount] = canonical
 	}
-	return State{shares: tracked}
+	return State{shares: tracked}, nil
 }
 
 func (s *State) AddShare(rootFS virtio.ShareMounter, share client.ShareMount, unsupportedFeature string, build func(client.ShareMount) (virtio.ShareMount, error)) error {
@@ -120,18 +122,21 @@ func (s *State) AddShares(rootFS virtio.ShareMounter, requested []client.ShareMo
 }
 
 func CanonicalRuntimeShare(share client.ShareMount) (client.ShareMount, error) {
-	mount := strings.TrimSpace(share.Mount)
-	if mount == "" {
-		return client.ShareMount{}, fmt.Errorf("share mount path is required")
+	canonical, err := vmruntime.CanonicalDirectoryShare(vmruntime.DirectoryShare{
+		Source: share.Source, Mount: share.Mount, Writable: share.Writable,
+		MapOwner: share.MapOwner, OwnerUID: share.OwnerUID, OwnerGID: share.OwnerGID,
+		Cache: share.Cache,
+	})
+	if err != nil {
+		return client.ShareMount{}, err
 	}
-	if !strings.HasPrefix(mount, "/") {
-		return client.ShareMount{}, fmt.Errorf("share mount path %q must be absolute", mount)
-	}
-	mount = path.Clean(mount)
-	if mount == "/" {
-		return client.ShareMount{}, fmt.Errorf("share mount path / cannot replace the VM root filesystem")
-	}
-	share.Mount = mount
+	share.Source = canonical.Source
+	share.Mount = canonical.Mount
+	share.Writable = canonical.Writable
+	share.MapOwner = canonical.MapOwner
+	share.OwnerUID = canonical.OwnerUID
+	share.OwnerGID = canonical.OwnerGID
+	share.Cache = canonical.Cache
 	return share, nil
 }
 

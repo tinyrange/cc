@@ -54,6 +54,10 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -135,7 +139,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			fsdevs:              fsdevs,
 			network:             network,
 			dmesg:               req.Dmesg,
-			mounts:              mounts.NewState(req.Shares),
+			mounts:              mountState,
 		}, nil
 	}
 	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(image), windowsRuntimeModuleMap())
@@ -205,7 +209,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		fsdevs:              fsdevs,
 		network:             network,
 		dmesg:               req.Dmesg,
-		mounts:              mounts.NewState(req.Shares),
+		mounts:              mountState,
 	}, nil
 }
 

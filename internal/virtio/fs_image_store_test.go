@@ -111,12 +111,10 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 		store.releasePage(location)
 	}
 	store.mu.Lock()
-	locationCapacity := cap(store.locations)
-	referenceCapacity := cap(store.locationRefs)
-	freeLocationCapacity := cap(store.freeLocations)
+	locationChunks := len(store.locationChunks)
 	store.mu.Unlock()
-	if locationCapacity > 4 || referenceCapacity > 4 || freeLocationCapacity > 4 {
-		t.Fatalf("released location indexes retained peak capacity: locations=%d refs=%d free=%d", locationCapacity, referenceCapacity, freeLocationCapacity)
+	if locationChunks != 0 {
+		t.Fatalf("released location indexes retained %d chunks", locationChunks)
 	}
 	current, highWater, _, err := store.usage()
 	if current != 0 || highWater != uint64(len(locations))*imageDataPageSize || err != nil {
@@ -136,6 +134,39 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 	}
 	if freeCapacity != 0 || retainedFreeSet != 0 || retainedPending != 0 {
 		t.Fatalf("released page metadata retained free=%d free-set=%d pending=%d", freeCapacity, retainedFreeSet, retainedPending)
+	}
+}
+
+func TestImageDataStoreHighLiveTokenDoesNotPinReleasedIndexes(t *testing.T) {
+	store := newImageDataStore()
+	defer store.close()
+	locations := make([]uint64, 2000)
+	for i := range locations {
+		location, err := store.allocatePage([]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		locations[i] = location
+	}
+	for _, location := range locations[:len(locations)-1] {
+		store.releasePage(location)
+	}
+	if err := store.sync(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	chunks := len(store.locationChunks)
+	metadata := store.metadataUsageLocked()
+	store.mu.Unlock()
+	if chunks != 1 {
+		t.Fatalf("one high live token retained %d location chunks, want 1", chunks)
+	}
+	if metadata > 64<<10 {
+		t.Fatalf("one high live token retained %d bytes of store metadata", metadata)
+	}
+	page := make([]byte, imageDataPageSize)
+	if err := store.readPage(locations[len(locations)-1], page); err != nil {
+		t.Fatalf("read high live token: %v", err)
 	}
 }
 

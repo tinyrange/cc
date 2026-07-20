@@ -89,6 +89,7 @@ func sameFSBackend(a, b FSBackend) bool {
 // multiple guest paths.
 func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaimErr error) {
 	var errs []error
+	componentHighWater := uint64(0)
 	for _, backend := range m.distinctBackends() {
 		provider, ok := backend.(interface {
 			BackingUsage() (uint64, uint64, uint64, error)
@@ -96,16 +97,18 @@ func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaim
 		if !ok {
 			continue
 		}
-		backendCurrent, _, backendPhysical, err := provider.BackingUsage()
+		backendCurrent, backendHighWater, backendPhysical, err := provider.BackingUsage()
 		current += backendCurrent
+		componentHighWater = max(componentHighWater, backendHighWater)
 		physical += backendPhysical
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
 	m.mu.Lock()
-	if current > m.backingDataHighWater {
-		m.backingDataHighWater = current
+	observed := max(current, componentHighWater)
+	if observed > m.backingDataHighWater {
+		m.backingDataHighWater = observed
 	}
 	highWater = m.backingDataHighWater
 	m.mu.Unlock()
@@ -117,17 +120,20 @@ func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaim
 // the same time, so adding them invents a combined high-water value that was
 // never observed.
 func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
+	componentHighWater := uint64(0)
 	for _, backend := range m.distinctBackends() {
 		provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) })
 		if !ok {
 			continue
 		}
-		backendCurrent, _ := provider.BackingMetadataUsage()
+		backendCurrent, backendHighWater := provider.BackingMetadataUsage()
 		current += backendCurrent
+		componentHighWater = max(componentHighWater, backendHighWater)
 	}
 	m.mu.Lock()
-	if current > m.backingMetadataHighWater {
-		m.backingMetadataHighWater = current
+	observed := max(current, componentHighWater)
+	if observed > m.backingMetadataHighWater {
+		m.backingMetadataHighWater = observed
 	}
 	highWater = m.backingMetadataHighWater
 	m.mu.Unlock()

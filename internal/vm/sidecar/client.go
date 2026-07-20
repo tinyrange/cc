@@ -465,7 +465,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	if err != nil {
 		return err
 	}
-	if err := c.codec.Send(frame); err != nil {
+	if err := c.codec.SendContext(ctx, frame); err != nil {
 		return err
 	}
 
@@ -533,7 +533,7 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	if err != nil {
 		return err
 	}
-	if err := c.codec.Send(frame); err != nil {
+	if err := c.codec.SendContext(ctx, frame); err != nil {
 		return err
 	}
 	for {
@@ -644,19 +644,18 @@ func (c *Client) sendCancelContext(ctx context.Context, id uint64) error {
 	return c.codec.SendContext(ctx, frame)
 }
 
-// watchCancellation keeps cancellation independent from response delivery while
-// guaranteeing that a canceled call cannot return before its cancel frame has
-// been sent. A plain select between ctx.Done and a deferred stop channel can
-// choose the stop after both become ready, silently dropping the cancellation.
+// watchCancellation keeps cancellation independent from response delivery. A
+// failed cancel frame is scoped to the canceled request: tearing down the
+// multiplexed connection here would fail unrelated calls which may already
+// have completed on the worker. The delivery timeout and codec write deadline
+// release the shared writer without changing the worker's connection state.
 func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
 	stop := make(chan struct{})
 	result := make(chan bool, 1)
 	go func() {
 		select {
 		case <-ctx.Done():
-			if err := c.sendCancel(id); err != nil {
-				_ = c.Close()
-			}
+			_ = c.sendCancel(id)
 			result <- true
 		case <-stop:
 			result <- false
@@ -666,9 +665,7 @@ func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
 		close(stop)
 		sent := <-result
 		if ctx.Err() != nil && !sent {
-			if err := c.sendCancel(id); err != nil {
-				_ = c.Close()
-			}
+			_ = c.sendCancel(id)
 		}
 	}
 }
