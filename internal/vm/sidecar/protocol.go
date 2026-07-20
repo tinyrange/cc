@@ -184,6 +184,16 @@ type WorkerCodec struct {
 	send chan struct{}
 }
 
+type WorkerStreamWriteError struct {
+	Err error
+}
+
+func (e *WorkerStreamWriteError) Error() string {
+	return fmt.Sprintf("sidecar worker stream write failed and the connection was poisoned: %v", e.Err)
+}
+
+func (e *WorkerStreamWriteError) Unwrap() error { return e.Err }
+
 func NewWorkerCodec(conn io.ReadWriteCloser) *WorkerCodec {
 	return &WorkerCodec{
 		conn: conn,
@@ -215,7 +225,11 @@ func (c *WorkerCodec) SendContext(ctx context.Context, frame WorkerFrame) error 
 			defer conn.SetWriteDeadline(time.Time{})
 		}
 	}
-	return c.enc.Encode(frame)
+	if err := c.enc.Encode(frame); err != nil {
+		_ = c.conn.Close()
+		return &WorkerStreamWriteError{Err: err}
+	}
+	return nil
 }
 
 func (c *WorkerCodec) Receive() (WorkerFrame, error) {

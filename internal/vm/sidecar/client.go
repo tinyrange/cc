@@ -30,6 +30,17 @@ type Client struct {
 // enough for its bounded delivery queue to fill.
 var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflow")
 
+type TerminationUnconfirmedError struct {
+	RequestID uint64
+	Cause     error
+}
+
+func (e *TerminationUnconfirmedError) Error() string {
+	return fmt.Sprintf("sidecar request %d termination is unconfirmed; worker connection was quarantined: %v", e.RequestID, e.Cause)
+}
+
+func (e *TerminationUnconfirmedError) Unwrap() error { return e.Cause }
+
 type workerCall struct {
 	frames   chan WorkerFrame
 	done     chan error
@@ -443,7 +454,7 @@ func (c *Client) Exec(ctx context.Context, id string, req client.ExecRequest) ([
 	return events, err
 }
 
-func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) (retErr error) {
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
@@ -477,7 +488,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	}
 
 	stopCancellationWatch := c.watchCancellation(ctx, requestID)
-	defer stopCancellationWatch()
+	defer func() { retErr = errors.Join(retErr, stopCancellationWatch()) }()
 
 	for {
 		got, err := c.nextFrame(ctx, call)
@@ -513,7 +524,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	}
 }
 
-func (c *Client) call(ctx context.Context, frameType string, payload any, onFrame func(WorkerFrame) error, out any) error {
+func (c *Client) call(ctx context.Context, frameType string, payload any, onFrame func(WorkerFrame) error, out any) (retErr error) {
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
@@ -528,7 +539,7 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	defer c.unregisterCall(id)
 
 	stopCancellationWatch := c.watchCancellation(ctx, id)
-	defer stopCancellationWatch()
+	defer func() { retErr = errors.Join(retErr, stopCancellationWatch()) }()
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {
 		return err
@@ -644,28 +655,42 @@ func (c *Client) sendCancelContext(ctx context.Context, id uint64) error {
 	return c.codec.SendContext(ctx, frame)
 }
 
-// watchCancellation keeps cancellation independent from response delivery. A
-// failed cancel frame is scoped to the canceled request: tearing down the
-// multiplexed connection here would fail unrelated calls which may already
-// have completed on the worker. The delivery timeout and codec write deadline
-// release the shared writer without changing the worker's connection state.
-func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
+func (c *Client) quarantineCancellation(id uint64, cause error) error {
+	err := &TerminationUnconfirmedError{RequestID: id, Cause: cause}
+	c.closePending(err)
+	_ = c.conn.Close()
+	return err
+}
+
+// watchCancellation returns an explicit recovery error if the cancel frame is
+// not delivered. Once delivery is uncertain the multiplexed stream is no
+// longer reusable: the worker may still mutate its VM and a failed write may
+// have left a partial JSON frame. Quarantining the connection makes that
+// instance-level transition visible to every in-flight caller.
+func (c *Client) watchCancellation(ctx context.Context, id uint64) func() error {
 	stop := make(chan struct{})
-	result := make(chan bool, 1)
+	type cancellationResult struct {
+		sent bool
+		err  error
+	}
+	result := make(chan cancellationResult, 1)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.sendCancel(id)
-			result <- true
+			result <- cancellationResult{sent: true, err: c.sendCancel(id)}
 		case <-stop:
-			result <- false
+			result <- cancellationResult{}
 		}
 	}()
-	return func() {
+	return func() error {
 		close(stop)
-		sent := <-result
-		if ctx.Err() != nil && !sent {
-			_ = c.sendCancel(id)
+		result := <-result
+		if ctx.Err() != nil && !result.sent {
+			result.err = c.sendCancel(id)
 		}
+		if result.err != nil {
+			return c.quarantineCancellation(id, result.err)
+		}
+		return nil
 	}
 }

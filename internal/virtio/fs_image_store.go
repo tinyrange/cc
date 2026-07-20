@@ -458,6 +458,15 @@ func (s *imageDataStore) compactLocked() error {
 	}
 	var page [imageDataPageSize]byte
 	var next uint64
+	type locationUpdate struct {
+		chunk  *imageLocationChunk
+		slot   int
+		offset uint64
+	}
+	// Do not publish any replacement offsets until every live page has been
+	// copied successfully. On failure the old file remains authoritative, so
+	// its location table must remain byte-for-byte usable as well.
+	updates := make([]locationUpdate, 0, s.liveLocations)
 	for _, chunk := range s.locationChunks {
 		for slot, encodedOffset := range chunk.offsets {
 			if encodedOffset == 0 {
@@ -473,9 +482,12 @@ func (s *imageDataStore) compactLocked() error {
 				cleanup()
 				return err
 			}
-			chunk.offsets[slot] = next + 1
+			updates = append(updates, locationUpdate{chunk: chunk, slot: slot, offset: next + 1})
 			next += imageDataPageSize
 		}
+	}
+	for _, update := range updates {
+		update.chunk.offsets[update.slot] = update.offset
 	}
 	oldFile, oldPath := s.file, s.path
 	s.file, s.path, s.next = f, path, next

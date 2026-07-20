@@ -21,6 +21,28 @@ type blockingSnapshotDirectory struct {
 	once    sync.Once
 }
 
+type retryLookupDirectory struct {
+	mu       sync.Mutex
+	failures int
+}
+
+func (d *retryLookupDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
+func (d *retryLookupDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
+func (d *retryLookupDirectory) Owner() (uint32, uint32) { return 0, 0 }
+func (d *retryLookupDirectory) RDev() uint32            { return 0 }
+func (d *retryLookupDirectory) ReadDir() ([]imagefs.DirEnt, error) {
+	return []imagefs.DirEnt{{Name: "important", Mode: 0o644}}, nil
+}
+func (d *retryLookupDirectory) Lookup(string) (imagefs.Entry, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failures != 0 {
+		d.failures--
+		return imagefs.Entry{}, errors.New("transient lower lookup failure")
+	}
+	return imagefs.Entry{File: &snapshotFile{mode: 0o644, modTime: time.Unix(0, 0)}}, nil
+}
+
 func (d *blockingSnapshotDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
 func (d *blockingSnapshotDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
 func (d *blockingSnapshotDirectory) Owner() (uint32, uint32) { return 0, 0 }
@@ -30,8 +52,23 @@ func (d *blockingSnapshotDirectory) ReadDir() ([]imagefs.DirEnt, error) {
 	<-d.release
 	return nil, nil
 }
+func (d *blockingSnapshotDirectory) ReadDirContext(ctx context.Context) ([]imagefs.DirEnt, error) {
+	d.once.Do(func() { close(d.started) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-d.release:
+		return nil, nil
+	}
+}
 func (d *blockingSnapshotDirectory) Lookup(string) (imagefs.Entry, error) {
 	return imagefs.Entry{}, os.ErrNotExist
+}
+func (d *blockingSnapshotDirectory) LookupContext(ctx context.Context, name string) (imagefs.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return imagefs.Entry{}, err
+	}
+	return d.Lookup(name)
 }
 
 type copyUpProbeFile struct {
@@ -114,6 +151,22 @@ func TestImageFSSnapshotCancellationDoesNotHoldFilesystemLock(t *testing.T) {
 		t.Fatalf("filesystem mutation after canceled snapshot: errno %d", errno)
 	}
 	close(lower.release)
+}
+
+func TestImageFSSnapshotRetriesTransientLowerLookupFailure(t *testing.T) {
+	lower := &retryLookupDirectory{failures: 1}
+	backend := NewImageFS(lower, "").(*imageFS)
+	defer backend.Close()
+	if _, err := backend.RootSnapshotContext(t.Context()); err == nil {
+		t.Fatal("snapshot silently omitted a lower entry after lookup failure")
+	}
+	snapshot, err := backend.RootSnapshotContext(t.Context())
+	if err != nil {
+		t.Fatalf("snapshot retry: %v", err)
+	}
+	if _, err := snapshot.Lookup("important"); err != nil {
+		t.Fatalf("retried snapshot omitted lower entry: %v", err)
+	}
 }
 
 func TestImageFSOpenHandleSurvivesUnlinkAndReplacement(t *testing.T) {

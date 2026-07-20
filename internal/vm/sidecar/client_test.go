@@ -56,16 +56,20 @@ func TestWorkerDialTarget(t *testing.T) {
 	}
 }
 
-func TestCancelDeliveryFailureDoesNotCloseMultiplexedConnection(t *testing.T) {
+func TestCancelDeliveryFailureQuarantinesMultiplexedConnection(t *testing.T) {
 	conn := &closeProbeConn{}
 	worker := &Client{conn: conn, codec: NewWorkerCodec(conn)}
 	worker.codec.send <- struct{}{}
 	ctx, cancel := context.WithCancel(t.Context())
 	stop := worker.watchCancellation(ctx, 42)
 	cancel()
-	stop()
-	if conn.closed {
-		t.Fatal("failed request cancellation closed the multiplexed worker connection")
+	err := stop()
+	var terminationErr *TerminationUnconfirmedError
+	if !errors.As(err, &terminationErr) || terminationErr.RequestID != 42 {
+		t.Fatalf("cancel error = %v, want request-scoped termination uncertainty", err)
+	}
+	if !conn.closed {
+		t.Fatal("uncertain request cancellation left the worker connection reusable")
 	}
 	<-worker.codec.send
 }

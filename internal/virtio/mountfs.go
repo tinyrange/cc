@@ -115,6 +115,22 @@ func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaim
 	return current, highWater, physical, errors.Join(errs...)
 }
 
+func (m *mountedFS) BackingCurrent() (current uint64) {
+	for _, backend := range m.distinctBackends() {
+		if provider, ok := backend.(interface{ BackingCurrent() uint64 }); ok {
+			current += provider.BackingCurrent()
+			continue
+		}
+		if provider, ok := backend.(interface {
+			BackingUsage() (uint64, uint64, uint64, error)
+		}); ok {
+			value, _, _, _ := provider.BackingUsage()
+			current += value
+		}
+	}
+	return current
+}
+
 // BackingMetadataUsage forwards metadata telemetry independently from backing
 // data. Keeping the two peaks separate matters: their maxima need not occur at
 // the same time, so adding them invents a combined high-water value that was

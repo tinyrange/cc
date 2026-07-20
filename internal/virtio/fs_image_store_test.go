@@ -40,6 +40,42 @@ func TestImageDataStorePortableCompactionPreservesLiveLocations(t *testing.T) {
 	}
 }
 
+func TestImageDataStoreFailedCompactionPreservesOldLocations(t *testing.T) {
+	store := newImageDataStore()
+	defer store.close()
+	locations := make([]uint64, 3)
+	for i := range locations {
+		location, err := store.allocatePage(bytes.Repeat([]byte{byte(i + 1)}, int(imageDataPageSize)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		locations[i] = location
+	}
+	store.releasePage(locations[0])
+
+	store.mu.Lock()
+	// Leave the second live page readable, then force the later read to fail.
+	// A non-transactional compaction has already redirected the first live
+	// token to offset zero by the time it observes this failure.
+	if err := store.file.Truncate(2 * int64(imageDataPageSize)); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	err := store.compactLocked()
+	store.mu.Unlock()
+	if err == nil {
+		t.Fatal("compaction unexpectedly succeeded with a truncated source")
+	}
+
+	page := make([]byte, imageDataPageSize)
+	if err := store.readPage(locations[1], page); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(page, bytes.Repeat([]byte{2}, len(page))) {
+		t.Fatal("failed compaction changed a live page mapping")
+	}
+}
+
 func TestImageDataStoreRetainsFailedReplacementCleanupForRetry(t *testing.T) {
 	store := newImageDataStore()
 	dir := t.TempDir()

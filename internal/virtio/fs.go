@@ -326,46 +326,47 @@ type FS struct {
 	entryTTL       time.Duration
 	attrTTL        time.Duration
 
-	mu               sync.Mutex
-	workerOnce       sync.Once
-	mem              GuestMemory
-	irq              IRQController
-	backend          FSBackend
-	tag              [fsCfgTagSize]byte
-	deviceFeatureSel uint32
-	driverFeatureSel uint32
-	driverFeatures   uint64
-	sharedMemorySel  uint32
-	queueSel         uint32
-	status           uint32
-	interruptStatus  uint32
-	irqHigh          bool
-	configGeneration uint32
-	queues           []queue
-	mmioReads        uint64
-	mmioWrites       uint64
-	queueNotifies    []uint64
-	kickPollLoops    uint64
-	kickPollHits     uint64
-	kickPollMisses   uint64
-	kickPollWorks    uint64
-	fuseRequests     atomic.Uint64
-	interruptRaises  uint64
-	irqTransitions   uint64
-	closeOnce        sync.Once
-	closed           chan struct{}
-	workerWG         sync.WaitGroup
-	kickPollWG       sync.WaitGroup
-	workCh           chan *fsWork
-	nextWorkSeq      []uint64
-	nextCompleteSeq  []uint64
-	completions      map[fsCompletionKey]fsCompletion
-	fuseOpStats      [fuseStatsSlots]fuseOpStat
-	stageStats       [fsStageCount]timingStat
-	scratch16        [16]byte
-	scratch8         [8]byte
-	scratch4         [4]byte
-	scratch2         [2]byte
+	mu                  sync.Mutex
+	workerOnce          sync.Once
+	mem                 GuestMemory
+	irq                 IRQController
+	backend             FSBackend
+	backingUsageTracker *FSBackingUsageTracker
+	tag                 [fsCfgTagSize]byte
+	deviceFeatureSel    uint32
+	driverFeatureSel    uint32
+	driverFeatures      uint64
+	sharedMemorySel     uint32
+	queueSel            uint32
+	status              uint32
+	interruptStatus     uint32
+	irqHigh             bool
+	configGeneration    uint32
+	queues              []queue
+	mmioReads           uint64
+	mmioWrites          uint64
+	queueNotifies       []uint64
+	kickPollLoops       uint64
+	kickPollHits        uint64
+	kickPollMisses      uint64
+	kickPollWorks       uint64
+	fuseRequests        atomic.Uint64
+	interruptRaises     uint64
+	irqTransitions      uint64
+	closeOnce           sync.Once
+	closed              chan struct{}
+	workerWG            sync.WaitGroup
+	kickPollWG          sync.WaitGroup
+	workCh              chan *fsWork
+	nextWorkSeq         []uint64
+	nextCompleteSeq     []uint64
+	completions         map[fsCompletionKey]fsCompletion
+	fuseOpStats         [fuseStatsSlots]fuseOpStat
+	stageStats          [fsStageCount]timingStat
+	scratch16           [16]byte
+	scratch8            [8]byte
+	scratch4            [4]byte
+	scratch2            [2]byte
 }
 
 const fuseStatsSlots = 64
@@ -1527,6 +1528,10 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		return fsReply{}, fmt.Errorf("virtio-fs short request: %d", len(req))
 	}
 	opcode := binary.LittleEndian.Uint32(req[4:8])
+	defer func() {
+		tracker := f.backingUsageTracker
+		tracker.Sample()
+	}()
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
 	callerUID := binary.LittleEndian.Uint32(req[24:28])
@@ -2857,6 +2862,15 @@ func (f *FS) BackingUsage() (current, highWater, physical uint64, reclaimErr err
 	return provider.BackingUsage()
 }
 
+func (f *FS) BackingUsageTracker() *FSBackingUsageTracker {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.backingUsageTracker
+}
+
 func (f *FS) BackingMetadataUsage() (current, highWater uint64) {
 	if f == nil {
 		return 0, 0
@@ -3138,21 +3152,25 @@ type imageFS struct {
 	debugPaths []string
 	debugLog   io.Writer
 
-	mu                 sync.Mutex
-	nextNodeID         uint64
-	nextHandle         uint64
-	nodes              map[uint64]*imageNode
-	handles            map[uint64]imageHandle
-	dirHandles         map[uint64][]dirEntry
-	dirHandleNodes     map[uint64]uint64
-	xattrBytes         uint64
-	metadataHighWater  uint64
-	retainedNodes      int
-	retainedHandles    int
-	retainedDirHandles int
-	retainedEntries    int
-	retainedWhiteouts  int
-	materializations   map[uint64]*imageDirMaterialization
+	mu                    sync.Mutex
+	nextNodeID            uint64
+	nextHandle            uint64
+	nodes                 map[uint64]*imageNode
+	handles               map[uint64]imageHandle
+	dirHandles            map[uint64][]dirEntry
+	dirHandleNodes        map[uint64]uint64
+	xattrBytes            uint64
+	metadataHighWater     uint64
+	retainedNodes         int
+	retainedHandles       int
+	retainedDirHandles    int
+	retainedEntries       int
+	retainedWhiteouts     int
+	materializations      map[uint64]*imageDirMaterialization
+	materializationCtx    context.Context
+	materializationCancel context.CancelFunc
+	materializationWG     sync.WaitGroup
+	closed                bool
 }
 
 type imageHandle struct {
@@ -3446,20 +3464,23 @@ func NewImageFSWithOwner(root imagefs.Directory, statfsPath string, uid, gid uin
 }
 
 func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapOwner bool) FSBackend {
+	materializationCtx, materializationCancel := context.WithCancel(context.Background())
 	imgFS := &imageFS{
-		dataStore:      newImageDataStore(),
-		ownerUID:       uid,
-		ownerGID:       gid,
-		mapOwner:       mapOwner,
-		debugPaths:     virtioFSDebugPathsFromEnv(),
-		debugLog:       os.Stderr,
-		nextNodeID:     2,
-		nextHandle:     1,
-		nodes:          map[uint64]*imageNode{},
-		handles:        map[uint64]imageHandle{},
-		dirHandles:     map[uint64][]dirEntry{},
-		dirHandleNodes: map[uint64]uint64{},
-		retainedNodes:  1,
+		dataStore:             newImageDataStore(),
+		ownerUID:              uid,
+		ownerGID:              gid,
+		mapOwner:              mapOwner,
+		debugPaths:            virtioFSDebugPathsFromEnv(),
+		debugLog:              os.Stderr,
+		nextNodeID:            2,
+		nextHandle:            1,
+		nodes:                 map[uint64]*imageNode{},
+		handles:               map[uint64]imageHandle{},
+		dirHandles:            map[uint64][]dirEntry{},
+		dirHandleNodes:        map[uint64]uint64{},
+		retainedNodes:         1,
+		materializationCtx:    materializationCtx,
+		materializationCancel: materializationCancel,
 	}
 	imgFS.root = imgFS.dataStore.dir
 	if root == nil {
@@ -5650,7 +5671,15 @@ func (p *imageFS) Close() error {
 		return nil
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if !p.closed {
+		p.closed = true
+		p.materializationCancel()
+		for _, materialization := range p.materializations {
+			materialization.cancel()
+		}
+	}
+	p.mu.Unlock()
+	p.materializationWG.Wait()
 	return p.dataStore.close()
 }
 
@@ -5659,6 +5688,15 @@ func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
 		return 0, 0, 0, nil
 	}
 	return p.dataStore.usage()
+}
+
+func (p *imageFS) BackingCurrent() uint64 {
+	if p == nil {
+		return 0
+	}
+	p.dataStore.mu.Lock()
+	defer p.dataStore.mu.Unlock()
+	return p.dataStore.current
 }
 
 func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
@@ -5899,7 +5937,7 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 		}
 		entry, err := node.abstractDir.Lookup(ent.Name)
 		if err != nil {
-			continue
+			return nil, -linuxEIO
 		}
 		if _, errno := p.createAbstractNode(node, ent.Name, entry); errno != 0 {
 			return nil, errno
@@ -5943,7 +5981,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 		}
 		entry, err := lowerDir.Lookup(ent.Name)
 		if err != nil {
-			continue
+			return -linuxEIO
 		}
 		lowerEntries = append(lowerEntries, lowerEntry{name: ent.Name, entry: entry})
 	}
@@ -5981,12 +6019,13 @@ type imageLowerEntry struct {
 }
 
 type imageDirMaterialization struct {
-	done chan struct{}
-	err  error
+	done   chan struct{}
+	cancel context.CancelFunc
+	err    error
 }
 
-func readImageLowerEntries(lowerDir imagefs.Directory) ([]imageLowerEntry, error) {
-	ents, err := lowerDir.ReadDir()
+func readImageLowerEntries(ctx context.Context, lowerDir imagefs.Directory) ([]imageLowerEntry, error) {
+	ents, err := imagefs.ReadDirContext(ctx, lowerDir)
 	if err != nil {
 		return nil, err
 	}
@@ -5996,9 +6035,9 @@ func readImageLowerEntries(lowerDir imagefs.Directory) ([]imageLowerEntry, error
 		if ent.Name == "." || ent.Name == ".." {
 			continue
 		}
-		entry, err := lowerDir.Lookup(ent.Name)
+		entry, err := imagefs.LookupContext(ctx, lowerDir, ent.Name)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("lookup lower entry %q: %w", ent.Name, err)
 		}
 		entries = append(entries, imageLowerEntry{name: ent.Name, entry: entry})
 	}
@@ -6029,26 +6068,35 @@ func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint6
 		p.mu.Unlock()
 		return nil
 	}
+	if p.closed {
+		p.mu.Unlock()
+		return os.ErrClosed
+	}
 	materialization := p.materializations[nodeID]
 	if materialization == nil {
 		if p.materializations == nil {
 			p.materializations = make(map[uint64]*imageDirMaterialization)
 		}
-		materialization = &imageDirMaterialization{done: make(chan struct{})}
+		materializationCtx, cancel := context.WithCancel(p.materializationCtx)
+		materialization = &imageDirMaterialization{done: make(chan struct{}), cancel: cancel}
 		p.materializations[nodeID] = materialization
-		go p.finishDirMaterialization(nodeID, lowerDir, materialization)
+		p.materializationWG.Add(1)
+		go p.finishDirMaterialization(materializationCtx, nodeID, lowerDir, materialization)
 	}
 	p.mu.Unlock()
 	select {
 	case <-ctx.Done():
+		materialization.cancel()
 		return ctx.Err()
 	case <-materialization.done:
 		return materialization.err
 	}
 }
 
-func (p *imageFS) finishDirMaterialization(nodeID uint64, lowerDir imagefs.Directory, materialization *imageDirMaterialization) {
-	entries, err := readImageLowerEntries(lowerDir)
+func (p *imageFS) finishDirMaterialization(ctx context.Context, nodeID uint64, lowerDir imagefs.Directory, materialization *imageDirMaterialization) {
+	defer p.materializationWG.Done()
+	defer materialization.cancel()
+	entries, err := readImageLowerEntries(ctx, lowerDir)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]

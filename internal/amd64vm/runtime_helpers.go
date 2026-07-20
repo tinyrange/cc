@@ -45,6 +45,7 @@ func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.Share
 		sourceDir := filepath.Dir(req.AMD64EmulatorPath)
 		devs = append(devs, newFSDevice(ShareFSBase, ShareFSIRQ, EmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
 	}
+	virtio.AttachFSBackingUsageTracker(devs)
 	return devs, rootFS, nil
 }
 

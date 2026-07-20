@@ -1,6 +1,7 @@
 package imagefs
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -37,6 +38,35 @@ type Directory interface {
 	Lookup(name string) (Entry, error)
 	Owner() (uid, gid uint32)
 	RDev() uint32
+}
+
+// ContextDirectory lets snapshot materialization cancel lower-filesystem work
+// during VM teardown. Directory remains the compatibility interface; callers
+// keep legacy implementations owned until their operation returns.
+type ContextDirectory interface {
+	Directory
+	ReadDirContext(context.Context) ([]DirEnt, error)
+	LookupContext(context.Context, string) (Entry, error)
+}
+
+func ReadDirContext(ctx context.Context, directory Directory) ([]DirEnt, error) {
+	if contextual, ok := directory.(ContextDirectory); ok {
+		return contextual.ReadDirContext(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return directory.ReadDir()
+}
+
+func LookupContext(ctx context.Context, directory Directory, name string) (Entry, error) {
+	if contextual, ok := directory.(ContextDirectory); ok {
+		return contextual.LookupContext(ctx, name)
+	}
+	if err := ctx.Err(); err != nil {
+		return Entry{}, err
+	}
+	return directory.Lookup(name)
 }
 
 type Symlink interface {
@@ -294,6 +324,13 @@ func (d *hostDir) ReadDir() ([]DirEnt, error) {
 	return out, nil
 }
 
+func (d *hostDir) ReadDirContext(ctx context.Context) ([]DirEnt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return d.ReadDir()
+}
+
 func (d *hostDir) Lookup(name string) (Entry, error) {
 	host := filepath.Join(d.hostPath, filepath.FromSlash(name))
 	info, err := os.Lstat(host)
@@ -324,6 +361,13 @@ func (d *hostDir) Lookup(name string) (Entry, error) {
 	default:
 		return Entry{File: &hostFile{hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, size: uint64(info.Size()), modTime: modTime}}, nil
 	}
+}
+
+func (d *hostDir) LookupContext(ctx context.Context, name string) (Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return Entry{}, err
+	}
+	return d.Lookup(name)
 }
 
 func (l *hostSymlink) Stat() fs.FileMode       { return l.mode & linuxPermMask }

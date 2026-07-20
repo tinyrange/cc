@@ -23,25 +23,34 @@ func virtioFSStats(fsdevs []*virtio.FS) []virtio.FSStats {
 
 func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uint64, err error) {
 	var errs []error
-	providers := 0
+	var tracker *virtio.FSBackingUsageTracker
+	sharedTracker := true
+	devices := 0
 	for i, fsdev := range fsdevs {
 		if fsdev == nil {
 			continue
 		}
+		devices++
 		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
-		providers++
+		deviceTracker := fsdev.BackingUsageTracker()
+		if deviceTracker == nil {
+			sharedTracker = false
+		} else if tracker == nil {
+			tracker = deviceTracker
+		} else if deviceTracker != tracker {
+			sharedTracker = false
+		}
 		current += deviceCurrent
-		highWater = max(highWater, deviceHighWater)
+		if tracker == nil || !sharedTracker {
+			highWater = max(highWater, deviceHighWater)
+		}
 		physical += devicePhysical
 		if deviceErr != nil {
 			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
 		}
 	}
-	// One device has an exact internally observed peak. For multiple devices,
-	// the maximum component peak is a conservative lower bound; summing their
-	// independent peaks would invent a state which may never have existed.
-	if providers == 0 {
-		highWater = 0
+	if devices != 0 && tracker != nil && sharedTracker {
+		current, highWater = tracker.Usage()
 	} else {
 		highWater = max(highWater, current)
 	}
