@@ -39,9 +39,11 @@ type relay struct {
 	maxStored   int64
 	captures    map[string]*capture
 	controlBuf  []byte
-	pollFDs     []unix.PollFd
+	pollFDs     []int
+	pollReady   []bool
 	pollCapture []*capture
 	pollDirty   bool
+	poller      relayPoller
 }
 
 type capture struct {
@@ -111,17 +113,20 @@ func (r *relay) run() error {
 }
 
 func (r *relay) serve(control *os.File) error {
+	defer r.poller.close()
 	for {
 		if r.pollDirty {
-			r.rebuildPollSet(control)
+			if err := r.rebuildPollSet(control); err != nil {
+				return err
+			}
 		}
-		if _, err := unix.Poll(r.pollFDs, -1); err != nil {
+		if err := r.poller.wait(r.pollReady); err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue
 			}
-			return fmt.Errorf("poll capture relay: %w", err)
+			return fmt.Errorf("wait for capture relay input: %w", err)
 		}
-		if r.pollFDs[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0 {
+		if r.pollReady[0] {
 			stop, err := r.readControl(control)
 			if err != nil {
 				return err
@@ -131,7 +136,7 @@ func (r *relay) serve(control *os.File) error {
 			}
 		}
 		for i, capture := range r.pollCapture {
-			if r.pollFDs[i+1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
+			if !r.pollReady[i+1] {
 				continue
 			}
 			complete, err := capture.drainReady()
@@ -146,17 +151,26 @@ func (r *relay) serve(control *os.File) error {
 	}
 }
 
-func (r *relay) rebuildPollSet(control *os.File) {
-	r.pollFDs = append(r.pollFDs[:0], unix.PollFd{Fd: int32(control.Fd()), Events: unix.POLLIN})
+func (r *relay) rebuildPollSet(control *os.File) error {
+	r.pollFDs = append(r.pollFDs[:0], int(control.Fd()))
 	r.pollCapture = r.pollCapture[:0]
 	for _, capture := range r.captures {
 		if capture.reader == nil {
 			continue
 		}
 		r.pollCapture = append(r.pollCapture, capture)
-		r.pollFDs = append(r.pollFDs, unix.PollFd{Fd: int32(capture.reader.Fd()), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR})
+		r.pollFDs = append(r.pollFDs, int(capture.reader.Fd()))
+	}
+	if cap(r.pollReady) < len(r.pollFDs) {
+		r.pollReady = make([]bool, len(r.pollFDs))
+	} else {
+		r.pollReady = r.pollReady[:len(r.pollFDs)]
+	}
+	if err := r.poller.reset(r.pollFDs); err != nil {
+		return fmt.Errorf("configure capture relay readiness: %w", err)
 	}
 	r.pollDirty = false
+	return nil
 }
 
 func (r *relay) readControl(control *os.File) (bool, error) {
@@ -228,11 +242,17 @@ func (r *relay) register(fields []string) error {
 	var err error
 	c.spool, err = os.OpenFile(c.outputPath, os.O_WRONLY|os.O_TRUNC, 0)
 	if err == nil {
-		c.reader, err = os.OpenFile(c.fifoPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		// Start connected so poll/kqueue never latch an EOF before the command
+		// opens its end. finishPrimary replaces this with a read-only descriptor,
+		// preserving real EOF detection without retaining a second FIFO handle.
+		c.reader, err = os.OpenFile(c.fifoPath, os.O_RDWR|syscall.O_NONBLOCK, 0)
 	}
 	if err != nil {
 		if c.spool != nil {
 			_ = c.spool.Close()
+		}
+		if c.reader != nil {
+			_ = c.reader.Close()
 		}
 		if publishErr := writeExisting(c.registered, "error: "+err.Error()+"\n"); publishErr != nil {
 			return fmt.Errorf("register capture %s: %w (publish failure: %v)", c.account, err, publishErr)
@@ -369,6 +389,16 @@ func (c *capture) markOverflowLocked() {
 func (c *capture) finishPrimary() error {
 	if c.primaryDone {
 		return nil
+	}
+	reader, err := os.OpenFile(c.fifoPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("release capture FIFO writer %s: %w", c.account, err)
+	}
+	previous := c.reader
+	c.reader = reader
+	c.owner.pollDirty = true
+	if previous != nil {
+		_ = previous.Close()
 	}
 	if err := writeExisting(c.finished, "1\n"); err != nil {
 		return fmt.Errorf("publish capture finish %s: %w", c.account, err)
