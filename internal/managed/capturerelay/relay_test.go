@@ -79,15 +79,23 @@ func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
 	if err := <-writerDone; err != nil {
 		t.Fatal(err)
 	}
-	accounting := make([]byte, 128)
-	if err := shell.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
+	accounting := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 128)
+		n, err := shell.Read(buf)
+		if err != nil {
+			accounting <- "read error: " + err.Error()
+			return
+		}
+		accounting <- string(buf[:n])
+	}()
+	var got string
+	select {
+	case got = <-accounting:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for capture accounting")
 	}
-	n, err := shell.Read(accounting)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(accounting[:n]), "\x1dvmsh-capture:split-output:100000\x1f\n"; got != want {
+	if want := "\x1dvmsh-capture:split-output:100000\x1f\n"; got != want {
 		t.Fatalf("accounting = %q, want %q", got, want)
 	}
 	after, err := os.Stat(output)
