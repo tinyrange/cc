@@ -74,9 +74,10 @@ func (c *workerCall) finish(err error) {
 }
 
 const (
-	workerConnectTimeout = 5 * time.Second
-	workerRetryDelay     = 10 * time.Millisecond
-	workerHelloTimeout   = 5 * time.Second
+	workerConnectTimeout        = 5 * time.Second
+	workerRetryDelay            = 10 * time.Millisecond
+	workerHelloTimeout          = 5 * time.Second
+	workerCancelDeliveryTimeout = time.Second
 )
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
@@ -630,11 +631,17 @@ func (c *Client) waitExecInputAck(call *workerCall, stop <-chan struct{}) bool {
 }
 
 func (c *Client) sendCancel(id uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), workerCancelDeliveryTimeout)
+	defer cancel()
+	return c.sendCancelContext(ctx, id)
+}
+
+func (c *Client) sendCancelContext(ctx context.Context, id uint64) error {
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameCancel, WorkerCancelRequest{})
 	if err != nil {
 		return err
 	}
-	return c.codec.Send(frame)
+	return c.codec.SendContext(ctx, frame)
 }
 
 // watchCancellation keeps cancellation independent from response delivery while
@@ -647,7 +654,9 @@ func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.sendCancel(id)
+			if err := c.sendCancel(id); err != nil {
+				_ = c.Close()
+			}
 			result <- true
 		case <-stop:
 			result <- false
@@ -657,7 +666,9 @@ func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
 		close(stop)
 		sent := <-result
 		if ctx.Err() != nil && !sent {
-			_ = c.sendCancel(id)
+			if err := c.sendCancel(id); err != nil {
+				_ = c.Close()
+			}
 		}
 	}
 }

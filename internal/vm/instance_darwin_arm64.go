@@ -180,13 +180,17 @@ func (i *darwinInstance) RootSnapshotContext(ctx context.Context) (imagefs.Direc
 }
 
 func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *darwinInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, imageName, hvfhost.ImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "Linux", i.ManagedCapabilities(), i.session, imageName, hvfhost.ImageMountPath(imageName))
 }
 
 func (i *darwinInstance) Wait() error {

@@ -1725,6 +1725,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if closer, ok := root.(interface{ Close() error }); ok {
+			defer func() { _ = closer.Close() }()
+		}
 		var opts oci.SaveOptions
 		if sourceImage == "" {
 			sourceImage = requestedImage

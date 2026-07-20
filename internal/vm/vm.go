@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/builtin"
 	vmhost "j5.nz/cc/internal/vm/host"
+	"j5.nz/cc/internal/vm/mounts"
 )
 
 const DefaultInstanceID = "default"
@@ -68,6 +69,10 @@ type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
 }
 
+type imageSnapshotContextProvider interface {
+	SnapshotImageContext(context.Context, string) (imagefs.Directory, error)
+}
+
 type instanceBalloonController interface {
 	SetBalloonMB(uint64) error
 }
@@ -111,26 +116,28 @@ type managerStart struct {
 }
 
 type Machine struct {
-	lifecycleMu      sync.Mutex
-	balloonMu        sync.Mutex
-	backingMu        sync.Mutex
-	snapshotMu       sync.Mutex
-	snapshotCancel   context.CancelFunc
-	backingHighWater uint64
-	id               string
-	image            string
-	initSystem       string
-	kernel           string
-	memoryMB         uint64
-	balloonMB        uint64
-	cpus             int
-	nestedVirt       bool
-	startedAt        time.Time
-	instance         Instance
-	lastErr          error
-	exitedAt         time.Time
-	stopping         bool
-	stop             *machineStopOperation
+	lifecycleMu              sync.Mutex
+	balloonMu                sync.Mutex
+	backingMu                sync.Mutex
+	snapshotMu               sync.Mutex
+	snapshotCancel           context.CancelFunc
+	backingHighWater         uint64
+	backingDataHighWater     uint64
+	backingMetadataHighWater uint64
+	id                       string
+	image                    string
+	initSystem               string
+	kernel                   string
+	memoryMB                 uint64
+	balloonMB                uint64
+	cpus                     int
+	nestedVirt               bool
+	startedAt                time.Time
+	instance                 Instance
+	lastErr                  error
+	exitedAt                 time.Time
+	stopping                 bool
+	stop                     *machineStopOperation
 }
 
 type machineStopOperation struct {
@@ -659,6 +666,11 @@ func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecRe
 
 func (m *Manager) RunIn(ctx context.Context, id string, req client.RunRequest) (client.ExecResponse, error) {
 	id = instanceID(id)
+	shares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	req.Shares = shares
 	m.mu.Lock()
 	machine := m.running[id]
 	m.mu.Unlock()
@@ -684,6 +696,11 @@ func (m *Manager) RunStream(ctx context.Context, req client.RunRequest, inputs <
 
 func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	id = instanceID(id)
+	shares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return err
+	}
+	req.Shares = shares
 	m.mu.Lock()
 	machine := m.running[id]
 	stopping := machine != nil && machine.stopping
@@ -728,7 +745,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		return err
 	}
 	unlock()
-	err := machine.instance.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
+	err = machine.instance.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	if err != nil && m.instanceIsStopping(id, machine) {
 		return stoppedVMError(id)
 	}
@@ -756,20 +773,18 @@ func addInstanceShares(ctx context.Context, instance vmhost.Instance, shares []c
 func validateRuntimeShares(shares []client.ShareMount) error {
 	seen := make(map[string]client.ShareMount, len(shares))
 	for _, share := range shares {
-		mount := strings.TrimSpace(share.Mount)
-		if mount == "" {
-			return fmt.Errorf("share mount path is required")
+		canonical, err := mounts.CanonicalRuntimeShare(share)
+		if err != nil {
+			return err
 		}
-		if !strings.HasPrefix(mount, "/") {
-			return fmt.Errorf("share mount path %q must be absolute", mount)
-		}
+		mount := canonical.Mount
 		if existing, ok := seen[mount]; ok {
-			if existing.Source != share.Source || existing.Writable != share.Writable || existing.Cache != share.Cache {
+			if existing != canonical {
 				return fmt.Errorf("share mount %q is specified more than once with different settings", mount)
 			}
 			continue
 		}
-		seen[mount] = share
+		seen[mount] = canonical
 	}
 	return nil
 }
@@ -907,12 +922,12 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName strin
 	if !ok {
 		return nil, "", fmt.Errorf("VM %q root filesystem cannot be flushed", machine.id)
 	}
-	if err := flusher.Flush(ctx); err != nil {
+	if err := flusher.Flush(snapshotCtx); err != nil {
 		return nil, "", err
 	}
 	if imageName != "" {
-		if snapshotter, ok := machine.instance.(imageSnapshotProvider); ok {
-			root, err := snapshotter.SnapshotImage(imageName)
+		if snapshotter, ok := machine.instance.(imageSnapshotContextProvider); ok {
+			root, err := snapshotter.SnapshotImageContext(snapshotCtx, imageName)
 			if err != nil {
 				return nil, "", err
 			}
@@ -920,16 +935,11 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName strin
 		}
 		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", machine.id, imageName)
 	}
-	snapshotter, ok := machine.instance.(rootSnapshotProvider)
+	contextSnapshotter, ok := machine.instance.(rootSnapshotContextProvider)
 	if !ok {
-		return nil, "", fmt.Errorf("VM %q root filesystem cannot be snapshotted", machine.id)
+		return nil, "", fmt.Errorf("VM %q root filesystem does not support cancelable snapshots", machine.id)
 	}
-	var root imagefs.Directory
-	if contextSnapshotter, ok := machine.instance.(rootSnapshotContextProvider); ok {
-		root, err = contextSnapshotter.RootSnapshotContext(snapshotCtx)
-	} else {
-		root, err = snapshotter.RootSnapshot()
-	}
+	root, err := contextSnapshotter.RootSnapshotContext(snapshotCtx)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1111,17 +1121,28 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 	if snapshot.backingProvider != nil {
 		current, highWater, physical, err := snapshot.backingProvider.BackingUsage()
 		snapshot.state.BackingDataBytes = current
-		snapshot.state.BackingDataHighWaterBytes = highWater
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingDataHighWater = max(snapshot.machine.backingDataHighWater, current, highWater)
+		snapshot.state.BackingDataHighWaterBytes = snapshot.machine.backingDataHighWater
+		snapshot.machine.backingMu.Unlock()
 		snapshot.state.BackingPhysicalBytes = physical
 		if err != nil {
 			snapshot.state.BackingReclaimError = err.Error()
 		}
 	}
 	if snapshot.backingMetadataProvider != nil {
-		snapshot.state.BackingMetadataBytes, snapshot.state.BackingMetadataHighWaterBytes = snapshot.backingMetadataProvider.BackingMetadataUsage()
+		current, highWater := snapshot.backingMetadataProvider.BackingMetadataUsage()
+		snapshot.state.BackingMetadataBytes = current
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingMetadataHighWater = max(snapshot.machine.backingMetadataHighWater, current, highWater)
+		snapshot.state.BackingMetadataHighWaterBytes = snapshot.machine.backingMetadataHighWater
+		snapshot.machine.backingMu.Unlock()
 	}
 	if snapshot.backingProvider != nil || snapshot.backingMetadataProvider != nil {
 		snapshot.state.BackingBytes = saturatingUint64Add(snapshot.state.BackingDataBytes, snapshot.state.BackingMetadataBytes)
+		// Either component peak is a lower bound for the combined usage at
+		// that instant. Taking their maximum is safe; adding them would invent
+		// a state whose peaks may have occurred at different times.
 		observedHighWater := max(snapshot.state.BackingBytes, snapshot.state.BackingDataHighWaterBytes, snapshot.state.BackingMetadataHighWaterBytes)
 		snapshot.machine.backingMu.Lock()
 		if observedHighWater > snapshot.machine.backingHighWater {

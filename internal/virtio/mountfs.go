@@ -39,14 +39,16 @@ type mountedFS struct {
 	closeOnce      sync.Once
 	closeErr       error
 
-	mu         sync.RWMutex
-	nextNodeID uint64
-	nextInode  uint64
-	nextHandle uint64
-	nodes      map[uint64]*mountedNode
-	pathToNode map[string]uint64
-	inodes     map[mountedBackendInode]uint64
-	handles    map[uint64]*mountedHandle
+	mu                       sync.RWMutex
+	nextNodeID               uint64
+	nextInode                uint64
+	nextHandle               uint64
+	nodes                    map[uint64]*mountedNode
+	pathToNode               map[string]uint64
+	inodes                   map[mountedBackendInode]uint64
+	handles                  map[uint64]*mountedHandle
+	backingDataHighWater     uint64
+	backingMetadataHighWater uint64
 }
 
 func (m *mountedFS) distinctBackends() []FSBackend {
@@ -94,14 +96,19 @@ func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaim
 		if !ok {
 			continue
 		}
-		backendCurrent, backendHighWater, backendPhysical, err := provider.BackingUsage()
+		backendCurrent, _, backendPhysical, err := provider.BackingUsage()
 		current += backendCurrent
-		highWater += backendHighWater
 		physical += backendPhysical
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
+	m.mu.Lock()
+	if current > m.backingDataHighWater {
+		m.backingDataHighWater = current
+	}
+	highWater = m.backingDataHighWater
+	m.mu.Unlock()
 	return current, highWater, physical, errors.Join(errs...)
 }
 
@@ -115,10 +122,15 @@ func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
 		if !ok {
 			continue
 		}
-		backendCurrent, backendHighWater := provider.BackingMetadataUsage()
+		backendCurrent, _ := provider.BackingMetadataUsage()
 		current += backendCurrent
-		highWater += backendHighWater
 	}
+	m.mu.Lock()
+	if current > m.backingMetadataHighWater {
+		m.backingMetadataHighWater = current
+	}
+	highWater = m.backingMetadataHighWater
+	m.mu.Unlock()
 	return current, highWater
 }
 
@@ -176,7 +188,10 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 	mounts := make([]shareMount, 0, len(shares))
 	for _, share := range shares {
 		mountPath := cleanMountPath(share.GuestPath)
-		if mountPath == "/" || share.Backend == nil {
+		if share.Backend == nil {
+			continue
+		}
+		if mountPath == "/" {
 			continue
 		}
 		mounts = append(mounts, shareMount{
@@ -226,7 +241,31 @@ func (m *mountedFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory,
 }
 
 func (m *mountedFS) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
-	return m.RootSnapshotAtContext(context.Background(), guestPath)
+	guestPath = cleanMountPath(guestPath)
+	if guestPath == "/" {
+		if snap, ok := m.root.(interface {
+			RootSnapshot() (imagefs.Directory, error)
+		}); ok {
+			return snap.RootSnapshot()
+		}
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	m.mu.RLock()
+	for i := range m.mounts {
+		if m.mounts[i].path != guestPath {
+			continue
+		}
+		backend := m.mounts[i].backend
+		m.mu.RUnlock()
+		if snap, ok := backend.(interface {
+			RootSnapshot() (imagefs.Directory, error)
+		}); ok {
+			return snap.RootSnapshot()
+		}
+		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
+	}
+	m.mu.RUnlock()
+	return nil, fmt.Errorf("mount %q is not available", guestPath)
 }
 
 func (m *mountedFS) RootSnapshotAtContext(ctx context.Context, guestPath string) (imagefs.Directory, error) {
@@ -237,27 +276,24 @@ func (m *mountedFS) RootSnapshotAtContext(ctx context.Context, guestPath string)
 		}); ok {
 			return snap.RootSnapshotContext(ctx)
 		}
-		if snap, ok := m.root.(interface {
-			RootSnapshot() (imagefs.Directory, error)
-		}); ok {
-			return snap.RootSnapshot()
-		}
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	for i := range m.mounts {
 		mount := &m.mounts[i]
 		if mount.path != guestPath {
 			continue
 		}
-		if snap, ok := mount.backend.(interface {
-			RootSnapshot() (imagefs.Directory, error)
+		backend := mount.backend
+		m.mu.RUnlock()
+		if snap, ok := backend.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
 		}); ok {
-			return snap.RootSnapshot()
+			return snap.RootSnapshotContext(ctx)
 		}
-		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
+		return nil, fmt.Errorf("mount %q does not support cancelable snapshots", guestPath)
 	}
+	m.mu.RUnlock()
 	return nil, fmt.Errorf("mount %q is not available", guestPath)
 }
 
@@ -310,7 +346,10 @@ func (m *mountedFS) AddShares(shares []ShareMount) error {
 				continue
 			}
 			delete(m.pathToNode, existingPath)
-			delete(m.nodes, id)
+			node := m.nodes[id]
+			if !m.nodeHasHandleLocked(node) {
+				delete(m.nodes, id)
+			}
 		}
 	}
 	return nil

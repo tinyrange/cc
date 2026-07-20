@@ -27,14 +27,16 @@ func virtioFSBackingUsage(fsdevs []*virtio.FS) (current, highWater, physical uin
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
+		deviceCurrent, _, devicePhysical, deviceErr := fsdev.BackingUsage()
 		current += deviceCurrent
-		highWater += deviceHighWater
 		physical += devicePhysical
 		if deviceErr != nil {
 			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
 		}
 	}
+	// A sum of independent device peaks describes a state that may never have
+	// existed. The manager retains the high-water mark of this aggregate sample.
+	highWater = current
 	return current, highWater, physical, errors.Join(errs...)
 }
 
@@ -43,9 +45,9 @@ func virtioFSBackingMetadataUsage(fsdevs []*virtio.FS) (current, highWater uint6
 		if fsdev == nil {
 			continue
 		}
-		deviceCurrent, deviceHighWater := fsdev.BackingMetadataUsage()
+		deviceCurrent, _ := fsdev.BackingMetadataUsage()
 		current += deviceCurrent
-		highWater += deviceHighWater
 	}
+	highWater = current
 	return current, highWater
 }

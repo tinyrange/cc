@@ -282,6 +282,7 @@ func (s *imageDataStore) releasePage(location uint64) {
 	s.locationRefs[location] = 0
 	s.liveLocations--
 	s.freeLocations = append(s.freeLocations, location)
+	s.compactReleasedLocationsLocked(location)
 	s.free = append(s.free, offset)
 	s.freeSet[offset] = struct{}{}
 	scheduleReclaim := len(s.pendingReclaim) == 0
@@ -293,6 +294,39 @@ func (s *imageDataStore) releasePage(location uint64) {
 	s.mu.Unlock()
 	if scheduleReclaim {
 		globalImageDataReclaimer.schedule(s)
+	}
+}
+
+// compactReleasedLocationsLocked returns trailing, no-longer-referenced
+// allocation tokens to the Go allocator. Tokens remain stable while any live
+// filesystem or snapshot references them; only the dead suffix is renumbered.
+func (s *imageDataStore) compactReleasedLocationsLocked(released uint64) {
+	if released+1 != uint64(len(s.locations)) {
+		return
+	}
+	newLen := len(s.locations)
+	for newLen > 1 && s.locations[newLen-1] == 0 && s.locationRefs[newLen-1] == 0 {
+		newLen--
+	}
+	if newLen == len(s.locations) {
+		return
+	}
+	filtered := s.freeLocations[:0]
+	for _, location := range s.freeLocations {
+		if location < uint64(newLen) {
+			filtered = append(filtered, location)
+		}
+	}
+	s.freeLocations = filtered
+	s.locations = s.locations[:newLen]
+	s.locationRefs = s.locationRefs[:newLen]
+	s.nextLocation = uint64(newLen - 1)
+	if cap(s.locations) >= 64 && newLen*4 <= cap(s.locations) {
+		s.locations = append([]uint64(nil), s.locations...)
+		s.locationRefs = append([]uint32(nil), s.locationRefs...)
+	}
+	if cap(s.freeLocations) >= 64 && len(s.freeLocations)*4 <= cap(s.freeLocations) {
+		s.freeLocations = append([]uint64(nil), s.freeLocations...)
 	}
 }
 
@@ -351,6 +385,29 @@ func (s *imageDataStore) flushReclaimLocked() {
 		if err := s.compactLocked(); err != nil && s.reclaimErr == nil {
 			s.reclaimErr = err
 		}
+	}
+	s.compactMetadataLocked()
+}
+
+func (s *imageDataStore) compactMetadataLocked() {
+	if len(s.freeSet)*4 < s.retainedFreeSet && (s.retainedFreeSet >= 64 || len(s.freeSet) == 0) {
+		freeSet := make(map[uint64]struct{}, len(s.freeSet))
+		free := make([]uint64, 0, len(s.freeSet))
+		for offset := range s.freeSet {
+			freeSet[offset] = struct{}{}
+			free = append(free, offset)
+		}
+		s.freeSet = freeSet
+		s.free = free
+		s.retainedFreeSet = len(freeSet)
+	}
+	if len(s.pendingReclaim)*4 < s.retainedPendingReclaim && (s.retainedPendingReclaim >= 64 || len(s.pendingReclaim) == 0) {
+		pending := make(map[uint64]struct{}, len(s.pendingReclaim))
+		for offset := range s.pendingReclaim {
+			pending[offset] = struct{}{}
+		}
+		s.pendingReclaim = pending
+		s.retainedPendingReclaim = len(pending)
 	}
 }
 

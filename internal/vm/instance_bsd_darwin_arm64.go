@@ -97,6 +97,13 @@ func (i *darwinBSDInstance) NetworkIPv4() string {
 }
 
 func (i *darwinBSDInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *darwinBSDInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if i == nil {
 		return nil, fmt.Errorf("instance is not running")
 	}
@@ -110,7 +117,11 @@ func (i *darwinBSDInstance) RootSnapshot() (imagefs.Directory, error) {
 }
 
 func (i *darwinBSDInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
-	return i.RootSnapshot()
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *darwinBSDInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	return i.RootSnapshotContext(ctx)
 }
 
 func (i *darwinBSDInstance) closeNetwork() {

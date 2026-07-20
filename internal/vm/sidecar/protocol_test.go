@@ -1,8 +1,11 @@
 package sidecar
 
 import (
+	"context"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -44,6 +47,24 @@ func TestWorkerCodecRoundTrip(t *testing.T) {
 	if req.ID != "vm1" || len(req.Request.Command) != 2 || req.Request.Command[1] != "ok" {
 		t.Fatalf("request = %+v", req)
 	}
+}
+
+func TestWorkerCodecContextBoundsBlockedSend(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	codec := NewWorkerCodec(left)
+	defer codec.Close()
+	frame := mustWorkerFrame(1, WorkerFrameCancel, WorkerCancelRequest{})
+	blocked := make(chan error, 1)
+	go func() { blocked <- codec.Send(frame) }()
+	t.Cleanup(func() { <-blocked })
+	time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := codec.SendContext(ctx, frame); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked send error = %v", err)
+	}
+	_ = left.Close()
 }
 
 func TestExecResponseFromEvents(t *testing.T) {

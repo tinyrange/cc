@@ -29,11 +29,15 @@ func (i *windowsInstance) RootSnapshotContext(ctx context.Context) (imagefs.Dire
 }
 
 func (i *windowsInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *windowsInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
 	if i.image != nil && i.image.Name == imageName {
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, imageName, whphost.ImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "Linux", i.ManagedCapabilities(), i.rootFS, imageName, whphost.ImageMountPath(imageName))
 }

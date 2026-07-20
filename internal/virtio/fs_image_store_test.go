@@ -110,6 +110,14 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 	for _, location := range locations {
 		store.releasePage(location)
 	}
+	store.mu.Lock()
+	locationCapacity := cap(store.locations)
+	referenceCapacity := cap(store.locationRefs)
+	freeLocationCapacity := cap(store.freeLocations)
+	store.mu.Unlock()
+	if locationCapacity > 4 || referenceCapacity > 4 || freeLocationCapacity > 4 {
+		t.Fatalf("released location indexes retained peak capacity: locations=%d refs=%d free=%d", locationCapacity, referenceCapacity, freeLocationCapacity)
+	}
 	current, highWater, _, err := store.usage()
 	if current != 0 || highWater != uint64(len(locations))*imageDataPageSize || err != nil {
 		t.Fatalf("usage after logical release = %d, %d, %v", current, highWater, err)
@@ -119,9 +127,15 @@ func TestImageDataStoreBatchesReleasedPagesAndAccountsImmediately(t *testing.T) 
 	}
 	store.mu.Lock()
 	next := store.next
+	freeCapacity := cap(store.free)
+	retainedFreeSet := store.retainedFreeSet
+	retainedPending := store.retainedPendingReclaim
 	store.mu.Unlock()
 	if next != 0 {
 		t.Fatalf("backing length after batched reclaim = %d, want 0", next)
+	}
+	if freeCapacity != 0 || retainedFreeSet != 0 || retainedPending != 0 {
+		t.Fatalf("released page metadata retained free=%d free-set=%d pending=%d", freeCapacity, retainedFreeSet, retainedPending)
 	}
 }
 

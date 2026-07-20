@@ -1,10 +1,11 @@
 package sidecar
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -180,7 +181,7 @@ type WorkerCodec struct {
 	conn io.ReadWriteCloser
 	enc  *json.Encoder
 	dec  *json.Decoder
-	mu   sync.Mutex
+	send chan struct{}
 }
 
 func NewWorkerCodec(conn io.ReadWriteCloser) *WorkerCodec {
@@ -188,12 +189,32 @@ func NewWorkerCodec(conn io.ReadWriteCloser) *WorkerCodec {
 		conn: conn,
 		enc:  json.NewEncoder(conn),
 		dec:  json.NewDecoder(conn),
+		send: make(chan struct{}, 1),
 	}
 }
 
 func (c *WorkerCodec) Send(frame WorkerFrame) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.SendContext(context.Background(), frame)
+}
+
+func (c *WorkerCodec) SendContext(ctx context.Context, frame WorkerFrame) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case c.send <- struct{}{}:
+		defer func() { <-c.send }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if conn, ok := c.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			if err := conn.SetWriteDeadline(deadline); err != nil {
+				return err
+			}
+			defer conn.SetWriteDeadline(time.Time{})
+		}
+	}
 	return c.enc.Encode(frame)
 }
 

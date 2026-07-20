@@ -26,7 +26,21 @@ type RootSnapshotAtContextProvider interface {
 }
 
 func RootSnapshot(rootFS any, rootDir string) (imagefs.Directory, error) {
-	return RootSnapshotContext(context.Background(), rootFS, rootDir)
+	if rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if rootDir != "" {
+		snapshotter, ok := rootFS.(RootSnapshotAtter)
+		if !ok {
+			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		}
+		return snapshotter.RootSnapshotAt(rootDir)
+	}
+	snapshotter, ok := rootFS.(RootSnapshotter)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return snapshotter.RootSnapshot()
 }
 
 func RootSnapshotContext(ctx context.Context, rootFS any, rootDir string) (imagefs.Directory, error) {
@@ -37,20 +51,12 @@ func RootSnapshotContext(ctx context.Context, rootFS any, rootDir string) (image
 		if snapshotter, ok := rootFS.(RootSnapshotAtContextProvider); ok {
 			return snapshotter.RootSnapshotAtContext(ctx, rootDir)
 		}
-		snapshotter, ok := rootFS.(RootSnapshotAtter)
-		if !ok {
-			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-		}
-		return snapshotter.RootSnapshotAt(rootDir)
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
 	}
 	if snapshotter, ok := rootFS.(RootSnapshotContextProvider); ok {
 		return snapshotter.RootSnapshotContext(ctx)
 	}
-	snapshotter, ok := rootFS.(RootSnapshotter)
-	if !ok {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-	}
-	return snapshotter.RootSnapshot()
+	return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
 }
 
 func ImageSnapshot(rootFS any, imageName, mountPath string) (imagefs.Directory, error) {
@@ -62,6 +68,17 @@ func ImageSnapshot(rootFS any, imageName, mountPath string) (imagefs.Directory, 
 		return nil, fmt.Errorf("image mount %q cannot be snapshotted", imageName)
 	}
 	return snapshotter.RootSnapshotAt(mountPath)
+}
+
+func ImageSnapshotContext(ctx context.Context, rootFS any, imageName, mountPath string) (imagefs.Directory, error) {
+	if rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	snapshotter, ok := rootFS.(RootSnapshotAtContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("image mount %q does not support cancelable snapshots", imageName)
+	}
+	return snapshotter.RootSnapshotAtContext(ctx, mountPath)
 }
 
 func RootSnapshotWithCapabilities(display string, caps managedguest.Capabilities, rootFS any, rootDir string) (imagefs.Directory, error) {
@@ -76,6 +93,13 @@ func ImageSnapshotWithCapabilities(display string, caps managedguest.Capabilitie
 		return nil, unsupportedFeature(display, caps, "image snapshots")
 	}
 	return ImageSnapshot(rootFS, imageName, mountPath)
+}
+
+func ImageSnapshotContextWithCapabilities(ctx context.Context, display string, caps managedguest.Capabilities, rootFS any, imageName, mountPath string) (imagefs.Directory, error) {
+	if !caps.ImageSnapshot {
+		return nil, unsupportedFeature(display, caps, "image snapshots")
+	}
+	return ImageSnapshotContext(ctx, rootFS, imageName, mountPath)
 }
 
 func unsupportedFeature(runtimeName string, caps managedguest.Capabilities, feature string) error {

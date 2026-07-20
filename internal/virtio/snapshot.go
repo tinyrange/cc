@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"j5.nz/cc/internal/imagefs"
@@ -156,12 +157,20 @@ func unixAttrModTime(attr FuseAttr) time.Time {
 }
 
 type snapshotDir struct {
-	mode    fs.FileMode
-	uid     uint32
-	gid     uint32
-	rdev    uint32
-	modTime time.Time
-	entries map[string]imagefs.Entry
+	mode      fs.FileMode
+	uid       uint32
+	gid       uint32
+	rdev      uint32
+	modTime   time.Time
+	entries   map[string]imagefs.Entry
+	closeOnce sync.Once
+}
+
+func (d *snapshotDir) Close() error {
+	if d != nil {
+		d.closeOnce.Do(func() { releaseSnapshotDirEntries(d) })
+	}
+	return nil
 }
 
 func (d *snapshotDir) Stat() fs.FileMode       { return d.mode }
@@ -265,11 +274,15 @@ func releaseSnapshotDir(dir *snapshotDir) {
 	if dir == nil {
 		return
 	}
+	_ = dir.Close()
+}
+
+func releaseSnapshotDirEntries(dir *snapshotDir) {
 	for _, entry := range dir.entries {
 		switch {
 		case entry.Dir != nil:
 			if child, ok := entry.Dir.(*snapshotDir); ok {
-				releaseSnapshotDir(child)
+				_ = child.Close()
 			}
 		case entry.File != nil:
 			if file, ok := entry.File.(*snapshotFile); ok {

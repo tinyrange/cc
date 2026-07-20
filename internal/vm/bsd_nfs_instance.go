@@ -75,7 +75,7 @@ func (i *bsdNFSInstance) AddShare(ctx context.Context, share client.ShareMount) 
 	i.mu.Lock()
 	if existing, ok := i.mounted[key]; ok {
 		i.mu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable {
+		if existing == share {
 			return nil
 		}
 	} else {
@@ -121,12 +121,28 @@ func (i *bsdNFSInstance) RootSnapshot() (imagefs.Directory, error) {
 	return snapshotter.RootSnapshot()
 }
 
+func (i *bsdNFSInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(rootSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
+	}
+	return snapshotter.RootSnapshotContext(ctx)
+}
+
 func (i *bsdNFSInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	snapshotter, ok := i.Instance.(imageSnapshotProvider)
 	if !ok {
 		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
 	}
 	return snapshotter.SnapshotImage(imageName)
+}
+
+func (i *bsdNFSInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(imageSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("image %q does not support cancelable snapshots", imageName)
+	}
+	return snapshotter.SnapshotImageContext(ctx, imageName)
 }
 
 func (i *bsdNFSInstance) NetworkIPv4() string {

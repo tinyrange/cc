@@ -168,9 +168,13 @@ func TestImageFSPageOverlayPreservesLowerBytesAndSnapshots(t *testing.T) {
 	if err != nil || snapshotData[imageDataPageSize+17] != 0xfe {
 		t.Fatalf("snapshot changed after live write: byte=%#x err=%v", snapshotData[imageDataPageSize+17], err)
 	}
-	snapshotFile := entry.File.(*snapshotFile)
-	runtime.SetFinalizer(snapshotFile, nil)
-	snapshotFile.releaseStore()
+	closer, ok := snapshot.(interface{ Close() error })
+	if !ok {
+		t.Fatal("snapshot has no deterministic close operation")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if current, _, _, _ := backend.dataStore.usage(); current != imageDataPageSize {
 		t.Fatalf("released snapshot retained old COW page: %d", current)
 	}
@@ -540,5 +544,25 @@ func TestImageFSMetadataHighWaterSurvivesUnpolledChurnAndCompacts(t *testing.T) 
 	}
 	if after > before+16<<10 {
 		t.Fatalf("metadata maps did not compact after churn: before=%d after=%d", before, after)
+	}
+}
+
+func TestImageFSHandleMapsReleaseBurstCapacity(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	type opened struct{ node, handle uint64 }
+	handles := make([]opened, 128)
+	for i := range handles {
+		node, handle := createImageFile(t, backend, fmt.Sprintf("open-%03d", i), "")
+		handles[i] = opened{node: node, handle: handle}
+	}
+	for _, opened := range handles {
+		backend.Release(opened.node, opened.handle)
+	}
+	backend.mu.Lock()
+	retained := backend.retainedHandles
+	active := len(backend.handles)
+	backend.mu.Unlock()
+	if active != 0 || retained != 0 {
+		t.Fatalf("released handles active=%d retained=%d", active, retained)
 	}
 }

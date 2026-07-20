@@ -66,8 +66,16 @@ type rootSnapshotProvider interface {
 	RootSnapshot() (imagefs.Directory, error)
 }
 
+type rootSnapshotContextProvider interface {
+	RootSnapshotContext(context.Context) (imagefs.Directory, error)
+}
+
 type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
+}
+
+type imageSnapshotContextProvider interface {
+	SnapshotImageContext(context.Context, string) (imagefs.Directory, error)
 }
 
 type inProcessVMHost struct {
@@ -353,12 +361,28 @@ func (i *hostedInstance) RootSnapshot() (imagefs.Directory, error) {
 	return snapshotter.RootSnapshot()
 }
 
+func (i *hostedInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(rootSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
+	}
+	return snapshotter.RootSnapshotContext(ctx)
+}
+
 func (i *hostedInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	snapshotter, ok := i.Instance.(imageSnapshotProvider)
 	if !ok {
 		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
 	}
 	return snapshotter.SnapshotImage(imageName)
+}
+
+func (i *hostedInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(imageSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("image %q does not support cancelable snapshots", imageName)
+	}
+	return snapshotter.SnapshotImageContext(ctx, imageName)
 }
 
 func (i *hostedInstance) NetworkIPv4() string {

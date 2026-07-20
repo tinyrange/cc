@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -358,13 +359,33 @@ func (s *ContainerSession) AddShares(ctx context.Context, requested []client.Sha
 	}
 	var mountsToAdd []virtio.ShareMount
 	var sharesToAdd []client.ShareMount
-	for _, share := range requested {
+	releasePrepared := true
+	defer func() {
+		if !releasePrepared {
+			return
+		}
+		for _, mount := range mountsToAdd {
+			if closer, ok := mount.Backend.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+	for _, rawShare := range requested {
+		share := rawShare
 		key := strings.TrimSpace(share.Mount)
 		if key == "" {
 			return fmt.Errorf("share mount path is required")
 		}
+		if !strings.HasPrefix(key, "/") {
+			return fmt.Errorf("share mount path %q must be absolute", key)
+		}
+		key = path.Clean(key)
+		if key == "/" {
+			return fmt.Errorf("share mount path / cannot replace the VM root filesystem")
+		}
+		share.Mount = key
 		if existing, ok := prospective[key]; ok {
-			if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
+			if existing == share {
 				continue
 			}
 			return fmt.Errorf("share mount %q already exists", key)
@@ -381,6 +402,7 @@ func (s *ContainerSession) AddShares(ctx context.Context, requested []client.Sha
 		sharesToAdd = append(sharesToAdd, share)
 	}
 	if len(mountsToAdd) == 0 {
+		releasePrepared = false
 		return nil
 	}
 	if batch, ok := s.rootFS.(virtio.ShareBatchMounter); ok {
@@ -396,8 +418,9 @@ func (s *ContainerSession) AddShares(ctx context.Context, requested []client.Sha
 		s.shares = make(map[string]client.ShareMount)
 	}
 	for _, share := range sharesToAdd {
-		s.shares[strings.TrimSpace(share.Mount)] = share
+		s.shares[share.Mount] = share
 	}
+	releasePrepared = false
 	return nil
 }
 
@@ -657,11 +680,30 @@ func (s *ContainerSession) Flush(ctx context.Context) error {
 }
 
 func (s *ContainerSession) RootSnapshot() (imagefs.Directory, error) {
-	return s.RootSnapshotContext(context.Background())
+	return s.RootSnapshotAt("/")
 }
 
 func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
-	return s.RootSnapshotAtContext(context.Background(), guestPath)
+	if s == nil || s.rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if strings.TrimSpace(guestPath) == "" {
+		guestPath = "/"
+	}
+	if guestPath == "/" {
+		if snapshotter, ok := s.rootFS.(interface {
+			RootSnapshot() (imagefs.Directory, error)
+		}); ok {
+			return snapshotter.RootSnapshot()
+		}
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if snapshotter, ok := s.rootFS.(interface {
+		RootSnapshotAt(string) (imagefs.Directory, error)
+	}); ok {
+		return snapshotter.RootSnapshotAt(guestPath)
+	}
+	return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
 }
 
 func (s *ContainerSession) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
@@ -681,26 +723,14 @@ func (s *ContainerSession) RootSnapshotAtContext(ctx context.Context, guestPath 
 		}); ok {
 			return snapshotter.RootSnapshotContext(ctx)
 		}
-		snapshotter, ok := s.rootFS.(interface {
-			RootSnapshot() (imagefs.Directory, error)
-		})
-		if !ok {
-			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
-		}
-		return snapshotter.RootSnapshot()
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
 	}
 	if snapshotter, ok := s.rootFS.(interface {
 		RootSnapshotAtContext(context.Context, string) (imagefs.Directory, error)
 	}); ok {
 		return snapshotter.RootSnapshotAtContext(ctx, guestPath)
 	}
-	snapshotter, ok := s.rootFS.(interface {
-		RootSnapshotAt(string) (imagefs.Directory, error)
-	})
-	if !ok {
-		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
-	}
-	return snapshotter.RootSnapshotAt(guestPath)
+	return nil, fmt.Errorf("mount %q does not support cancelable snapshots", guestPath)
 }
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {

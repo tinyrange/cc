@@ -4527,6 +4527,7 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
 	delete(p.handles, fh)
+	p.compactImageHandleMapsLocked()
 	if ok {
 		p.collectImageNodeLocked(handle.nodeID)
 	}
@@ -4764,6 +4765,7 @@ func (p *imageFS) ReleaseDir(_ uint64, fh uint64) {
 	nodeID := p.dirHandleNodes[fh]
 	delete(p.dirHandles, fh)
 	delete(p.dirHandleNodes, fh)
+	p.compactImageDirHandleMapsLocked()
 	p.collectImageNodeLocked(nodeID)
 	p.mu.Unlock()
 }
@@ -5748,6 +5750,35 @@ func (p *imageFS) compactImageNodesLocked() {
 	}
 	p.nodes = rebuilt
 	p.retainedNodes = len(rebuilt)
+}
+
+func (p *imageFS) compactImageHandleMapsLocked() {
+	if len(p.handles)*4 >= p.retainedHandles || p.retainedHandles < 64 && !(len(p.handles) == 0 && p.retainedHandles >= 16) {
+		return
+	}
+	rebuilt := make(map[uint64]imageHandle, len(p.handles))
+	for id, handle := range p.handles {
+		rebuilt[id] = handle
+	}
+	p.handles = rebuilt
+	p.retainedHandles = len(rebuilt)
+}
+
+func (p *imageFS) compactImageDirHandleMapsLocked() {
+	if len(p.dirHandles)*4 >= p.retainedDirHandles || p.retainedDirHandles < 64 && !(len(p.dirHandles) == 0 && p.retainedDirHandles >= 16) {
+		return
+	}
+	handles := make(map[uint64][]dirEntry, len(p.dirHandles))
+	nodes := make(map[uint64]uint64, len(p.dirHandleNodes))
+	for id, entries := range p.dirHandles {
+		handles[id] = entries
+	}
+	for id, node := range p.dirHandleNodes {
+		nodes[id] = node
+	}
+	p.dirHandles = handles
+	p.dirHandleNodes = nodes
+	p.retainedDirHandles = len(handles)
 }
 
 func (p *imageFS) bumpImageMetadataFloorLocked() {

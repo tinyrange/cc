@@ -45,10 +45,10 @@ func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 	}).(*mountedFS)
 
 	current, highWater, _, err := fsys.BackingUsage()
-	if current != 40 || highWater != 60 || !errors.Is(err, rootErr) {
+	if current != 40 || highWater != 40 || !errors.Is(err, rootErr) {
 		t.Fatalf("backing usage = %d, %d, %v", current, highWater, err)
 	}
-	if current, highWater := fsys.BackingMetadataUsage(); current != 8 || highWater != 17 {
+	if current, highWater := fsys.BackingMetadataUsage(); current != 8 || highWater != 8 {
 		t.Fatalf("metadata usage = %d, %d", current, highWater)
 	}
 	if err := fsys.Close(); !errors.Is(err, closeErr) {
@@ -334,6 +334,33 @@ func TestMountedFSOpenDirectorySurvivesRemoval(t *testing.T) {
 	if _, errno := fsys.GetAttr(nodeID); errno != -linuxENOENT {
 		t.Fatalf("getattr released removed directory: errno %d, want %d", errno, -linuxENOENT)
 	}
+}
+
+func TestMountedFSOpenDirectorySurvivesRuntimeMountReplacement(t *testing.T) {
+	root := imageBackend(t, nil)
+	if _, _, errno := root.(fsMkdirBackend).Mkdir(1, "data", 0o700, 0, 0); errno != 0 {
+		t.Fatalf("mkdir backend directory: errno %d", errno)
+	}
+	fsys := NewMountedFS(root, nil).(*mountedFS)
+	nodeID, _, errno := fsys.Lookup(1, "data")
+	if errno != 0 {
+		t.Fatalf("lookup old directory: errno %d", errno)
+	}
+	fh, errno := fsys.OpenDir(nodeID, 0)
+	if errno != 0 {
+		t.Fatalf("open old directory: errno %d", errno)
+	}
+	if err := fsys.AddShare(ShareMount{GuestPath: "/data", Backend: imageBackend(t, map[string]string{"/new": "mounted"})}); err != nil {
+		t.Fatal(err)
+	}
+	if _, errno := fsys.ReadDir(nodeID, fh, 0, 4096); errno != 0 {
+		t.Fatalf("old open directory after mount replacement: errno %d", errno)
+	}
+	newID, _, errno := fsys.Lookup(1, "data")
+	if errno != 0 || newID == nodeID {
+		t.Fatalf("replacement lookup node=%d old=%d errno=%d", newID, nodeID, errno)
+	}
+	fsys.ReleaseDir(nodeID, fh)
 }
 
 func BenchmarkImageFSGentooLikeTinyFiles(b *testing.B) {

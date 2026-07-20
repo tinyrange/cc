@@ -37,6 +37,10 @@ func (i *linuxInstance) RootSnapshotContext(ctx context.Context) (imagefs.Direct
 }
 
 func (i *linuxInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *linuxInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
@@ -45,9 +49,9 @@ func (i *linuxInstance) SnapshotImage(imageName string) (imagefs.Directory, erro
 	}
 	if i.image != nil && i.image.Name == imageName {
 		if i.defaultRootDir != "" {
-			return mounts.RootSnapshotWithCapabilities("Linux", i.caps, i.rootFS, i.defaultRootDir)
+			return mounts.RootSnapshotContext(ctx, i.rootFS, i.defaultRootDir)
 		}
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("Linux", i.caps, i.rootFS, imageName, kvmhost.ImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "Linux", i.caps, i.rootFS, imageName, kvmhost.ImageMountPath(imageName))
 }

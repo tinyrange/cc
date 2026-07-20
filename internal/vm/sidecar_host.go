@@ -713,20 +713,31 @@ func (i *sidecarInstance) ConsoleHistory(ctx context.Context) (string, error) {
 }
 
 func (i *sidecarInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *sidecarInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
-	return mounts.RootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
+	if !i.ManagedCapabilities().RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
+	}
+	return mounts.RootSnapshotContext(ctx, i.rootFS, "")
 }
 
 func (i *sidecarInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *sidecarInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
 }
 
 func (i *sidecarInstance) NetworkIPv4() string {

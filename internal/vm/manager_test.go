@@ -265,6 +265,30 @@ func TestManagerRunStreamValidatesAllSharesBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestManagerRunStreamCanonicalizesRuntimeShareMounts(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shares", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.RunStreamIn(ctx, "shares", client.RunRequest{
+		Image: "alpine", Command: []string{"true"},
+		Shares: []client.ShareMount{{Source: "/host/data", Mount: " /work/../data/ ", Writable: true}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if len(inst.shares) != 1 || inst.shares[0].Mount != "/data" {
+		t.Fatalf("runtime shares = %+v", inst.shares)
+	}
+}
+
 func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
@@ -1139,6 +1163,35 @@ func TestManagerStopCancelsActiveRootSnapshot(t *testing.T) {
 	}
 }
 
+func TestManagerStopCancelsActiveAlternateImageSnapshot(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingImageSnapshotInstance{fakeInstance: newFakeInstance(), started: make(chan struct{})}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "snapshot", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, _, err := manager.SnapshotRootFS(ctx, "snapshot", "alternate")
+		snapshotDone <- err
+	}()
+	select {
+	case <-inst.started:
+	case <-time.After(time.Second):
+		t.Fatal("alternate image snapshot did not start")
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.ShutdownInstance(stopCtx, "snapshot"); err != nil {
+		t.Fatalf("stop waited behind alternate image snapshot: %v", err)
+	}
+	if err := <-snapshotDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot error = %v, want cancellation", err)
+	}
+}
+
 type fakeHost struct {
 	mu                sync.Mutex
 	caps              VMHostCapabilities
@@ -1406,6 +1459,17 @@ type blockingSnapshotInstance struct {
 	started chan struct{}
 }
 
+type blockingImageSnapshotInstance struct {
+	*fakeInstance
+	started chan struct{}
+}
+
+func (i *blockingImageSnapshotInstance) SnapshotImageContext(ctx context.Context, _ string) (imagefs.Directory, error) {
+	close(i.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func (i *blockingSnapshotInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	close(i.started)
 	<-ctx.Done()
@@ -1554,12 +1618,26 @@ func (i *fakeInstance) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (i *fakeInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *fakeInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.root, nil
 }
 
 func (i *fakeInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *fakeInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	root, ok := i.snapshots[imageName]
