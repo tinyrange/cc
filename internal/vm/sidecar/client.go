@@ -42,11 +42,16 @@ func (e *TerminationUnconfirmedError) Error() string {
 func (e *TerminationUnconfirmedError) Unwrap() error { return e.Cause }
 
 type workerCall struct {
-	frames   chan WorkerFrame
-	done     chan error
-	inputAck chan struct{}
-	abort    sync.Once
-	aborting chan struct{}
+	frames        chan WorkerFrame
+	done          chan struct{}
+	inputAck      chan struct{}
+	abort         sync.Once
+	aborting      chan struct{}
+	terminal      sync.Once
+	terminalReady chan struct{}
+	finishOnce    sync.Once
+	errMu         sync.Mutex
+	err           error
 }
 
 type WorkerRequirements struct {
@@ -73,18 +78,27 @@ func (e *MissingWorkerCapabilityError) Error() string {
 
 func newWorkerCall() *workerCall {
 	return &workerCall{
-		frames:   make(chan WorkerFrame, 256),
-		done:     make(chan error, 1),
-		inputAck: make(chan struct{}, 1),
-		aborting: make(chan struct{}),
+		frames:        make(chan WorkerFrame, 256),
+		done:          make(chan struct{}),
+		inputAck:      make(chan struct{}, 1),
+		aborting:      make(chan struct{}),
+		terminalReady: make(chan struct{}),
 	}
 }
 
 func (c *workerCall) finish(err error) {
-	select {
-	case c.done <- err:
-	default:
-	}
+	c.finishOnce.Do(func() {
+		c.errMu.Lock()
+		c.err = err
+		c.errMu.Unlock()
+		close(c.done)
+	})
+}
+
+func (c *workerCall) result() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	return c.err
 }
 
 const (
@@ -311,6 +325,9 @@ func (c *Client) receiveLoop() {
 		}
 		select {
 		case call.frames <- frame:
+			if frame.Type == WorkerFrameDone || frame.Type == WorkerFrameError {
+				call.terminal.Do(func() { close(call.terminalReady) })
+			}
 		default:
 			err := fmt.Errorf("%w for request %d", ErrWorkerCallOverflow, frame.ID)
 			id := frame.ID
@@ -579,21 +596,35 @@ func (c *Client) nextFrame(ctx context.Context, call *workerCall) (WorkerFrame, 
 	}
 	select {
 	case <-call.aborting:
-		return WorkerFrame{}, <-call.done
+		<-call.done
+		return WorkerFrame{}, call.result()
 	default:
 	}
 	select {
-	case err := <-call.done:
-		return WorkerFrame{}, err
+	case <-call.terminalReady:
+		return <-call.frames, nil
+	default:
+	}
+	select {
+	case <-call.done:
+		return WorkerFrame{}, call.result()
 	default:
 	}
 	select {
 	case <-call.aborting:
-		return WorkerFrame{}, <-call.done
+		<-call.done
+		return WorkerFrame{}, call.result()
+	case <-call.terminalReady:
+		return <-call.frames, nil
 	case <-ctx.Done():
+		select {
+		case <-call.terminalReady:
+			return <-call.frames, nil
+		default:
+		}
 		return WorkerFrame{}, ctx.Err()
-	case err := <-call.done:
-		return WorkerFrame{}, err
+	case <-call.done:
+		return WorkerFrame{}, call.result()
 	case frame := <-call.frames:
 		return frame, nil
 	}

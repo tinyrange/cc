@@ -21,6 +21,40 @@ type mountedLifecycleBackend struct {
 	closeErr                     error
 }
 
+type retryCloseBackend struct {
+	FSBackend
+	closes int
+}
+
+type nonComparableFSBackend struct {
+	FSBackend
+	state []string
+}
+
+func (b nonComparableFSBackend) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
+	return b.FSBackend.(fsCreateBackend).Create(parent, name, flags, mode, uid, gid)
+}
+
+func (b nonComparableFSBackend) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	return b.FSBackend.(fsLinkBackend).Link(nodeID, newParent, newName)
+}
+
+func (b nonComparableFSBackend) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
+	return b.FSBackend.(fsRenameBackend).Rename(parent, name, newParent, newName, flags)
+}
+
+func (b nonComparableFSBackend) Unlink(parent uint64, name string) int32 {
+	return b.FSBackend.(fsUnlinkBackend).Unlink(parent, name)
+}
+
+func (b *retryCloseBackend) Close() error {
+	b.closes++
+	if b.closes == 1 {
+		return &CloseIncompleteError{Resource: "test backend", Timeout: time.Millisecond}
+	}
+	return nil
+}
+
 func (b *mountedLifecycleBackend) BackingUsage() (uint64, uint64, uint64, error) {
 	return b.current, b.highWater, b.physical, b.usageErr
 }
@@ -60,6 +94,69 @@ func TestMountedFSForwardsBackingLifecycleOncePerBackend(t *testing.T) {
 	if root.closes != 1 || share.closes != 1 {
 		t.Fatalf("close counts root=%d share=%d, want one each", root.closes, share.closes)
 	}
+}
+
+func TestMountedFSRetriesOnlyIncompleteClose(t *testing.T) {
+	backend := &retryCloseBackend{FSBackend: imageBackend(t, nil)}
+	fsys := NewMountedFS(backend, nil).(*mountedFS)
+	var incomplete *CloseIncompleteError
+	if err := fsys.Close(); !errors.As(err, &incomplete) {
+		t.Fatalf("first close = %v, want incomplete ownership", err)
+	}
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("completed close replay: %v", err)
+	}
+	if backend.closes != 2 {
+		t.Fatalf("backend close calls = %d, want one retry then cached success", backend.closes)
+	}
+}
+
+func TestVirtioFSCloseBoundsWorkerWaitAndRetriesBackend(t *testing.T) {
+	backend := &retryCloseBackend{FSBackend: imageBackend(t, nil)}
+	fsys := NewFS(0, 0, 0, "test", backend)
+	fsys.workerWG.Add(1)
+	var incomplete *CloseIncompleteError
+	if err := fsys.closeWithin(20 * time.Millisecond); !errors.As(err, &incomplete) {
+		t.Fatalf("close with live worker = %v, want incomplete ownership", err)
+	}
+	if backend.closes != 0 {
+		t.Fatal("backend closed while a device worker could still be using it")
+	}
+	fsys.workerWG.Done()
+	if err := fsys.Close(); !errors.As(err, &incomplete) {
+		t.Fatalf("first backend close = %v, want retryable incomplete result", err)
+	}
+	if err := fsys.Close(); err != nil {
+		t.Fatalf("backend close retry: %v", err)
+	}
+	if backend.closes != 2 {
+		t.Fatalf("backend close calls = %d, want two", backend.closes)
+	}
+}
+
+func TestMountedFSUsesStableRouteIdentityForNonComparableBackend(t *testing.T) {
+	backend := nonComparableFSBackend{FSBackend: imageBackend(t, nil), state: []string{"valid"}}
+	fsys := NewMountedFS(backend, nil).(*mountedFS)
+	nodeID, fh, _, errno := fsys.Create(1, "source", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o644, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create: errno %d", errno)
+	}
+	if _, _, errno := fsys.Link(nodeID, 1, "linked"); errno != 0 {
+		t.Fatalf("same-route hard link: errno %d", errno)
+	}
+	if errno := fsys.Rename(1, "linked", 1, "renamed", 0); errno != 0 {
+		t.Fatalf("same-route rename: errno %d", errno)
+	}
+	if errno := fsys.Unlink(1, "source"); errno != 0 {
+		t.Fatalf("unlink open node: errno %d", errno)
+	}
+	if fsys.node(nodeID) == nil {
+		t.Fatal("open node was discarded after unlink")
+	}
+	fsys.Release(nodeID, fh)
 }
 
 func TestMountedFSAddShareSnapshotsAndConflicts(t *testing.T) {

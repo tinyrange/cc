@@ -459,6 +459,26 @@ func (i *hostedInstance) BackingCombinedUsage() (uint64, uint64) {
 	return current, max(current, dataHigh, metadataHigh)
 }
 
+func (i *hostedInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if provider, ok := i.Instance.(interface {
+		BackingSnapshot() virtio.FSBackingUsageSnapshot
+	}); ok {
+		return provider.BackingSnapshot()
+	}
+	data, dataHigh, physical, err := i.BackingUsage()
+	metadata, metadataHigh := i.BackingMetadataUsage()
+	combined := data + metadata
+	if combined < data {
+		combined = ^uint64(0)
+	}
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: data, DataHighWaterBytes: dataHigh,
+		MetadataBytes: metadata, MetadataHighWaterBytes: metadataHigh,
+		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
+		PhysicalBytes: physical, ReclaimError: err,
+	}
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil

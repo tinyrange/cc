@@ -1,0 +1,119 @@
+package capturerelay
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestRetirementReleasesSpoolAndContinuesDrainingWriter(t *testing.T) {
+	dir := t.TempDir()
+	controlPath := filepath.Join(dir, "relay-control")
+	shellPath := filepath.Join(dir, "shell-control")
+	if err := syscall.Mkfifo(shellPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shell, err := os.OpenFile(shellPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shell.Close()
+
+	relayDone := make(chan error, 1)
+	go func() { relayDone <- Run([]string{controlPath, shellPath, "65536"}) }()
+	waitForFile(t, controlPath+".ready", true)
+	control, err := os.OpenFile(controlPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+
+	output := filepath.Join(dir, "output")
+	paths := []string{output, output + ".closed", output + ".overflow", output + ".retired", output + ".registered"}
+	for _, path := range paths {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := output + ".fifo"
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	account := "split-output"
+	fmt.Fprintf(control, "register\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", account, output, fifo, output+".closed", output+".overflow", output+".retired", output+".registered")
+	waitForFile(t, output+".registered", true)
+
+	writerReady := make(chan struct{})
+	continueWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		writer, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			writerDone <- err
+			return
+		}
+		if _, err := writer.Write([]byte(strings.Repeat("a", 50000))); err != nil {
+			writerDone <- err
+			return
+		}
+		close(writerReady)
+		<-continueWriter
+		_, err = writer.Write([]byte(strings.Repeat("b", 50000)))
+		writerDone <- errors.Join(err, writer.Close())
+	}()
+	<-writerReady
+	fmt.Fprintf(control, "finish\t%s\n", account)
+	fmt.Fprintf(control, "retire\t%s\n", account)
+	waitForFile(t, output+".retired", true)
+
+	before, err := os.Stat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(continueWriter)
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+	accounting := make([]byte, 128)
+	if err := shell.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := shell.Read(accounting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(accounting[:n]), "\x1dvmsh-capture:split-output:100000\x1f\n"; got != want {
+		t.Fatalf("accounting = %q, want %q", got, want)
+	}
+	after, err := os.Stat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() || after.Size() > 50000 {
+		t.Fatalf("retired spool grew from %d to %d", before.Size(), after.Size())
+	}
+	if data, err := os.ReadFile(output + ".closed"); err != nil || len(data) != 0 {
+		t.Fatalf("retired capture recreated completion marker: %q, %v", data, err)
+	}
+	fmt.Fprintln(control, "stop")
+	if err := <-relayDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForFile(t *testing.T, path string, nonempty bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(path); err == nil && (!nonempty || info.Size() != 0) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}

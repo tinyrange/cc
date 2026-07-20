@@ -800,6 +800,45 @@ func TestClosePendingDoesNotBlockFullCall(t *testing.T) {
 	}
 }
 
+func TestExecInputWaitDoesNotConsumeCallFailure(t *testing.T) {
+	call := newWorkerCall()
+	waiting := make(chan bool, 1)
+	go func() { waiting <- (&Client{}).waitExecInputAck(t.Context(), call) }()
+	want := errors.New("connection failed")
+	call.finish(want)
+	if <-waiting {
+		t.Fatal("input acknowledgement succeeded after call failure")
+	}
+	if _, err := (&Client{}).nextFrame(t.Context(), call); !errors.Is(err, want) {
+		t.Fatalf("main call failure = %v, want %v", err, want)
+	}
+}
+
+func TestQueuedTerminalFrameWinsCallerCancellation(t *testing.T) {
+	call := newWorkerCall()
+	done := mustWorkerFrame(7, WorkerFrameDone, nil)
+	call.frames <- done
+	call.terminal.Do(func() { close(call.terminalReady) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	got, err := (&Client{}).nextFrame(ctx, call)
+	if err != nil || got.Type != WorkerFrameDone {
+		t.Fatalf("next frame = %+v, %v; want queued terminal response", got, err)
+	}
+}
+
+func TestQueuedTerminalFrameWinsLaterConnectionFailure(t *testing.T) {
+	call := newWorkerCall()
+	done := mustWorkerFrame(7, WorkerFrameDone, nil)
+	call.frames <- done
+	call.terminal.Do(func() { close(call.terminalReady) })
+	call.finish(errors.New("connection closed after terminal response"))
+	got, err := (&Client{}).nextFrame(t.Context(), call)
+	if err != nil || got.Type != WorkerFrameDone {
+		t.Fatalf("next frame = %+v, %v; want queued terminal response", got, err)
+	}
+}
+
 func mustWorkerFrame(id uint64, frameType string, payload any) WorkerFrame {
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {

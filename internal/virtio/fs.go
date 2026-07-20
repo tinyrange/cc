@@ -353,8 +353,13 @@ type FS struct {
 	fuseRequests        atomic.Uint64
 	interruptRaises     uint64
 	irqTransitions      uint64
-	closeOnce           sync.Once
+	closeStart          sync.Once
+	cleanupOnce         sync.Once
+	closeMu             sync.Mutex
+	backendClosed       bool
+	backendCloseErr     error
 	closed              chan struct{}
+	workersDone         chan struct{}
 	workerWG            sync.WaitGroup
 	kickPollWG          sync.WaitGroup
 	workCh              chan *fsWork
@@ -367,6 +372,15 @@ type FS struct {
 	scratch8            [8]byte
 	scratch4            [4]byte
 	scratch2            [2]byte
+}
+
+type CloseIncompleteError struct {
+	Resource string
+	Timeout  time.Duration
+}
+
+func (e *CloseIncompleteError) Error() string {
+	return fmt.Sprintf("close %s: work did not stop within %s; resources remain quarantined for retry", e.Resource, e.Timeout)
 }
 
 const fuseStatsSlots = 64
@@ -530,47 +544,76 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 }
 
 func (f *FS) Close() error {
+	return f.closeWithin(2 * time.Second)
+}
+
+func (f *FS) closeWithin(timeout time.Duration) error {
 	if f == nil {
 		return nil
 	}
-	closedNow := false
-	f.closeOnce.Do(func() {
+	f.closeStart.Do(func() {
 		close(f.closed)
-		closedNow = true
-	})
-	if closedNow {
+		// Prevent a concurrent enqueue from adding workers after the wait starts.
+		f.workerOnce.Do(func() {})
 		f.mu.Lock()
 		f.kickPoll = false
 		f.kickPollActive = false
 		f.configGeneration++
 		f.mu.Unlock()
+		if starter, ok := f.backend.(interface{ BeginClose() }); ok {
+			starter.BeginClose()
+		}
+		f.workersDone = make(chan struct{})
+		go func() {
+			f.workerWG.Wait()
+			f.kickPollWG.Wait()
+			close(f.workersDone)
+		}()
+	})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-f.workersDone:
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "virtio-fs workers", Timeout: timeout}
 	}
-	f.workerWG.Wait()
-	f.kickPollWG.Wait()
-	for {
-		select {
-		case work := <-f.workCh:
-			putFSReqBuffer(work.req, work.pooledReq)
-		default:
-			f.mu.Lock()
-			irq := f.irq
-			f.irq = nil
-			f.mem = nil
-			f.clearQueueCachesLocked()
-			f.interruptStatus = 0
-			f.irqHigh = false
-			f.mu.Unlock()
-			if irq != nil {
-				_ = irq.SetIRQ(f.IRQ, false)
-			}
-			if closedNow {
-				if closer, ok := f.backend.(interface{ Close() error }); ok {
-					return closer.Close()
+	f.cleanupOnce.Do(func() {
+		for {
+			select {
+			case work := <-f.workCh:
+				putFSReqBuffer(work.req, work.pooledReq)
+			default:
+				f.mu.Lock()
+				irq := f.irq
+				f.irq = nil
+				f.mem = nil
+				f.clearQueueCachesLocked()
+				f.interruptStatus = 0
+				f.irqHigh = false
+				f.mu.Unlock()
+				if irq != nil {
+					_ = irq.SetIRQ(f.IRQ, false)
 				}
+				return
 			}
-			return nil
+		}
+	})
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.backendClosed {
+		return f.backendCloseErr
+	}
+	if closer, ok := f.backend.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			var incomplete *CloseIncompleteError
+			if errors.As(err, &incomplete) {
+				return err
+			}
+			f.backendCloseErr = err
 		}
 	}
+	f.backendClosed = true
+	return f.backendCloseErr
 }
 
 func resolveVirtioFSKickPoll() bool {
@@ -1140,6 +1183,11 @@ func (f *FS) enqueueWorks(works []fsWork) {
 }
 
 func (f *FS) startKickPollerLocked() {
+	select {
+	case <-f.closed:
+		return
+	default:
+	}
 	if f.kickPollActive {
 		return
 	}
@@ -1292,11 +1340,22 @@ func (f *FS) startWorkers() {
 func (f *FS) runWorker() {
 	defer f.workerWG.Done()
 	for {
+		select {
+		case <-f.closed:
+			return
+		default:
+		}
 		var work *fsWork
 		select {
 		case <-f.closed:
 			return
 		case work = <-f.workCh:
+		}
+		select {
+		case <-f.closed:
+			putFSReqBuffer(work.req, work.pooledReq)
+			return
+		default:
 		}
 		reply, err := f.dispatchFUSE(work.req)
 		putFSReqBuffer(work.req, work.pooledReq)
@@ -3183,6 +3242,7 @@ type imageFS struct {
 	materializationCtx    context.Context
 	materializationCancel context.CancelFunc
 	materializationWG     sync.WaitGroup
+	beginClose            sync.Once
 	closeStart            sync.Once
 	closeDone             chan struct{}
 	closeErr              error
@@ -5700,17 +5760,28 @@ func (p *imageFS) Close() error {
 	return p.closeWithin(2 * time.Second)
 }
 
-func (p *imageFS) closeWithin(timeout time.Duration) error {
+func (p *imageFS) BeginClose() {
 	if p == nil {
-		return nil
+		return
 	}
-	p.closeStart.Do(func() {
+	p.beginClose.Do(func() {
 		p.mu.Lock()
 		p.closed = true
 		p.materializationCancel()
 		for _, materialization := range p.materializations {
 			materialization.cancel()
 		}
+		p.mu.Unlock()
+	})
+}
+
+func (p *imageFS) closeWithin(timeout time.Duration) error {
+	if p == nil {
+		return nil
+	}
+	p.BeginClose()
+	p.closeStart.Do(func() {
+		p.mu.Lock()
 		p.closeDone = make(chan struct{})
 		done := p.closeDone
 		p.mu.Unlock()
@@ -5732,7 +5803,7 @@ func (p *imageFS) closeWithin(timeout time.Duration) error {
 	case <-done:
 		return p.closeErr
 	case <-timer.C:
-		return fmt.Errorf("close image filesystem: lower filesystem operation did not stop within %s; backing storage remains quarantined until it exits", timeout)
+		return &CloseIncompleteError{Resource: "image filesystem lower operation", Timeout: timeout}
 	}
 }
 

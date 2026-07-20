@@ -16,6 +16,8 @@ func (b *aggregateUsageBackend) BackingUsage() (uint64, uint64, uint64, error) {
 	return b.current, b.highWater, b.current, nil
 }
 
+func (b *aggregateUsageBackend) BackingCurrent() uint64 { return b.current }
+
 func (b *aggregateUsageBackend) BackingMetadataUsage() (uint64, uint64) {
 	return b.metadata, b.metadataHighWater
 }
@@ -34,6 +36,7 @@ func TestVirtioFSBackingUsageTracksAggregateMutationPeaks(t *testing.T) {
 	tracker.Sample()
 	one.current, two.current = 2, 3
 	one.metadata, two.metadata = 7, 11
+	tracker.Sample()
 	current, highWater, _, err := virtioFSBackingUsage(devices)
 	if err != nil || current != 5 || highWater != 130 {
 		t.Fatalf("aggregate data usage current=%d high-water=%d err=%v", current, highWater, err)

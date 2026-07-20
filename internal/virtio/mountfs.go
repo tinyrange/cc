@@ -36,8 +36,10 @@ type mountedFS struct {
 	writebackCache bool
 	debugPaths     []string
 	debugLog       io.Writer
-	closeOnce      sync.Once
-	closeErr       error
+	closeMu        sync.Mutex
+	closeBackends  []FSBackend
+	closedBackends []bool
+	closeErrors    []error
 
 	mu                       sync.RWMutex
 	nextNodeID               uint64
@@ -163,16 +165,52 @@ func (m *mountedFS) Close() error {
 	if m == nil {
 		return nil
 	}
-	m.closeOnce.Do(func() {
-		var errs []error
-		for _, backend := range m.distinctBackends() {
-			if closer, ok := backend.(interface{ Close() error }); ok {
-				errs = append(errs, closer.Close())
+	m.BeginClose()
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.closeBackends == nil {
+		m.closeBackends = m.distinctBackends()
+		m.closedBackends = make([]bool, len(m.closeBackends))
+		m.closeErrors = make([]error, len(m.closeBackends))
+	}
+	var errs []error
+	for i, backend := range m.closeBackends {
+		if m.closedBackends[i] {
+			if m.closeErrors[i] != nil {
+				errs = append(errs, m.closeErrors[i])
 			}
+			continue
 		}
-		m.closeErr = errors.Join(errs...)
-	})
-	return m.closeErr
+		closer, ok := backend.(interface{ Close() error })
+		if !ok {
+			m.closedBackends[i] = true
+			continue
+		}
+		if err := closer.Close(); err != nil {
+			var incomplete *CloseIncompleteError
+			if errors.As(err, &incomplete) {
+				errs = append(errs, err)
+				continue
+			}
+			m.closeErrors[i] = err
+			m.closedBackends[i] = true
+			errs = append(errs, err)
+		} else {
+			m.closedBackends[i] = true
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *mountedFS) BeginClose() {
+	if m == nil {
+		return
+	}
+	for _, backend := range m.distinctBackends() {
+		if starter, ok := backend.(interface{ BeginClose() }); ok {
+			starter.BeginClose()
+		}
+	}
 }
 
 type shareMount struct {
@@ -188,10 +226,12 @@ type mountedNode struct {
 	backend         FSBackend
 	backendNodeID   uint64
 	backendResolved bool
+	backendRoute    string
 }
 
 type mountedHandle struct {
 	backend FSBackend
+	route   string
 	nodeID  uint64
 	fh      uint64
 	dir     bool
@@ -586,7 +626,7 @@ func (m *mountedFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid u
 	if errno != 0 {
 		return 0, errno
 	}
-	return m.storeHandle(backend, backendNodeID, fh, false), 0
+	return m.storeHandle(node.path, backend, backendNodeID, fh, false), 0
 }
 
 func (m *mountedFS) Release(nodeID uint64, fh uint64) {
@@ -681,12 +721,12 @@ func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 		if errno != 0 {
 			return 0, errno
 		}
-		return m.storeHandle(backend, backendNodeID, fh, true), 0
+		return m.storeHandle(node.path, backend, backendNodeID, fh, true), 0
 	}
 	if errno != -linuxENOENT || !m.isSyntheticPath(node.path) {
 		return 0, errno
 	}
-	return m.storeHandle(nil, 0, 0, true), 0
+	return m.storeHandle(node.path, nil, 0, 0, true), 0
 }
 
 func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
@@ -882,11 +922,11 @@ func (m *mountedFS) LinkForCaller(nodeID uint64, newParent uint64, newName strin
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	newBackend, newParentID, newMount, errno := m.resolveBackendNode(parentNode.path)
+	_, newParentID, newMount, errno := m.resolveBackendNode(parentNode.path)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	if !sameWritableMount(mount, newMount) || backend != newBackend {
+	if !sameWritableMount(mount, newMount) {
 		return 0, FuseAttr{}, -linuxEXDEV
 	}
 	linkBackend, ok := backend.(fsLinkBackend)
@@ -997,7 +1037,7 @@ func (m *mountedFS) CreateForCaller(parent uint64, name string, flags uint32, mo
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
 	attr = m.backendAttr(backend, backendNodeID, attr)
-	return id, m.storeHandle(backend, backendNodeID, fh, false), attr, 0
+	return id, m.storeHandle(childPath, backend, backendNodeID, fh, false), attr, 0
 }
 
 func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32) {
@@ -1125,12 +1165,12 @@ func (m *mountedFS) RenameForCaller(parent uint64, name string, newParent uint64
 		m.debugPathf("rename-error", oldPath, "resolve_old_parent_errno=%d", errno)
 		return errno
 	}
-	newBackend, newParentID, newMount, errno := m.resolveBackendNode(newParentNode.path)
+	_, newParentID, newMount, errno := m.resolveBackendNode(newParentNode.path)
 	if errno != 0 {
 		m.debugPathf("rename-error", newPath, "resolve_new_parent_errno=%d", errno)
 		return errno
 	}
-	if !sameWritableMount(oldMount, newMount) || oldBackend != newBackend {
+	if !sameWritableMount(oldMount, newMount) {
 		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEXDEV)
 		return -linuxEXDEV
 	}
@@ -1485,6 +1525,7 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 			node.backend = backend
 			node.backendNodeID = backendNodeID
 			node.backendResolved = true
+			node.backendRoute = m.backendRouteForPathLocked(guestPath)
 		}
 		return id
 	}
@@ -1496,6 +1537,7 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 		backend:         backend,
 		backendNodeID:   backendNodeID,
 		backendResolved: backend != nil,
+		backendRoute:    m.backendRouteForPathLocked(guestPath),
 	}
 	m.pathToNode[guestPath] = id
 	return id
@@ -1530,7 +1572,7 @@ func (m *mountedFS) nodeHasHandleLocked(node *mountedNode) bool {
 		return false
 	}
 	for _, handle := range m.handles {
-		if handle.backend == node.backend && handle.nodeID == node.backendNodeID {
+		if handle.route == node.backendRoute && handle.nodeID == node.backendNodeID {
 			return true
 		}
 	}
@@ -1574,13 +1616,25 @@ func (m *mountedFS) renameNode(oldPath, newPath string) {
 	}
 }
 
-func (m *mountedFS) storeHandle(backend FSBackend, nodeID uint64, fh uint64, dir bool) uint64 {
+func (m *mountedFS) storeHandle(guestPath string, backend FSBackend, nodeID uint64, fh uint64, dir bool) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := m.nextHandle
 	m.nextHandle++
-	m.handles[id] = &mountedHandle{backend: backend, nodeID: nodeID, fh: fh, dir: dir}
+	m.handles[id] = &mountedHandle{backend: backend, route: m.backendRouteForPathLocked(guestPath), nodeID: nodeID, fh: fh, dir: dir}
 	return id
+}
+
+func (m *mountedFS) backendRouteForPathLocked(guestPath string) string {
+	guestPath = cleanMountPath(guestPath)
+	best := "/"
+	for i := range m.mounts {
+		mount := &m.mounts[i]
+		if (guestPath == mount.path || strings.HasPrefix(guestPath, mount.path+"/")) && len(mount.path) > len(best) {
+			best = mount.path
+		}
+	}
+	return best
 }
 
 func (m *mountedFS) handle(id uint64, dir bool) *mountedHandle {

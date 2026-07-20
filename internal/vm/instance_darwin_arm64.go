@@ -144,6 +144,18 @@ func (i *darwinInstance) BackingMetadataUsage() (uint64, uint64) {
 	return i.session.BackingMetadataUsage()
 }
 
+func (i *darwinInstance) BackingCombinedUsage() (uint64, uint64) {
+	usage := i.BackingSnapshot()
+	return usage.CombinedBytes, usage.CombinedHighWaterBytes
+}
+
+func (i *darwinInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if i == nil || i.session == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	return i.session.BackingSnapshot()
+}
+
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.managedCore().Exec(ctx, req)
 }

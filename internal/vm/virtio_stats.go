@@ -111,3 +111,18 @@ func virtioFSBackingCombinedUsage(fsdevs []*virtio.FS) (current, highWater uint6
 	current = saturatingUint64Add(data, metadata)
 	return current, max(current, dataHigh, metadataHigh)
 }
+
+func virtioFSBackingSnapshot(fsdevs []*virtio.FS) virtio.FSBackingUsageSnapshot {
+	if tracker := virtio.SharedFSBackingUsageTracker(fsdevs); tracker != nil {
+		return tracker.Snapshot()
+	}
+	data, dataHigh, physical, err := virtioFSBackingUsage(fsdevs)
+	metadata, metadataHigh := virtioFSBackingMetadataUsage(fsdevs)
+	combined := saturatingUint64Add(data, metadata)
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: data, DataHighWaterBytes: dataHigh,
+		MetadataBytes: metadata, MetadataHighWaterBytes: metadataHigh,
+		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
+		PhysicalBytes: physical, ReclaimError: err,
+	}
+}

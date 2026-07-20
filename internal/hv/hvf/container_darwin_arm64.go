@@ -473,6 +473,27 @@ func (s *ContainerSession) BackingMetadataUsage() (current, highWater uint64) {
 	return current, highWater
 }
 
+func (s *ContainerSession) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if s == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	if tracker := virtio.SharedFSBackingUsageTracker(s.fsdevs); tracker != nil {
+		return tracker.Snapshot()
+	}
+	data, dataHigh, physical, err := s.BackingUsage()
+	metadata, metadataHigh := s.BackingMetadataUsage()
+	combined := data + metadata
+	if combined < data {
+		combined = ^uint64(0)
+	}
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: data, DataHighWaterBytes: dataHigh,
+		MetadataBytes: metadata, MetadataHighWaterBytes: metadataHigh,
+		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
+		PhysicalBytes: physical, ReclaimError: err,
+	}
+}
+
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	_, _ = ctx, forward
 	return fmt.Errorf("instance network port forwarding is not supported on darwin/arm64")

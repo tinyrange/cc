@@ -580,6 +580,13 @@ func (i *windowsInstance) BackingCombinedUsage() (uint64, uint64) {
 	return virtioFSBackingCombinedUsage(i.fsdevs)
 }
 
+func (i *windowsInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if i == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	return virtioFSBackingSnapshot(i.fsdevs)
+}
+
 func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.core().Exec(ctx, req)
 }

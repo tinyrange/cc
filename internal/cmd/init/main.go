@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/capturerelay"
 	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -39,6 +40,7 @@ const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
 const archiveMode = "--ccx3-fs-archive"
 const extractMode = "--ccx3-fs-extract"
+const captureRelayMode = "--ccx3-capture-relay"
 
 var credentialSetupMu sync.Mutex
 
@@ -416,6 +418,13 @@ func (g *systemdCommandGate) WaitForCommand(argv []string) func() error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == captureRelayMode {
+		if err := capturerelay.Run(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ccx3-init: capture relay:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == stage2Mode {
 		if err := runStage2(); err != nil {
 			fmt.Fprintf(os.Stderr, "ccx3-init: stage2: %v\n", err)

@@ -309,9 +309,13 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "backing", Image: "alpine", MemoryMB: 512}); err != nil {
 		t.Fatal(err)
 	}
+	inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls = 0, 0, 0, 0
 	state := manager.StatusOf("backing")
 	if state.MemoryMB != 512 || state.BackingBytes != 5<<20 || state.BackingHighWaterBytes != 11<<20 || state.BackingDataBytes != 3<<20 || state.BackingDataHighWaterBytes != 9<<20 || state.BackingMetadataBytes != 2<<20 || state.BackingMetadataHighWaterBytes != 7<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
 		t.Fatalf("reported state = %+v", state)
+	}
+	if inst.snapshotCalls != 1 || inst.usageCalls != 0 || inst.metadataCalls != 0 || inst.combinedCalls != 0 {
+		t.Fatalf("backing provider calls snapshot=%d data=%d metadata=%d combined=%d", inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls)
 	}
 }
 
@@ -1440,6 +1444,10 @@ type backingUsageTestInstance struct {
 	metadata, metadataHighWater  uint64
 	combined, combinedHighWater  uint64
 	reclaimErr                   error
+	snapshotCalls                int
+	usageCalls                   int
+	metadataCalls                int
+	combinedCalls                int
 }
 
 type blockingBalloonInstance struct {
@@ -1505,15 +1513,28 @@ func (i *blockingBalloonInstance) Close() error {
 }
 
 func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	i.usageCalls++
 	return i.current, i.highWater, i.physical, i.reclaimErr
 }
 
 func (i *backingUsageTestInstance) BackingMetadataUsage() (uint64, uint64) {
+	i.metadataCalls++
 	return i.metadata, i.metadataHighWater
 }
 
 func (i *backingUsageTestInstance) BackingCombinedUsage() (uint64, uint64) {
+	i.combinedCalls++
 	return i.combined, i.combinedHighWater
+}
+
+func (i *backingUsageTestInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	i.snapshotCalls++
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: i.current, DataHighWaterBytes: i.highWater,
+		MetadataBytes: i.metadata, MetadataHighWaterBytes: i.metadataHighWater,
+		CombinedBytes: i.combined, CombinedHighWaterBytes: i.combinedHighWater,
+		PhysicalBytes: i.physical, ReclaimError: i.reclaimErr,
+	}
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {
