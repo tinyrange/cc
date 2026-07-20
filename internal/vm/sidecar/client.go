@@ -475,15 +475,8 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 		go c.forwardExecInputs(requestID, call, inputs, stopInputs)
 	}
 
-	cancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.sendCancel(requestID)
-		case <-cancelDone:
-		}
-	}()
-	defer close(cancelDone)
+	stopCancellationWatch := c.watchCancellation(ctx, requestID)
+	defer stopCancellationWatch()
 
 	for {
 		got, err := c.nextFrame(ctx, call)
@@ -533,17 +526,8 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	}
 	defer c.unregisterCall(id)
 
-	cancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.sendCancel(id)
-		case <-cancelDone:
-		}
-	}()
-	defer func() {
-		close(cancelDone)
-	}()
+	stopCancellationWatch := c.watchCancellation(ctx, id)
+	defer stopCancellationWatch()
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {
 		return err
@@ -651,4 +635,29 @@ func (c *Client) sendCancel(id uint64) error {
 		return err
 	}
 	return c.codec.Send(frame)
+}
+
+// watchCancellation keeps cancellation independent from response delivery while
+// guaranteeing that a canceled call cannot return before its cancel frame has
+// been sent. A plain select between ctx.Done and a deferred stop channel can
+// choose the stop after both become ready, silently dropping the cancellation.
+func (c *Client) watchCancellation(ctx context.Context, id uint64) func() {
+	stop := make(chan struct{})
+	result := make(chan bool, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.sendCancel(id)
+			result <- true
+		case <-stop:
+			result <- false
+		}
+	}()
+	return func() {
+		close(stop)
+		sent := <-result
+		if ctx.Err() != nil && !sent {
+			_ = c.sendCancel(id)
+		}
+	}
 }
