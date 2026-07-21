@@ -49,6 +49,8 @@ type mountedFS struct {
 	nextHandle               uint64
 	nodes                    map[uint64]*mountedNode
 	pathToNode               map[string]uint64
+	pathRefs                 map[uint64]uint64
+	backendNodes             map[mountedBackendNode]uint64
 	inodes                   map[mountedBackendInode]uint64
 	handles                  map[uint64]*mountedHandle
 	backingDataHighWater     uint64
@@ -324,12 +326,20 @@ type mountedHandle struct {
 	nodeID  uint64
 	fh      uint64
 	dir     bool
+	entries []dirEntry
 }
 
 type mountedBackendInode struct {
 	backendType string
 	backendPtr  uintptr
 	inode       uint64
+}
+
+type mountedBackendNode struct {
+	backendType string
+	backendPtr  uintptr
+	route       string
+	nodeID      uint64
 }
 
 func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
@@ -369,9 +379,11 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 		nodes: map[uint64]*mountedNode{
 			1: {id: 1, path: "/"},
 		},
-		pathToNode: map[string]uint64{"/": 1},
-		inodes:     map[mountedBackendInode]uint64{},
-		handles:    map[uint64]*mountedHandle{},
+		pathToNode:   map[string]uint64{"/": 1},
+		pathRefs:     map[uint64]uint64{1: 1},
+		backendNodes: map[mountedBackendNode]uint64{},
+		inodes:       map[mountedBackendInode]uint64{},
+		handles:      map[uint64]*mountedHandle{},
 	}
 }
 
@@ -495,15 +507,16 @@ func (m *mountedFS) AddShares(shares []ShareMount) error {
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
 	for _, mount := range prepared {
+		removed := make(map[uint64]struct{})
 		for existingPath, id := range m.pathToNode {
 			if existingPath != mount.path && !strings.HasPrefix(existingPath, strings.TrimSuffix(mount.path, "/")+"/") {
 				continue
 			}
-			delete(m.pathToNode, existingPath)
-			node := m.nodes[id]
-			if !m.nodeHasHandleLocked(node) {
-				delete(m.nodes, id)
-			}
+			m.unbindPathLocked(existingPath)
+			removed[id] = struct{}{}
+		}
+		for id := range removed {
+			m.deleteNodeIfDetachedLocked(id)
 		}
 	}
 	return nil
@@ -550,11 +563,10 @@ func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
 	if mount := m.mountForPath(node.path); mount != nil {
 		return cachePolicyForMode(mount.cache)
 	}
-	// The writable COW root can retain directory entries, but its attributes
-	// change through link, unlink, chmod, and writes. Keeping those attributes
-	// for the aggressive 60-second TTL makes already-open runtimes observe
-	// impossible link counts after a sibling alias is removed.
-	return FSCachePolicy{Mode: fsCacheNormal, EntryTTL: 60 * time.Second}
+	// Root mutations all pass through this FUSE mount, and hard links share one
+	// FUSE node. The kernel can therefore update cached inode metadata coherently
+	// while directory traversal retains the batched READDIRPLUS results.
+	return FSCachePolicy{Mode: fsCacheNormal, EntryTTL: 60 * time.Second, AttrTTL: 60 * time.Second}
 }
 
 func cleanMountPath(value string) string {
@@ -575,11 +587,22 @@ func (m *mountedFS) SnapshotNodePaths() []string {
 		ids = append(ids, int(id))
 	}
 	sort.Ints(ids)
-	paths := make([]string, 0, len(ids))
+	paths := make([]string, 0, len(m.pathToNode))
 	for _, id := range ids {
-		if node := m.nodes[uint64(id)]; node != nil && node.path != "" {
-			paths = append(paths, node.path)
+		nodeID := uint64(id)
+		node := m.nodes[nodeID]
+		if node == nil || node.path == "" {
+			continue
 		}
+		paths = append(paths, node.path)
+		var aliases []string
+		for nodePath, mappedID := range m.pathToNode {
+			if mappedID == nodeID && nodePath != node.path {
+				aliases = append(aliases, nodePath)
+			}
+		}
+		sort.Strings(aliases)
+		paths = append(paths, aliases...)
 	}
 	m.mu.RUnlock()
 	return paths
@@ -627,12 +650,8 @@ func (m *mountedFS) restoreNodePath(nodePath string) error {
 			}
 		}
 	}
-	if node := m.node(childID); node == nil || node.path != nodePath {
-		got := ""
-		if node != nil {
-			got = node.path
-		}
-		return fmt.Errorf("restore mountedfs node %q: got node %d path %q", nodePath, childID, got)
+	if mappedID := m.nodeIDForPath(nodePath); mappedID != childID {
+		return fmt.Errorf("restore mountedfs node %q: mapped to node %d, want %d", nodePath, mappedID, childID)
 	}
 	return nil
 }
@@ -718,7 +737,7 @@ func (m *mountedFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid u
 	if errno != 0 {
 		return 0, errno
 	}
-	return m.storeHandle(node.path, backend, backendNodeID, fh, false), 0
+	return m.storeHandle(node.path, backend, backendNodeID, fh, false, nil), 0
 }
 
 func (m *mountedFS) Release(nodeID uint64, fh uint64) {
@@ -813,32 +832,44 @@ func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 		if errno != 0 {
 			return 0, errno
 		}
-		return m.storeHandle(node.path, backend, backendNodeID, fh, true), 0
+		entries, errno := m.snapshotDirEntries(node, backend, backendNodeID, fh)
+		if errno != 0 {
+			backend.ReleaseDir(backendNodeID, fh)
+			return 0, errno
+		}
+		return m.storeHandle(node.path, backend, backendNodeID, fh, true, entries), 0
 	}
 	if errno != -linuxENOENT || !m.isSyntheticPath(node.path) {
 		return 0, errno
 	}
-	return m.storeHandle(node.path, nil, 0, 0, true), 0
+	entries, errno := m.snapshotDirEntries(node, nil, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return m.storeHandle(node.path, nil, 0, 0, true, entries), 0
 }
 
 func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
-	node := m.node(nodeID)
-	if node == nil {
+	if m.node(nodeID) == nil {
 		return nil, -linuxENOENT
 	}
 	handle := m.handle(fh, true)
 	if handle == nil {
 		return nil, -linuxEBADF
 	}
+	return encodeDirEntries(handle.entries, off, maxBytes), 0
+}
+
+func (m *mountedFS) snapshotDirEntries(node *mountedNode, backend FSBackend, backendNodeID uint64, fh uint64) ([]dirEntry, int32) {
 
 	entries := []dirEntry{
-		{name: ".", typ: dirTypeDir, ino: nodeID},
+		{name: ".", typ: dirTypeDir, ino: node.id},
 		{name: "..", typ: dirTypeDir, ino: m.ensureNode(parentPath(node.path))},
 	}
 
 	names := map[string]dirEntry{}
-	if handle.backend != nil {
-		children, errno := m.readBackendDir(handle.backend, handle.nodeID, handle.fh)
+	if backend != nil {
+		children, errno := m.readBackendDir(backend, backendNodeID, fh)
 		if errno != 0 {
 			return nil, errno
 		}
@@ -847,7 +878,7 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 				continue
 			}
 			childPath := path.Join(node.path, child.name)
-			childID := m.ensureResolvedNode(childPath, handle.backend, child.ino)
+			childID := m.ensureResolvedNode(childPath, backend, child.ino)
 			child.ino = childID
 			names[child.name] = child
 		}
@@ -864,7 +895,7 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 	for _, name := range sorted {
 		entries = append(entries, names[name])
 	}
-	return encodeDirEntries(entries, off, maxBytes), 0
+	return entries, 0
 }
 
 func (m *mountedFS) ReleaseDir(nodeID uint64, fh uint64) {
@@ -1129,7 +1160,7 @@ func (m *mountedFS) CreateForCaller(parent uint64, name string, flags uint32, mo
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
 	attr = m.backendAttr(backend, backendNodeID, attr)
-	return id, m.storeHandle(childPath, backend, backendNodeID, fh, false), attr, 0
+	return id, m.storeHandle(childPath, backend, backendNodeID, fh, false, nil), attr, 0
 }
 
 func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32) {
@@ -1519,11 +1550,23 @@ func (m *mountedFS) mountChildren(parent string) []string {
 }
 
 func (m *mountedFS) readBackendDir(backend FSBackend, nodeID uint64, fh uint64) ([]dirEntry, int32) {
-	data, errno := backend.ReadDir(nodeID, fh, 0, 1<<20)
-	if errno != 0 {
-		return nil, errno
+	var entries []dirEntry
+	offset := uint64(0)
+	for {
+		data, errno := backend.ReadDir(nodeID, fh, offset, 1<<20)
+		if errno != 0 {
+			return nil, errno
+		}
+		if len(data) == 0 {
+			return entries, 0
+		}
+		page, next, ok := decodeDirEntries(data)
+		if !ok || len(page) == 0 || next <= offset {
+			return nil, -linuxEIO
+		}
+		entries = append(entries, page...)
+		offset = next
 	}
-	return decodeDirEntries(data), 0
 }
 
 func encodeDirEntries(entries []dirEntry, off uint64, maxBytes uint32) []byte {
@@ -1546,21 +1589,23 @@ func encodeDirEntries(entries []dirEntry, off uint64, maxBytes uint32) []byte {
 	return out
 }
 
-func decodeDirEntries(data []byte) []dirEntry {
+func decodeDirEntries(data []byte) ([]dirEntry, uint64, bool) {
 	var entries []dirEntry
+	var next uint64
 	for len(data) >= fuseDirentBaseSize {
 		ino := readLE64(data[0:8])
+		next = readLE64(data[8:16])
 		nameLen := int(readLE32(data[16:20]))
 		typ := readLE32(data[20:24])
 		reclen := align8(fuseDirentBaseSize + nameLen)
 		if nameLen < 0 || len(data) < reclen {
-			break
+			return nil, 0, false
 		}
 		name := string(data[24 : 24+nameLen])
 		entries = append(entries, dirEntry{name: name, typ: typ, ino: ino})
 		data = data[reclen:]
 	}
-	return entries
+	return entries, next, len(data) == 0
 }
 
 func backendLookupPath(backend FSBackend, guestPath string) (uint64, FuseAttr, int32) {
@@ -1612,12 +1657,21 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 	guestPath = cleanMountPath(guestPath)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var key mountedBackendNode
+	if backend != nil {
+		key = m.backendNodeKeyLocked(guestPath, backend, backendNodeID)
+		if id := m.backendNodes[key]; id != 0 {
+			m.bindPathLocked(guestPath, id)
+			return id
+		}
+	}
 	if id, ok := m.pathToNode[guestPath]; ok {
 		if node := m.nodes[id]; node != nil && backend != nil {
 			node.backend = backend
 			node.backendNodeID = backendNodeID
 			node.backendResolved = true
 			node.backendRoute = m.backendRouteForPathLocked(guestPath)
+			m.backendNodes[key] = id
 		}
 		return id
 	}
@@ -1631,8 +1685,74 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 		backendResolved: backend != nil,
 		backendRoute:    m.backendRouteForPathLocked(guestPath),
 	}
-	m.pathToNode[guestPath] = id
+	m.bindPathLocked(guestPath, id)
+	if backend != nil {
+		m.backendNodes[key] = id
+	}
 	return id
+}
+
+func (m *mountedFS) bindPathLocked(guestPath string, nodeID uint64) {
+	var detached uint64
+	if oldID, ok := m.pathToNode[guestPath]; ok {
+		if oldID == nodeID {
+			return
+		}
+		if m.pathRefs[oldID] > 1 {
+			m.pathRefs[oldID]--
+		} else {
+			delete(m.pathRefs, oldID)
+			detached = oldID
+		}
+	}
+	m.pathToNode[guestPath] = nodeID
+	m.pathRefs[nodeID]++
+	if detached != 0 {
+		m.deleteNodeIfDetachedLocked(detached)
+	}
+}
+
+func (m *mountedFS) unbindPathLocked(guestPath string) uint64 {
+	nodeID, ok := m.pathToNode[guestPath]
+	if !ok {
+		return 0
+	}
+	delete(m.pathToNode, guestPath)
+	if m.pathRefs[nodeID] > 1 {
+		m.pathRefs[nodeID]--
+		if node := m.nodes[nodeID]; node != nil && node.path == guestPath {
+			for remainingPath, remainingID := range m.pathToNode {
+				if remainingID == nodeID {
+					node.path = remainingPath
+					break
+				}
+			}
+		}
+	} else {
+		delete(m.pathRefs, nodeID)
+	}
+	return nodeID
+}
+
+func (m *mountedFS) deleteNodeIfDetachedLocked(nodeID uint64) {
+	if m.pathRefs[nodeID] != 0 || m.nodeHasHandleLocked(m.nodes[nodeID]) {
+		return
+	}
+	for key, mappedID := range m.backendNodes {
+		if mappedID == nodeID {
+			delete(m.backendNodes, key)
+		}
+	}
+	delete(m.nodes, nodeID)
+}
+
+func (m *mountedFS) backendNodeKeyLocked(guestPath string, backend FSBackend, backendNodeID uint64) mountedBackendNode {
+	return mountedBackendNode{
+		backendType: reflect.TypeOf(backend).String(),
+		backendPtr:  backendPointer(backend),
+		route:       m.backendRouteForPathLocked(guestPath),
+		nodeID:      backendNodeID,
+	}
 }
 
 func (m *mountedFS) nodeForPath(guestPath string) *mountedNode {
@@ -1647,15 +1767,16 @@ func (m *mountedFS) removeNode(guestPath string) {
 	m.debugPathf("cache-remove", guestPath, "")
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	removed := make(map[uint64]struct{})
 	for existingPath, id := range m.pathToNode {
 		if existingPath != guestPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(guestPath, "/")+"/") {
 			continue
 		}
-		delete(m.pathToNode, existingPath)
-		node := m.nodes[id]
-		if !m.nodeHasHandleLocked(node) {
-			delete(m.nodes, id)
-		}
+		m.unbindPathLocked(existingPath)
+		removed[id] = struct{}{}
+	}
+	for id := range removed {
+		m.deleteNodeIfDetachedLocked(id)
 	}
 }
 
@@ -1678,7 +1799,7 @@ func (m *mountedFS) collectDetachedNode(nodeID uint64) {
 	if node == nil || m.nodeHasHandleLocked(node) {
 		return
 	}
-	if id, linked := m.pathToNode[node.path]; linked && id == nodeID {
+	if m.pathRefs[nodeID] != 0 {
 		return
 	}
 	delete(m.nodes, nodeID)
@@ -1698,22 +1819,22 @@ func (m *mountedFS) renameNode(oldPath, newPath string) {
 		}
 		suffix := strings.TrimPrefix(existingPath, oldPath)
 		updates[cleanMountPath(newPath+suffix)] = id
-		delete(m.pathToNode, existingPath)
+		m.unbindPathLocked(existingPath)
 	}
 	for updatedPath, id := range updates {
-		m.pathToNode[updatedPath] = id
+		m.bindPathLocked(updatedPath, id)
 		if node := m.nodes[id]; node != nil {
 			node.path = updatedPath
 		}
 	}
 }
 
-func (m *mountedFS) storeHandle(guestPath string, backend FSBackend, nodeID uint64, fh uint64, dir bool) uint64 {
+func (m *mountedFS) storeHandle(guestPath string, backend FSBackend, nodeID uint64, fh uint64, dir bool, entries []dirEntry) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := m.nextHandle
 	m.nextHandle++
-	m.handles[id] = &mountedHandle{backend: backend, route: m.backendRouteForPathLocked(guestPath), nodeID: nodeID, fh: fh, dir: dir}
+	m.handles[id] = &mountedHandle{backend: backend, route: m.backendRouteForPathLocked(guestPath), nodeID: nodeID, fh: fh, dir: dir, entries: entries}
 	return id
 }
 

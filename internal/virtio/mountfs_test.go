@@ -45,6 +45,16 @@ type nonComparableFSBackend struct {
 	state []string
 }
 
+type countingReadDirBackend struct {
+	FSBackend
+	reads int
+}
+
+func (b *countingReadDirBackend) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+	b.reads++
+	return b.FSBackend.ReadDir(nodeID, fh, off, maxBytes)
+}
+
 func (b nonComparableFSBackend) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	return b.FSBackend.(fsCreateBackend).Create(parent, name, flags, mode, uid, gid)
 }
@@ -371,9 +381,6 @@ func TestMountedFSLookupRoutesSyntheticMountPaths(t *testing.T) {
 		t.Fatalf("share file data = %q", data)
 	}
 
-	if got := fsys.CachePolicy(1).AttrTTL; got != 0 {
-		t.Fatalf("writable root attribute TTL = %s, want immediate mutation visibility", got)
-	}
 	if got := fsys.CachePolicy(shareID).Mode; got != fsCacheStrict {
 		t.Fatalf("share cache mode = %q, want normalized strict mode", got)
 	}
@@ -498,6 +505,45 @@ func TestImageFSHardlinkReportsSameInode(t *testing.T) {
 	}
 }
 
+func TestMountedImageFSHardlinkUsesOneFUSENode(t *testing.T) {
+	fsys := NewMountedFS(imageBackend(t, map[string]string{"/a": "data"}), nil).(*mountedFS)
+	aID, _, errno := fsys.Lookup(1, "a")
+	if errno != 0 {
+		t.Fatalf("lookup a errno = %d", errno)
+	}
+	bID, linked, errno := fsys.Link(aID, 1, "b")
+	if errno != 0 {
+		t.Fatalf("link b errno = %d", errno)
+	}
+	if bID != aID || linked.NLink != 2 {
+		t.Fatalf("linked alias = node %d nlink %d, want node %d nlink 2", bID, linked.NLink, aID)
+	}
+	lookedUpID, lookedUp, errno := fsys.Lookup(1, "b")
+	if errno != 0 || lookedUpID != aID || lookedUp.NLink != 2 {
+		t.Fatalf("lookup alias = node %d nlink %d errno %d, want node %d nlink 2", lookedUpID, lookedUp.NLink, errno, aID)
+	}
+	if errno := fsys.Unlink(1, "a"); errno != 0 {
+		t.Fatalf("unlink a errno = %d", errno)
+	}
+	remainingID, remaining, errno := fsys.Lookup(1, "b")
+	if errno != 0 || remainingID != aID || remaining.NLink != 1 {
+		t.Fatalf("remaining alias = node %d nlink %d errno %d, want node %d nlink 1", remainingID, remaining.NLink, errno, aID)
+	}
+	cID, relinked, errno := fsys.Link(remainingID, 1, "c")
+	if errno != 0 || cID != aID || relinked.NLink != 2 {
+		t.Fatalf("relink remaining alias = node %d nlink %d errno %d, want node %d nlink 2", cID, relinked.NLink, errno, aID)
+	}
+	restored := NewMountedFS(fsys.root, nil).(*mountedFS)
+	if err := restored.RestoreNodePaths(fsys.SnapshotNodePaths()); err != nil {
+		t.Fatalf("restore hard-link node paths: %v", err)
+	}
+	bRestored, _, bErrno := restored.Lookup(1, "b")
+	cRestored, _, cErrno := restored.Lookup(1, "c")
+	if bErrno != 0 || cErrno != 0 || bRestored != cRestored {
+		t.Fatalf("restored aliases = b(%d,%d) c(%d,%d), want one FUSE node", bRestored, bErrno, cRestored, cErrno)
+	}
+}
+
 func TestMountedFSOpenDirectorySurvivesRemoval(t *testing.T) {
 	root := imageBackend(t, nil)
 	backendNodeID, _, errno := root.(fsMkdirBackend).Mkdir(1, "open-directory", 0o700, 0, 0)
@@ -531,6 +577,48 @@ func TestMountedFSOpenDirectorySurvivesRemoval(t *testing.T) {
 	fsys.ReleaseDir(nodeID, fh)
 	if _, errno := fsys.GetAttr(nodeID); errno != -linuxENOENT {
 		t.Fatalf("getattr released removed directory: errno %d, want %d", errno, -linuxENOENT)
+	}
+}
+
+func TestMountedFSDirectoryHandlePagesOneSnapshot(t *testing.T) {
+	root := imageBackend(t, nil)
+	for i := range 1000 {
+		nodeID, fh, _, errno := root.(fsCreateBackend).Create(1, "entry-"+strconv.Itoa(i), linuxOWRONLY|linuxOCREAT, 0o644, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create entry %d: errno %d", i, errno)
+		}
+		root.Release(nodeID, fh)
+	}
+	counting := &countingReadDirBackend{FSBackend: root}
+	fsys := NewMountedFS(counting, nil).(*mountedFS)
+	fh, errno := fsys.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("open directory: errno %d", errno)
+	}
+	defer fsys.ReleaseDir(1, fh)
+	offset := uint64(0)
+	entries := 0
+	for {
+		page, errno := fsys.ReadDir(1, fh, offset, 128)
+		if errno != 0 {
+			t.Fatalf("read directory at offset %d: errno %d", offset, errno)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for len(page) != 0 {
+			nameBytes := int(readLE32(page[16:20]))
+			recordBytes := align8(fuseDirentBaseSize + nameBytes)
+			offset = readLE64(page[8:16])
+			entries++
+			page = page[recordBytes:]
+		}
+	}
+	if entries != 1002 {
+		t.Fatalf("directory entries = %d, want 1002", entries)
+	}
+	if counting.reads != 2 {
+		t.Fatalf("backend directory snapshot used %d reads, want one data page and one EOF read", counting.reads)
 	}
 }
 

@@ -81,6 +81,66 @@ func TestVirtioFSPollReportsUnsupportedWithoutNotifications(t *testing.T) {
 	}
 }
 
+func TestVirtioFSReadDirPlusBatchesDirectoryAttributes(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	for _, name := range []string{"alpha", "beta", "gamma"} {
+		nodeID, fh := createImageFile(t, backend, name, name)
+		backend.Release(nodeID, fh)
+	}
+	fh, errno := backend.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("open directory: errno %d", errno)
+	}
+	defer backend.ReleaseDir(1, fh)
+
+	initReq := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(initReq[4:8], fuseInit)
+	initReply, err := (&FS{backend: backend}).dispatchFUSE(initReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags := binary.LittleEndian.Uint32(initReply.extra[12:16]); flags&fuseCapDoReadDirPlus == 0 {
+		t.Fatalf("INIT flags %#x do not advertise READDIRPLUS", flags)
+	}
+
+	req := make([]byte, fuseInHeaderSize+24)
+	binary.LittleEndian.PutUint32(req[4:8], fuseReadDirPlus)
+	binary.LittleEndian.PutUint64(req[8:16], 42)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	binary.LittleEndian.PutUint64(req[40:48], fh)
+	binary.LittleEndian.PutUint32(req[56:60], 4096)
+	reply, err := (&FS{backend: backend}).dispatchFUSE(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.errno != 0 {
+		t.Fatalf("READDIRPLUS errno = %d", reply.errno)
+	}
+	count := 0
+	for cursor := 0; cursor < len(reply.extra); {
+		if len(reply.extra)-cursor < fuseDirentPlusBaseSize {
+			t.Fatalf("short READDIRPLUS record at %d", cursor)
+		}
+		entryNode := binary.LittleEndian.Uint64(reply.extra[cursor : cursor+8])
+		attrNode := binary.LittleEndian.Uint64(reply.extra[cursor+40 : cursor+48])
+		dirent := cursor + fuseEntryOutSize
+		direntNode := binary.LittleEndian.Uint64(reply.extra[dirent : dirent+8])
+		nameBytes := int(binary.LittleEndian.Uint32(reply.extra[dirent+16 : dirent+20]))
+		recordBytes := align8(fuseDirentPlusBaseSize + nameBytes)
+		if recordBytes > len(reply.extra)-cursor {
+			t.Fatalf("READDIRPLUS record exceeds reply at %d", cursor)
+		}
+		if entryNode == 0 || entryNode != attrNode || entryNode != direntNode {
+			t.Fatalf("READDIRPLUS node mismatch: entry=%d attr=%d dirent=%d", entryNode, attrNode, direntNode)
+		}
+		count++
+		cursor += recordBytes
+	}
+	if count != 5 {
+		t.Fatalf("READDIRPLUS entries = %d, want 5", count)
+	}
+}
+
 func TestVirtioFSMountedExchangeFailsInsteadOfReportingUnsafeSuccess(t *testing.T) {
 	backend := newEmptyImageFS(t)
 	for _, name := range []string{"left", "right"} {

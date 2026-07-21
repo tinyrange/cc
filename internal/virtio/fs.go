@@ -50,6 +50,7 @@ const (
 	fuseStatfsOutSize      = 80
 	fuseStatxOutSize       = 288
 	fuseDirentBaseSize     = 24
+	fuseDirentPlusBaseSize = fuseEntryOutSize + fuseDirentBaseSize
 	fuseWriteOutSize       = 8
 	fuseLKInSize           = 48
 	fuseLKOutSize          = 24
@@ -93,6 +94,7 @@ const (
 	fuseDestroy     = 38
 	fuseIoctl       = 39
 	fusePoll        = 40
+	fuseReadDirPlus = 44
 	fuseRename2     = 45
 	fuseLseek       = 46
 	fuseSyncFS      = 50
@@ -130,6 +132,7 @@ const (
 
 const (
 	fuseCapBigWrites      = 1 << 5
+	fuseCapDoReadDirPlus  = 1 << 13
 	fuseCapWritebackCache = 1 << 16
 	fuseCapMaxPages       = 1 << 22
 )
@@ -1672,6 +1675,7 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		reqMajor := binary.LittleEndian.Uint32(req[40:44])
 		reqMinor := binary.LittleEndian.Uint32(req[44:48])
 		maxWrite, flags := f.backend.Init()
+		flags |= fuseCapDoReadDirPlus
 		if maxWrite == 0 {
 			maxWrite = 128 << 10
 		}
@@ -1948,9 +1952,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
 		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(nodeID, flags, true))
 		return reply(0, extra), nil
-	case fuseReadDir:
+	case fuseReadDir, fuseReadDirPlus:
 		if len(req) < fuseInHeaderSize+24 {
-			return fsReply{}, fmt.Errorf("virtio-fs READDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
@@ -1958,7 +1962,13 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if logEnabled {
 			f.logPathf("readdir", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
 		}
-		data, errno := f.backend.ReadDir(nodeID, fh, off, size)
+		var data []byte
+		var errno int32
+		if opcode == fuseReadDirPlus {
+			data, errno = f.readDirPlus(nodeID, fh, off, size)
+		} else {
+			data, errno = f.backend.ReadDir(nodeID, fh, off, size)
+		}
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
@@ -2381,6 +2391,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "OPENDIR"
 	case fuseReadDir:
 		return "READDIR"
+	case fuseReadDirPlus:
+		return "READDIRPLUS"
 	case fuseReleaseDir:
 		return "RELEASEDIR"
 	case fuseFsyncDir:
@@ -2524,6 +2536,53 @@ func (f *FS) encodeFuseEntryOut(dst []byte, nodeID uint64) {
 	binary.LittleEndian.PutUint64(dst[8:16], 1)
 	encodeFuseTTL(dst[16:24], dst[32:36], policy.EntryTTL)
 	encodeFuseTTL(dst[24:32], dst[36:40], policy.AttrTTL)
+}
+
+func (f *FS) readDirPlus(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+	var out []byte
+	for {
+		entries, errno := f.backend.ReadDir(nodeID, fh, off, maxBytes)
+		if errno != 0 {
+			return nil, errno
+		}
+		if len(entries) == 0 {
+			return out, 0
+		}
+		for cursor := 0; cursor < len(entries); {
+			if len(entries)-cursor < fuseDirentBaseSize {
+				return nil, -linuxEIO
+			}
+			nameBytes := int(binary.LittleEndian.Uint32(entries[cursor+16 : cursor+20]))
+			direntBytes := align8(fuseDirentBaseSize + nameBytes)
+			if direntBytes > len(entries)-cursor {
+				return nil, -linuxEIO
+			}
+			plusBytes := align8(fuseDirentPlusBaseSize + nameBytes)
+			if len(out)+plusBytes > int(maxBytes) {
+				return out, 0
+			}
+			off = binary.LittleEndian.Uint64(entries[cursor+8 : cursor+16])
+			childID := binary.LittleEndian.Uint64(entries[cursor : cursor+8])
+			attr, attrErrno := f.backend.GetAttr(childID)
+			cursor += direntBytes
+			if attrErrno == -linuxENOENT {
+				continue
+			}
+			if attrErrno != 0 {
+				return nil, attrErrno
+			}
+			start := len(out)
+			out = append(out, make([]byte, plusBytes)...)
+			f.encodeFuseEntryOut(out[start:start+fuseEntryOutSize], childID)
+			encodeFuseAttr(out[start+40:start+fuseEntryOutSize], attr)
+			copy(out[start+fuseEntryOutSize:], entries[cursor-direntBytes:cursor])
+		}
+		if len(out) != 0 {
+			return out, 0
+		}
+		// Every entry in this page disappeared between READDIR and GETATTR.
+		// Continue from the last cookie instead of reporting a false EOF.
+	}
 }
 
 func encodeFuseAttrTTL(dst []byte, ttl time.Duration) {
@@ -5416,6 +5475,7 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 	child.ctime = time.Now()
 	p.touchImageDirectoryLocked(parentNode, child.ctime)
 	if p.imageNodeReferenceCountLocked(childID) == 0 {
+		child.nlink = 0
 		p.collectImageNodeLocked(childID)
 	} else {
 		p.refreshImageNodeLinksLocked(child)
@@ -5527,6 +5587,7 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	newParentNode.modTime, newParentNode.ctime = now, now
 	if replaced != nil {
 		if p.imageNodeReferenceCountLocked(replaced.id) == 0 {
+			replaced.nlink = 0
 			p.collectImageNodeLocked(replaced.id)
 		} else {
 			p.refreshImageNodeLinksLocked(replaced)
@@ -5799,7 +5860,19 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	if nodeID == 1 {
 		return
 	}
-	if p.imageNodeReferenceCountLocked(nodeID) == 0 && !p.imageNodeHasHandleLocked(nodeID) {
+	node := p.nodes[nodeID]
+	if node == nil {
+		return
+	}
+	// Regular-file link counts are maintained when directory entries change.
+	// Most Release calls therefore prove the node is still linked in O(1),
+	// instead of rescanning every directory after every close. Directories are
+	// not hard-linkable and remain on the conservative reference scan.
+	linked := node.nlink != 0
+	if node.isDir() {
+		linked = p.imageNodeReferenceCountLocked(nodeID) != 0
+	}
+	if !linked && !p.imageNodeHasHandleLocked(nodeID) {
 		if node := p.nodes[nodeID]; node != nil {
 			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
 			p.retainedEntries -= node.retainedEntries

@@ -82,6 +82,49 @@ func TestRuntimeLinuxImageFSPreservesTrailingSpaceNames(t *testing.T) {
 	requireRunResponse(t, resp, err, 0)
 }
 
+func TestRuntimeLinuxImageFSLargeDirectoryListing(t *testing.T) {
+	const files = 30000
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "imagefs-large-directory", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+
+	execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", fmt.Sprintf(`set -eu; mkdir /many; i=0; while [ "$i" -lt %d ]; do : >"/many/entry-$i"; i=$((i+1)); done`, files)},
+		User:    "root",
+	})
+	listings := []struct{ name, script string }{
+		{"find", fmt.Sprintf(`set -eu; test "$(find /many -maxdepth 1 -type f | wc -l)" -eq %d`, files)},
+		{"ls", `set -eu; ls -1 /many >/dev/null`},
+	}
+	for _, listing := range listings {
+		started := time.Now()
+		execInRuntimeRequest(t, inst, client.ExecRequest{Command: []string{"sh", "-lc", listing.script}, User: "root"})
+		elapsed := time.Since(started)
+		if elapsed > 15*time.Second {
+			t.Fatalf("%s of %d imageFS entries took %s", listing.name, files, elapsed)
+		}
+		t.Logf("%s of %d imageFS entries completed in %s", listing.name, files, elapsed)
+	}
+	execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", `set -eu
+test "$(stat -c %h /many/entry-9999)" -eq 1
+ln /many/entry-9999 /many/alias
+test "$(stat -c %h /many/entry-9999)" -eq 2
+rm /many/alias
+test "$(stat -c %h /many/entry-9999)" -eq 1
+chmod 640 /many/entry-9999
+test "$(stat -c %a /many/entry-9999)" = 640
+printf payload >/many/entry-9999
+test "$(stat -c %s /many/entry-9999)" -eq 7
+mv /many/entry-9999 /many/renamed
+test ! -e /many/entry-9999
+test "$(cat /many/renamed)" = payload`},
+		User: "root",
+	})
+}
+
 func TestRuntimeLinuxImageFSKernelPermissionAndDirectorySemantics(t *testing.T) {
 	t.Setenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR", t.TempDir())
 	env := newRuntimeBootEnv(t)
