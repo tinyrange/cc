@@ -36,6 +36,9 @@ type GuestInitConfig struct {
 	Network            *GuestNetworkConfig `json:"network,omitempty"`
 	SnapshotMMIOBase   uint64              `json:"snapshot_mmio_base,omitempty"`
 	UnixTime           int64               `json:"unix_time,omitempty"`
+	KernelRelease      string              `json:"kernel_release,omitempty"`
+	ModuleSymversPath  string              `json:"module_symvers_path,omitempty"`
+	ModuleSymvers      []byte              `json:"-"`
 }
 
 type GuestNetworkConfig struct {
@@ -148,6 +151,12 @@ func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestIni
 			config.RootFSImagePath = "/ccx3/rootfs." + strings.TrimSpace(config.RootFSImageType)
 		}
 	}
+	if len(config.ModuleSymvers) > 0 {
+		if strings.TrimSpace(config.KernelRelease) == "" {
+			return nil, fmt.Errorf("kernel release is required with Module.symvers")
+		}
+		config.ModuleSymversPath = "/ccx3/Module.symvers"
+	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return nil, fmt.Errorf("marshal guest init config: %w", err)
@@ -175,6 +184,14 @@ func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestIni
 			Path: config.RootFSImagePath,
 			Mode: 0o600,
 			Data: config.RootFSImage,
+			Type: initramfs.TypeRegular,
+		})
+	}
+	if len(config.ModuleSymvers) > 0 {
+		files = append(files, initramfs.File{
+			Path: config.ModuleSymversPath,
+			Mode: 0o644,
+			Data: config.ModuleSymvers,
 			Type: initramfs.TypeRegular,
 		})
 	}

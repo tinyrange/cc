@@ -66,11 +66,17 @@ type Manager struct {
 }
 
 type metadata struct {
-	Version     string `json:"version"`
-	Source      string `json:"source"`
-	PackageName string `json:"package_name"`
-	PackageFile string `json:"package_file"`
-	Arch        string `json:"arch"`
+	Version           string `json:"version"`
+	Source            string `json:"source"`
+	PackageName       string `json:"package_name"`
+	PackageFile       string `json:"package_file"`
+	ModuleSymversFile string `json:"module_symvers_file,omitempty"`
+	Arch              string `json:"arch"`
+}
+
+type KernelMetadata struct {
+	Release       string
+	ModuleSymvers []byte
 }
 
 type indexEntry struct {
@@ -195,6 +201,31 @@ func (m *Manager) KernelVersion() (string, error) {
 	return parts[len(parts)-2], nil
 }
 
+func (m *Manager) ReadKernelMetadata() (KernelMetadata, error) {
+	meta, err := m.readMetadata()
+	if err != nil {
+		return KernelMetadata{}, err
+	}
+	if strings.TrimSpace(meta.ModuleSymversFile) == "" {
+		return KernelMetadata{}, fmt.Errorf("matching Module.symvers is not cached for kernel %s", meta.Version)
+	}
+	data, err := os.ReadFile(meta.ModuleSymversFile)
+	if err != nil {
+		return KernelMetadata{}, fmt.Errorf("read Module.symvers for kernel %s: %w", meta.Version, err)
+	}
+	if len(data) == 0 {
+		return KernelMetadata{}, fmt.Errorf("Module.symvers for kernel %s is empty", meta.Version)
+	}
+	if err := validateModuleSymvers(data); err != nil {
+		return KernelMetadata{}, fmt.Errorf("validate Module.symvers for kernel %s: %w", meta.Version, err)
+	}
+	release, err := m.KernelVersion()
+	if err != nil {
+		return KernelMetadata{}, err
+	}
+	return KernelMetadata{Release: release, ModuleSymvers: data}, nil
+}
+
 func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]string) ([]Module, error) {
 	start := time.Now()
 	config, err := m.readKernelConfig()
@@ -300,7 +331,14 @@ func (m *Manager) statusLocked() client.KernelState {
 	}
 
 	meta, err := m.readMetadata()
-	if err == nil {
+	if err == nil && strings.TrimSpace(meta.ModuleSymversFile) != "" {
+		if _, statErr := os.Stat(meta.PackageFile); statErr != nil {
+			err = statErr
+		} else if _, statErr := os.Stat(meta.ModuleSymversFile); statErr != nil {
+			err = statErr
+		}
+	}
+	if err == nil && strings.TrimSpace(meta.ModuleSymversFile) != "" {
 		return client.KernelState{
 			Status:  "downloaded",
 			Version: meta.Version,
@@ -325,7 +363,9 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 		return fmt.Errorf("create kernel cache dir: %w", err)
 	}
 	if meta, err := m.readMetadata(); err == nil {
-		if _, statErr := os.Stat(meta.PackageFile); statErr == nil {
+		_, packageErr := os.Stat(meta.PackageFile)
+		_, symversErr := os.Stat(meta.ModuleSymversFile)
+		if packageErr == nil && strings.TrimSpace(meta.ModuleSymversFile) != "" && symversErr == nil {
 			return nil
 		}
 	}
@@ -334,12 +374,13 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create kernel package dir: %w", err)
 	}
-	var entry indexEntry
+	var entry, developmentEntry indexEntry
 	var apkPath string
+	var developmentAPKPath string
 	var downloadErr error
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		entry, err = m.fetchIndexEntry(ctx)
+		entry, developmentEntry, err = m.fetchIndexEntries(ctx)
 		if err != nil {
 			return err
 		}
@@ -354,6 +395,19 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 			packageURL += separator + "cc-repository-retry=" + strconv.Itoa(attempt)
 		}
 		downloadErr = m.downloadFile(ctx, packageURL, apkPath, entry, report)
+		if downloadErr != nil {
+			if !isAlpineRepositoryRace(downloadErr) {
+				return downloadErr
+			}
+			continue
+		}
+		developmentFilename := fmt.Sprintf("%s-%s.apk", developmentEntry.Name, developmentEntry.Version)
+		developmentAPKPath = filepath.Join(destDir, developmentFilename)
+		developmentURL := m.packageURL(developmentFilename)
+		if attempt > 0 {
+			developmentURL += "?cc-repository-retry=" + strconv.Itoa(attempt)
+		}
+		downloadErr = m.downloadFile(ctx, developmentURL, developmentAPKPath, developmentEntry, report)
 		if downloadErr == nil {
 			break
 		}
@@ -369,13 +423,36 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 		return err
 	}
 	_ = os.Remove(apkPath)
+	developmentTarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", developmentEntry.Name, developmentEntry.Version))
+	if err := decompressAPKToTar(developmentAPKPath, developmentTarPath); err != nil {
+		return err
+	}
+	_ = os.Remove(developmentAPKPath)
+	symvers, err := readTarFileWithSuffix(developmentTarPath, "/Module.symvers")
+	_ = os.Remove(developmentTarPath)
+	if err != nil {
+		return fmt.Errorf("extract matching Module.symvers: %w", err)
+	}
+	if err := validateModuleSymvers(symvers); err != nil {
+		return fmt.Errorf("validate matching Module.symvers: %w", err)
+	}
+	symversPath := filepath.Join(destDir, fmt.Sprintf("Module.symvers-%s", entry.Version))
+	tmpSymversPath := symversPath + ".tmp"
+	if err := os.WriteFile(tmpSymversPath, symvers, 0o644); err != nil {
+		return fmt.Errorf("write matching Module.symvers: %w", err)
+	}
+	if err := os.Rename(tmpSymversPath, symversPath); err != nil {
+		_ = os.Remove(tmpSymversPath)
+		return fmt.Errorf("finalize matching Module.symvers: %w", err)
+	}
 
 	meta := metadata{
-		Version:     entry.Version,
-		Source:      m.sourceName(),
-		PackageName: entry.Name,
-		PackageFile: tarPath,
-		Arch:        entry.Arch,
+		Version:           entry.Version,
+		Source:            m.sourceName(),
+		PackageName:       entry.Name,
+		PackageFile:       tarPath,
+		ModuleSymversFile: symversPath,
+		Arch:              entry.Arch,
 	}
 
 	if err := m.writeMetadata(meta); err != nil {
@@ -389,6 +466,7 @@ func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter)
 	m.packageFiles = map[string][]byte{}
 	m.modulePaths = map[string]string{}
 	m.packageIndex = map[string]tarIndexEntry{}
+	m.tarIndexes = map[string]map[string]tarIndexEntry{}
 	m.indexedTar = ""
 	m.mu.Unlock()
 
@@ -608,38 +686,49 @@ func cloneModuleDeps(src map[string][]string) map[string][]string {
 	return out
 }
 
-func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
+func (m *Manager) fetchIndexEntries(ctx context.Context) (indexEntry, indexEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.indexURL(), nil)
 	if err != nil {
-		return indexEntry{}, err
+		return indexEntry{}, indexEntry{}, err
 	}
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
+		return indexEntry{}, indexEntry{}, fmt.Errorf("download kernel index: %w", err)
 	}
 	defer resp.Body.Close()
 	if err := download.BoundResponse(resp, 64<<20); err != nil {
-		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
+		return indexEntry{}, indexEntry{}, fmt.Errorf("download kernel index: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return indexEntry{}, fmt.Errorf("download kernel index: status %s", resp.Status)
+		return indexEntry{}, indexEntry{}, fmt.Errorf("download kernel index: status %s", resp.Status)
 	}
 
 	indexData, err := readAPKIndex(resp.Body)
 	if err != nil {
-		return indexEntry{}, err
+		return indexEntry{}, indexEntry{}, err
 	}
 
 	entry, ok := indexData[m.packageName]
 	if !ok {
-		return indexEntry{}, fmt.Errorf("kernel package %q not found in APKINDEX", m.packageName)
+		return indexEntry{}, indexEntry{}, fmt.Errorf("kernel package %q not found in APKINDEX", m.packageName)
 	}
 	if entry.Arch != m.arch {
-		return indexEntry{}, fmt.Errorf("kernel package arch %q does not match expected %q", entry.Arch, m.arch)
+		return indexEntry{}, indexEntry{}, fmt.Errorf("kernel package arch %q does not match expected %q", entry.Arch, m.arch)
 	}
-	return entry, nil
+	developmentName := m.packageName + "-dev"
+	developmentEntry, ok := indexData[developmentName]
+	if !ok {
+		return indexEntry{}, indexEntry{}, fmt.Errorf("kernel development package %q not found in APKINDEX", developmentName)
+	}
+	if developmentEntry.Arch != m.arch {
+		return indexEntry{}, indexEntry{}, fmt.Errorf("kernel development package arch %q does not match expected %q", developmentEntry.Arch, m.arch)
+	}
+	if developmentEntry.Version != entry.Version {
+		return indexEntry{}, indexEntry{}, fmt.Errorf("kernel package versions do not match: %s=%s, %s=%s", entry.Name, entry.Version, developmentEntry.Name, developmentEntry.Version)
+	}
+	return entry, developmentEntry, nil
 }
 
 func (m *Manager) downloadFile(ctx context.Context, url, destPath string, entry indexEntry, report progressReporter) error {
@@ -666,8 +755,7 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, entry 
 	if err != nil {
 		return fmt.Errorf("create kernel package file: %w", err)
 	}
-	hasher := sha1.New()
-	if err := copyWithProgress(io.MultiWriter(f, hasher), resp.Body, resp.ContentLength, filepath.Base(destPath), report); err != nil {
+	if err := copyWithProgress(f, resp.Body, resp.ContentLength, filepath.Base(destPath), report); err != nil {
 		f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write kernel package: %w", err)
@@ -681,7 +769,11 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string, entry 
 		return &download.LengthError{Expected: entry.Size, Actual: resp.ContentLength}
 	}
 	if expected, ok := alpineChecksumHex(entry.Checksum); ok {
-		actual := hex.EncodeToString(hasher.Sum(nil))
+		actual, err := apkChecksumHex(tmpPath)
+		if err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("verify kernel package checksum: %w", err)
+		}
 		if !strings.EqualFold(expected, actual) {
 			_ = os.Remove(tmpPath)
 			return &download.DigestError{Expected: "sha1:" + expected, Actual: "sha1:" + actual}
@@ -823,6 +915,63 @@ func buildTarIndex(packagePath string) (map[string]tarIndexEntry, error) {
 	}
 }
 
+func readTarFileWithSuffix(packagePath, suffix string) ([]byte, error) {
+	index, err := buildTarIndex(packagePath)
+	if err != nil {
+		return nil, err
+	}
+	var match string
+	for name := range index {
+		if !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		if match != "" {
+			return nil, fmt.Errorf("package contains multiple files ending in %q", suffix)
+		}
+		match = name
+	}
+	if match == "" {
+		return nil, fmt.Errorf("package file ending in %q not found", suffix)
+	}
+	entry := index[match]
+	f, err := os.Open(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("open package: %w", err)
+	}
+	defer f.Close()
+	data := make([]byte, entry.Size)
+	n, err := f.ReadAt(data, entry.Offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("read package file %q: %w", match, err)
+	}
+	if int64(n) != entry.Size {
+		return nil, fmt.Errorf("read package file %q: short read %d/%d", match, n, entry.Size)
+	}
+	return data, nil
+}
+
+func validateModuleSymvers(data []byte) error {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[1] != "module_layout" {
+			continue
+		}
+		crc := strings.TrimPrefix(fields[0], "0x")
+		if len(crc) != 8 {
+			return fmt.Errorf("module_layout has invalid CRC %q", fields[0])
+		}
+		if _, err := strconv.ParseUint(crc, 16, 32); err != nil {
+			return fmt.Errorf("module_layout has invalid CRC %q", fields[0])
+		}
+		return nil
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read symbol versions: %w", err)
+	}
+	return fmt.Errorf("module_layout CRC is missing")
+}
+
 type countingReader struct {
 	r io.Reader
 	n int64
@@ -949,6 +1098,66 @@ func alpineChecksumHex(value string) (string, bool) {
 	return hex.EncodeToString(raw), true
 }
 
+func apkChecksumHex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	type memberRange struct{ start, end int64 }
+	var members []memberRange
+	for {
+		if _, err := reader.Peek(1); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return "", err
+		}
+		position, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return "", err
+		}
+		start := position - int64(reader.Buffered())
+		gzr, err := gzip.NewReader(reader)
+		if err != nil {
+			return "", fmt.Errorf("open gzip member %d: %w", len(members)+1, err)
+		}
+		gzr.Multistream(false)
+		if _, err := io.Copy(io.Discard, gzr); err != nil {
+			_ = gzr.Close()
+			return "", fmt.Errorf("read gzip member %d: %w", len(members)+1, err)
+		}
+		if err := gzr.Close(); err != nil {
+			return "", fmt.Errorf("close gzip member %d: %w", len(members)+1, err)
+		}
+		position, err = f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return "", err
+		}
+		end := position - int64(reader.Buffered())
+		if end <= start {
+			return "", fmt.Errorf("gzip member %d has invalid range", len(members)+1)
+		}
+		members = append(members, memberRange{start: start, end: end})
+	}
+	if len(members) == 0 {
+		return "", fmt.Errorf("package has no gzip members")
+	}
+	checksumMember := members[0]
+	if len(members) > 1 {
+		// APK v2's Q1 value covers the control stream, which follows the
+		// signature stream. A single-member fallback keeps unsigned packages
+		// and older test repositories usable.
+		checksumMember = members[1]
+	}
+	hasher := sha1.New()
+	if _, err := io.Copy(hasher, io.NewSectionReader(f, checksumMember.start, checksumMember.end-checksumMember.start)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
 func (m *Manager) readMetadata() (metadata, error) {
 	var ret metadata
 	buf, err := os.ReadFile(m.metadataPath())
@@ -969,8 +1178,14 @@ func (m *Manager) writeMetadata(meta metadata) error {
 	if err != nil {
 		return fmt.Errorf("marshal kernel metadata: %w", err)
 	}
-	if err := os.WriteFile(m.metadataPath(), buf, 0o644); err != nil {
+	path := m.metadataPath()
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, buf, 0o644); err != nil {
 		return fmt.Errorf("write kernel metadata: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize kernel metadata: %w", err)
 	}
 	return nil
 }

@@ -56,6 +56,8 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		Network:           req.Network,
 		SnapshotMMIOBase:  SnapshotBase,
 		UnixTime:          req.UnixTime,
+		KernelRelease:     req.KernelRelease,
+		ModuleSymvers:     req.ModuleSymvers,
 	})
 }
 
@@ -77,6 +79,8 @@ func BuildExecInitramfs(req RunRequest, command []string, env []string, workDir 
 		ExitMarkerPrefix:  CommandExitMarkerPref,
 		Network:           req.Network,
 		UnixTime:          req.UnixTime,
+		KernelRelease:     req.KernelRelease,
+		ModuleSymvers:     req.ModuleSymvers,
 	})
 }
 

@@ -62,6 +62,49 @@ func TestConfigurePackageManagersDoesNotDisableAptPipelining(t *testing.T) {
 	}
 }
 
+func TestInstallModuleSymversUsesKernelBuildPath(t *testing.T) {
+	root := t.TempDir()
+	release := "6.18.39-0-virt"
+	want := []byte("0x12345678\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n")
+	if err := installModuleSymvers(root, release, want); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "lib", "modules", release, "build", "Module.symvers")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Module.symvers = %q, want %q", got, want)
+	}
+
+	replacement := []byte("0x87654321\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n")
+	if err := installModuleSymvers(root, release, replacement); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("replaced Module.symvers = %q, want %q", got, replacement)
+	}
+}
+
+func TestInstallModuleSymversRejectsInvalidRelease(t *testing.T) {
+	root := t.TempDir()
+	if err := installModuleSymvers(root, "../escape", []byte("data")); err == nil {
+		t.Fatal("invalid kernel release unexpectedly accepted")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid install wrote %d root entries", len(entries))
+	}
+}
+
 func TestCommandNeedsSystemdReady(t *testing.T) {
 	tests := []struct {
 		name string

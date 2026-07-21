@@ -37,11 +37,12 @@ const (
 )
 
 const (
-	sidecarBootTLVEnd      uint16 = 0
-	sidecarBootTLVMetadata uint16 = 1
-	sidecarBootTLVKernel   uint16 = 2
-	sidecarBootTLVInit     uint16 = 3
-	sidecarBootTLVModule   uint16 = 4
+	sidecarBootTLVEnd           uint16 = 0
+	sidecarBootTLVMetadata      uint16 = 1
+	sidecarBootTLVKernel        uint16 = 2
+	sidecarBootTLVInit          uint16 = 3
+	sidecarBootTLVModule        uint16 = 4
+	sidecarBootTLVModuleSymvers uint16 = 5
 )
 
 type sidecarBootBundleMetadata struct {
@@ -51,6 +52,7 @@ type sidecarBootBundleMetadata struct {
 	AMD64EmulatorPath  string            `json:"amd64_emulator_path,omitempty"`
 	ModuleNames        []string          `json:"module_names,omitempty"`
 	NeedsAMD64Emulator bool              `json:"needs_amd64_emulator,omitempty"`
+	KernelRelease      string            `json:"kernel_release,omitempty"`
 }
 
 func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req client.CreateInstanceRequest) (sidecarStartResources, error) {
@@ -221,6 +223,10 @@ func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *o
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
+	kernelMetadata, err := readRuntimeKernelProviderMetadata(kernelProvider)
+	if err != nil {
+		return sidecarStartResources{}, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, h.kernel.ExtractPackageFile)
 	if err != nil {
 		return sidecarStartResources{}, err
@@ -238,6 +244,8 @@ func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *o
 		Init:               initBin,
 		AMD64EmulatorPath:  qemuX8664,
 		Modules:            modules,
+		KernelRelease:      kernelMetadata.Release,
+		ModuleSymvers:      kernelMetadata.ModuleSymvers,
 		NeedsAMD64Emulator: needsAMD64,
 	}
 	if image != nil {
@@ -274,6 +282,7 @@ func writeSidecarBootBundle(w io.Writer, bundle sidecarBootBundle) error {
 		AMD64EmulatorPath:  bundle.AMD64EmulatorPath,
 		ModuleNames:        moduleNames,
 		NeedsAMD64Emulator: bundle.NeedsAMD64Emulator,
+		KernelRelease:      bundle.KernelRelease,
 	})
 	if err != nil {
 		return err
@@ -289,6 +298,11 @@ func writeSidecarBootBundle(w io.Writer, bundle sidecarBootBundle) error {
 	}
 	for _, module := range bundle.Modules {
 		if err := writeSidecarBootTLV(w, sidecarBootTLVModule, module.Data); err != nil {
+			return err
+		}
+	}
+	if len(bundle.ModuleSymvers) != 0 {
+		if err := writeSidecarBootTLV(w, sidecarBootTLVModuleSymvers, bundle.ModuleSymvers); err != nil {
 			return err
 		}
 	}

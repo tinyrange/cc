@@ -53,6 +53,18 @@ type runtimeKernelProvider interface {
 	PlanModuleLoad([]string, map[string]string) ([]alpine.Module, error)
 }
 
+type runtimeKernelMetadataProvider interface {
+	ReadKernelMetadata() (alpine.KernelMetadata, error)
+}
+
+func readRuntimeKernelProviderMetadata(provider runtimeKernelProvider) (alpine.KernelMetadata, error) {
+	metadataProvider, ok := provider.(runtimeKernelMetadataProvider)
+	if !ok {
+		return alpine.KernelMetadata{}, nil
+	}
+	return metadataProvider.ReadKernelMetadata()
+}
+
 func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
 	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache}
 }
@@ -416,6 +428,8 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	} else if bundle != nil {
 		return vmruntime.RunRequest{
 			Kernel:            append([]byte(nil), bundle.Kernel...),
+			KernelRelease:     bundle.KernelRelease,
+			ModuleSymvers:     append([]byte(nil), bundle.ModuleSymvers...),
 			Init:              append([]byte(nil), bundle.Init...),
 			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
 			Modules:           append([]alpine.Module(nil), bundle.Modules...),
@@ -458,6 +472,10 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	kernelMetadata, err := readRuntimeKernelProviderMetadata(kernelProvider)
+	if err != nil {
+		return vmruntime.RunRequest{}, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	timing.Since(ctx, "backend.plan_module_load", start)
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
 	start = time.Now()
@@ -480,6 +498,8 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timingLog("buildBaseRequest guestinit.Build took=%s image=%q init_bytes=%d", time.Since(start), imageName, len(initBin))
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
+		KernelRelease:     kernelMetadata.Release,
+		ModuleSymvers:     kernelMetadata.ModuleSymvers,
 		Init:              initBin,
 		AMD64EmulatorPath: qemuX8664,
 		Modules:           modules,
@@ -577,6 +597,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		}
 		return vmruntime.RunRequest{
 			Kernel:            append([]byte(nil), bundle.Kernel...),
+			KernelRelease:     bundle.KernelRelease,
+			ModuleSymvers:     append([]byte(nil), bundle.ModuleSymvers...),
 			Init:              append([]byte(nil), bundle.Init...),
 			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
 			Modules:           append([]alpine.Module(nil), bundle.Modules...),
@@ -623,6 +645,10 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	kernelMetadata, err := readRuntimeKernelProviderMetadata(kernelProvider)
+	if err != nil {
+		return vmruntime.RunRequest{}, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
@@ -647,6 +673,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	}
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
+		KernelRelease:     kernelMetadata.Release,
+		ModuleSymvers:     kernelMetadata.ModuleSymvers,
 		Init:              initBin,
 		AMD64EmulatorPath: qemuX8664,
 		Modules:           modules,
@@ -771,6 +799,7 @@ func readSidecarBootBundle(r io.Reader) (*sidecarBootBundle, error) {
 			bundle.Config = metadata.Config
 			bundle.AMD64EmulatorPath = metadata.AMD64EmulatorPath
 			bundle.NeedsAMD64Emulator = metadata.NeedsAMD64Emulator
+			bundle.KernelRelease = metadata.KernelRelease
 			bundle.Modules = make([]alpine.Module, 0, len(modules))
 			for i, data := range modules {
 				bundle.Modules = append(bundle.Modules, alpine.Module{Name: metadata.ModuleNames[i], Data: data})
@@ -788,6 +817,8 @@ func readSidecarBootBundle(r io.Reader) (*sidecarBootBundle, error) {
 			bundle.Init = append(bundle.Init[:0], data...)
 		case sidecarBootTLVModule:
 			modules = append(modules, data)
+		case sidecarBootTLVModuleSymvers:
+			bundle.ModuleSymvers = append(bundle.ModuleSymvers[:0], data...)
 		default:
 			return nil, fmt.Errorf("unknown boot bundle TLV type %d", typ)
 		}

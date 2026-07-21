@@ -112,6 +112,8 @@ type config struct {
 	SnapshotMMIOBase   uint64   `json:"snapshot_mmio_base,omitempty"`
 	SnapshotModules    []string `json:"snapshot_modules,omitempty"`
 	UnixTime           int64    `json:"unix_time,omitempty"`
+	KernelRelease      string   `json:"kernel_release,omitempty"`
+	ModuleSymversPath  string   `json:"module_symvers_path,omitempty"`
 }
 
 type network struct {
@@ -119,6 +121,63 @@ type network struct {
 	Address   string `json:"address,omitempty"`
 	Gateway   string `json:"gateway,omitempty"`
 	DNS       string `json:"dns,omitempty"`
+}
+
+func installModuleSymvers(root, release string, data []byte) error {
+	release = strings.TrimSpace(release)
+	if release == "" || release == "." || release == ".." || filepath.Base(release) != release {
+		return fmt.Errorf("invalid kernel release %q", release)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("Module.symvers is empty")
+	}
+
+	headersDir := filepath.Join(root, "usr", "src", "linux-headers-"+release)
+	if err := os.MkdirAll(headersDir, 0o755); err != nil {
+		return fmt.Errorf("create kernel metadata directory: %w", err)
+	}
+	symversPath := filepath.Join(headersDir, "Module.symvers")
+	tmp, err := os.CreateTemp(headersDir, ".Module.symvers-*")
+	if err != nil {
+		return fmt.Errorf("create temporary Module.symvers: %w", err)
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("set Module.symvers permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write Module.symvers: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close Module.symvers: %w", err)
+	}
+	if err := os.Rename(tmpPath, symversPath); err != nil {
+		return fmt.Errorf("install Module.symvers: %w", err)
+	}
+	ok = true
+
+	modulesDir := filepath.Join(root, "lib", "modules", release)
+	if err := os.MkdirAll(modulesDir, 0o755); err != nil {
+		return fmt.Errorf("create kernel module directory: %w", err)
+	}
+	buildPath := filepath.Join(modulesDir, "build")
+	if _, err := os.Lstat(buildPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect kernel build link: %w", err)
+	}
+	linkTarget := filepath.Join("..", "..", "..", "usr", "src", "linux-headers-"+release)
+	if err := os.Symlink(linkTarget, buildPath); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("install kernel build link: %w", err)
+	}
+	return nil
 }
 
 type share struct {
@@ -502,6 +561,16 @@ func run() error {
 	configureMemoryOvercommit("/proc")
 
 	modules := cfg.Modules
+	var moduleSymvers []byte
+	if cfg.ModuleSymversPath != "" {
+		moduleSymvers, err = os.ReadFile(cfg.ModuleSymversPath)
+		if err != nil {
+			return fmt.Errorf("read staged Module.symvers: %w", err)
+		}
+		if len(moduleSymvers) == 0 {
+			return fmt.Errorf("staged Module.symvers is empty")
+		}
+	}
 	var deferredModulePaths []string
 	var deferredModules []modulePayload
 	if cfg.SnapshotMMIOBase != 0 {
@@ -522,6 +591,13 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		if len(moduleSymvers) > 0 {
+			writeStage(bootStart, "installing kernel symbol versions")
+			if err := installModuleSymvers("/", cfg.KernelRelease, moduleSymvers); err != nil {
+				return fmt.Errorf("install kernel symbol versions: %w", err)
+			}
+			writeStage(bootStart, "kernel symbol versions installed")
+		}
 		writeStage(bootStart, "configuring hostname")
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)

@@ -69,6 +69,8 @@ func CloseFSBackend(backend virtio.FSBackend) error {
 // RunRequest is the backend-neutral request shape for the managed guest runtime.
 type RunRequest struct {
 	Kernel            []byte
+	KernelRelease     string
+	ModuleSymvers     []byte
 	Init              []byte
 	AMD64EmulatorPath string
 	Modules           []alpine.Module

@@ -118,6 +118,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
 	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	stageStart = time.Now()
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	timing.Since(ctx, "startup.initramfs", stageStart)
@@ -223,6 +226,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.WorkDir = "/"
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
@@ -366,6 +372,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}
 	if qemuX8664 != "" {
 		initCfg.EmulatorTag = vmruntime.EmulatorTag
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return client.ExecResponse{}, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {

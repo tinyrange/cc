@@ -74,6 +74,7 @@ func run() error {
 	defer cancel()
 
 	var kernel []byte
+	var kernelMetadata alpine.KernelMetadata
 	var modules []alpine.Module
 	var initBin []byte
 	if restoreSnapshot == "" {
@@ -89,6 +90,10 @@ func run() error {
 		modules, err = kernelManager.PlanModuleLoad(windowsTinybootConfigVars(), windowsTinybootModuleMap())
 		if err != nil {
 			return fmt.Errorf("plan modules: %w", err)
+		}
+		kernelMetadata, err = kernelManager.ReadKernelMetadata()
+		if err != nil {
+			return fmt.Errorf("read kernel metadata: %w", err)
 		}
 		initBin, err = guestinit.BuildForArch(ctx, filepath.Join(cacheDir, "guestinit"), "amd64")
 		if err != nil {
@@ -148,6 +153,8 @@ func run() error {
 				ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
 				DisableCgroupMount: true,
 				UnixTime:           time.Now().Unix(),
+				KernelRelease:      kernelMetadata.Release,
+				ModuleSymvers:      kernelMetadata.ModuleSymvers,
 			}
 			if strings.TrimSpace(snapshotDir) != "" {
 				initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase

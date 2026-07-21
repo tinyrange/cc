@@ -64,6 +64,27 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
 }
 
+func TestRuntimeLinuxExposesMatchingModuleSymbolVersions(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
+
+	resp := execInRuntime(t, inst, []string{
+		"sh",
+		"-lc",
+		`set -eu
+release=$(uname -r)
+symvers=/usr/src/linux-headers-$release/Module.symvers
+test -s "$symvers"
+test "$(readlink -f /lib/modules/$release/build/Module.symvers)" = "$symvers"
+crc=$(awk '$2 == "module_layout" { print $1; exit }' "$symvers")
+test "${crc#0x}" != "$crc"
+test "${#crc}" -eq 10
+printf 'release=%s bytes=%s\n' "$release" "$(wc -c < "$symvers")"`,
+	})
+	requireGuestOutput(t, resp.Output, "release=", "bytes=")
+}
+
 func TestRuntimeLinuxImageFSPreservesTrailingSpaceNames(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())

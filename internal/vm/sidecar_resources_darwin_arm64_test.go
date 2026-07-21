@@ -3,12 +3,38 @@
 package vm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
 
+	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/netstack"
 )
+
+func TestSidecarBootBundlePreservesKernelModuleMetadata(t *testing.T) {
+	want := sidecarBootBundle{
+		Kernel:        []byte("kernel"),
+		Init:          []byte("init"),
+		KernelRelease: "6.18.39-0-virt",
+		ModuleSymvers: []byte("0x12345678\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n"),
+		Modules:       []alpine.Module{{Name: "virtiofs", Data: []byte("module")}},
+	}
+	var encoded bytes.Buffer
+	if err := writeSidecarBootBundle(&encoded, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSidecarBootBundle(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.KernelRelease != want.KernelRelease || !bytes.Equal(got.ModuleSymvers, want.ModuleSymvers) {
+		t.Fatalf("kernel metadata = release %q, symvers %q", got.KernelRelease, got.ModuleSymvers)
+	}
+	if len(got.Modules) != 1 || got.Modules[0].Name != "virtiofs" || !bytes.Equal(got.Modules[0].Data, []byte("module")) {
+		t.Fatalf("modules = %#v", got.Modules)
+	}
+}
 
 func TestDarwinSidecarSwitchAllocatesDistinctLeases(t *testing.T) {
 	defaultDarwinSidecarSwitch.Unregister("freebsd")

@@ -296,6 +296,8 @@ type sidecarBootBundle struct {
 	Architecture       string
 	Config             oci.RuntimeConfig
 	Kernel             []byte
+	KernelRelease      string
+	ModuleSymvers      []byte
 	Init               []byte
 	AMD64EmulatorPath  string
 	Modules            []alpine.Module

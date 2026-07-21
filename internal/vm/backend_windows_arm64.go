@@ -174,6 +174,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
 	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, ""); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
@@ -288,6 +291,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, ""); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
