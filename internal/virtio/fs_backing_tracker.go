@@ -115,12 +115,16 @@ func (t *FSBackingUsageTracker) sampleStable() {
 	t.stale = stale
 	t.highWater = max(t.highWater, current, dataPeak)
 	t.metadataHighWater = max(t.metadataHighWater, metadata, metadataPeak)
-	combined := current + metadata
-	if combined < current {
-		combined = ^uint64(0)
-	}
-	if combined > t.combinedHighWater {
-		t.combinedHighWater = combined
+	// Only a quiescent sample proves that the independently queried data and
+	// metadata values existed together. During a mutation the current values
+	// remain useful when disclosed as stale, but their sum must not become a
+	// permanent fictional peak.
+	if !stale {
+		combined := current + metadata
+		if combined < current {
+			combined = ^uint64(0)
+		}
+		t.combinedHighWater = max(t.combinedHighWater, combined)
 	}
 	// A component's independently recorded peak is a safe lower bound for
 	// aggregate pressure: every other component was non-negative when that

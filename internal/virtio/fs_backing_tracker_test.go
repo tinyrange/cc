@@ -110,3 +110,30 @@ func TestFSBackingTrackerRetainsBackendPeakMissedBetweenSamples(t *testing.T) {
 		t.Fatalf("transient backend peak was not retained: %+v", snapshot)
 	}
 }
+
+func TestFSBackingTrackerDoesNotPromoteStaleAggregatePeak(t *testing.T) {
+	backend := &blockingUsageBackend{current: 11}
+	device := NewFS(0, 0, 0, "root", backend)
+	tracker := AttachFSBackingUsageTracker([]*FS{device})
+	doneMutation := tracker.TrackMutation()
+	defer doneMutation()
+	backend.mu.Lock()
+	backend.current = 100
+	backend.highWater = 100
+	backend.mu.Unlock()
+	tracker.RequestSample()
+	deadline := time.Now().Add(time.Second)
+	for snapshot := tracker.Snapshot(); snapshot.DataBytes != 100 || !snapshot.Stale; snapshot = tracker.Snapshot() {
+		if time.Now().After(deadline) {
+			t.Fatalf("stale mutation sample was not published: %+v", snapshot)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snapshot := tracker.Snapshot()
+	if snapshot.CombinedBytes != 117 {
+		t.Fatalf("stale current aggregate = %d, want 117", snapshot.CombinedBytes)
+	}
+	if snapshot.CombinedHighWaterBytes != 100 {
+		t.Fatalf("stale sample promoted aggregate high-water to %d, want component lower bound 100", snapshot.CombinedHighWaterBytes)
+	}
+}

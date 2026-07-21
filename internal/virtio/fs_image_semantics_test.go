@@ -3,6 +3,7 @@ package virtio
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -631,6 +632,57 @@ func TestImageFSOpenDirectorySurvivesRemoval(t *testing.T) {
 	backend.ReleaseDir(dirID, fh)
 	if _, errno := backend.GetAttr(dirID); errno != -linuxENOENT {
 		t.Fatalf("getattr after released directory: errno %d, want %d", errno, -linuxENOENT)
+	}
+}
+
+func TestImageFSReadsLargeDirectoryWithoutCopyingItPerPage(t *testing.T) {
+	backend := newEmptyImageFS(t)
+	const files = 10000
+	for i := range files {
+		nodeID, fh, _, errno := backend.Create(1, fmt.Sprintf("entry-%05d", i), linuxOWRONLY|linuxOCREAT, 0o644, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create entry %d: errno %d", i, errno)
+		}
+		backend.Release(nodeID, fh)
+	}
+	fh, errno := backend.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("open large directory: errno %d", errno)
+	}
+	defer backend.ReleaseDir(1, fh)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	offset := uint64(0)
+	entries := 0
+	for {
+		page, errno := backend.ReadDir(1, fh, offset, 128)
+		if errno != 0 {
+			t.Fatalf("read directory at offset %d: errno %d", offset, errno)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for cursor := 0; cursor < len(page); {
+			if len(page)-cursor < fuseDirentBaseSize {
+				t.Fatalf("short directory record at offset %d", offset)
+			}
+			nameBytes := int(binary.LittleEndian.Uint32(page[cursor+16 : cursor+20]))
+			recordBytes := align8(fuseDirentBaseSize + nameBytes)
+			if recordBytes > len(page)-cursor {
+				t.Fatalf("directory record exceeds page at offset %d", offset)
+			}
+			offset = binary.LittleEndian.Uint64(page[cursor+8 : cursor+16])
+			entries++
+			cursor += recordBytes
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if entries != files+2 {
+		t.Fatalf("large directory entries = %d, want %d", entries, files+2)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Fatalf("paged large-directory read allocated %d bytes", allocated)
 	}
 }
 

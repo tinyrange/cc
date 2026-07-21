@@ -4896,9 +4896,9 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 
 func (p *imageFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
 	p.mu.Lock()
-	entries := append([]dirEntry(nil), p.dirHandles[fh]...)
-	p.mu.Unlock()
-	if entries == nil {
+	defer p.mu.Unlock()
+	entries, ok := p.dirHandles[fh]
+	if !ok {
 		return nil, -linuxEBADF
 	}
 	var out []byte
