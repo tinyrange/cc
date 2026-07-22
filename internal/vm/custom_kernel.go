@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"j5.nz/cc/internal/kernel/alpine"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 const customKernelFilePrefix = "file:"
@@ -48,4 +49,17 @@ func readRuntimeKernel(manager *alpine.Manager, flavor string) ([]byte, error) {
 
 func planRuntimeKernelModules(manager *alpine.Manager, flavor string, configVars []string, moduleMap map[string]string) ([]alpine.Module, error) {
 	return manager.PlanModuleLoad(configVars, moduleMap)
+}
+
+func applyRuntimeKernelMetadata(config *vmruntime.GuestInitConfig, manager *alpine.Manager, flavor string) error {
+	if _, custom := customKernelPath(flavor); custom {
+		return nil
+	}
+	metadata, err := manager.ReadKernelMetadata()
+	if err != nil {
+		return err
+	}
+	config.KernelRelease = metadata.Release
+	config.ModuleSymvers = metadata.ModuleSymvers
+	return nil
 }

@@ -186,6 +186,12 @@ func buildManagedRootFromPreparedBase(root imagefs.Directory, closeRoot func() e
 		_ = closeRoot()
 		return nil, nil, err
 	}
+	if err := rootplan.AddSymlinks(overlay, []rootplan.Symlink{
+		{Path: "/etc/localtime", Target: "/usr/share/zoneinfo/UTC"},
+	}); err != nil {
+		_ = closeRoot()
+		return nil, nil, err
+	}
 	return overlay.Root(), closeRoot, nil
 }
 

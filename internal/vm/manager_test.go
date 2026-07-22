@@ -104,6 +104,221 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	}
 }
 
+func TestManagerRetargetsRunningGuestBalloon(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "pressure", Image: "alpine", MemoryMB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetInstanceBalloon("pressure", 768); err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	target := inst.balloonTarget
+	inst.mu.Unlock()
+	if target != 768 {
+		t.Fatalf("instance balloon target = %d, want 768", target)
+	}
+	if state := manager.StatusOf("pressure"); state.BalloonMB != 768 {
+		t.Fatalf("reported balloon target = %d, want 768", state.BalloonMB)
+	}
+}
+
+func TestManagerShutdownAbortsHungBalloonRetarget(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingBalloonInstance{
+		fakeInstance:   newFakeInstance(),
+		balloonStarted: make(chan struct{}),
+		releaseBalloon: make(chan struct{}),
+		closeStarted:   make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "pressure", Image: "alpine", MemoryMB: 2048}); err != nil {
+		t.Fatal(err)
+	}
+	inst.blockBalloon.Store(true)
+	balloonDone := make(chan error, 1)
+	go func() { balloonDone <- manager.SetInstanceBalloon("pressure", 768) }()
+	<-inst.balloonStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "pressure") }()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("pressure").Status != "stopping" && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if state := manager.StatusOf("pressure"); state.Status != "stopping" && state.Status != "stopped" {
+		t.Fatalf("state while shutdown owns the VM = %+v", state)
+	}
+	select {
+	case <-inst.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("instance close waited behind a hung balloon device operation")
+	}
+	if err := manager.SetInstanceBalloon("pressure", 512); err == nil {
+		t.Fatal("balloon retarget was accepted after shutdown took ownership")
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	close(inst.releaseBalloon)
+	if err := <-balloonDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerSerializesMutableBackendOperationWithShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingShareInstance{
+		fakeInstance: newFakeInstance(), shareStarted: make(chan struct{}), releaseShare: make(chan struct{}), closeStarted: make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shared", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	shareDone := make(chan error, 1)
+	go func() { shareDone <- manager.AddShareTo(ctx, "shared", client.ShareMount{Mount: "/data"}) }()
+	<-inst.shareStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "shared") }()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("shared").Status != "stopping" && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	select {
+	case <-inst.closeStarted:
+		t.Fatal("instance close raced an active share update")
+	default:
+	}
+	if err := manager.AddPortForwardTo(ctx, "shared", client.PortForward{}); err == nil {
+		t.Fatal("backend operation was admitted after shutdown took ownership")
+	}
+	close(inst.releaseShare)
+	if err := <-shareDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerRunStreamShareMutationCannotRaceShutdown(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingShareInstance{
+		fakeInstance: newFakeInstance(), shareStarted: make(chan struct{}), releaseShare: make(chan struct{}), closeStarted: make(chan struct{}),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shared-run", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.RunStreamIn(ctx, "shared-run", client.RunRequest{Image: "alpine", Command: []string{"true"}, Shares: []client.ShareMount{{Mount: "/data"}}}, nil, func(client.ExecEvent) error { return nil })
+	}()
+	<-inst.shareStarted
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.ShutdownInstance(ctx, "shared-run") }()
+	select {
+	case <-inst.closeStarted:
+		t.Fatal("instance close raced RunStreamIn share mutation")
+	default:
+	}
+	close(inst.releaseShare)
+	if err := <-runDone; err != nil && !strings.Contains(err.Error(), "stopping") {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerRunStreamValidatesAllSharesBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shares", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.RunStreamIn(ctx, "shares", client.RunRequest{
+		Image: "alpine", Command: []string{"true"},
+		Shares: []client.ShareMount{{Source: "/host/one", Mount: "/one"}, {Source: "/host/two"}},
+	}, nil, nil)
+	if err == nil {
+		t.Fatal("invalid share set was admitted")
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if len(inst.shares) != 0 {
+		t.Fatalf("failed multi-share request left mutations: %+v", inst.shares)
+	}
+}
+
+func TestManagerRunStreamCanonicalizesRuntimeShareMounts(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := newFakeInstance()
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "shares", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.RunStreamIn(ctx, "shares", client.RunRequest{
+		Image: "alpine", Command: []string{"true"},
+		Shares: []client.ShareMount{{Source: "/host/data", Mount: " /work/../data/ ", Writable: true}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if len(inst.shares) != 1 || inst.shares[0].Mount != "/data" {
+		t.Fatalf("runtime shares = %+v", inst.shares)
+	}
+}
+
+func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &backingUsageTestInstance{
+		fakeInstance:      newFakeInstance(),
+		current:           3 << 20,
+		highWater:         9 << 20,
+		metadata:          2 << 20,
+		metadataHighWater: 7 << 20,
+		combined:          5 << 20,
+		combinedHighWater: 11 << 20,
+		physical:          5 << 20,
+		reclaimErr:        errors.New("backing filesystem refused reclamation"),
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "backing", Image: "alpine", MemoryMB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls = 0, 0, 0, 0
+	state := manager.StatusOf("backing")
+	if state.MemoryMB != 512 || state.BackingBytes != 5<<20 || state.BackingHighWaterBytes != 11<<20 || state.BackingDataBytes != 3<<20 || state.BackingDataHighWaterBytes != 9<<20 || state.BackingMetadataBytes != 2<<20 || state.BackingMetadataHighWaterBytes != 7<<20 || state.BackingPhysicalBytes != 5<<20 || state.BackingReclaimError != "backing filesystem refused reclamation" {
+		t.Fatalf("reported state = %+v", state)
+	}
+	if inst.snapshotCalls != 1 || inst.usageCalls != 0 || inst.metadataCalls != 0 || inst.combinedCalls != 0 {
+		t.Fatalf("backing provider calls snapshot=%d data=%d metadata=%d combined=%d", inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls)
+	}
+}
+
 func TestManagerStatusProviderDoesNotBlockManagementAndReconcilesShutdown(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})
@@ -277,7 +492,7 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if state.Status != "crashed" || state.ExitReason != "hypervisor exited" || state.ExitedAt == "" || state.StartedAt == "" {
+	if state.Status != "crashed" || state.Error != "hypervisor exited" || state.ExitReason != "VM backend exited unexpectedly" || state.ExitedAt == "" || state.StartedAt == "" {
 		t.Fatalf("crash state = %+v", state)
 	}
 	host.queueInstance(newFakeInstance())
@@ -288,6 +503,53 @@ func TestManagerRetainsCrashStatusUntilNextGeneration(t *testing.T) {
 		t.Fatalf("replacement state = %+v", state)
 	}
 	_ = manager.ShutdownAll(context.Background())
+}
+
+func TestManagerShutdownReapsCrashedGeneration(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 1})
+	crashed := newFakeInstance()
+	crashed.waitErr = errors.New("hypervisor exited")
+	host.queueInstance(crashed)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "alpha", Image: "alpine", MemoryMB: 256}); err != nil {
+		t.Fatal(err)
+	}
+	_ = crashed.Close()
+	deadline := time.Now().Add(time.Second)
+	for manager.StatusOf("alpha").Status != "crashed" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := manager.ShutdownInstance(context.Background(), "alpha"); err != nil {
+		t.Fatalf("reap crashed generation: %v", err)
+	}
+	if states := manager.Statuses(); len(states) != 0 {
+		t.Fatalf("states after reap = %+v, want none", states)
+	}
+}
+
+func TestManagerBoundsCrashDiagnosticsWithoutDuplicatingExitReason(t *testing.T) {
+	host := newFakeHost(VMHostCapabilities{MaxVMs: 1})
+	crashed := newFakeInstance()
+	crashed.waitErr = errors.New(strings.Repeat("panic-trace\n", 20000))
+	host.queueInstance(crashed)
+	manager := testManager(host)
+	if _, err := manager.Start(context.Background(), client.CreateInstanceRequest{ID: "panic", Image: "alpine", MemoryMB: 256}); err != nil {
+		t.Fatal(err)
+	}
+	_ = crashed.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		state := manager.StatusOf("panic")
+		if state.Status != "crashed" {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if len(state.Error) > maxLifecycleDiagnosticBytes || state.ExitReason != "VM backend exited unexpectedly" || state.Error == state.ExitReason {
+			t.Fatalf("bounded crash state = %+v", state)
+		}
+		return
+	}
+	t.Fatal("crashed VM did not publish a tombstone")
 }
 
 func TestManagerExplicitShutdownRecordsStoppedState(t *testing.T) {
@@ -311,7 +573,14 @@ func TestManagerExplicitShutdownRecordsStoppedState(t *testing.T) {
 func TestManagerRejectsInvalidResourcesBeforeHostAllocation(t *testing.T) {
 	host := newFakeHost(VMHostCapabilities{MaxVMs: 4})
 	manager := testManager(host)
-	_, err := manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: ^uint64(0), CPUs: 1})
+	_, err := manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: 1, CPUs: 1})
+	if err == nil {
+		t.Fatal("memory request below the supported minimum was accepted")
+	}
+	if len(host.starts) != 0 {
+		t.Fatalf("host starts after minimum-memory rejection = %+v", host.starts)
+	}
+	_, err = manager.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine", MemoryMB: ^uint64(0), CPUs: 1})
 	if err == nil {
 		t.Fatal("overflowing memory request was accepted")
 	}
@@ -507,7 +776,7 @@ func TestManagerShutdownAllDeadlinePreservesFailedAndPendingInstances(t *testing
 		t.Fatalf("ShutdownAll error = %v, want deadline and beta cleanup errors", err)
 	}
 
-	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "running" {
+	if state := manager.StatusOf("alpha"); state.ID != "alpha" || state.Status != "stopping" {
 		t.Fatalf("pending instance state = %+v", state)
 	}
 	if state := manager.StatusOf("beta"); state.ID != "beta" || state.Status != "running" {
@@ -871,6 +1140,64 @@ func TestManagerSnapshotConsoleForwardAndStats(t *testing.T) {
 	}
 }
 
+func TestManagerStopCancelsActiveRootSnapshot(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingSnapshotInstance{fakeInstance: newFakeInstance(), started: make(chan struct{})}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "snapshot", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, _, err := manager.SnapshotRootFS(ctx, "snapshot", "")
+		snapshotDone <- err
+	}()
+	select {
+	case <-inst.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not start")
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.ShutdownInstance(stopCtx, "snapshot"); err != nil {
+		t.Fatalf("stop waited behind snapshot: %v", err)
+	}
+	if err := <-snapshotDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot error = %v, want cancellation", err)
+	}
+}
+
+func TestManagerStopCancelsActiveAlternateImageSnapshot(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	inst := &blockingImageSnapshotInstance{fakeInstance: newFakeInstance(), started: make(chan struct{})}
+	host.queueInstance(inst)
+	manager := testManager(host)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "snapshot", Image: "alpine"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, _, err := manager.SnapshotRootFS(ctx, "snapshot", "alternate")
+		snapshotDone <- err
+	}()
+	select {
+	case <-inst.started:
+	case <-time.After(time.Second):
+		t.Fatal("alternate image snapshot did not start")
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.ShutdownInstance(stopCtx, "snapshot"); err != nil {
+		t.Fatalf("stop waited behind alternate image snapshot: %v", err)
+	}
+	if err := <-snapshotDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot error = %v, want cancellation", err)
+	}
+}
+
 type fakeHost struct {
 	mu                sync.Mutex
 	caps              VMHostCapabilities
@@ -985,6 +1312,9 @@ func (h *fakeHost) StartStream(_ context.Context, req client.CreateInstanceReque
 	h.starts = append(h.starts, req)
 	inst := h.popInstanceLocked()
 	h.mu.Unlock()
+	if controller, ok := inst.(interface{ SetBalloonMB(uint64) error }); ok {
+		_ = controller.SetBalloonMB(req.BalloonMB)
+	}
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "status", Message: "fake start"}); err != nil {
 			return nil, err
@@ -1002,6 +1332,9 @@ func (h *fakeHost) StartBlankStream(_ context.Context, req client.StartInstanceR
 	h.blankStarts = append(h.blankStarts, req)
 	inst := h.popInstanceLocked()
 	h.mu.Unlock()
+	if controller, ok := inst.(interface{ SetBalloonMB(uint64) error }); ok {
+		_ = controller.SetBalloonMB(req.BalloonMB)
+	}
 	if onEvent != nil {
 		if err := onEvent(client.BootEvent{Kind: "status", Message: "fake blank start"}); err != nil {
 			return nil, err
@@ -1102,6 +1435,119 @@ type fakeInstance struct {
 	virtioFSStats  func() []virtio.FSStats
 	execStream     func(client.ExecRequest, func(client.ExecEvent) error) error
 	waitErr        error
+	balloonTarget  uint64
+}
+
+type backingUsageTestInstance struct {
+	*fakeInstance
+	current, highWater, physical uint64
+	metadata, metadataHighWater  uint64
+	combined, combinedHighWater  uint64
+	reclaimErr                   error
+	snapshotCalls                int
+	usageCalls                   int
+	metadataCalls                int
+	combinedCalls                int
+}
+
+type blockingBalloonInstance struct {
+	*fakeInstance
+	balloonStarted chan struct{}
+	releaseBalloon chan struct{}
+	closeStarted   chan struct{}
+	blockBalloon   atomic.Bool
+}
+
+type blockingShareInstance struct {
+	*fakeInstance
+	shareStarted chan struct{}
+	releaseShare chan struct{}
+	closeStarted chan struct{}
+}
+
+type blockingSnapshotInstance struct {
+	*fakeInstance
+	started chan struct{}
+}
+
+type blockingImageSnapshotInstance struct {
+	*fakeInstance
+	started chan struct{}
+}
+
+func (i *blockingImageSnapshotInstance) SnapshotImageContext(ctx context.Context, _ string) (imagefs.Directory, error) {
+	close(i.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (i *blockingSnapshotInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	close(i.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (i *blockingShareInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	close(i.shareStarted)
+	<-i.releaseShare
+	return i.fakeInstance.AddShare(ctx, share)
+}
+
+func (i *blockingShareInstance) Close() error {
+	close(i.closeStarted)
+	return i.fakeInstance.Close()
+}
+
+func (i *blockingBalloonInstance) SetBalloonMB(target uint64) error {
+	if !i.blockBalloon.Load() {
+		return i.fakeInstance.SetBalloonMB(target)
+	}
+	close(i.balloonStarted)
+	<-i.releaseBalloon
+	return i.fakeInstance.SetBalloonMB(target)
+}
+
+func (i *blockingBalloonInstance) Close() error {
+	close(i.closeStarted)
+	return i.fakeInstance.Close()
+}
+
+func (i *backingUsageTestInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	i.usageCalls++
+	return i.current, i.highWater, i.physical, i.reclaimErr
+}
+
+func (i *backingUsageTestInstance) BackingMetadataUsage() (uint64, uint64) {
+	i.metadataCalls++
+	return i.metadata, i.metadataHighWater
+}
+
+func (i *backingUsageTestInstance) BackingCombinedUsage() (uint64, uint64) {
+	i.combinedCalls++
+	return i.combined, i.combinedHighWater
+}
+
+func (i *backingUsageTestInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	i.snapshotCalls++
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: i.current, DataHighWaterBytes: i.highWater,
+		MetadataBytes: i.metadata, MetadataHighWaterBytes: i.metadataHighWater,
+		CombinedBytes: i.combined, CombinedHighWaterBytes: i.combinedHighWater,
+		PhysicalBytes: i.physical, ReclaimError: i.reclaimErr,
+	}
+}
+
+func (i *fakeInstance) SetBalloonMB(target uint64) error {
+	i.mu.Lock()
+	i.balloonTarget = target
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *fakeInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.balloonTarget, i.balloonTarget, true, true
 }
 
 type shutdownTestInstance struct {
@@ -1200,12 +1646,26 @@ func (i *fakeInstance) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (i *fakeInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *fakeInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.root, nil
 }
 
 func (i *fakeInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *fakeInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	root, ok := i.snapshots[imageName]

@@ -3,7 +3,6 @@
 package vm
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -15,8 +14,6 @@ import (
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
-
-var defaultGatewayMACBytes = []byte{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x01}
 
 type darwinNetworkRuntime struct {
 	*networkRuntime
@@ -40,8 +37,8 @@ func newDarwinARM64NetworkRuntime(id string, cfg *client.NetworkConfig) (*darwin
 		Base:   arm64vm.NetBase,
 		Size:   arm64vm.NetSize,
 		IRQ:    arm64vm.NetIRQ,
-		TXHook: func(packet []byte) {
-			defaultDarwinSidecarSwitch.Forward(lease.id, packet)
+		TXHook: func(packet []byte) bool {
+			return defaultDarwinSidecarSwitch.Forward(lease.id, packet)
 		},
 	})
 	if err != nil || common == nil {
@@ -95,16 +92,16 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 			Base:   arm64vm.NetBase,
 			Size:   arm64vm.NetSize,
 			IRQ:    arm64vm.NetIRQ,
-			TXHook: func(packet []byte) {
+			TXHook: func(packet []byte) bool {
 				if frameTargetsDefaultGateway(packet) {
-					return
+					return false
 				}
-				_ = codec.Send(virtio.NetPacket{
+				return codec.Send(virtio.NetPacket{
 					Kind:     virtio.NetPacketTX,
 					VMID:     DefaultInstanceID,
 					DeviceID: "eth0",
 					Frame:    append([]byte(nil), packet...),
-				})
+				}) == nil
 			},
 		})
 		if err != nil {
@@ -133,13 +130,6 @@ func newDarwinRemoteNetworkRuntime(cfg *client.NetworkConfig) (*darwinNetworkRun
 		mac: mac,
 		dev: dev,
 	}, closeFn: codec.Close}, nil
-}
-
-func frameTargetsDefaultGateway(frame []byte) bool {
-	if len(frame) < 6 {
-		return false
-	}
-	return bytes.Equal(frame[:6], defaultGatewayMACBytes)
 }
 
 func (n *darwinNetworkRuntime) Close() error {

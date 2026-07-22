@@ -2,6 +2,7 @@ package mounts
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -255,7 +256,10 @@ func TestManagedMountStateAddShareTracksDuplicates(t *testing.T) {
 
 func TestManagedMountStateIncludesStartupShares(t *testing.T) {
 	share := client.ShareMount{Source: "/host/data", Mount: "/data", Writable: true, Cache: "auto"}
-	state := NewState([]client.ShareMount{share})
+	state, err := NewState([]client.ShareMount{share})
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := &recordingShareMounter{}
 	builds := 0
 	build := func(share client.ShareMount) (virtio.ShareMount, error) {
@@ -271,6 +275,76 @@ func TestManagedMountStateIncludesStartupShares(t *testing.T) {
 	}
 	if err := state.AddShare(root, client.ShareMount{Source: "/other", Mount: "/data"}, "shares", build); err == nil {
 		t.Fatal("conflicting startup share unexpectedly succeeded")
+	}
+}
+
+func TestManagedMountStateBuildsWholeShareBatchBeforeMutation(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &recordingShareMounter{}
+	builds := 0
+	err = state.AddShares(root, []client.ShareMount{
+		{Source: "/host/one", Mount: "/one"},
+		{Source: "/host/two", Mount: "/two"},
+	}, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+		builds++
+		if builds == 2 {
+			return virtio.ShareMount{}, errors.New("injected second build failure")
+		}
+		return virtio.ShareMount{GuestPath: share.Mount}, nil
+	})
+	if err == nil {
+		t.Fatal("share batch unexpectedly succeeded")
+	}
+	if len(root.shares) != 0 || len(state.shares) != 0 {
+		t.Fatalf("failed share batch mutated root/state: root=%+v state=%+v", root.shares, state.shares)
+	}
+}
+
+func TestManagedMountStateClosesPreparedSharesAfterBatchFailure(t *testing.T) {
+	state, err := NewState(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &recordingShareMounter{}
+	prepared := &closingShareBackend{}
+	builds := 0
+	err = state.AddShares(root, []client.ShareMount{
+		{Source: "/host/one", Mount: "/one/../one"},
+		{Source: "/host/two", Mount: "/two"},
+	}, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+		builds++
+		if builds == 2 {
+			return virtio.ShareMount{}, errors.New("injected second build failure")
+		}
+		return virtio.ShareMount{GuestPath: share.Mount, Backend: prepared}, nil
+	})
+	if err == nil {
+		t.Fatal("share batch unexpectedly succeeded")
+	}
+	if prepared.closes != 1 {
+		t.Fatalf("prepared backend closes = %d, want 1", prepared.closes)
+	}
+	if len(root.shares) != 0 {
+		t.Fatalf("failed share batch mutated root: %+v", root.shares)
+	}
+}
+
+func TestCanonicalRuntimeShareRejectsRootAndNormalizesAliases(t *testing.T) {
+	if _, err := CanonicalRuntimeShare(client.ShareMount{Mount: "/"}); err == nil {
+		t.Fatal("root runtime share unexpectedly accepted")
+	}
+	if _, err := NewState([]client.ShareMount{{Mount: "/"}}); err == nil {
+		t.Fatal("invalid startup share was silently omitted from mount state")
+	}
+	share, err := CanonicalRuntimeShare(client.ShareMount{Source: "/host", Mount: " /data/../data/ "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if share.Mount != "/data" {
+		t.Fatalf("canonical mount = %q", share.Mount)
 	}
 }
 
@@ -312,6 +386,16 @@ func (m *recordingImageMounter) AddImage(_ context.Context, mountPath string, im
 
 type recordingShareMounter struct {
 	shares []virtio.ShareMount
+}
+
+type closingShareBackend struct {
+	virtio.FSBackend
+	closes int
+}
+
+func (b *closingShareBackend) Close() error {
+	b.closes++
+	return nil
 }
 
 func (m *recordingShareMounter) AddShare(share virtio.ShareMount) error {

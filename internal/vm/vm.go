@@ -17,10 +17,13 @@ import (
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/builtin"
 	vmhost "j5.nz/cc/internal/vm/host"
+	"j5.nz/cc/internal/vm/mounts"
 )
 
 const DefaultInstanceID = "default"
 const maxExitTombstones = 64
+const minimumGuestMemoryMB = 128
+const maxLifecycleDiagnosticBytes = 4096
 
 var ErrManagerClosing = errors.New("VM manager is shutting down")
 
@@ -58,8 +61,40 @@ type rootSnapshotProvider interface {
 	RootSnapshot() (imagefs.Directory, error)
 }
 
+type rootSnapshotContextProvider interface {
+	RootSnapshotContext(context.Context) (imagefs.Directory, error)
+}
+
 type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
+}
+
+type imageSnapshotContextProvider interface {
+	SnapshotImageContext(context.Context, string) (imagefs.Directory, error)
+}
+
+type instanceBalloonController interface {
+	SetBalloonMB(uint64) error
+}
+
+type instanceBalloonStateProvider interface {
+	BalloonState() (targetMB, actualMB uint64, driverReady, supported bool)
+}
+
+type instanceBackingUsageProvider interface {
+	BackingUsage() (uint64, uint64, uint64, error)
+}
+
+type instanceBackingMetadataUsageProvider interface {
+	BackingMetadataUsage() (uint64, uint64)
+}
+
+type instanceBackingCombinedUsageProvider interface {
+	BackingCombinedUsage() (uint64, uint64)
+}
+
+type instanceBackingSnapshotProvider interface {
+	BackingSnapshot() virtio.FSBackingUsageSnapshot
 }
 
 type Manager struct {
@@ -89,20 +124,28 @@ type managerStart struct {
 }
 
 type Machine struct {
-	id         string
-	image      string
-	initSystem string
-	kernel     string
-	memoryMB   uint64
-	balloonMB  uint64
-	cpus       int
-	nestedVirt bool
-	startedAt  time.Time
-	instance   Instance
-	lastErr    error
-	exitedAt   time.Time
-	stopping   bool
-	stop       *machineStopOperation
+	lifecycleMu              sync.Mutex
+	balloonMu                sync.Mutex
+	backingMu                sync.Mutex
+	snapshotMu               sync.Mutex
+	snapshotCancel           context.CancelFunc
+	backingHighWater         uint64
+	backingDataHighWater     uint64
+	backingMetadataHighWater uint64
+	id                       string
+	image                    string
+	initSystem               string
+	kernel                   string
+	memoryMB                 uint64
+	balloonMB                uint64
+	cpus                     int
+	nestedVirt               bool
+	startedAt                time.Time
+	instance                 Instance
+	lastErr                  error
+	exitedAt                 time.Time
+	stopping                 bool
+	stop                     *machineStopOperation
 }
 
 type machineStopOperation struct {
@@ -134,8 +177,10 @@ func NewManagerWithHost(host VMHost) *Manager {
 }
 
 func newManagerBudgets(m *Manager) *Manager {
-	m.maxMemoryMB = hostMemoryMB()
-	m.maxCPUs = runtime.NumCPU()
+	// Guest memory is sparsely committed and vCPUs are scheduler work, so
+	// configured totals are not useful host-capacity ceilings. The vmsh host
+	// observes real memory pressure and dynamically balloons guests instead.
+	// Explicit test/embedding budgets can still set these fields when desired.
 	return m
 }
 
@@ -236,6 +281,11 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
 	}
+	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Shares = canonicalShares
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -348,6 +398,11 @@ func (m *Manager) StartBlankInstanceStream(
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
 	}
+	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Shares = canonicalShares
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -401,12 +456,10 @@ func (m *Manager) StartBlankInstanceStream(
 		return client.InstanceState{}, err
 	}
 	if !startupShares {
-		for _, share := range shares {
-			if err := inst.AddShare(startCtx, share); err != nil {
-				start.cleanupErr = inst.Close()
-				m.finishStart(id, start)
-				return client.InstanceState{}, errors.Join(err, start.cleanupErr)
-			}
+		if err := addInstanceShares(startCtx, inst, shares); err != nil {
+			start.cleanupErr = inst.Close()
+			m.finishStart(id, start)
+			return client.InstanceState{}, errors.Join(err, start.cleanupErr)
 		}
 	}
 
@@ -547,6 +600,11 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 	m.mu.Lock()
 	machine := m.running[id]
 	if machine == nil {
+		if _, exited := m.exited[id]; exited {
+			delete(m.exited, id)
+			m.mu.Unlock()
+			return nil
+		}
 		m.mu.Unlock()
 		return fmt.Errorf("no VM %q is running", id)
 	}
@@ -571,12 +629,22 @@ func (m *Manager) beginMachineStopLocked(machine *Machine) *machineStopOperation
 	stop := &machineStopOperation{done: make(chan struct{}), observers: 1}
 	machine.stop = stop
 	machine.stopping = true
+	machine.snapshotMu.Lock()
+	if machine.snapshotCancel != nil {
+		machine.snapshotCancel()
+	}
+	machine.snapshotMu.Unlock()
 	go m.runMachineStop(machine, stop)
 	return stop
 }
 
 func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
+	machine.lifecycleMu.Lock()
+	// Closing the instance is the recovery mechanism for a backend balloon
+	// request which has stopped making progress. Do not wait behind balloonMu:
+	// Close must be allowed to tear down the device and make that request return.
 	err := machine.instance.Close()
+	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
 	if err == nil {
@@ -616,6 +684,11 @@ func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecRe
 
 func (m *Manager) RunIn(ctx context.Context, id string, req client.RunRequest) (client.ExecResponse, error) {
 	id = instanceID(id)
+	shares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	req.Shares = shares
 	m.mu.Lock()
 	machine := m.running[id]
 	m.mu.Unlock()
@@ -641,6 +714,11 @@ func (m *Manager) RunStream(ctx context.Context, req client.RunRequest, inputs <
 
 func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	id = instanceID(id)
+	shares, err := mounts.CanonicalRuntimeShares(req.Shares)
+	if err != nil {
+		return err
+	}
+	req.Shares = shares
 	m.mu.Lock()
 	machine := m.running[id]
 	stopping := machine != nil && machine.stopping
@@ -666,19 +744,67 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		}
 		return err
 	}
-	for _, share := range req.Shares {
-		if err := machine.instance.AddShare(ctx, share); err != nil {
-			if m.instanceIsStopping(id, machine) {
-				return stoppedVMError(id)
-			}
-			return err
-		}
+	if err := validateRuntimeShares(req.Shares); err != nil {
+		return err
 	}
-	err := machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	locked, unlock, lockErr := m.lockMachineOperation(id)
+	if lockErr != nil {
+		return lockErr
+	}
+	if locked != machine {
+		unlock()
+		return stoppedVMError(id)
+	}
+	if err := addInstanceShares(ctx, machine.instance, req.Shares); err != nil {
+		unlock()
+		if m.instanceIsStopping(id, machine) {
+			return stoppedVMError(id)
+		}
+		return err
+	}
+	unlock()
+	err = machine.instance.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	if err != nil && m.instanceIsStopping(id, machine) {
 		return stoppedVMError(id)
 	}
 	return err
+}
+
+func addInstanceShares(ctx context.Context, instance vmhost.Instance, shares []client.ShareMount) error {
+	if len(shares) > 1 {
+		batch, ok := instance.(interface {
+			AddShares(context.Context, []client.ShareMount) error
+		})
+		if !ok {
+			return fmt.Errorf("instance does not support atomic multi-share mutation")
+		}
+		return batch.AddShares(ctx, shares)
+	}
+	for _, share := range shares {
+		if err := instance.AddShare(ctx, share); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRuntimeShares(shares []client.ShareMount) error {
+	seen := make(map[string]client.ShareMount, len(shares))
+	for _, share := range shares {
+		canonical, err := mounts.CanonicalRuntimeShare(share)
+		if err != nil {
+			return err
+		}
+		mount := canonical.Mount
+		if existing, ok := seen[mount]; ok {
+			if existing != canonical {
+				return fmt.Errorf("share mount %q is specified more than once with different settings", mount)
+			}
+			continue
+		}
+		seen[mount] = canonical
+	}
+	return nil
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -727,103 +853,138 @@ func (m *Manager) AddPortForward(ctx context.Context, forward client.PortForward
 }
 
 func (m *Manager) AddShareTo(ctx context.Context, id string, share client.ShareMount) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	return machine.instance.AddShare(ctx, share)
 }
 
 func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward client.PortForward) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	return machine.instance.AddPortForward(ctx, forward)
 }
 
 func (m *Manager) AllowServiceProxyPortTo(ctx context.Context, id string, port int) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	allower, ok := machine.instance.(serviceProxyPortAllower)
 	if !ok {
-		return fmt.Errorf("VM %q network does not support service proxy port updates", id)
+		return fmt.Errorf("VM %q network does not support service proxy port updates", machine.id)
 	}
 	return allower.AllowServiceProxyPort(ctx, port)
 }
 
 func (m *Manager) FlushInstance(ctx context.Context, id string) error {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	flusher, ok := machine.instance.(instanceFlushProvider)
 	if !ok {
-		return fmt.Errorf("VM %q root filesystem cannot be flushed", id)
+		return fmt.Errorf("VM %q root filesystem cannot be flushed", machine.id)
 	}
 	return flusher.Flush(ctx)
 }
 
 func (m *Manager) ConsoleHistory(ctx context.Context, id string) (string, error) {
-	id = instanceID(id)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return "", fmt.Errorf("no VM %q is running", id)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return "", err
 	}
+	defer unlock()
 	provider, ok := machine.instance.(consoleHistoryProvider)
 	if !ok {
-		return "", fmt.Errorf("VM %q console history is not available", id)
+		return "", fmt.Errorf("VM %q console history is not available", machine.id)
 	}
 	return provider.ConsoleHistory(ctx)
 }
 
 func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName string) (imagefs.Directory, string, error) {
-	id = instanceID(id)
-	imageName = strings.TrimSpace(imageName)
-	m.mu.Lock()
-	machine := m.running[id]
-	m.mu.Unlock()
-	if machine == nil {
-		return nil, "", fmt.Errorf("no VM %q is running", id)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if err := m.FlushInstance(ctx, id); err != nil {
+	imageName = strings.TrimSpace(imageName)
+	machine, unlock, err := m.lockMachineOperation(id)
+	if err != nil {
+		return nil, "", err
+	}
+	defer unlock()
+	snapshotCtx, snapshotCancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.running[machine.id] != machine || machine.stopping {
+		m.mu.Unlock()
+		snapshotCancel()
+		return nil, "", stoppedVMError(machine.id)
+	}
+	machine.snapshotMu.Lock()
+	machine.snapshotCancel = snapshotCancel
+	machine.snapshotMu.Unlock()
+	m.mu.Unlock()
+	defer func() {
+		snapshotCancel()
+		machine.snapshotMu.Lock()
+		machine.snapshotCancel = nil
+		machine.snapshotMu.Unlock()
+	}()
+	flusher, ok := machine.instance.(instanceFlushProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("VM %q root filesystem cannot be flushed", machine.id)
+	}
+	if err := flusher.Flush(snapshotCtx); err != nil {
 		return nil, "", err
 	}
 	if imageName != "" {
-		if snapshotter, ok := machine.instance.(imageSnapshotProvider); ok {
-			root, err := snapshotter.SnapshotImage(imageName)
+		if snapshotter, ok := machine.instance.(imageSnapshotContextProvider); ok {
+			root, err := snapshotter.SnapshotImageContext(snapshotCtx, imageName)
 			if err != nil {
 				return nil, "", err
 			}
 			return root, imageName, nil
 		}
-		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", id, imageName)
+		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", machine.id, imageName)
 	}
-	snapshotter, ok := machine.instance.(rootSnapshotProvider)
+	contextSnapshotter, ok := machine.instance.(rootSnapshotContextProvider)
 	if !ok {
-		return nil, "", fmt.Errorf("VM %q root filesystem cannot be snapshotted", id)
+		return nil, "", fmt.Errorf("VM %q root filesystem does not support cancelable snapshots", machine.id)
 	}
-	root, err := snapshotter.RootSnapshot()
+	root, err := contextSnapshotter.RootSnapshotContext(snapshotCtx)
 	if err != nil {
 		return nil, "", err
 	}
 	return root, machine.image, nil
+}
+
+func (m *Manager) lockMachineOperation(id string) (*Machine, func(), error) {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	stopping := machine != nil && machine.stopping
+	m.mu.Unlock()
+	if machine == nil {
+		return nil, nil, fmt.Errorf("no VM %q is running", id)
+	}
+	if stopping {
+		return nil, nil, stoppedVMError(id)
+	}
+	machine.lifecycleMu.Lock()
+	m.mu.Lock()
+	valid := m.running[id] == machine && !machine.stopping
+	m.mu.Unlock()
+	if !valid {
+		machine.lifecycleMu.Unlock()
+		return nil, nil, stoppedVMError(id)
+	}
+	return machine, machine.lifecycleMu.Unlock, nil
 }
 
 func (m *Manager) Status() client.InstanceState {
@@ -907,10 +1068,15 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 }
 
 type managerStatusSnapshot struct {
-	id       string
-	machine  *Machine
-	state    client.InstanceState
-	provider networkIPv4Provider
+	id                      string
+	machine                 *Machine
+	state                   client.InstanceState
+	provider                networkIPv4Provider
+	backingProvider         instanceBackingUsageProvider
+	backingMetadataProvider instanceBackingMetadataUsageProvider
+	backingCombinedProvider instanceBackingCombinedUsageProvider
+	backingSnapshotProvider instanceBackingSnapshotProvider
+	balloonProvider         instanceBalloonStateProvider
 }
 
 func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
@@ -943,24 +1109,135 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
 	}
 	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
+	if machine.stopping {
+		snapshot.state.Status = "stopping"
+		return snapshot
+	}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
 		snapshot.provider = provider
+	}
+	if provider, ok := machine.instance.(instanceBackingUsageProvider); ok {
+		snapshot.backingProvider = provider
+	}
+	if provider, ok := machine.instance.(instanceBackingMetadataUsageProvider); ok {
+		snapshot.backingMetadataProvider = provider
+	}
+	if provider, ok := machine.instance.(instanceBackingCombinedUsageProvider); ok {
+		snapshot.backingCombinedProvider = provider
+	}
+	if provider, ok := machine.instance.(instanceBackingSnapshotProvider); ok {
+		snapshot.backingSnapshotProvider = provider
+	}
+	if provider, ok := machine.instance.(instanceBalloonStateProvider); ok {
+		snapshot.balloonProvider = provider
+	} else {
+		snapshot.state.BalloonMB = 0
+		snapshot.state.BalloonStatus = "unsupported"
 	}
 	return snapshot
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.backingSnapshotProvider == nil && snapshot.balloonProvider == nil {
 		return snapshot.state
 	}
-	ipv4 := snapshot.provider.NetworkIPv4()
+	if snapshot.provider != nil {
+		snapshot.state.NetworkIPv4 = snapshot.provider.NetworkIPv4()
+	}
+	if snapshot.backingProvider != nil && snapshot.backingSnapshotProvider == nil {
+		current, highWater, physical, err := snapshot.backingProvider.BackingUsage()
+		snapshot.state.BackingDataBytes = current
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingDataHighWater = max(snapshot.machine.backingDataHighWater, current, highWater)
+		snapshot.state.BackingDataHighWaterBytes = snapshot.machine.backingDataHighWater
+		snapshot.machine.backingMu.Unlock()
+		snapshot.state.BackingPhysicalBytes = physical
+		if err != nil {
+			snapshot.state.BackingReclaimError = err.Error()
+		}
+	}
+	if snapshot.backingMetadataProvider != nil && snapshot.backingSnapshotProvider == nil {
+		current, highWater := snapshot.backingMetadataProvider.BackingMetadataUsage()
+		snapshot.state.BackingMetadataBytes = current
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingMetadataHighWater = max(snapshot.machine.backingMetadataHighWater, current, highWater)
+		snapshot.state.BackingMetadataHighWaterBytes = snapshot.machine.backingMetadataHighWater
+		snapshot.machine.backingMu.Unlock()
+	}
+	if (snapshot.backingProvider != nil || snapshot.backingMetadataProvider != nil) && snapshot.backingSnapshotProvider == nil {
+		snapshot.state.BackingBytes = saturatingUint64Add(snapshot.state.BackingDataBytes, snapshot.state.BackingMetadataBytes)
+		// Either component peak is a lower bound for the combined usage at
+		// that instant. Taking their maximum is safe; adding them would invent
+		// a state whose peaks may have occurred at different times.
+		observedHighWater := max(snapshot.state.BackingBytes, snapshot.state.BackingDataHighWaterBytes, snapshot.state.BackingMetadataHighWaterBytes)
+		snapshot.machine.backingMu.Lock()
+		if observedHighWater > snapshot.machine.backingHighWater {
+			snapshot.machine.backingHighWater = observedHighWater
+		}
+		snapshot.state.BackingHighWaterBytes = snapshot.machine.backingHighWater
+		snapshot.machine.backingMu.Unlock()
+	}
+	if snapshot.backingCombinedProvider != nil && snapshot.backingSnapshotProvider == nil {
+		current, highWater := snapshot.backingCombinedProvider.BackingCombinedUsage()
+		snapshot.state.BackingBytes = current
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingHighWater = max(snapshot.machine.backingHighWater, current, highWater)
+		snapshot.state.BackingHighWaterBytes = snapshot.machine.backingHighWater
+		snapshot.machine.backingMu.Unlock()
+	}
+	if snapshot.backingSnapshotProvider != nil {
+		usage := snapshot.backingSnapshotProvider.BackingSnapshot()
+		snapshot.state.BackingDataBytes = usage.DataBytes
+		snapshot.state.BackingMetadataBytes = usage.MetadataBytes
+		snapshot.state.BackingBytes = usage.CombinedBytes
+		snapshot.state.BackingPhysicalBytes = usage.PhysicalBytes
+		snapshot.state.BackingUsageStale = usage.Stale
+		snapshot.state.BackingActiveMutations = usage.ActiveMutations
+		snapshot.machine.backingMu.Lock()
+		snapshot.machine.backingDataHighWater = max(snapshot.machine.backingDataHighWater, usage.DataBytes, usage.DataHighWaterBytes)
+		snapshot.machine.backingMetadataHighWater = max(snapshot.machine.backingMetadataHighWater, usage.MetadataBytes, usage.MetadataHighWaterBytes)
+		snapshot.machine.backingHighWater = max(snapshot.machine.backingHighWater, usage.CombinedBytes, usage.CombinedHighWaterBytes)
+		snapshot.state.BackingDataHighWaterBytes = snapshot.machine.backingDataHighWater
+		snapshot.state.BackingMetadataHighWaterBytes = snapshot.machine.backingMetadataHighWater
+		snapshot.state.BackingHighWaterBytes = snapshot.machine.backingHighWater
+		snapshot.machine.backingMu.Unlock()
+		if usage.ReclaimError != nil {
+			snapshot.state.BackingReclaimError = usage.ReclaimError.Error()
+		}
+	}
+	if snapshot.balloonProvider != nil {
+		target, actual, ready, supported := snapshot.balloonProvider.BalloonState()
+		if !supported {
+			snapshot.state.BalloonMB = 0
+			snapshot.state.BalloonStatus = "unsupported"
+		} else {
+			snapshot.state.BalloonMB = target
+			snapshot.state.BalloonActualMB = actual
+			switch {
+			case !ready:
+				snapshot.state.BalloonStatus = "driver_unavailable"
+			case target == actual:
+				snapshot.state.BalloonStatus = "converged"
+			case actual < target:
+				snapshot.state.BalloonStatus = "inflating"
+			default:
+				snapshot.state.BalloonStatus = "deflating"
+			}
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running == nil || m.running[snapshot.id] != snapshot.machine {
 		return m.statusSnapshotLocked(snapshot.id).state
 	}
-	snapshot.state.NetworkIPv4 = ipv4
 	return snapshot.state
+}
+
+func saturatingUint64Add(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
 }
 
 func (m *Manager) watch(machine *Machine) {
@@ -992,8 +1269,8 @@ func (m *Manager) recordExitLocked(machine *Machine, err error) {
 	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
 	if err != nil {
 		state.Status = "crashed"
-		state.Error = err.Error()
-		state.ExitReason = err.Error()
+		state.Error = boundedLifecycleDiagnostic(err.Error())
+		state.ExitReason = "VM backend exited unexpectedly"
 	} else {
 		state.ExitReason = "clean shutdown"
 	}
@@ -1009,6 +1286,21 @@ func (m *Manager) recordExitLocked(machine *Machine, err error) {
 		}
 		delete(m.exited, oldestID)
 	}
+}
+
+func boundedLifecycleDiagnostic(diagnostic string) string {
+	diagnostic = strings.TrimSpace(diagnostic)
+	if len(diagnostic) <= maxLifecycleDiagnosticBytes {
+		return diagnostic
+	}
+	const headBytes = 512
+	omitted := len(diagnostic) - maxLifecycleDiagnosticBytes
+	marker := fmt.Sprintf("\n[... %d diagnostic bytes omitted ...]\n", omitted)
+	tailBytes := maxLifecycleDiagnosticBytes - headBytes - len(marker)
+	if tailBytes < 0 {
+		tailBytes = 0
+	}
+	return diagnostic[:headBytes] + marker + diagnostic[len(diagnostic)-tailBytes:]
 }
 
 func (m *Manager) checkCapacityLocked(maxVMs int, memoryMB uint64, cpus int) error {
@@ -1039,6 +1331,48 @@ func (m *Manager) resourceUsageLocked() (uint64, int) {
 	return memory, cpus
 }
 
+func (m *Manager) SetInstanceBalloon(id string, targetMB uint64) error {
+	id = strings.TrimSpace(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	if machine == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("VM %q is not running", id)
+	}
+	if targetMB > machine.memoryMB {
+		m.mu.Unlock()
+		return fmt.Errorf("balloon target %d MiB exceeds VM memory %d MiB", targetMB, machine.memoryMB)
+	}
+	if machine.stopping {
+		m.mu.Unlock()
+		return fmt.Errorf("VM %q is stopping", id)
+	}
+	controller, ok := machine.instance.(instanceBalloonController)
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("VM %q does not support dynamic ballooning", id)
+	}
+	machine.balloonMu.Lock()
+	m.mu.Lock()
+	if m.running[id] != machine || machine.stopping {
+		m.mu.Unlock()
+		machine.balloonMu.Unlock()
+		return fmt.Errorf("VM %q is stopping", id)
+	}
+	m.mu.Unlock()
+	err := controller.SetBalloonMB(targetMB)
+	machine.balloonMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("set VM %q balloon target: %w", id, err)
+	}
+	m.mu.Lock()
+	if current := m.running[id]; current == machine {
+		current.balloonMB = targetMB
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {
 	if *memoryMB == 0 {
 		*memoryMB = 512
@@ -1048,6 +1382,9 @@ func normalizeResources(memoryMB, balloonMB *uint64, cpus *int) error {
 	}
 	if *cpus < 0 {
 		return fmt.Errorf("cpus must be positive")
+	}
+	if *memoryMB < minimumGuestMemoryMB {
+		return fmt.Errorf("memory_mb must be at least %d MiB", minimumGuestMemoryMB)
 	}
 	maxAllocationMB := uint64(^uint(0)>>1) >> 20
 	if *memoryMB > maxAllocationMB {

@@ -66,8 +66,16 @@ type rootSnapshotProvider interface {
 	RootSnapshot() (imagefs.Directory, error)
 }
 
+type rootSnapshotContextProvider interface {
+	RootSnapshotContext(context.Context) (imagefs.Directory, error)
+}
+
 type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
+}
+
+type imageSnapshotContextProvider interface {
+	SnapshotImageContext(context.Context, string) (imagefs.Directory, error)
 }
 
 type inProcessVMHost struct {
@@ -353,12 +361,28 @@ func (i *hostedInstance) RootSnapshot() (imagefs.Directory, error) {
 	return snapshotter.RootSnapshot()
 }
 
+func (i *hostedInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(rootSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
+	}
+	return snapshotter.RootSnapshotContext(ctx)
+}
+
 func (i *hostedInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	snapshotter, ok := i.Instance.(imageSnapshotProvider)
 	if !ok {
 		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
 	}
 	return snapshotter.SnapshotImage(imageName)
+}
+
+func (i *hostedInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(imageSnapshotContextProvider)
+	if !ok {
+		return nil, fmt.Errorf("image %q does not support cancelable snapshots", imageName)
+	}
+	return snapshotter.SnapshotImageContext(ctx, imageName)
 }
 
 func (i *hostedInstance) NetworkIPv4() string {
@@ -383,6 +407,76 @@ func (i *hostedInstance) AllowServiceProxyPort(ctx context.Context, port int) er
 		return fmt.Errorf("network does not support service proxy port updates")
 	}
 	return allower.AllowServiceProxyPort(ctx, port)
+}
+
+func (i *hostedInstance) SetBalloonMB(target uint64) error {
+	controller, ok := i.Instance.(interface{ SetBalloonMB(uint64) error })
+	if !ok {
+		return fmt.Errorf("dynamic ballooning is unsupported")
+	}
+	return controller.SetBalloonMB(target)
+}
+
+func (i *hostedInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	provider, ok := i.Instance.(interface {
+		BalloonState() (uint64, uint64, bool, bool)
+	})
+	if !ok {
+		return 0, 0, false, false
+	}
+	return provider.BalloonState()
+}
+
+func (i *hostedInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	provider, ok := i.Instance.(interface {
+		BackingUsage() (uint64, uint64, uint64, error)
+	})
+	if !ok {
+		return 0, 0, 0, nil
+	}
+	return provider.BackingUsage()
+}
+
+func (i *hostedInstance) BackingMetadataUsage() (uint64, uint64) {
+	provider, ok := i.Instance.(interface{ BackingMetadataUsage() (uint64, uint64) })
+	if !ok {
+		return 0, 0
+	}
+	return provider.BackingMetadataUsage()
+}
+
+func (i *hostedInstance) BackingCombinedUsage() (uint64, uint64) {
+	provider, ok := i.Instance.(interface{ BackingCombinedUsage() (uint64, uint64) })
+	if ok {
+		return provider.BackingCombinedUsage()
+	}
+	data, dataHigh, _, _ := i.BackingUsage()
+	metadata, metadataHigh := i.BackingMetadataUsage()
+	current := data + metadata
+	if current < data {
+		current = ^uint64(0)
+	}
+	return current, max(current, dataHigh, metadataHigh)
+}
+
+func (i *hostedInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if provider, ok := i.Instance.(interface {
+		BackingSnapshot() virtio.FSBackingUsageSnapshot
+	}); ok {
+		return provider.BackingSnapshot()
+	}
+	data, dataHigh, physical, err := i.BackingUsage()
+	metadata, metadataHigh := i.BackingMetadataUsage()
+	combined := data + metadata
+	if combined < data {
+		combined = ^uint64(0)
+	}
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: data, DataHighWaterBytes: dataHigh,
+		MetadataBytes: metadata, MetadataHighWaterBytes: metadataHigh,
+		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
+		PhysicalBytes: physical, ReclaimError: err,
+	}
 }
 
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {

@@ -37,11 +37,12 @@ const (
 )
 
 const (
-	sidecarBootTLVEnd      uint16 = 0
-	sidecarBootTLVMetadata uint16 = 1
-	sidecarBootTLVKernel   uint16 = 2
-	sidecarBootTLVInit     uint16 = 3
-	sidecarBootTLVModule   uint16 = 4
+	sidecarBootTLVEnd           uint16 = 0
+	sidecarBootTLVMetadata      uint16 = 1
+	sidecarBootTLVKernel        uint16 = 2
+	sidecarBootTLVInit          uint16 = 3
+	sidecarBootTLVModule        uint16 = 4
+	sidecarBootTLVModuleSymvers uint16 = 5
 )
 
 type sidecarBootBundleMetadata struct {
@@ -51,6 +52,7 @@ type sidecarBootBundleMetadata struct {
 	AMD64EmulatorPath  string            `json:"amd64_emulator_path,omitempty"`
 	ModuleNames        []string          `json:"module_names,omitempty"`
 	NeedsAMD64Emulator bool              `json:"needs_amd64_emulator,omitempty"`
+	KernelRelease      string            `json:"kernel_release,omitempty"`
 }
 
 func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req client.CreateInstanceRequest) (sidecarStartResources, error) {
@@ -70,13 +72,26 @@ func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req cl
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
+	bootOwned := true
+	defer func() {
+		if bootOwned {
+			bootResources.closeAll()
+		}
+	}()
 	root := virtio.NewImageFS(image.RootFS, image.RootFSDir)
 	shares, err := sidecarShareMounts(req.Shares)
 	if err != nil {
+		if closer, ok := root.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
+	mounted := virtio.NewMountedFS(root, shares)
+	rootFS, err := sidecarSnapshotRoot(mounted)
 	if err != nil {
+		if closer, ok := mounted.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
@@ -87,9 +102,9 @@ func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req cl
 	netResources, err := prepareSidecarNetResources(h.cacheDir, req.ID, req.Network)
 	if err != nil {
 		fsResources.closeAll()
-		bootResources.closeAll()
 		return sidecarStartResources{}, err
 	}
+	bootOwned = false
 	return combineSidecarResources(fsResources, bootResources, netResources), nil
 }
 
@@ -118,10 +133,17 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	}
 	shares, err := sidecarShareMounts(req.Shares)
 	if err != nil {
+		if closer, ok := root.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
-	rootFS, err := sidecarSnapshotRoot(virtio.NewMountedFS(root, shares))
+	mounted := virtio.NewMountedFS(root, shares)
+	rootFS, err := sidecarSnapshotRoot(mounted)
 	if err != nil {
+		if closer, ok := mounted.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	fsResources, err := serveSidecarFS(h.cacheDir, rootFS)
@@ -201,6 +223,10 @@ func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *o
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
+	kernelMetadata, err := readRuntimeKernelProviderMetadata(kernelProvider)
+	if err != nil {
+		return sidecarStartResources{}, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, h.kernel.ExtractPackageFile)
 	if err != nil {
 		return sidecarStartResources{}, err
@@ -218,6 +244,8 @@ func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *o
 		Init:               initBin,
 		AMD64EmulatorPath:  qemuX8664,
 		Modules:            modules,
+		KernelRelease:      kernelMetadata.Release,
+		ModuleSymvers:      kernelMetadata.ModuleSymvers,
 		NeedsAMD64Emulator: needsAMD64,
 	}
 	if image != nil {
@@ -254,6 +282,7 @@ func writeSidecarBootBundle(w io.Writer, bundle sidecarBootBundle) error {
 		AMD64EmulatorPath:  bundle.AMD64EmulatorPath,
 		ModuleNames:        moduleNames,
 		NeedsAMD64Emulator: bundle.NeedsAMD64Emulator,
+		KernelRelease:      bundle.KernelRelease,
 	})
 	if err != nil {
 		return err
@@ -269,6 +298,11 @@ func writeSidecarBootBundle(w io.Writer, bundle sidecarBootBundle) error {
 	}
 	for _, module := range bundle.Modules {
 		if err := writeSidecarBootTLV(w, sidecarBootTLVModule, module.Data); err != nil {
+			return err
+		}
+	}
+	if len(bundle.ModuleSymvers) != 0 {
+		if err := writeSidecarBootTLV(w, sidecarBootTLVModuleSymvers, bundle.ModuleSymvers); err != nil {
 			return err
 		}
 	}
@@ -294,11 +328,19 @@ func serveSidecarFS(cacheDir string, backend sidecarRootFS) (sidecarStartResourc
 		return virtio.ServeFSBackend(conn, backend)
 	})
 	if err != nil {
+		if closer, ok := backend.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		return sidecarStartResources{}, err
 	}
 	return sidecarStartResources{
-		env:    []string{sidecarFSSocketEnv + "=" + socketPath},
-		close:  closeFn,
+		env: []string{sidecarFSSocketEnv + "=" + socketPath},
+		close: func() {
+			closeFn()
+			if closer, ok := backend.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		},
 		remote: true,
 		rootFS: backend,
 	}, nil
@@ -335,8 +377,8 @@ func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.Network
 		Config: cfg,
 		IP:     lease.ip,
 		MAC:    lease.mac,
-		TXHook: func(packet []byte) {
-			defaultDarwinSidecarSwitch.Forward(lease.id, packet)
+		TXHook: func(packet []byte) bool {
+			return defaultDarwinSidecarSwitch.Forward(lease.id, packet)
 		},
 		RXHook: func(frame []byte) error {
 			codecMu.Lock()
@@ -385,8 +427,11 @@ func prepareSidecarNetResourcesWithMode(cacheDir, id string, cfg *client.Network
 			if packet.Kind != virtio.NetPacketTX {
 				return nil
 			}
-			defaultDarwinSidecarSwitch.Forward(lease.id, packet.Frame)
+			handled := defaultDarwinSidecarSwitch.Forward(lease.id, packet.Frame)
 			if mode == "bridge" {
+				return nil
+			}
+			if handled {
 				return nil
 			}
 			if runtime == nil {
@@ -534,17 +579,17 @@ func (s *darwinSidecarSwitch) Unregister(id string) {
 	s.mu.Unlock()
 }
 
-func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
+func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) bool {
 	source, ok := s.sourceEndpoint(sourceID)
 	if !ok {
 		s.recordSourceViolation(sourceID, netstack.SourceMalformed)
-		return
+		return true
 	}
 	if violation := netstack.ValidateGuestSource(frame, source.mac, source.ip); violation != netstack.SourceValid {
 		if violation != netstack.SourceUnsupportedProtocol {
 			s.recordSourceViolation(sourceID, violation)
 		}
-		return
+		return true
 	}
 	dst := append(net.HardwareAddr(nil), frame[0:6]...)
 	if binary.BigEndian.Uint16(frame[12:14]) == 0x0806 && len(frame) >= 42 {
@@ -552,17 +597,19 @@ func (s *darwinSidecarSwitch) Forward(sourceID string, frame []byte) {
 		if targetIP != nil {
 			if target := s.endpointByIP(sourceID, targetIP); target.rx != nil {
 				target.rx(frame)
-				return
+				return true
 			}
 		}
 	}
 	if isDarwinSidecarBroadcastMAC(dst) || isDarwinSidecarMulticastMAC(dst) {
 		s.forwardToAll(sourceID, frame)
-		return
+		return false
 	}
 	if target := s.endpointByMAC(sourceID, dst); target.rx != nil {
 		target.rx(frame)
+		return true
 	}
+	return false
 }
 
 func (s *darwinSidecarSwitch) sourceEndpoint(id string) (darwinSidecarEndpoint, bool) {
@@ -680,6 +727,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 	for i, share := range mounts.ConvertShareMounts(shares) {
 		mount, err := arm64ShareMount(share)
 		if err != nil {
+			_ = vmruntime.CloseShareMounts(out)
 			return nil, fmt.Errorf("share %d: %w", i, err)
 		}
 		out = append(out, mount)
@@ -696,6 +744,11 @@ func sidecarRuntimeShareMount(share client.ShareMount) (virtio.ShareMount, error
 }
 
 func arm64ShareMount(share vmruntime.DirectoryShare) (virtio.ShareMount, error) {
+	canonical, err := vmruntime.CanonicalDirectoryShare(share)
+	if err != nil {
+		return virtio.ShareMount{}, err
+	}
+	share = canonical
 	_, backend, err := buildDarwinShareBackend(share)
 	if err != nil {
 		return virtio.ShareMount{}, err

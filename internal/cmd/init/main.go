@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/managed/capturerelay"
 	"j5.nz/cc/internal/managed/guestagent"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -36,6 +38,11 @@ const initDurationMarker = "__CCX3_INIT_MS__:"
 const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
+const archiveMode = "--ccx3-fs-archive"
+const extractMode = "--ccx3-fs-extract"
+const captureRelayMode = "--ccx3-capture-relay"
+
+var credentialSetupMu sync.Mutex
 
 const (
 	managedExecTimingRecv            = "recv"
@@ -50,21 +57,33 @@ const (
 	managedExecTimingWaitDone        = "wait_done"
 	managedExecTimingStreamsDone     = "streams_done"
 	managedExecTimingExitSent        = "exit_sent"
-	managedExecTimingStdinCloseRecv  = "stdin_close_recv"
 )
 const stage2Mode = "--ccx3-stage2"
 const stage2Path = "/etc/ccx3/stage2"
 const stage2ConfigPath = "/etc/ccx3/config.json"
+const snapshotStage2Path = "/var/tmp/.ccx3-snapshot-stage2"
+const snapshotStage2ConfigPath = "/var/tmp/.ccx3-snapshot-config.json"
+const snapshotModuleDir = "/var/tmp/.ccx3-snapshot-modules"
 const initSystemSystemd = "systemd"
 const systemdReadyTimeout = 30 * time.Second
-const execProtocolChunkSize = 256
+
+// Exec output is base64-framed by the managed protocol. Small fragments create
+// thousands of sidecar frames for ordinary file transfers and can overflow a
+// bounded transport queue even while its consumer is making progress.
+const execProtocolChunkSize = 32 << 10
 const defaultVsockConnectTimeout = 5 * time.Second
 const stage2VsockConnectAttemptTimeout = 500 * time.Millisecond
+const managedExecGroupTerminateGrace = 500 * time.Millisecond
+const managedExecGroupKillWait = 2 * time.Second
 
 var consoleFD = 2
 var kmsgFD = -1
 var protocolMu sync.Mutex
 var setTimeOfDay = unix.Settimeofday
+var managedChildren = struct {
+	sync.Mutex
+	pids map[int]struct{}
+}{pids: make(map[int]struct{})}
 
 type config struct {
 	Command            []string `json:"command"`
@@ -91,7 +110,10 @@ type config struct {
 	DisableCgroupMount bool     `json:"disable_cgroup_mount,omitempty"`
 	Network            *network `json:"network,omitempty"`
 	SnapshotMMIOBase   uint64   `json:"snapshot_mmio_base,omitempty"`
+	SnapshotModules    []string `json:"snapshot_modules,omitempty"`
 	UnixTime           int64    `json:"unix_time,omitempty"`
+	KernelRelease      string   `json:"kernel_release,omitempty"`
+	ModuleSymversPath  string   `json:"module_symvers_path,omitempty"`
 }
 
 type network struct {
@@ -99,6 +121,63 @@ type network struct {
 	Address   string `json:"address,omitempty"`
 	Gateway   string `json:"gateway,omitempty"`
 	DNS       string `json:"dns,omitempty"`
+}
+
+func installModuleSymvers(root, release string, data []byte) error {
+	release = strings.TrimSpace(release)
+	if release == "" || release == "." || release == ".." || filepath.Base(release) != release {
+		return fmt.Errorf("invalid kernel release %q", release)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("Module.symvers is empty")
+	}
+
+	headersDir := filepath.Join(root, "usr", "src", "linux-headers-"+release)
+	if err := os.MkdirAll(headersDir, 0o755); err != nil {
+		return fmt.Errorf("create kernel metadata directory: %w", err)
+	}
+	symversPath := filepath.Join(headersDir, "Module.symvers")
+	tmp, err := os.CreateTemp(headersDir, ".Module.symvers-*")
+	if err != nil {
+		return fmt.Errorf("create temporary Module.symvers: %w", err)
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("set Module.symvers permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write Module.symvers: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close Module.symvers: %w", err)
+	}
+	if err := os.Rename(tmpPath, symversPath); err != nil {
+		return fmt.Errorf("install Module.symvers: %w", err)
+	}
+	ok = true
+
+	modulesDir := filepath.Join(root, "lib", "modules", release)
+	if err := os.MkdirAll(modulesDir, 0o755); err != nil {
+		return fmt.Errorf("create kernel module directory: %w", err)
+	}
+	buildPath := filepath.Join(modulesDir, "build")
+	if _, err := os.Lstat(buildPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect kernel build link: %w", err)
+	}
+	linkTarget := filepath.Join("..", "..", "..", "usr", "src", "linux-headers-"+release)
+	if err := os.Symlink(linkTarget, buildPath); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("install kernel build link: %w", err)
+	}
+	return nil
 }
 
 type share struct {
@@ -140,6 +219,7 @@ type managedExec struct {
 	stdin   io.WriteCloser
 	pty     *os.File
 	process *os.Process
+	family  *guestagent.ProcessFamily
 	group   bool
 	start   time.Time
 }
@@ -165,10 +245,11 @@ func (m *managedExec) closeStdin() error {
 	return err
 }
 
-func (m *managedExec) setProcess(proc *os.Process, group bool) {
+func (m *managedExec) setProcess(proc *os.Process, group bool, family *guestagent.ProcessFamily) {
 	m.stdinMu.Lock()
 	defer m.stdinMu.Unlock()
 	m.process = proc
+	m.family = family
 	m.group = group
 }
 
@@ -188,16 +269,33 @@ func (m *managedExec) signal(name string) error {
 	if m.process == nil {
 		return fmt.Errorf("process is not started")
 	}
-	if m.group && m.process.Pid > 0 {
-		err := syscall.Kill(-m.process.Pid, sig)
+	process := m.process
+	family := m.family
+	if family != nil {
+		_ = family.Signal(sig)
+	}
+	if m.group && process.Pid > 0 {
+		err := syscall.Kill(-process.Pid, sig)
 		if err == nil {
+			if family != nil {
+				return family.Signal(sig)
+			}
 			return nil
 		}
 		if errors.Is(err, syscall.ESRCH) {
+			if family != nil {
+				return family.Signal(sig)
+			}
 			return nil
 		}
 	}
-	return m.process.Signal(sig)
+	err = process.Signal(sig)
+	if family != nil {
+		if familyErr := family.Signal(sig); err == nil {
+			err = familyErr
+		}
+	}
+	return err
 }
 
 func (m *managedExec) resize(cols, rows int) error {
@@ -270,13 +368,29 @@ func prepareExecRequest(cfg config, req execRequest) preparedExecRequest {
 }
 
 func startPreparedExec(cfg config, control io.Writer, active *guestagent.ActiveExecSet, req preparedExecRequest, waitReady func() error) {
-	stdinR, stdinW := io.Pipe()
+	// Use a kernel pipe for command input. An io.Pipe requires a guest Go
+	// goroutine to rendezvous with every write; immediately after snapshot
+	// restore that rendezvous could stall even though the child was already
+	// running. The kernel pipe also preserves natural backpressure without an
+	// arbitrary in-memory input limit.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		writeExecStderr(cfg, control, req.ID, "ccx3-init: open command stdin: "+err.Error()+"\n")
+		reporterForConfig(cfg, control, req.ID, time.Now()).Exit(126)
+		return
+	}
 	managed := &managedExec{stdin: stdinW, start: time.Now()}
 	closeStdin := active.Add(req.ID, managed)
-	go runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {
-		_ = managed.closeStdin()
-		active.Delete(req.ID)
-	})
+	// The input sink is fully usable once it is registered: the kernel pipe can
+	// queue data before the command worker runs. Advertise that state without a
+	// goroutine rendezvous, which may not be scheduled promptly after restore.
+	writeExecTiming(control, req.ID, "input_ready", managed.start)
+	go func() {
+		runManagedExec(cfg, control, req.ID, req.Command, req.Env, req.RootDir, req.WorkDir, req.User, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitReady, func() {
+			_ = managed.closeStdin()
+			active.Delete(req.ID)
+		})
+	}()
 	if closeStdin {
 		if err := managed.closeStdin(); err != nil {
 			writeKernel("ccx3-init: close pending stdin: " + err.Error())
@@ -363,6 +477,13 @@ func (g *systemdCommandGate) WaitForCommand(argv []string) func() error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == captureRelayMode {
+		if err := capturerelay.Run(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ccx3-init: capture relay:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == stage2Mode {
 		if err := runStage2(); err != nil {
 			fmt.Fprintf(os.Stderr, "ccx3-init: stage2: %v\n", err)
@@ -374,6 +495,20 @@ func main() {
 		if err := runExecPivot(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "ccx3-init: exec pivot: %v\n", err)
 			os.Exit(126)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == archiveMode {
+		if err := runArchiveHelper(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: fs archive: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == extractMode {
+		if err := runExtractHelper(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: fs extract: %v\n", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -426,6 +561,16 @@ func run() error {
 	configureMemoryOvercommit("/proc")
 
 	modules := cfg.Modules
+	var moduleSymvers []byte
+	if cfg.ModuleSymversPath != "" {
+		moduleSymvers, err = os.ReadFile(cfg.ModuleSymversPath)
+		if err != nil {
+			return fmt.Errorf("read staged Module.symvers: %w", err)
+		}
+		if len(moduleSymvers) == 0 {
+			return fmt.Errorf("staged Module.symvers is empty")
+		}
+	}
 	var deferredModulePaths []string
 	var deferredModules []modulePayload
 	if cfg.SnapshotMMIOBase != 0 {
@@ -446,6 +591,13 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		if len(moduleSymvers) > 0 {
+			writeStage(bootStart, "installing kernel symbol versions")
+			if err := installModuleSymvers("/", cfg.KernelRelease, moduleSymvers); err != nil {
+				return fmt.Errorf("install kernel symbol versions: %w", err)
+			}
+			writeStage(bootStart, "kernel symbol versions installed")
+		}
 		writeStage(bootStart, "configuring hostname")
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)
@@ -495,11 +647,19 @@ func run() error {
 				return bootInitSystem(cfg, bootStart)
 			}
 			if len(deferredModules) > 0 {
-				writeStage(bootStart, "loading deferred modules")
-				if err := loadModulePayloads(deferredModules); err != nil {
+				writeStage(bootStart, "staging deferred modules")
+				cfg.SnapshotModules, err = stageSnapshotModules(deferredModules)
+				if err != nil {
 					return err
 				}
-				writeStage(bootStart, "deferred modules loaded")
+				writeStage(bootStart, "deferred modules staged")
+			}
+			if cfg.SnapshotMMIOBase != 0 {
+				writeStage(bootStart, "preparing snapshot stage2")
+				if err := prepareSnapshotStage2(cfg); err != nil {
+					return fmt.Errorf("prepare snapshot stage2: %w", err)
+				}
+				writeStage(bootStart, "snapshot stage2 prepared")
 			}
 			if err := triggerSnapshotMMIO(cfg.SnapshotMMIOBase); err != nil {
 				return fmt.Errorf("trigger snapshot: %w", err)
@@ -510,6 +670,7 @@ func run() error {
 					return fmt.Errorf("seed entropy after snapshot restore: %w", err)
 				}
 				writeStage(bootStart, "entropy seeded")
+				return execSnapshotStage2()
 			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
@@ -546,6 +707,7 @@ func run() error {
 
 func runStage2() error {
 	writeKernel("ccx3-init: stage2 starting")
+	snapshotRestore := os.Getenv("CCX3_STAGE2_CONFIG") == snapshotStage2ConfigPath
 	var cfg config
 	buf, err := readStage2Config()
 	if err != nil {
@@ -553,6 +715,14 @@ func runStage2() error {
 	}
 	if err := json.Unmarshal(buf, &cfg); err != nil {
 		return fmt.Errorf("decode config: %w", err)
+	}
+	if snapshotRestore {
+		if err := loadModules(cfg.SnapshotModules); err != nil {
+			return fmt.Errorf("load snapshot modules: %w", err)
+		}
+		_ = os.RemoveAll(snapshotModuleDir)
+		_ = os.Remove(snapshotStage2ConfigPath)
+		_ = os.Remove(snapshotStage2Path)
 	}
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = "/"
@@ -574,6 +744,49 @@ func runStage2() error {
 		writeProtocolLineTo(control, cfg.ReadyMarker)
 	}
 	return commandLoop(cfg, control)
+}
+
+func prepareSnapshotStage2(cfg config) error {
+	if err := copyCurrentExecutable(snapshotStage2Path); err != nil {
+		return err
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("encode snapshot stage2 config: %w", err)
+	}
+	if err := os.WriteFile(snapshotStage2ConfigPath, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write snapshot stage2 config: %w", err)
+	}
+	if err := os.Chmod(snapshotStage2ConfigPath, 0o600); err != nil {
+		return fmt.Errorf("chmod snapshot stage2 config: %w", err)
+	}
+	return nil
+}
+
+func stageSnapshotModules(modules []modulePayload) ([]string, error) {
+	if err := os.RemoveAll(snapshotModuleDir); err != nil {
+		return nil, fmt.Errorf("clear snapshot module directory: %w", err)
+	}
+	if err := os.MkdirAll(snapshotModuleDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create snapshot module directory: %w", err)
+	}
+	paths := make([]string, 0, len(modules))
+	for i, module := range modules {
+		path := filepath.Join(snapshotModuleDir, fmt.Sprintf("%03d-%s", i, filepath.Base(module.path)))
+		if err := os.WriteFile(path, module.data, 0o600); err != nil {
+			return nil, fmt.Errorf("stage snapshot module %s: %w", module.path, err)
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func execSnapshotStage2() error {
+	env := append(os.Environ(), "CCX3_STAGE2_CONFIG="+snapshotStage2ConfigPath)
+	if err := syscall.Exec(snapshotStage2Path, []string{snapshotStage2Path, stage2Mode}, env); err != nil {
+		return fmt.Errorf("exec snapshot stage2: %w", err)
+	}
+	return fmt.Errorf("snapshot stage2 returned unexpectedly")
 }
 
 func waitForSystemdControlSocket(timeout time.Duration) error {
@@ -941,10 +1154,20 @@ func parseUint32(value string) (uint32, error) {
 }
 
 func lookPathForExec(file string) (string, error) {
+	return lookPathForExecEnv(file, os.Environ())
+}
+
+func lookPathForExecEnv(file string, env []string) (string, error) {
 	if strings.Contains(file, "/") {
 		return file, nil
 	}
-	pathEnv := os.Getenv("PATH")
+	pathEnv := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathEnv = strings.TrimPrefix(entry, "PATH=")
+			break
+		}
+	}
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
@@ -1823,6 +2046,21 @@ func appendStat(buf *strings.Builder, label, path string) {
 	buf.WriteString("\n")
 }
 
+func managedExecStartFailure(err error, argv []string, rootDir, workDir string) (int, string) {
+	command := "command"
+	if len(argv) > 0 && strings.TrimSpace(argv[0]) != "" {
+		command = argv[0]
+	}
+	switch {
+	case errors.Is(err, exec.ErrNotFound), errors.Is(err, os.ErrNotExist):
+		return 127, command + ": executable not found\n"
+	case errors.Is(err, os.ErrPermission):
+		return 126, command + ": permission denied\n"
+	default:
+		return 126, "ccx3-init: exec error: " + err.Error() + "\n" + collectExecDiagnostics(rootDir, argv, workDir)
+	}
+}
+
 func collectExecDiagnostics(rootDir string, argv []string, workDir string) string {
 	var buf strings.Builder
 	if rootDir != "" {
@@ -1960,15 +2198,6 @@ func readModulePayloads(modules []string) ([]modulePayload, error) {
 	return payloads, nil
 }
 
-func loadModulePayloads(modules []modulePayload) error {
-	for _, module := range modules {
-		if err := loadModuleData(module.path, module.data); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func loadModuleData(path string, data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("module %s is empty", path)
@@ -2034,6 +2263,19 @@ func execCommand(cfg config) error {
 }
 
 func execCommandGo(argv []string, env []string, workDir string, user string) (int, *guestagent.ExecUsage, error) {
+	cred, err := guestagent.CredentialForUser(user)
+	if err != nil {
+		return 0, nil, err
+	}
+	if cred != nil {
+		credentialSetupMu.Lock()
+		err := guestagent.EnsureCredentialUser("", cred)
+		credentialSetupMu.Unlock()
+		if err != nil {
+			return 0, nil, err
+		}
+		env = guestagent.EnvironmentForCredential("", env, cred)
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	start := time.Now()
 	cmd.Env = env
@@ -2044,16 +2286,11 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	cmd.Stdin = console
 	cmd.Stdout = console
 	cmd.Stderr = console
-	if cred, err := guestagent.CredentialForUser(user); err != nil {
-		return 0, nil, err
-	} else if cred != nil {
-		if err := guestagent.EnsureCredentialUser("", cred); err != nil {
-			return 0, nil, err
-		}
+	if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
-	err := cmd.Run()
+	err = cmd.Run()
 	usage := guestagent.UsageFromProcessState(cmd.ProcessState, time.Since(start))
 	if err == nil {
 		return 0, usage, nil
@@ -2080,7 +2317,7 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 			writeKernel("ccx3-init: fs_archive request missing id")
 			return true
 		}
-		go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path)
+		go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User))
 	case "fs_mkdir":
 		if req.ID == "" {
 			writeKernel("ccx3-init: fs_mkdir request missing id")
@@ -2131,10 +2368,6 @@ func handleInitControlRequest(cfg config, control io.Writer, active *guestagent.
 		if !result.Found {
 			return true
 		}
-		managed, _ := result.Exec.(*managedExec)
-		if managed != nil {
-			writeExecTiming(control, req.ID, managedExecTimingStdinCloseRecv, managed.start)
-		}
 		if result.Err != nil {
 			writeKernel("ccx3-init: close stdin: " + result.Err.Error())
 		}
@@ -2177,6 +2410,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	reader := bufio.NewReader(control)
 	active := guestagent.NewActiveExecSet()
 	systemdGate := newSystemdCommandGate(cfg.InitSystem)
+	startOrphanReaper()
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -2337,20 +2571,35 @@ func runSyncRequest(cfg config, control io.Writer, id string) {
 	proto.WriteExit(control, id, 0)
 }
 
-func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src string) {
+func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src, user string) {
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
-	if err := archivePathToControl(cfg, control, id, rootDir, src); err != nil {
+	if err := archivePathToControl(cfg, control, id, rootDir, src, user); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs archive: "+err.Error()+"\n")
 	}
 	proto.WriteExit(control, id, exitCode)
 }
 
-func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string) error {
+func archivePathToControl(cfg config, control io.Writer, id, rootDir, src, user string) error {
 	if strings.TrimSpace(src) == "" {
 		return fmt.Errorf("source path is required")
+	}
+	credential, err := guestagent.CredentialForUserInRoot(rootDir, user)
+	if err != nil {
+		return err
+	}
+	if credential != nil {
+		cmd := exec.Command("/proc/self/exe", archiveMode, rootDir, src)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+		cmd.Stdout = execOutputWriter{write: func(data []byte) { writeExecStdoutBytes(cfg, control, id, data) }}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := runArchiveHelperCommand(cmd); err != nil {
+			return archiveHelperError(err, stderr.String())
+		}
+		return nil
 	}
 	src = rootPath(rootDir, filepath.Clean(src))
 	info, err := os.Lstat(src)
@@ -2377,15 +2626,118 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 	}
 }
 
+type execOutputWriter struct {
+	write func([]byte)
+}
+
+func (w execOutputWriter) Write(data []byte) (int, error) {
+	if len(data) > 0 && w.write != nil {
+		w.write(data)
+	}
+	return len(data), nil
+}
+
+func runArchiveHelper(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("archive helper requires root and source paths")
+	}
+	src := rootPath(args[0], filepath.Clean(args[1]))
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	return guestagent.WritePathTar(os.Stdout, src, filepath.Base(src), info)
+}
+
+type extractHelperRequest struct {
+	RootDir string                `json:"root_dir,omitempty"`
+	Path    string                `json:"path"`
+	IsDir   bool                  `json:"is_dir,omitempty"`
+	Limits  *client.ArchiveLimits `json:"limits,omitempty"`
+}
+
+func runExtractHelper(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("extract helper requires one request")
+	}
+	var request extractHelperRequest
+	if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
+		return fmt.Errorf("decode request: %w", err)
+	}
+	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), request.Limits)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return guestagent.ExtractTarToPathContext(ctx, os.Stdin, request.RootDir, request.Path, request.IsDir, request.Limits)
+}
+
+func archiveHelperError(runErr error, stderr string) error {
+	stderr = strings.TrimSpace(stderr)
+	if stderr != "" {
+		return errors.New(stderr)
+	}
+	return runErr
+}
+
+func runArchiveHelperCommand(cmd *exec.Cmd) error {
+	managedChildren.Lock()
+	err := cmd.Start()
+	if err == nil {
+		managedChildren.pids[cmd.Process.Pid] = struct{}{}
+	}
+	managedChildren.Unlock()
+	if err != nil {
+		return err
+	}
+	err = cmd.Wait()
+	managedChildren.Lock()
+	delete(managedChildren.pids, cmd.Process.Pid)
+	managedChildren.Unlock()
+	return err
+}
+
 func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, limits *client.ArchiveLimits, stdin io.ReadCloser, cleanup func()) {
 	defer cleanup()
+	defer stdin.Close()
 	proto := protocolForConfig(cfg)
 	proto.WriteBegin(control, id)
 	exitCode := 0
 	ctx, cancel, err := guestagent.ArchiveContext(context.Background(), limits)
 	if err == nil {
 		defer cancel()
-		err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
+		credential, credentialErr := guestagent.CredentialForUserInRoot(rootDir, user)
+		if credentialErr != nil {
+			err = credentialErr
+		} else if credential != nil {
+			credentialSetupMu.Lock()
+			userErr := guestagent.EnsureCredentialUser(rootDir, credential)
+			if userErr == nil {
+				userErr = guestagent.EnsureCredentialArchiveHome(rootDir, dst, credential)
+			}
+			credentialSetupMu.Unlock()
+			if userErr != nil {
+				err = userErr
+			}
+		}
+		if err == nil && credential != nil {
+			request, marshalErr := json.Marshal(extractHelperRequest{RootDir: rootDir, Path: dst, IsDir: dstDir, Limits: limits})
+			if marshalErr != nil {
+				err = marshalErr
+			} else {
+				cmd := exec.Command("/proc/self/exe", extractMode, string(request))
+				cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+				cmd.Stdin = stdin
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				if runErr := runArchiveHelperCommand(cmd); runErr != nil {
+					err = archiveHelperError(runErr, stderr.String())
+				}
+			}
+		}
+		if err == nil && credential == nil {
+			err = guestagent.ExtractTarToPathContext(ctx, stdin, rootDir, dst, dstDir, limits)
+		}
 	}
 	if err != nil {
 		exitCode = 1
@@ -2405,7 +2757,7 @@ func runFSMkdirRequest(cfg config, control io.Writer, id, rootDir, dir, user str
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
-	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(rootDir, target, user); err != nil {
 		exitCode = 1
 		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
 	}
@@ -2430,7 +2782,7 @@ func runFSWriteRequest(cfg config, control io.Writer, id, rootDir, dst, user str
 	} else if err := writeStreamToPath(stdin, target, 0o644); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
-	} else if err := guestagent.ChownPathForUser(target, user); err != nil {
+	} else if err := guestagent.ChownPathForUser(rootDir, target, user); err != nil {
 		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
 		exitCode = 1
 	}
@@ -2475,7 +2827,12 @@ func managedExecCommand(argv []string, env []string, rootDir string, workDir str
 	if useExecPivot {
 		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, cred, argv)...)...)
 	} else {
-		cmd = exec.Command(argv[0], argv[1:]...)
+		executable, err := lookPathForExecEnv(argv[0], env)
+		if err != nil {
+			executable = argv[0]
+		}
+		cmd = exec.Command(executable, argv[1:]...)
+		cmd.Args[0] = argv[0]
 		if workDir != "" {
 			cmd.Dir = workDir
 		}
@@ -2526,7 +2883,14 @@ func managedExecExitCode(waitErr error, state *os.ProcessState) (int, error) {
 }
 
 func startManagedExecProcess(cmd *exec.Cmd, controlW **os.File) error {
+	// Keep registration atomic with Start so the PID 1 orphan reaper cannot
+	// consume a short-lived managed command before os.Process.Wait observes it.
+	managedChildren.Lock()
 	err := cmd.Start()
+	if err == nil {
+		managedChildren.pids[cmd.Process.Pid] = struct{}{}
+	}
+	managedChildren.Unlock()
 	if controlW != nil && *controlW != nil {
 		_ = (*controlW).Close()
 		*controlW = nil
@@ -2544,6 +2908,9 @@ type managedExecWaitResult struct {
 
 func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitResult {
 	state, waitErr := cmd.Process.Wait()
+	managedChildren.Lock()
+	delete(managedChildren.pids, cmd.Process.Pid)
+	managedChildren.Unlock()
 	cmd.ProcessState = state
 	usage := guestagent.UsageFromProcessState(state, time.Since(execStart))
 	exitCode, exitErr := managedExecExitCode(waitErr, state)
@@ -2558,6 +2925,67 @@ func waitManagedExecProcess(cmd *exec.Cmd, execStart time.Time) managedExecWaitR
 		ExitCode:     exitCode,
 		ExitErr:      exitErr,
 	}
+}
+
+func startOrphanReaper() {
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			reapOrphanedChildren(os.Getpid())
+		}
+	}()
+}
+
+// reapOrphanedChildren prevents descendants left behind by canceled command
+// trees from accumulating as zombies under ccx3-init. Managed direct children
+// remain owned by os.Process.Wait so their structured exit status is preserved.
+func reapOrphanedChildren(parentPID int) {
+	managedChildren.Lock()
+	defer managedChildren.Unlock()
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		pid64, err := strconv.ParseInt(entry.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+		pid := int(pid64)
+		if _, tracked := managedChildren.pids[pid]; tracked {
+			continue
+		}
+		state, ppid, ok := procProcessState(filepath.Join("/proc", entry.Name(), "stat"))
+		if !ok || state != 'Z' || ppid != parentPID {
+			continue
+		}
+		var status syscall.WaitStatus
+		_, _ = syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+	}
+}
+
+func procProcessState(path string) (byte, int, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	// The comm field is parenthesized and may itself contain spaces. State and
+	// parent PID are the first two fields after its final closing parenthesis.
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return 0, 0, false
+	}
+	fields := bytes.Fields(data[end+1:])
+	if len(fields) < 2 || len(fields[0]) != 1 {
+		return 0, 0, false
+	}
+	ppid, err := strconv.Atoi(string(fields[1]))
+	if err != nil {
+		return 0, 0, false
+	}
+	return fields[0][0], ppid, true
 }
 
 func managedExecStreamCount(tty bool, hasStdin bool, hasControl bool) int {
@@ -2695,7 +3123,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		rootMounts = mounts
 		defer teardownExecRoot(rootMounts)
 	}
-	execCred, err := guestagent.CredentialForUser(user)
+	execCred, err := guestagent.CredentialForUserInRoot(rootDir, user)
 	if err != nil {
 		writeKernel("ccx3-init: resolve user: " + err.Error())
 		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
@@ -2703,18 +3131,28 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		return
 	}
 	if execCred != nil {
-		if err := guestagent.EnsureCredentialUser(rootDir, execCred); err != nil {
+		credentialSetupMu.Lock()
+		err := guestagent.EnsureCredentialUser(rootDir, execCred)
+		credentialSetupMu.Unlock()
+		if err != nil {
 			writeKernel("ccx3-init: ensure user: " + err.Error())
 			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
 			reporter.Exit(126)
 			return
 		}
-		if err := guestagent.EnsureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
-			writeKernel("ccx3-init: ensure workdir: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
-			reporter.Exit(126)
-			return
-		}
+		env = guestagent.EnvironmentForCredential(rootDir, env, execCred)
+	}
+	if err := guestagent.EnsureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
+		writeKernel("ccx3-init: ensure workdir: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
+		reporter.Exit(126)
+		return
+	}
+	if err := validateManagedExecWorkDir(rootDir, workDir); err != nil {
+		writeKernel("ccx3-init: validate workdir: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: invalid workdir: "+err.Error()+"\n")
+		reporter.Exit(126)
+		return
 	}
 	cmd, useExecPivot := managedExecCommand(argv, env, rootDir, workDir, execCred, tty)
 	var (
@@ -2775,25 +3213,29 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setctty: true,
 			Ctty:    0,
 		}
-		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		var ptyEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			ptyEmit = reporter.Stdout
 		}
+		done = make(chan struct{}, managedExecDoneStreamCount(true, stdin != nil, controlR != nil))
 		go copyManagedExecReader(done, ptyMaster, nil, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, ptyEmit)
 		if stdin != nil {
 			go copyManagedExecStdinToPTY(done, stdin, ptyMaster)
 		}
 	} else {
 		if stdin != nil {
-			var err error
-			stdinW, err = cmd.StdinPipe()
-			if err != nil {
-				closeManagedExecStdinPipe(stdin, nil, nil)
-				writeKernel("ccx3-init: open stdin pipe: " + err.Error())
-				writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
-				reporter.Exit(126)
-				return
+			if file, ok := stdin.(*os.File); ok {
+				cmd.Stdin = file
+			} else {
+				var err error
+				stdinW, err = cmd.StdinPipe()
+				if err != nil {
+					closeManagedExecStdinPipe(stdin, nil, nil)
+					writeKernel("ccx3-init: open stdin pipe: " + err.Error())
+					writeExecStderr(cfg, control, id, "ccx3-init: open stdin pipe: "+err.Error()+"\n")
+					reporter.Exit(126)
+					return
+				}
 			}
 		} else {
 			devNull, err := os.Open("/dev/null")
@@ -2822,11 +3264,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			return
 		}
 
-		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		var stdoutEmit func([]byte)
 		if cfg.OutputMarkerPref != "" {
 			stdoutEmit = reporter.Stdout
 		}
+		done = make(chan struct{}, managedExecDoneStreamCount(false, stdin != nil, controlR != nil))
 		go copyManagedExecReader(done, stdoutR, stdoutR.Close, func() { reporter.Timing(managedExecFirstOutputTimingPhase(false)) }, stdoutEmit)
 		var stderrEmit func([]byte)
 		if cfg.ErrorMarkerPref != "" {
@@ -2838,10 +3280,19 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go copyManagedExecReader(done, controlR, nil, nil, reporter.ControlBytes)
 	}
 	configureManagedExecProcessAttrs(cmd, rootDir, execCred, useExecPivot)
+	preparedFamily, prepareFamilyErr := guestagent.PrepareProcessFamily(cmd, id)
+	if prepareFamilyErr != nil {
+		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
+		writeKernel("ccx3-init: prepare command containment: " + prepareFamilyErr.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: prepare command containment: "+prepareFamilyErr.Error()+"\n")
+		reporter.Exit(126)
+		return
+	}
 
 	reporter.Timing(managedExecTimingStartCall)
 	startErr := startManagedExecProcess(cmd, &controlW)
 	if startErr != nil {
+		preparedFamily.Abort()
 		_ = managed.closeStdin()
 		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 		if ptySlave != nil {
@@ -2859,9 +3310,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			_ = stderrR.Close()
 		}
 		waitManagedExecStreams(done, cap(done))
+		exitCode, message := managedExecStartFailure(startErr, argv, rootDir, workDir)
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
-		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics(rootDir, argv, workDir))
-		reporter.Exit(126)
+		writeExecStderr(cfg, control, id, message)
+		reporter.Exit(exitCode)
 		return
 	}
 	reporter.Timing(managedExecTimingStarted)
@@ -2869,19 +3321,22 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		stdinDone = make(chan struct{}, 1)
 		go copyManagedExecStdinToPipe(stdinDone, stdin, stdinW)
 	}
-	managed.setProcess(cmd.Process, signalGroup)
+	startedFamily := preparedFamily.Start(cmd.Process.Pid)
+	managed.setProcess(cmd.Process, signalGroup, startedFamily)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil
 	}
 
 	reporter.Timing(managedExecTimingWaitBegin)
-	var waitResult managedExecWaitResult
-	if !tty {
-		waitManagedExecStreams(done, cap(done))
-		reporter.Timing(managedExecTimingStreamsDone)
+	waitResult := waitManagedExecProcess(cmd, execStart)
+	terminateManagedExecProcessGroup(cmd.Process.Pid)
+	managed.stdinMu.Lock()
+	family := managed.family
+	managed.stdinMu.Unlock()
+	if family != nil {
+		family.Terminate()
 	}
-	waitResult = waitManagedExecProcess(cmd, execStart)
 	reporter.Timing(managedExecTimingWaitDone)
 	if tty {
 		_ = managed.closeStdin()
@@ -2889,10 +3344,8 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if !tty {
 		closeManagedExecStdinPipe(stdin, stdinW, stdinDone)
 	}
-	if tty {
-		waitManagedExecStreams(done, cap(done))
-		reporter.Timing(managedExecTimingStreamsDone)
-	}
+	waitManagedExecStreams(done, cap(done))
+	reporter.Timing(managedExecTimingStreamsDone)
 
 	if waitResult.ExitErr != nil {
 		writeKernel("ccx3-init: exec error: " + waitResult.ExitErr.Error())
@@ -2905,6 +3358,52 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		reporter.Timing(managedExecTimingExitSent)
 		reporter.Exit(waitResult.ExitCode)
 	}
+}
+
+func terminateManagedExecProcessGroup(pgid int) {
+	if pgid <= 0 || !managedExecProcessGroupExists(pgid) {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if waitManagedExecProcessGroup(pgid, managedExecGroupTerminateGrace) {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = waitManagedExecProcessGroup(pgid, managedExecGroupKillWait)
+}
+
+func waitManagedExecProcessGroup(pgid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		reapOrphanedChildren(os.Getpid())
+		if !managedExecProcessGroupExists(pgid) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func managedExecProcessGroupExists(pgid int) bool {
+	err := syscall.Kill(-pgid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func validateManagedExecWorkDir(rootDir, workDir string) error {
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	target := rootPath(rootDir, filepath.Clean(workDir))
+	info, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", workDir)
+	}
+	return nil
 }
 
 func configureHostname(hostname string) error {
@@ -2932,10 +3431,16 @@ func configurePackageManagers(rootDir string) error {
 	if err := os.MkdirAll(aptDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", aptDir, err)
 	}
+	// Queue all HTTP work through one access-method worker so archive and
+	// security downloads cannot leave each other's connections idle. Do not
+	// disable apt's default HTTP pipelining: the old Pipeline-Depth=0 override
+	// made full Ubuntu updates slow enough to hit the archive's five-second
+	// keep-alive timeout, after which Ubuntu 24.04's apt worker crashed.
 	conf := strings.Join([]string{
 		`Acquire::Queue-Mode "access";`,
-		`Acquire::http::Pipeline-Depth "0";`,
-		`Acquire::https::Pipeline-Depth "0";`,
+		`Acquire::Languages "none";`,
+		`Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";`,
+		`Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";`,
 		"",
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(aptDir, "99ccvm-netstack"), []byte(conf), 0o644); err != nil {

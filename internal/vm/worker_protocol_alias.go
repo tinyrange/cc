@@ -23,6 +23,7 @@ const (
 	WorkerFrameExec         = sidecarproto.WorkerFrameExec
 	WorkerFrameAddShare     = sidecarproto.WorkerFrameAddShare
 	WorkerFrameExecInput    = sidecarproto.WorkerFrameExecInput
+	WorkerFrameExecInputAck = sidecarproto.WorkerFrameExecInputAck
 	WorkerFrameCancel       = sidecarproto.WorkerFrameCancel
 	WorkerFrameFlush        = sidecarproto.WorkerFrameFlush
 	WorkerFrameConsole      = sidecarproto.WorkerFrameConsole

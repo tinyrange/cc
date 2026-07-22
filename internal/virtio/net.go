@@ -21,7 +21,6 @@ const (
 	netFeatureCSUM          = uint64(1) << 0
 	vringAvailNoInterrupt   = 1
 	netFeatureMAC           = uint64(1) << 5
-	netFeatureHostTSO4      = uint64(1) << 11
 	netFeatureStatus        = uint64(1) << 16
 	netFeatureMergeRX       = uint64(1) << 15
 	netHdrFlagNeedsChecksum = 1
@@ -87,6 +86,17 @@ type NetBackend interface {
 	HandleTxPacket(packet []byte) error
 }
 
+// NetTXChecksumPolicy lets a backend request checksum completion for packets
+// that leave a checksum-trusting local path. The packet does not include the
+// virtio header and is only valid for the duration of the call.
+type NetTXChecksumPolicy interface {
+	NeedsTXChecksum(packet []byte) bool
+}
+
+type guestMemoryDetachRegistrar interface {
+	RegisterGuestMemoryDetach(func())
+}
+
 type Net struct {
 	Base         uint64
 	Size         uint64
@@ -123,6 +133,7 @@ type Net struct {
 	asyncTXRunning     bool
 	asyncTXAgain       bool
 	asyncTXErr         error
+	detached           bool
 }
 
 type netTXPacket struct {
@@ -148,9 +159,28 @@ func NewNet(base, size uint64, irq uint32, mac net.HardwareAddr, backend NetBack
 
 func (n *Net) Attach(mem GuestMemory, irq IRQController) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.mem = mem
 	n.irq = irq
+	n.detached = false
+	n.mu.Unlock()
+	if registrar, ok := mem.(guestMemoryDetachRegistrar); ok {
+		registrar.RegisterGuestMemoryDetach(n.Detach)
+	}
+}
+
+// Detach prevents any in-flight or future packet work from accessing guest
+// memory. Hypervisor backends call it before unmapping the memory registered
+// with KVM.
+func (n *Net) Detach() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.mem = nil
+	n.irq = nil
+	n.detached = true
+	n.pendingRx = nil
+	for index := range n.queues {
+		n.queues[index].clearCache()
+	}
 }
 
 func (n *Net) Contains(addr uint64, size int) bool {
@@ -533,6 +563,9 @@ func (n *Net) EnqueueRxPacketOwned(packet []byte) error {
 func (n *Net) enqueueRxPacket(packet []byte, owned bool) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.detached {
+		return nil
+	}
 	if len(n.pendingRx) == 0 {
 		delivered, err := n.processOneRXPacketLocked(packet)
 		if err != nil {
@@ -665,14 +698,20 @@ func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 		}
 		releaseData := data
 		if len(data) >= headerLen {
-			if n.CompleteTXChecksum {
+			packet := data[headerLen:]
+			completeChecksum := n.CompleteTXChecksum
+			if !completeChecksum {
+				if policy, ok := n.backend.(NetTXChecksumPolicy); ok {
+					completeChecksum = policy.NeedsTXChecksum(packet)
+				}
+			}
+			if completeChecksum {
 				if err := fixTXChecksum(data, headerLen); err != nil {
 					releaseNetPacketBuffer(releaseData)
 					releaseNetTXPackets(packets)
 					return nil, err
 				}
 			}
-			packet := data[headerLen:]
 			if n.backend != nil {
 				if len(packets) == cap(packets) {
 					releaseNetPacketBuffer(releaseData)
@@ -1045,7 +1084,7 @@ func (n *Net) legacyFeaturesLocked() uint64 {
 }
 
 func (n *Net) deviceFeaturesLocked() uint64 {
-	features := featureVersion1 | netFeatureCSUM | netFeatureMAC | netFeatureHostTSO4 | netFeatureStatus
+	features := featureVersion1 | netFeatureCSUM | netFeatureMAC | netFeatureStatus
 	if !n.DisableMergeRX {
 		features |= netFeatureMergeRX
 	}
@@ -1090,7 +1129,6 @@ func fixTXChecksum(frame []byte, headerLen int) error {
 	if csumStart < 0 || csumStart >= len(packet) || csumStart+csumOffset+2 > len(packet) {
 		return fmt.Errorf("virtio-net checksum range out of packet: start=%d offset=%d len=%d", csumStart, csumOffset, len(packet))
 	}
-	binary.LittleEndian.PutUint16(packet[csumStart+csumOffset:csumStart+csumOffset+2], 0)
 	sum := internetChecksum(packet[csumStart:])
 	binary.BigEndian.PutUint16(packet[csumStart+csumOffset:csumStart+csumOffset+2], sum)
 	return nil

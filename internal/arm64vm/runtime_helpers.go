@@ -1,6 +1,7 @@
 package arm64vm
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,8 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		Network:           req.Network,
 		SnapshotMMIOBase:  SnapshotBase,
 		UnixTime:          req.UnixTime,
+		KernelRelease:     req.KernelRelease,
+		ModuleSymvers:     req.ModuleSymvers,
 	})
 }
 
@@ -76,22 +79,30 @@ func BuildExecInitramfs(req RunRequest, command []string, env []string, workDir 
 		ExitMarkerPrefix:  CommandExitMarkerPref,
 		Network:           req.Network,
 		UnixTime:          req.UnixTime,
+		KernelRelease:     req.KernelRelease,
+		ModuleSymvers:     req.ModuleSymvers,
 	})
 }
 
 func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.ShareMounter, error) {
 	rootFSBackend := req.RootFS
+	rootFSOwned := false
 	if rootFSBackend == nil {
 		if req.Image == nil {
 			return nil, nil, fmt.Errorf("image or rootfs backend is required")
 		}
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
+		rootFSOwned = true
 	}
 	shares := make([]virtio.ShareMount, 0, len(req.Shares))
 	for i, share := range req.Shares {
 		mount, err := BuildShareMount(i, share)
 		if err != nil {
-			return nil, nil, err
+			var rootErr error
+			if rootFSOwned {
+				rootErr = vmruntime.CloseFSBackend(rootFSBackend)
+			}
+			return nil, nil, errors.Join(err, vmruntime.CloseShareMounts(shares), rootErr)
 		}
 		shares = append(shares, mount)
 	}
@@ -104,6 +115,7 @@ func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.Share
 		sourceDir := filepath.Dir(req.AMD64EmulatorPath)
 		devs = append(devs, newFSDevice(ShareFSBase, ShareFSIRQ, EmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
 	}
+	virtio.AttachFSBackingUsageTracker(devs)
 	return devs, rootFS, nil
 }
 
@@ -119,6 +131,10 @@ func SnapshotDeviceNode() fdt.Node {
 }
 
 func BuildShareMount(index int, share DirectoryShare) (virtio.ShareMount, error) {
+	share, err := vmruntime.CanonicalDirectoryShare(share)
+	if err != nil {
+		return virtio.ShareMount{}, err
+	}
 	_, backend, err := buildShareBackend(index, share)
 	if err != nil {
 		return virtio.ShareMount{}, err

@@ -4,6 +4,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"j5.nz/cc/client"
@@ -18,6 +19,21 @@ import (
 	"j5.nz/cc/internal/vm/netstate"
 	"j5.nz/cc/internal/vmruntime"
 )
+
+func (i *darwinInstance) SetBalloonMB(target uint64) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("running instance has no managed session")
+	}
+	return i.session.SetBalloonMB(target)
+}
+
+func (i *darwinInstance) BalloonState() (targetMB, actualMB uint64, driverReady, supported bool) {
+	if i == nil || i.session == nil {
+		return 0, 0, false, false
+	}
+	target, actual, ready := i.session.BalloonState()
+	return target, actual, ready, true
+}
 
 type darwinInstance struct {
 	*managedInstanceCore
@@ -75,6 +91,13 @@ func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) 
 	return mounts.AddDelegatedRuntimeShare(ctx, i.session, share, "runtime shares")
 }
 
+func (i *darwinInstance) AddShares(ctx context.Context, shares []client.ShareMount) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance does not support atomic multi-share mutation")
+	}
+	return i.session.AddShares(ctx, shares)
+}
+
 func (i *darwinInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	if i == nil {
 		return mounts.AddDelegatedRuntimeImage(ctx, nil, mountPath, image)
@@ -107,6 +130,32 @@ func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
 	return i.session.VirtioFSStats()
 }
 
+func (i *darwinInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	if i == nil || i.session == nil {
+		return 0, 0, 0, nil
+	}
+	return i.session.BackingUsage()
+}
+
+func (i *darwinInstance) BackingMetadataUsage() (uint64, uint64) {
+	if i == nil || i.session == nil {
+		return 0, 0
+	}
+	return i.session.BackingMetadataUsage()
+}
+
+func (i *darwinInstance) BackingCombinedUsage() (uint64, uint64) {
+	usage := i.BackingSnapshot()
+	return usage.CombinedBytes, usage.CombinedHighWaterBytes
+}
+
+func (i *darwinInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if i == nil || i.session == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	return i.session.BackingSnapshot()
+}
+
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.managedCore().Exec(ctx, req)
 }
@@ -129,20 +178,31 @@ func (i *darwinInstance) ConsoleHistory(ctx context.Context) (string, error) {
 }
 
 func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *darwinInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
-	return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
+	if !i.ManagedCapabilities().RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
+	}
+	return i.session.RootSnapshotContext(ctx)
 }
 
 func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *darwinInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, imageName, hvfhost.ImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "Linux", i.ManagedCapabilities(), i.session, imageName, hvfhost.ImageMountPath(imageName))
 }
 
 func (i *darwinInstance) Wait() error {

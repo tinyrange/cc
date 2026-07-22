@@ -28,6 +28,7 @@ type ManagedSession struct {
 	control    io.ReadWriteCloser
 	listener   io.Closer
 	vsock      *virtio.Vsock
+	fsdevs     []*virtio.FS
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
@@ -240,6 +241,7 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()
@@ -256,6 +258,8 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.SendExec(s.control, id, req)
 	s.sendMu.Unlock()
@@ -264,11 +268,14 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	stopKeepalive := s.startExecKeepalive(ctx, execKeepalive)
 	defer stopKeepalive()
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
 	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
@@ -284,13 +291,15 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 func (s *ManagedSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.control, managedagent.SyncRequest(id))
 	s.sendMu.Unlock()
 	if err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.waitForTranscript(ctx, start, func(text string) bool {
+	segment, err := s.waitForTranscriptCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -346,6 +355,12 @@ func (s *ManagedSession) Close() error {
 	if s.done != nil {
 		_ = s.done.wait()
 	}
+	if s.transcript != nil {
+		_ = s.transcript.Close()
+	}
+	if s.serialOut != nil && s.serialOut != s.transcript {
+		_ = s.serialOut.Close()
+	}
 	return nil
 }
 
@@ -353,5 +368,5 @@ func transcriptError(err error, serialText, controlText string) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, serialText, controlText)
+	return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, boundedManagedTranscript(serialText), boundedManagedTranscript(controlText))
 }

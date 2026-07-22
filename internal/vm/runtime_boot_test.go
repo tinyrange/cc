@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -50,7 +52,7 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 
 	resp, err := env.backend.Run(ctx, client.RunRequest{
 		Image:    env.imageName,
-		MemoryMB: env.memoryMB,
+		MemoryMB: minimumGuestMemoryMB,
 		CPUs:     1,
 		Command: []string{
 			"sh",
@@ -60,6 +62,572 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	})
 	requireRunResponse(t, resp, err, 0)
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
+}
+
+func TestRuntimeLinuxExposesMatchingModuleSymbolVersions(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
+
+	resp := execInRuntime(t, inst, []string{
+		"sh",
+		"-lc",
+		`set -eu
+release=$(uname -r)
+symvers=/usr/src/linux-headers-$release/Module.symvers
+test -s "$symvers"
+test "$(readlink -f /lib/modules/$release/build/Module.symvers)" = "$symvers"
+crc=$(awk '$2 == "module_layout" { print $1; exit }' "$symvers")
+test "${crc#0x}" != "$crc"
+test "${#crc}" -eq 10
+printf 'release=%s bytes=%s\n' "$release" "$(wc -c < "$symvers")"`,
+	})
+	requireGuestOutput(t, resp.Output, "release=", "bytes=")
+}
+
+func TestRuntimeLinuxImageFSPreservesTrailingSpaceNames(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		User:     "root",
+		Command: []string{
+			"sh", "-lc",
+			"set -eu; mkdir /work; printf A > /work/collision; printf B > '/work/collision '; test \"$(cat /work/collision)\" = A; test \"$(cat '/work/collision ')\" = B; test \"$(stat -c %i /work/collision)\" != \"$(stat -c %i '/work/collision ')\"",
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
+}
+
+func TestRuntimeLinuxImageFSLargeDirectoryListing(t *testing.T) {
+	const files = 30000
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "imagefs-large-directory", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+
+	execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", fmt.Sprintf(`set -eu; mkdir /many; i=0; while [ "$i" -lt %d ]; do : >"/many/entry-$i"; i=$((i+1)); done`, files)},
+		User:    "root",
+	})
+	listings := []struct{ name, script string }{
+		{"find", fmt.Sprintf(`set -eu; test "$(find /many -maxdepth 1 -type f | wc -l)" -eq %d`, files)},
+		{"ls", `set -eu; ls -1 /many >/dev/null`},
+	}
+	for _, listing := range listings {
+		started := time.Now()
+		execInRuntimeRequest(t, inst, client.ExecRequest{Command: []string{"sh", "-lc", listing.script}, User: "root"})
+		elapsed := time.Since(started)
+		if elapsed > 15*time.Second {
+			t.Fatalf("%s of %d imageFS entries took %s", listing.name, files, elapsed)
+		}
+		t.Logf("%s of %d imageFS entries completed in %s", listing.name, files, elapsed)
+	}
+	execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", `set -eu
+test "$(stat -c %h /many/entry-9999)" -eq 1
+ln /many/entry-9999 /many/alias
+test "$(stat -c %h /many/entry-9999)" -eq 2
+rm /many/alias
+test "$(stat -c %h /many/entry-9999)" -eq 1
+chmod 640 /many/entry-9999
+test "$(stat -c %a /many/entry-9999)" = 640
+printf payload >/many/entry-9999
+test "$(stat -c %s /many/entry-9999)" -eq 7
+mv /many/entry-9999 /many/renamed
+test ! -e /many/entry-9999
+test "$(cat /many/renamed)" = payload`},
+		User: "root",
+	})
+}
+
+func TestRuntimeLinuxImageFSKernelPermissionAndDirectorySemantics(t *testing.T) {
+	t.Setenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR", t.TempDir())
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "imagefs-posix-semantics", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+
+	setup := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; printf 'cc:x:1000:1000:cc:/home/cc:/bin/sh\n' >>/etc/passwd; printf 'cc:x:1000:\nshared:x:2345:cc\n' >>/etc/group; mkdir /work; chown 1000:1000 /work; mkdir /work/shared; chown root:2345 /work/shared; chmod 2770 /work/shared; printf root >/work/root-only; chmod 0600 /work/root-only"},
+		User:    "root",
+	})
+	if setup.ExitCode != 0 {
+		t.Fatalf("set up imageFS semantics fixture: %s", setup.Output)
+	}
+
+	user := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; printf group-access >/work/shared/file; mkdir /work/shared/child; test \"$(stat -c %g /work/shared/file)\" = 2345; test \"$(stat -c %g /work/shared/child)\" = 2345; test $(( $(stat -c %a /work/shared/child) / 1000 % 10 & 2 )) -eq 2; printf owned >/work/owned; chgrp 2345 /work/owned; test \"$(stat -c %g /work/owned)\" = 2345; if chgrp 999 /work/owned 2>/dev/null; then exit 90; fi; if printf denied >/work/root-only 2>/dev/null; then exit 91; fi"},
+		User:    "cc",
+	})
+	if user.ExitCode != 0 {
+		t.Fatalf("supplementary-group or setgid behavior failed: %s", user.Output)
+	}
+
+	privilegeBits := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; printf tool >/work/shared/tool; chmod 6755 /work/shared/tool; printf changed >>/work/shared/tool; test $(( $(stat -c %a /work/shared/tool) / 1000 )) -eq 0"},
+		User:    "cc",
+	})
+	if privilegeBits.ExitCode != 0 {
+		t.Fatalf("privilege bits survived an unprivileged write: %s", privilegeBits.Output)
+	}
+}
+
+func TestRuntimeCancelsInteractiveShellWithBlockedForegroundCommand(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "cancel-interactive-shell", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	inputs := make(chan client.ExecInput, 1)
+	inputs <- client.ExecInput{Kind: "stdin", Data: []byte("trap '' TERM INT\nprintf 'ready\\n'\nsleep 60\n")}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- inst.ExecStream(ctx, client.ExecRequest{Command: []string{"/bin/sh"}}, inputs, func(event client.ExecEvent) error {
+			if event.Kind == "stdout" && strings.Contains(event.Output, "ready") {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(runtimeExecTimeout()):
+		cancel()
+		t.Fatal("interactive shell did not start its foreground command")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("interactive shell cancellation = %v, want context canceled", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("interactive shell cancellation did not terminate and reap the foreground command")
+	}
+}
+
+func TestRuntimeContainsDetachedCommandWithoutGuestEnvironmentMarkers(t *testing.T) {
+	t.Setenv("CCX3_VM_TEST_GUEST_INIT_CACHE_DIR", t.TempDir())
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "detached-command-containment", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+
+	started := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-c", `set -eu; test "${CC_EXEC_FAMILY-unset}" = user-value; env -u CC_EXEC_FAMILY setsid sh -c 'trap "" TERM HUP INT; exec sleep 30' >/dev/null 2>&1 & echo $! >/tmp/detached.pid`},
+		Env:     []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "CC_EXEC_FAMILY=user-value"},
+		User:    "root",
+	})
+	if started.ExitCode != 0 {
+		t.Fatalf("start detached workload: %s", started.Output)
+	}
+	checked := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", `set -eu; pid=$(cat /tmp/detached.pid); i=0; while kill -0 "$pid" 2>/dev/null && test "$i" -lt 100; do i=$((i+1)); sleep .01; done; ! kill -0 "$pid" 2>/dev/null`},
+		User:    "root",
+	})
+	if checked.ExitCode != 0 {
+		t.Fatalf("detached workload survived command completion: %s", checked.Output)
+	}
+}
+
+func TestRuntimeArchiveControlsInitializeUserHomeAndPreserveHardLinks(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-user-home", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	rootFirst := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/true"},
+		WorkDir: "/home/cc",
+		User:    "root",
+	})
+	if rootFirst.ExitCode != 0 {
+		t.Fatalf("root command in shared workspace exited with %d: %s", rootFirst.ExitCode, rootFirst.Output)
+	}
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind:      "fs_extract",
+		Path:      "/home/cc/first-copy",
+		Directory: true,
+		Stdin:     tarPayload(t, map[string]string{"payload.txt": "first-copy"}),
+		User:      "1000:1000",
+	}, 0)
+	first := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; test \"$(stat -c %u:%g /home/cc)\" = 1000:1000; cat /home/cc/first-copy/payload.txt"},
+		User:    "1000:1000",
+	})
+	requireGuestOutput(t, first.Output, "first-copy")
+
+	created := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; mkdir -p /home/cc/links; printf linked >/home/cc/links/first; ln /home/cc/links/first /home/cc/links/second"},
+		User:    "1000:1000",
+	})
+	if created.ExitCode != 0 {
+		t.Fatalf("create guest hard links exited with %d: %s", created.ExitCode, created.Output)
+	}
+	archive := runRuntimeControl(t, inst, client.ExecRequest{Kind: "fs_archive", Path: "/home/cc/links", User: "1000:1000"}, 0)
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/home/cc/copied-links", Directory: true, Stdin: archive, User: "1000:1000",
+	}, 0)
+	verified := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; a=$(stat -c %i /home/cc/copied-links/links/first); b=$(stat -c %i /home/cc/copied-links/links/second); test \"$a\" = \"$b\"; test \"$(stat -c %h /home/cc/copied-links/links/first)\" -eq 2; printf change >/home/cc/copied-links/links/first; test \"$(cat /home/cc/copied-links/links/second)\" = change"},
+		User:    "1000:1000",
+	})
+	if verified.ExitCode != 0 {
+		t.Fatalf("copied hard-link topology check exited with %d: %s", verified.ExitCode, verified.Output)
+	}
+}
+
+func TestRuntimeArchiveTransferKeepsSparseFilesSparse(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-sparse-file", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+	created := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; mkdir /work; chown 1000:1000 /work"}, User: "root",
+	})
+	if created.ExitCode != 0 {
+		t.Fatalf("prepare sparse guest tree: %s", created.Output)
+	}
+	created = execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; mkdir -p /work/sparse-source; dd if=/dev/zero of=/work/sparse-source/file bs=1 count=0 seek=67108864 2>/dev/null; printf tail | dd of=/work/sparse-source/file bs=1 seek=67108860 conv=notrunc 2>/dev/null"},
+		User:    "1000:1000",
+	})
+	if created.ExitCode != 0 {
+		t.Fatalf("create sparse guest file: %s", created.Output)
+	}
+	archive := runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_archive", Path: "/work/sparse-source", User: "1000:1000",
+	}, 0)
+	if len(archive) > 1<<20 {
+		t.Fatalf("mounted sparse archive expanded to %d bytes", len(archive))
+	}
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/work/sparse-copy", Directory: true, Stdin: archive, User: "1000:1000",
+	}, 0)
+	verified := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; file=/work/sparse-copy/sparse-source/file; test \"$(stat -c %s \"$file\")\" = 67108864; test \"$(tail -c 4 \"$file\")\" = tail; test $(( $(stat -c %b \"$file\") * 512 )) -lt 1048576"},
+		User:    "1000:1000",
+	})
+	if verified.ExitCode != 0 {
+		t.Fatalf("sparse artifact round trip expanded or corrupted the file: %s", verified.Output)
+	}
+}
+
+func TestRuntimeArchiveTransferPreservesMountedXattrs(t *testing.T) {
+	sourceDir := t.TempDir()
+	sourceFile := filepath.Join(sourceDir, "file")
+	if err := os.WriteFile(sourceFile, []byte("xattr-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantValue := []byte{0, 1, 0xff}
+	if err := setRuntimeTestXattr(sourceFile, "user.vmsh-test", wantValue); err != nil {
+		t.Skipf("host test filesystem does not support user xattrs: %v", err)
+	}
+	info, err := os.Lstat(sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input bytes.Buffer
+	if err := writeRuntimePathTar(&input, sourceDir, filepath.Base(sourceDir), info); err != nil {
+		t.Fatal(err)
+	}
+
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-xattrs", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+	prepared := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", "mkdir /work; chown 1000:1000 /work"}, User: "root",
+	})
+	if prepared.ExitCode != 0 {
+		t.Fatalf("prepare mounted xattr destination: %s", prepared.Output)
+	}
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/work/xattr-copy", Directory: true, Stdin: input.Bytes(), User: "1000:1000",
+	}, 0)
+	archive := runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_archive", Path: "/work/xattr-copy", User: "1000:1000",
+	}, 0)
+	wantKey := "VMSH.xattr." + base64.RawURLEncoding.EncodeToString([]byte("user.vmsh-test"))
+	reader := tar.NewReader(bytes.NewReader(archive))
+	found := false
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, ok := header.PAXRecords[wantKey]
+		if !ok {
+			continue
+		}
+		value, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(value, wantValue) {
+			t.Fatalf("mounted xattr value = %v, want %v", value, wantValue)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("mounted artifact archive omitted the user xattr")
+	}
+}
+
+func TestRuntimeArchiveControlEnforcesSparseLogicalLimits(t *testing.T) {
+	const maxFile = int64(64 << 20)
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	header := &tar.Header{
+		Name: "oversized", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{
+			"VMSH.sparse.size":      strconv.FormatInt(maxFile+1, 10),
+			"VMSH.sparse.numblocks": "1",
+			"VMSH.sparse.map":       strconv.FormatInt(maxFile, 10) + ",1",
+		},
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write([]byte{'x'})
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "archive-sparse-limits", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/work/oversized", Stdin: archive.Bytes(), User: "root",
+		ArchiveLimits: &client.ArchiveLimits{MaxEntries: 10, MaxFileBytes: maxFile, MaxExpandedBytes: maxFile},
+	}, 1)
+	probe := execInRuntimeRequest(t, inst, client.ExecRequest{Command: []string{"/bin/sh", "-c", "test ! -e /work/oversized"}, User: "root"})
+	if probe.ExitCode != 0 {
+		t.Fatalf("rejected sparse archive left a destination behind: %s", probe.Output)
+	}
+}
+
+func TestRuntimeMountedImageFSRejectsUnsafeExchangeAndHonorsPOSIXLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("runtime helper archive requires a POSIX host")
+	}
+	helperDir := t.TempDir()
+	renameat2Syscall := 316
+	if runtime.GOARCH == "arm64" {
+		renameat2Syscall = 276
+	} else if runtime.GOARCH != "amd64" {
+		t.Skipf("renameat2 test helper does not define the syscall number for %s", runtime.GOARCH)
+	}
+	source := fmt.Sprintf(`package main
+import ("fmt"; "os"; "syscall"; "time"; "unsafe")
+func main() {
+	if os.Args[1] == "noreplace" {
+		old, new := "/work/noreplace-old", "/work/noreplace-new"
+		os.Remove(old); os.Remove(new); os.WriteFile(old, []byte("SOURCE"), 0600)
+		op, _ := syscall.BytePtrFromString(old); np, _ := syscall.BytePtrFromString(new)
+		atFDCWD := ^uintptr(99)
+		_, _, errno := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(op)), atFDCWD, uintptr(unsafe.Pointer(np)), 1, 0)
+		if errno != 0 { panic(errno) }
+		if _, err := os.Stat(old); !os.IsNotExist(err) { os.Exit(6) }
+		data, err := os.ReadFile(new); if err != nil || string(data) != "SOURCE" { os.Exit(7) }
+		fmt.Println("noreplace-renamed"); return
+	}
+	if os.Args[1] == "noreplace-existing" {
+		a, b, c := "/work/sequence-a", "/work/sequence-b", "/work/sequence-c"
+		os.Remove(a); os.Remove(b); os.Remove(c); os.WriteFile(a, []byte("A"), 0600)
+		ap, _ := syscall.BytePtrFromString(a); bp, _ := syscall.BytePtrFromString(b); cp, _ := syscall.BytePtrFromString(c)
+		atFDCWD := ^uintptr(99)
+		_, _, first := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(ap)), atFDCWD, uintptr(unsafe.Pointer(bp)), 1, 0)
+		if first != 0 { panic(first) }
+		os.WriteFile(c, []byte("C"), 0600)
+		_, _, second := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(bp)), atFDCWD, uintptr(unsafe.Pointer(cp)), 1, 0)
+		if second != syscall.EEXIST { fmt.Printf("second=%%v\n", second); os.Exit(10) }
+		bd, _ := os.ReadFile(b); cd, _ := os.ReadFile(c)
+		if string(bd) != "A" || string(cd) != "C" { os.Exit(11) }
+		fmt.Println("noreplace-existing-preserved"); return
+	}
+	if os.Args[1] == "hardlinks" {
+		a, b := "/work/link-a", "/work/link-b"; os.Remove(a); os.Remove(b)
+		if err := os.WriteFile(a, []byte("x"), 0600); err != nil { panic(err) }
+		if err := os.Link(a, b); err != nil { panic(err) }
+		info, err := os.Stat(a); if err != nil || info.Sys().(*syscall.Stat_t).Nlink != 2 { os.Exit(8) }
+		if err := os.Remove(b); err != nil { panic(err) }
+		info, err = os.Stat(a); if err != nil || info.Sys().(*syscall.Stat_t).Nlink != 1 { os.Exit(9) }
+		fmt.Println("hardlink-counts-current"); return
+	}
+ if os.Args[1] == "opendir" {
+  path := "/work/open-directory"
+  if err := os.Mkdir(path, 0700); err != nil { panic(err) }
+  dir, err := os.Open(path); if err != nil { panic(err) }
+  if err := os.Remove(path); err != nil { panic(err) }
+  if _, err := dir.Stat(); err != nil { panic(err) }
+  fmt.Println("open-directory-alive"); return
+ }
+ if os.Args[1] == "exchange" {
+  left, right := "/work/exchange-left", "/work/exchange-right"
+  os.WriteFile(left, []byte("LEFT"), 0600); os.WriteFile(right, []byte("RIGHT"), 0600)
+  lp, _ := syscall.BytePtrFromString(left); rp, _ := syscall.BytePtrFromString(right)
+  atFDCWD := ^uintptr(99)
+  _, _, errno := syscall.Syscall6(%d, atFDCWD, uintptr(unsafe.Pointer(lp)), atFDCWD, uintptr(unsafe.Pointer(rp)), 2, 0)
+  if errno == 0 { os.Exit(4) }
+  l, _ := os.ReadFile(left); r, _ := os.ReadFile(right)
+  if string(l) != "LEFT" || string(r) != "RIGHT" { os.Exit(5) }
+  fmt.Println("exchange-blocked"); return
+ }
+ f, err := os.OpenFile(os.Args[2], os.O_CREATE|os.O_RDWR, 0600); if err != nil { panic(err) }
+ lock := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+ err = syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lock)
+ if os.Args[1] == "hold" { if err != nil { panic(err) }; fmt.Println("locked"); time.Sleep(30*time.Second); return }
+ if err == syscall.EAGAIN || err == syscall.EACCES { fmt.Println("blocked"); return }
+ if err != nil { panic(err) }
+ os.Exit(3)
+}`, renameat2Syscall, renameat2Syscall, renameat2Syscall, renameat2Syscall)
+	sourcePath := filepath.Join(helperDir, "main.go")
+	binaryPath := filepath.Join(helperDir, "lock-helper")
+	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-trimpath", "-o", binaryPath, sourcePath)
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build POSIX lock helper: %v\n%s", err, output)
+	}
+	info, err := os.Lstat(binaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload bytes.Buffer
+	if err := writeRuntimePathTar(&payload, binaryPath, "lock-helper", info); err != nil {
+		t.Fatal(err)
+	}
+
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		ID: "imagefs-posix-locks", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
+	})
+	defer inst.Close()
+	runRuntimeControl(t, inst, client.ExecRequest{
+		Kind: "fs_extract", Path: "/work/lock-bin", Directory: true, Stdin: payload.Bytes(), User: "root",
+	}, 0)
+	exchange := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper exchange"}, User: "root",
+	})
+	if exchange.ExitCode != 0 {
+		t.Fatalf("mounted RENAME_EXCHANGE did not fail safely: exit=%d output=%s", exchange.ExitCode, exchange.Output)
+	}
+	noreplace := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper noreplace"}, User: "root",
+	})
+	if noreplace.ExitCode != 0 {
+		t.Fatalf("mounted RENAME_NOREPLACE failed for an absent target: exit=%d output=%s", noreplace.ExitCode, noreplace.Output)
+	}
+	contextInputs := make(chan client.ExecInput, 2)
+	var contextControl strings.Builder
+	var contextExit *int
+	commandSent := false
+	if err := inst.ExecStream(context.Background(), client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "printf 'ready\\n' >&3; IFS= read -r command; eval \"$command\"; status=$?; printf 'complete:%s\\n' \"$status\" >&3; exit \"$status\""},
+		User:    "root", ControlFD: true,
+	}, contextInputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			data := event.Data
+			if len(data) == 0 {
+				data = []byte(event.Output)
+			}
+			contextControl.Write(data)
+			if !commandSent && strings.Contains(contextControl.String(), "ready\n") {
+				commandSent = true
+				contextInputs <- client.ExecInput{Kind: "stdin", Data: []byte("/work/lock-bin/lock-helper noreplace-existing\n")}
+				close(contextInputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			contextExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("persistent root rename sequence: %v; control=%q", err, contextControl.String())
+	}
+	if !commandSent || contextExit == nil || *contextExit != 0 || contextControl.String() != "ready\ncomplete:0\n" {
+		t.Fatalf("persistent root rename completion: sent=%t exit=%v control=%q", commandSent, contextExit, contextControl.String())
+	}
+	hardlinks := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper hardlinks"}, User: "root",
+	})
+	if hardlinks.ExitCode != 0 {
+		t.Fatalf("mounted hard-link attributes remained stale: exit=%d output=%s", hardlinks.ExitCode, hardlinks.Output)
+	}
+	openDirectory := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper opendir"}, User: "root",
+	})
+	if openDirectory.ExitCode != 0 {
+		t.Fatalf("open directory descriptor did not survive rmdir: exit=%d output=%s", openDirectory.ExitCode, openDirectory.Output)
+	}
+	holdCtx, holdCancel := context.WithCancel(context.Background())
+	defer holdCancel()
+	inputs := make(chan client.ExecInput, 1)
+	inputs <- client.ExecInput{Kind: "stdin_close"}
+	locked := make(chan struct{})
+	holdDone := make(chan error, 1)
+	var holdOutput strings.Builder
+	go func() {
+		holdDone <- inst.ExecStream(holdCtx, client.ExecRequest{
+			Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper hold /work/lock-target"}, User: "root",
+		}, inputs, func(event client.ExecEvent) error {
+			data := event.Data
+			if len(data) == 0 {
+				data = []byte(event.Output)
+			}
+			holdOutput.Write(data)
+			if event.Kind == "stdout" && strings.Contains(holdOutput.String(), "locked\n") {
+				select {
+				case <-locked:
+				default:
+					close(locked)
+				}
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case err := <-holdDone:
+		t.Fatalf("lock holder exited before acquiring its lock: %v output=%s", err, holdOutput.String())
+	case <-time.After(runtimeExecTimeout()):
+		holdCancel()
+		t.Fatal("lock holder did not acquire its POSIX lock")
+	}
+	probe := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "exec /work/lock-bin/lock-helper try /work/lock-target"}, User: "root",
+	})
+	if probe.ExitCode != 0 {
+		t.Fatalf("conflicting POSIX lock was not blocked: exit=%d output=%s", probe.ExitCode, probe.Output)
+	}
+	holdCancel()
+	select {
+	case <-holdDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lock holder did not stop after cancellation")
+	}
 }
 
 func TestRuntimeBootsLinuxWithVirtioBalloon(t *testing.T) {
@@ -93,6 +661,73 @@ printf 'virtio-balloon-ok\n'`,
 		},
 	})
 	requireRunResponse(t, resp, err, 0)
+}
+
+func TestRuntimeNamedBlankImagePreservesInitialBalloonTarget(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("dynamic balloon recovery is currently implemented by Linux amd64 KVM")
+	}
+	env := newRuntimeBootEnv(t)
+	manager := NewManagerWithBackend(env.backend)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	const id = "blank-image-balloon"
+	state, err := manager.StartBlank(ctx, client.StartInstanceRequest{
+		ID: id, Image: env.imageName, MemoryMB: 768, BalloonMB: 384, CPUs: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.ShutdownAll(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for state.BalloonStatus != "converged" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		state = manager.StatusOf(id)
+	}
+	if state.BalloonMB != 384 || state.BalloonActualMB != 384 || state.BalloonStatus != "converged" {
+		t.Fatalf("named blank-image balloon state = %+v", state)
+	}
+}
+
+func TestRuntimeRetargetsBalloonWhileGuestRemainsRunning(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("dynamic balloon recovery is currently implemented by Linux amd64 KVM")
+	}
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{MemoryMB: 768})
+	defer inst.Close()
+	controller, ok := inst.(interface{ SetBalloonMB(uint64) error })
+	if !ok {
+		t.Fatal("running Linux VM does not expose dynamic balloon control")
+	}
+	if err := controller.SetBalloonMB(384); err != nil {
+		t.Fatal(err)
+	}
+	shrunk := execInRuntime(t, inst, []string{"sh", "-lc", `
+for attempt in $(seq 1 100); do
+	memory_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	if test "$memory_kb" -lt 600000; then printf '%s\n' "$memory_kb"; exit 0; fi
+	sleep 0.02
+done
+exit 1
+`})
+	if shrunk.ExitCode != 0 {
+		t.Fatalf("guest did not relinquish memory: %s", shrunk.Output)
+	}
+	if err := controller.SetBalloonMB(0); err != nil {
+		t.Fatal(err)
+	}
+	restored := execInRuntime(t, inst, []string{"sh", "-lc", `
+for attempt in $(seq 1 100); do
+	memory_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	if test "$memory_kb" -gt 700000; then printf '%s\n' "$memory_kb"; exit 0; fi
+	sleep 0.02
+done
+exit 1
+`})
+	if restored.ExitCode != 0 {
+		t.Fatalf("guest memory was not restored after pressure: %s", restored.Output)
+	}
 }
 
 func TestRuntimeOneShotReportsNonZeroExitAndStderr(t *testing.T) {
@@ -207,14 +842,14 @@ func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
 	}
 
 	resp, err := inst.Exec(ctx, client.ExecRequest{
-		Command: []string{"sh", "-c", "set -eu; pkg_info -q >/tmp/pkg-list; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
+		Command: []string{"sh", "-c", "set -eu; test \"$(date +%z)\" = +0000; pkg_info -q >/tmp/pkg-list; cc --version >/tmp/cc-version; test -s /tmp/cc-version"},
 		WorkDir: "/tmp",
 	})
 	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
-	_, _ = bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
+	ctx, inst := bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
 		name:     "FreeBSD",
 		envVar:   "CC_TEST_FREEBSD_KVM",
 		image:    "@freebsd",
@@ -223,6 +858,16 @@ func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
 		guestOS:  "FreeBSD",
 		label:    "freebsd",
 	})
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "set -eu; printf A > /tmp/collision; printf B > '/tmp/collision '; test \"$(cat /tmp/collision)\" = A; test \"$(cat '/tmp/collision ')\" = B; mkdir /tmp/work '/tmp/work '; : > /tmp/work/plain; : > '/tmp/work '/spaced"},
+		WorkDir: "/tmp",
+	})
+	requireRunResponse(t, resp, err, 0)
+	resp, err = inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "test -f spaced; test ! -e plain"},
+		WorkDir: "/tmp/work ",
+	})
+	requireRunResponse(t, resp, err, 0)
 }
 
 func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {
@@ -287,6 +932,20 @@ func bootManagedBSDRuntimeContract(t *testing.T, tc managedBSDRuntimeBootCase) (
 	if resp.ExitCode != 0 || normalized != expectedOutput {
 		t.Fatalf("%s exec response = code %d output %q, want %q", tc.name, resp.ExitCode, resp.Output, expectedOutput)
 	}
+
+	const escalationProbe = "/root/cc-nonroot-escalation-probe"
+	nonRoot, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "touch " + escalationProbe},
+		WorkDir: "/",
+		User:    "1000:1000",
+	})
+	requireRunResponse(t, nonRoot, err, 126)
+	probe, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "test ! -e " + escalationProbe},
+		WorkDir: "/",
+		User:    "root",
+	})
+	requireRunResponse(t, probe, err, 0)
 
 	var controlOutput string
 	var controlExit *int
@@ -389,7 +1048,7 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				Image:    env.imageName,
 				MemoryMB: env.memoryMB,
 				CPUs:     1,
-				User:     "daemon",
+				User:     "daemon:",
 				Command:  []string{"sh", "-lc", "true"},
 			},
 		},
@@ -402,6 +1061,25 @@ func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 				t.Fatalf("invalid request unexpectedly succeeded: %+v", resp)
 			}
 		})
+	}
+}
+
+func TestRuntimeRunsAsNamedGuestUser(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		User:     "daemon",
+		Command:  []string{"sh", "-lc", `test "$(id -un)" = daemon`},
+	})
+	if err != nil {
+		t.Fatalf("run as named guest user: %v", err)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("run as named guest user exit code = %d, output = %q", resp.ExitCode, resp.Output)
 	}
 }
 
@@ -613,15 +1291,20 @@ func TestRuntimeRestoresPersistentFromStartupSnapshot(t *testing.T) {
 	}
 
 	snapshotPath := singleSnapshotPath(t, snapshotRoot, captureConsole)
-	restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
-		RestoreSnapshot: snapshotPath,
-		MemoryMB:        256,
-		CPUs:            1,
-	})
-	defer restored.Close()
-
-	resp := execInRuntime(t, restored, []string{"sh", "-lc", "set -eu; printf 'restored-startup-snapshot\n'; cat /proc/sys/kernel/ostype"})
-	requireGuestOutput(t, resp.Output, "restored-startup-snapshot", "Linux")
+	shareRoot := t.TempDir()
+	share := client.ShareMount{Source: shareRoot, Mount: "/host", Writable: true, MapOwner: true, OwnerUID: 1000, OwnerGID: 1000, Cache: "strict"}
+	for restore := 0; restore < 3; restore++ {
+		restored := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+			RestoreSnapshot: snapshotPath,
+			MemoryMB:        256,
+			CPUs:            1,
+			Shares:          []client.ShareMount{share},
+		})
+		execPersistentControlInRuntime(t, restored)
+		if err := restored.Close(); err != nil {
+			t.Fatalf("close restored instance %d: %v", restore, err)
+		}
+	}
 }
 
 func TestRuntimeSnapshotAppliesCurrentBalloonTarget(t *testing.T) {
@@ -785,6 +1468,71 @@ func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
 	}
 }
 
+func TestRuntimeGuestPoweroffTerminatesSessionAndActiveCommand(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	execDone := make(chan error, 1)
+	go func() {
+		_, err := inst.Exec(context.Background(), client.ExecRequest{Command: []string{"poweroff", "-f"}, User: "root"})
+		execDone <- err
+	}()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- inst.Wait() }()
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("guest poweroff was classified as a crash: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guest poweroff left the VM session running")
+	}
+	select {
+	case <-execDone:
+	case <-time.After(time.Second):
+		t.Fatal("guest poweroff left the initiating command running")
+	}
+}
+
+func TestRuntimePersistentLifecycleRemainsResponsiveDuringBulkOutput(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
+
+	const producers = 8
+	start := make(chan struct{})
+	done := make(chan error, producers)
+	for range producers {
+		go func() {
+			<-start
+			done <- inst.ExecStream(context.Background(), client.ExecRequest{
+				Command: []string{"sh", "-lc", "head -c 4194304 /dev/zero"},
+			}, nil, func(client.ExecEvent) error { return nil })
+		}()
+	}
+	close(start)
+	time.Sleep(25 * time.Millisecond)
+
+	controlCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := inst.Exec(controlCtx, client.ExecRequest{Command: []string{"/bin/true"}})
+	if err != nil {
+		t.Fatalf("control command was starved by bulk output: %v", err)
+	}
+	if response.ExitCode != 0 {
+		t.Fatalf("control command exit = %d", response.ExitCode)
+	}
+	for range producers {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("bulk output command: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("bulk output command did not complete")
+		}
+	}
+}
+
 func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	readOnlyShare := t.TempDir()
@@ -837,7 +1585,7 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	rootMount := execInRuntime(t, inst, []string{
 		"sh",
 		"-lc",
-		"set -eu; awk '$4 == \"/\" && $5 == \"/\" { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo; printf 'root-mount-ok\n'",
+		"set -eu; awk '$4 == \"/\" && $5 == \"/\" { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo; df -k / >/tmp/root-df; test -s /tmp/root-df; printf 'root-mount-ok\n'",
 	})
 	requireGuestOutput(t, rootMount.Output, "root-mount-ok")
 
@@ -1317,7 +2065,7 @@ func execInRuntimeInstanceStream(t *testing.T, env *runtimeBootEnv, inst Instanc
 	var exitCode *int
 	err := env.backend.ExecInInstanceStream(ctx, inst, env.imageName, req, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
-		case "stdout", "stderr":
+		case "stdout", "stderr", "control":
 			writeExecEventOutput(&output, event)
 		case "exit":
 			code := event.ExitCode
@@ -1373,7 +2121,7 @@ func execStreamInRuntime(t *testing.T, inst Instance, req client.ExecRequest, in
 	var exitCode *int
 	err := inst.ExecStream(ctx, req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
-		case "stdout", "stderr":
+		case "stdout", "stderr", "control":
 			writeExecEventOutput(&output, event)
 		case "exit":
 			code := event.ExitCode
@@ -1391,6 +2139,46 @@ func execStreamInRuntime(t *testing.T, inst Instance, req client.ExecRequest, in
 		t.Fatalf("stream guest exec %q exited with %d, want %d\noutput:\n%s", req.Command, *exitCode, wantExit, output.String())
 	}
 	return output.String()
+}
+
+func execPersistentControlInRuntime(t *testing.T, inst Instance) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeExecTimeout())
+	defer cancel()
+	inputs := make(chan client.ExecInput, 1)
+	ready := false
+	var control bytes.Buffer
+	var output bytes.Buffer
+	var exitCode *int
+	err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"/bin/sh", "-c", "stty -echo; printf 'ready\\n' >&3; IFS= read -r command; eval \"$command\"; status=$?; printf 'complete:%s\\n' \"$status\" >&3; exit \"$status\""},
+		ControlFD: true,
+		TTY:       true,
+		WorkDir:   "/host",
+		User:      "1000",
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			writeExecEventOutput(&control, event)
+			if !ready {
+				ready = true
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'warm-command\\n'; test \"$PWD\" = /host\n")}
+				close(inputs)
+			}
+		case "stdout":
+			writeExecEventOutput(&output, event)
+		case "exit":
+			code := event.ExitCode
+			exitCode = &code
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("persistent restored guest shell: %v; control=%q output=%q console=%q", err, control.String(), output.String(), runtimeConsoleHistory(inst))
+	}
+	if !ready || exitCode == nil || *exitCode != 0 || control.String() != "ready\ncomplete:0\n" || strings.ReplaceAll(output.String(), "\r\n", "\n") != "warm-command\n" {
+		t.Fatalf("persistent restored guest shell ready=%t exit=%v control=%q output=%q", ready, exitCode, control.String(), output.String())
+	}
 }
 
 func execStreamSignalOnOutput(t *testing.T, inst Instance) string {

@@ -61,6 +61,36 @@ func TestLinuxEndpointQueueIsBoundedFIFO(t *testing.T) {
 	}
 }
 
+func TestLinuxSwitchConsumesKnownPeerUnicast(t *testing.T) {
+	switchNet := newLinuxVirtualSwitch()
+	leaseA := mustRegisterLinuxLease(t, switchNet, "a", nil)
+	leaseB := mustRegisterLinuxLease(t, switchNet, "b", nil)
+	a := &linuxNetworkRuntime{
+		networkRuntime: &networkRuntime{id: leaseA.id, ip: leaseA.ip, mac: leaseA.mac},
+		rxQueue:        make(chan []byte, 1),
+	}
+	b := &linuxNetworkRuntime{
+		networkRuntime: &networkRuntime{id: leaseB.id, ip: leaseB.ip, mac: leaseB.mac},
+		rxQueue:        make(chan []byte, 1),
+	}
+	switchNet.Attach(a)
+	switchNet.Attach(b)
+	frame := make([]byte, 14)
+	copy(frame[:6], leaseB.mac)
+	copy(frame[6:12], leaseA.mac)
+	frame[12], frame[13] = 0x08, 0x00
+	if !switchNet.Forward(a, frame) {
+		t.Fatal("known peer unicast was not consumed by virtual switch")
+	}
+	if got := <-b.rxQueue; !bytes.Equal(got, frame) {
+		t.Fatalf("forwarded frame = %x, want %x", got, frame)
+	}
+	copy(frame[:6], defaultGatewayMACBytes)
+	if switchNet.Forward(a, frame) {
+		t.Fatal("gateway frame was consumed instead of reaching netstack")
+	}
+}
+
 func mustRegisterLinuxLease(t *testing.T, s *linuxVirtualSwitch, id string, cfg *client.NetworkConfig) linuxNetworkLease {
 	t.Helper()
 	lease, err := s.Register(id, cfg)

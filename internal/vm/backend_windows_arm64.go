@@ -54,6 +54,10 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -135,7 +139,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			fsdevs:              fsdevs,
 			network:             network,
 			dmesg:               req.Dmesg,
-			mounts:              mounts.NewState(req.Shares),
+			mounts:              mountState,
 		}, nil
 	}
 	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(image), windowsRuntimeModuleMap())
@@ -169,6 +173,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, ""); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
@@ -205,7 +212,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		fsdevs:              fsdevs,
 		network:             network,
 		dmesg:               req.Dmesg,
-		mounts:              mounts.NewState(req.Shares),
+		mounts:              mountState,
 	}, nil
 }
 
@@ -216,9 +223,11 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Image:           req.Image,
 			InitSystem:      req.InitSystem,
 			Kernel:          req.Kernel,
+			Shares:          append([]client.ShareMount(nil), req.Shares...),
 			Network:         req.Network,
 			KernelModules:   append([]string(nil), req.KernelModules...),
 			MemoryMB:        req.MemoryMB,
+			BalloonMB:       req.BalloonMB,
 			CPUs:            req.CPUs,
 			NestedVirt:      req.NestedVirt,
 			Dmesg:           req.Dmesg,
@@ -282,6 +291,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, ""); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
@@ -366,7 +378,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, runExecRequest(req))
+		return inst.Exec(ctx, runningVMExecRequest(req))
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
@@ -410,7 +422,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return err
 		}
-		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+		return inst.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
@@ -503,7 +515,7 @@ type windowsInstance struct {
 	fsdevs  []*virtio.FS
 	dmesg   bool
 	network *windowsNetworkRuntime
-	mounts  mounts.State
+	mounts  *mounts.State
 }
 
 func (i *windowsInstance) ManagedCapabilities() guestCapabilities {
@@ -551,6 +563,34 @@ func (i *windowsInstance) VirtioFSStats() []virtio.FSStats {
 		return nil
 	}
 	return virtioFSStats(i.fsdevs)
+}
+
+func (i *windowsInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	if i == nil {
+		return 0, 0, 0, nil
+	}
+	return virtioFSBackingUsage(i.fsdevs)
+}
+
+func (i *windowsInstance) BackingMetadataUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingMetadataUsage(i.fsdevs)
+}
+
+func (i *windowsInstance) BackingCombinedUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingCombinedUsage(i.fsdevs)
+}
+
+func (i *windowsInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if i == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	return virtioFSBackingSnapshot(i.fsdevs)
 }
 
 func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {

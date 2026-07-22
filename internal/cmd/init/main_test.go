@@ -3,18 +3,107 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"j5.nz/cc/internal/managed/guestagent"
 )
+
+func TestConfigurePackageManagersDoesNotDisableAptPipelining(t *testing.T) {
+	root := t.TempDir()
+	aptPath := filepath.Join(root, "usr", "bin", "apt")
+	configPath := filepath.Join(root, "etc", "apt", "apt.conf.d", "99ccvm-netstack")
+	if err := os.MkdirAll(filepath.Dir(aptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aptPath, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`Acquire::http::Pipeline-Depth "0";`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := configurePackageManagers(root); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		config[fields[0]] = strings.Trim(fields[1], `";`)
+	}
+	if _, ok := config["Acquire::http::Pipeline-Depth"]; ok {
+		t.Fatalf("HTTP pipelining was overridden: %q", config["Acquire::http::Pipeline-Depth"])
+	}
+	if _, ok := config["Acquire::https::Pipeline-Depth"]; ok {
+		t.Fatalf("HTTPS pipelining was overridden: %q", config["Acquire::https::Pipeline-Depth"])
+	}
+	if config["Acquire::Queue-Mode"] != "access" {
+		t.Fatalf("queue mode = %q, want access", config["Acquire::Queue-Mode"])
+	}
+}
+
+func TestInstallModuleSymversUsesKernelBuildPath(t *testing.T) {
+	root := t.TempDir()
+	release := "6.18.39-0-virt"
+	want := []byte("0x12345678\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n")
+	if err := installModuleSymvers(root, release, want); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "lib", "modules", release, "build", "Module.symvers")
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Module.symvers = %q, want %q", got, want)
+	}
+
+	replacement := []byte("0x87654321\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n")
+	if err := installModuleSymvers(root, release, replacement); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("replaced Module.symvers = %q, want %q", got, replacement)
+	}
+}
+
+func TestInstallModuleSymversRejectsInvalidRelease(t *testing.T) {
+	root := t.TempDir()
+	if err := installModuleSymvers(root, "../escape", []byte("data")); err == nil {
+		t.Fatal("invalid kernel release unexpectedly accepted")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid install wrote %d root entries", len(entries))
+	}
+}
 
 func TestCommandNeedsSystemdReady(t *testing.T) {
 	tests := []struct {
@@ -44,6 +133,41 @@ func TestCommandNeedsSystemdReady(t *testing.T) {
 				t.Fatalf("commandNeedsSystemdReady(%q) = %v, want %v", test.argv, got, test.want)
 			}
 		})
+	}
+}
+
+func TestReapOrphanedChildrenPreservesManagedExitStatus(t *testing.T) {
+	managed := exec.Command("sh", "-c", "exit 7")
+	if err := startManagedExecProcess(managed, nil); err != nil {
+		t.Fatal(err)
+	}
+	orphan := exec.Command("sh", "-c", "exit 0")
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForZombie := func(pid int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			state, ppid, ok := procProcessState(filepath.Join("/proc", itoa(pid), "stat"))
+			if ok && state == 'Z' && ppid == os.Getpid() {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("process %d did not become a child zombie", pid)
+	}
+	waitForZombie(managed.Process.Pid)
+	waitForZombie(orphan.Process.Pid)
+
+	reapOrphanedChildren(os.Getpid())
+	result := waitManagedExecProcess(managed, time.Now())
+	if result.ExitErr != nil || result.ExitCode != 7 {
+		t.Fatalf("managed wait = exit %d, err %v", result.ExitCode, result.ExitErr)
+	}
+	if _, err := orphan.Process.Wait(); !errors.Is(err, syscall.ECHILD) {
+		t.Fatalf("orphan wait error = %v, want already reaped child", err)
 	}
 }
 
@@ -179,6 +303,24 @@ func TestManagedExecCommandDirect(t *testing.T) {
 	}
 	if cmd.WaitDelay != 2*time.Second {
 		t.Fatalf("wait delay = %s", cmd.WaitDelay)
+	}
+}
+
+func TestManagedExecCommandUsesRequestPATH(t *testing.T) {
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "installed-after-boot")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write executable: %v", err)
+	}
+	cmd, pivot := managedExecCommand([]string{"installed-after-boot", "arg"}, []string{"PATH=" + dir}, "", "", nil, false)
+	if pivot {
+		t.Fatal("direct command unexpectedly used pivot")
+	}
+	if cmd.Path != executable {
+		t.Fatalf("executable path = %q, want %q", cmd.Path, executable)
+	}
+	if !reflect.DeepEqual(cmd.Args, []string{"installed-after-boot", "arg"}) {
+		t.Fatalf("args = %#v", cmd.Args)
 	}
 }
 
@@ -337,6 +479,48 @@ func TestConfigureManagedExecProcessAttrsSetsProcessGroup(t *testing.T) {
 	configureManagedExecProcessAttrs(cmd, "", nil, false)
 	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
 		t.Fatalf("SysProcAttr = %+v, want Setpgid", cmd.SysProcAttr)
+	}
+}
+
+func TestValidateManagedExecWorkDirRejectsInvalidDirectories(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManagedExecWorkDir(root, "/missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing workdir error = %v", err)
+	}
+	if err := validateManagedExecWorkDir(root, "/file"); err == nil {
+		t.Fatal("file workdir was accepted")
+	}
+}
+
+func TestTerminateManagedExecProcessGroupReapsDescendants(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 30 >/dev/null 2>&1 & echo $!")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := startManagedExecProcess(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := waitManagedExecProcess(cmd, started); result.ExitCode != 0 {
+		t.Fatalf("shell exit = %+v", result)
+	}
+	terminateManagedExecProcessGroup(cmd.Process.Pid)
+	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("descendant %d still exists: %v", childPID, err)
 	}
 }
 
@@ -609,6 +793,17 @@ func TestManagedExecTimingPhaseSelection(t *testing.T) {
 	}
 	if got := managedExecFirstOutputTimingPhase(true); got != managedExecTimingFirstStderr {
 		t.Fatalf("stderr first phase = %q", got)
+	}
+}
+
+func TestManagedExecStartFailureUsesShellExitConventions(t *testing.T) {
+	code, message := managedExecStartFailure(&os.PathError{Op: "fork/exec", Path: "missing", Err: syscall.ENOENT}, []string{"missing"}, "", "/")
+	if code != 127 || message != "missing: executable not found\n" {
+		t.Fatalf("missing executable result = (%d, %q)", code, message)
+	}
+	code, message = managedExecStartFailure(&os.PathError{Op: "fork/exec", Path: "/bin/private", Err: syscall.EACCES}, []string{"/bin/private"}, "", "/")
+	if code != 126 || message != "/bin/private: permission denied\n" {
+		t.Fatalf("permission result = (%d, %q)", code, message)
 	}
 }
 

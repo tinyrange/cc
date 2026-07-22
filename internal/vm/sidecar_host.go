@@ -99,6 +99,10 @@ func (h *sidecarVMHost) Start(ctx context.Context, req client.CreateInstanceRequ
 }
 
 func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := h.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -117,7 +121,7 @@ func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstan
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), nil
 }
 
 func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
@@ -125,6 +129,10 @@ func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstance
 }
 
 func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	if inst, ok, err := h.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -143,7 +151,7 @@ func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartIn
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), nil
 }
 
 func (h *sidecarVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -242,7 +250,7 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecRequest{}, err
 		}
-		return runExecRequest(req), nil
+		return runningVMExecRequest(req), nil
 	}
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err
@@ -288,6 +296,8 @@ type sidecarBootBundle struct {
 	Architecture       string
 	Config             oci.RuntimeConfig
 	Kernel             []byte
+	KernelRelease      string
+	ModuleSymvers      []byte
 	Init               []byte
 	AMD64EmulatorPath  string
 	Modules            []alpine.Module
@@ -524,13 +534,13 @@ type sidecarInstance struct {
 	rootFS       sidecarRootFS
 	imageName    string
 	resolver     *sidecarCommandResolver
-	mounts       mounts.State
+	mounts       *mounts.State
 	networkIPv4  string
 	network      *networkRuntime
 	hasImageRoot bool
 }
 
-func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string, resources sidecarStartResources) *sidecarInstance {
+func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string, mountState *mounts.State, resources sidecarStartResources) *sidecarInstance {
 	inst := &sidecarInstance{
 		id:           id,
 		sidecar:      sidecar,
@@ -539,6 +549,7 @@ func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string,
 		resolver:     resources.resolver,
 		networkIPv4:  resources.networkIPv4,
 		network:      resources.network,
+		mounts:       mountState,
 		hasImageRoot: resources.resolver != nil,
 	}
 	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources)
@@ -713,20 +724,31 @@ func (i *sidecarInstance) ConsoleHistory(ctx context.Context) (string, error) {
 }
 
 func (i *sidecarInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *sidecarInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
-	return mounts.RootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
+	if !i.ManagedCapabilities().RootSnapshot {
+		return mounts.RootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
+	}
+	return mounts.RootSnapshotContext(ctx, i.rootFS, "")
 }
 
 func (i *sidecarInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	return i.SnapshotImageContext(context.Background(), imageName)
+}
+
+func (i *sidecarInstance) SnapshotImageContext(ctx context.Context, imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
 		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
-		return i.RootSnapshot()
+		return i.RootSnapshotContext(ctx)
 	}
-	return mounts.ImageSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
+	return mounts.ImageSnapshotContextWithCapabilities(ctx, "sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
 }
 
 func (i *sidecarInstance) NetworkIPv4() string {

@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ const (
 	fsCfgNumQueueOff       = fsCfgTagSize
 	fsCfgTotalSize         = fsCfgTagSize + 4
 	fsInterruptVring       = 0x1
+	fsAvailNoInterrupt     = 0x1
 	virtioStatusFeaturesOK = 0x8
 	featureRingEventIdx    = uint64(1) << 29
 	fuseInHeaderSize       = 40
@@ -48,6 +50,7 @@ const (
 	fuseStatfsOutSize      = 80
 	fuseStatxOutSize       = 288
 	fuseDirentBaseSize     = 24
+	fuseDirentPlusBaseSize = fuseEntryOutSize + fuseDirentBaseSize
 	fuseWriteOutSize       = 8
 	fuseLKInSize           = 48
 	fuseLKOutSize          = 24
@@ -55,55 +58,60 @@ const (
 )
 
 const (
-	fuseLookup     = 1
-	fuseForget     = 2
-	fuseGetAttr    = 3
-	fuseSetAttr    = 4
-	fuseReadlink   = 5
-	fuseSymlink    = 6
-	fuseMknod      = 8
-	fuseMkdir      = 9
-	fuseUnlink     = 10
-	fuseRmDir      = 11
-	fuseRename     = 12
-	fuseLink       = 13
-	fuseOpen       = 14
-	fuseRead       = 15
-	fuseWrite      = 16
-	fuseStatfs     = 17
-	fuseRelease    = 18
-	fuseFsync      = 20
-	fuseGetXattr   = 22
-	fuseListXattr  = 23
-	fuseFlush      = 25
-	fuseInit       = 26
-	fuseOpenDir    = 27
-	fuseReadDir    = 28
-	fuseReleaseDir = 29
-	fuseFsyncDir   = 30
-	fuseGetLK      = 31
-	fuseSetLK      = 32
-	fuseSetLKW     = 33
-	fuseAccess     = 34
-	fuseCreate     = 35
-	fuseDestroy    = 38
-	fuseIoctl      = 39
-	fusePoll       = 40
-	fuseRename2    = 45
-	fuseLseek      = 46
-	fuseSyncFS     = 50
-	fuseTmpfile    = 51
-	fuseStatx      = 52
+	fuseLookup      = 1
+	fuseForget      = 2
+	fuseGetAttr     = 3
+	fuseSetAttr     = 4
+	fuseReadlink    = 5
+	fuseSymlink     = 6
+	fuseMknod       = 8
+	fuseMkdir       = 9
+	fuseUnlink      = 10
+	fuseRmDir       = 11
+	fuseRename      = 12
+	fuseLink        = 13
+	fuseOpen        = 14
+	fuseRead        = 15
+	fuseWrite       = 16
+	fuseStatfs      = 17
+	fuseRelease     = 18
+	fuseFsync       = 20
+	fuseSetXattr    = 21
+	fuseGetXattr    = 22
+	fuseListXattr   = 23
+	fuseRemoveXattr = 24
+	fuseFlush       = 25
+	fuseInit        = 26
+	fuseOpenDir     = 27
+	fuseReadDir     = 28
+	fuseReleaseDir  = 29
+	fuseFsyncDir    = 30
+	fuseGetLK       = 31
+	fuseSetLK       = 32
+	fuseSetLKW      = 33
+	fuseAccess      = 34
+	fuseCreate      = 35
+	fuseDestroy     = 38
+	fuseIoctl       = 39
+	fusePoll        = 40
+	fuseReadDirPlus = 44
+	fuseRename2     = 45
+	fuseLseek       = 46
+	fuseSyncFS      = 50
+	fuseTmpfile     = 51
+	fuseStatx       = 52
 )
 
 const (
-	fattrMode  = 1 << 0
-	fattrUID   = 1 << 1
-	fattrGID   = 1 << 2
-	fattrSize  = 1 << 3
-	fattrATime = 1 << 4
-	fattrMTime = 1 << 5
-	fattrFH    = 1 << 6
+	fattrMode     = 1 << 0
+	fattrUID      = 1 << 1
+	fattrGID      = 1 << 2
+	fattrSize     = 1 << 3
+	fattrATime    = 1 << 4
+	fattrMTime    = 1 << 5
+	fattrFH       = 1 << 6
+	fattrATimeNow = 1 << 7
+	fattrMTimeNow = 1 << 8
 )
 
 const (
@@ -118,8 +126,13 @@ const (
 )
 
 const (
-	fuseCapPosixLocks     = 1 << 1
+	linuxRenameNoReplace = 1
+	linuxRenameExchange  = 2
+)
+
+const (
 	fuseCapBigWrites      = 1 << 5
+	fuseCapDoReadDirPlus  = 1 << 13
 	fuseCapWritebackCache = 1 << 16
 	fuseCapMaxPages       = 1 << 22
 )
@@ -168,6 +181,11 @@ type FSBackend interface {
 type fsXattrBackend interface {
 	GetXattr(nodeID uint64, name string) ([]byte, int32)
 	ListXattr(nodeID uint64) ([]byte, int32)
+}
+
+type fsXattrMutationBackend interface {
+	SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32
+	RemoveXattr(nodeID uint64, name string) int32
 }
 
 type fsFlushBackend interface {
@@ -311,46 +329,63 @@ type FS struct {
 	entryTTL       time.Duration
 	attrTTL        time.Duration
 
-	mu               sync.Mutex
-	workerOnce       sync.Once
-	mem              GuestMemory
-	irq              IRQController
-	backend          FSBackend
-	tag              [fsCfgTagSize]byte
-	deviceFeatureSel uint32
-	driverFeatureSel uint32
-	driverFeatures   uint64
-	sharedMemorySel  uint32
-	queueSel         uint32
-	status           uint32
-	interruptStatus  uint32
-	irqHigh          bool
-	configGeneration uint32
-	queues           []queue
-	mmioReads        uint64
-	mmioWrites       uint64
-	queueNotifies    []uint64
-	kickPollLoops    uint64
-	kickPollHits     uint64
-	kickPollMisses   uint64
-	kickPollWorks    uint64
-	fuseRequests     atomic.Uint64
-	interruptRaises  uint64
-	irqTransitions   uint64
-	closeOnce        sync.Once
-	closed           chan struct{}
-	workerWG         sync.WaitGroup
-	kickPollWG       sync.WaitGroup
-	workCh           chan *fsWork
-	nextWorkSeq      []uint64
-	nextCompleteSeq  []uint64
-	completions      map[fsCompletionKey]fsCompletion
-	fuseOpStats      [fuseStatsSlots]fuseOpStat
-	stageStats       [fsStageCount]timingStat
-	scratch16        [16]byte
-	scratch8         [8]byte
-	scratch4         [4]byte
-	scratch2         [2]byte
+	mu                  sync.Mutex
+	workerOnce          sync.Once
+	mem                 GuestMemory
+	irq                 IRQController
+	backend             FSBackend
+	backingUsageTracker *FSBackingUsageTracker
+	tag                 [fsCfgTagSize]byte
+	deviceFeatureSel    uint32
+	driverFeatureSel    uint32
+	driverFeatures      uint64
+	sharedMemorySel     uint32
+	queueSel            uint32
+	status              uint32
+	interruptStatus     uint32
+	irqHigh             bool
+	configGeneration    uint32
+	queues              []queue
+	mmioReads           uint64
+	mmioWrites          uint64
+	queueNotifies       []uint64
+	kickPollLoops       uint64
+	kickPollHits        uint64
+	kickPollMisses      uint64
+	kickPollWorks       uint64
+	fuseRequests        atomic.Uint64
+	interruptRaises     uint64
+	irqTransitions      uint64
+	closeStart          sync.Once
+	cleanupOnce         sync.Once
+	closeMu             sync.Mutex
+	backendClosed       bool
+	backendCloseErr     error
+	backendCloseDone    chan struct{}
+	beginCloseDone      chan struct{}
+	closed              chan struct{}
+	workersDone         chan struct{}
+	workerWG            sync.WaitGroup
+	kickPollWG          sync.WaitGroup
+	workCh              chan *fsWork
+	nextWorkSeq         []uint64
+	nextCompleteSeq     []uint64
+	completions         map[fsCompletionKey]fsCompletion
+	fuseOpStats         [fuseStatsSlots]fuseOpStat
+	stageStats          [fsStageCount]timingStat
+	scratch16           [16]byte
+	scratch8            [8]byte
+	scratch4            [4]byte
+	scratch2            [2]byte
+}
+
+type CloseIncompleteError struct {
+	Resource string
+	Timeout  time.Duration
+}
+
+func (e *CloseIncompleteError) Error() string {
+	return fmt.Sprintf("close %s: work did not stop within %s; resources remain quarantined for retry", e.Resource, e.Timeout)
 }
 
 const fuseStatsSlots = 64
@@ -367,18 +402,17 @@ const (
 )
 
 type fsWork struct {
-	qidx              int
-	head              uint16
-	seq               uint64
-	generation        uint32
-	unique            uint64
-	opcode            uint32
-	req               []byte
-	pooledReq         bool
-	suppressInterrupt bool
-	respCount         int
-	respDescs         [fsInlineRespDescs]fsDesc
-	respExtra         []fsDesc
+	qidx       int
+	head       uint16
+	seq        uint64
+	generation uint32
+	unique     uint64
+	opcode     uint32
+	req        []byte
+	pooledReq  bool
+	respCount  int
+	respDescs  [fsInlineRespDescs]fsDesc
+	respExtra  []fsDesc
 }
 
 type fsCompletionKey struct {
@@ -405,31 +439,37 @@ var fsReqPool = sync.Pool{
 }
 
 type FSStats struct {
-	Tag             string        `json:"tag"`
-	Async           bool          `json:"async"`
-	WorkerCount     int           `json:"worker_count"`
-	CacheMode       string        `json:"cache_mode"`
-	WritebackCache  bool          `json:"writeback_cache"`
-	EventIdx        bool          `json:"event_idx"`
-	MMIOReads       uint64        `json:"mmio_reads"`
-	MMIOWrites      uint64        `json:"mmio_writes"`
-	QueueNotifies   []uint64      `json:"queue_notifies"`
-	KickPollLoops   uint64        `json:"kick_poll_loops"`
-	KickPollHits    uint64        `json:"kick_poll_hits"`
-	KickPollMisses  uint64        `json:"kick_poll_misses"`
-	KickPollWorks   uint64        `json:"kick_poll_works"`
-	FUSERequests    uint64        `json:"fuse_requests"`
-	InterruptRaises uint64        `json:"interrupt_raises"`
-	IRQTransitions  uint64        `json:"irq_transitions"`
-	IRQHigh         bool          `json:"irq_high"`
-	InterruptStatus uint32        `json:"interrupt_status"`
-	QueueReady      []bool        `json:"queue_ready"`
-	QueueLastAvail  []uint16      `json:"queue_last_avail"`
-	QueueAvailIdx   []uint16      `json:"queue_avail_idx"`
-	QueueUsedIdx    []uint16      `json:"queue_used_idx"`
-	QueueNoNotify   []bool        `json:"queue_no_notify"`
-	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
-	Stages          []TimingStats `json:"stages"`
+	Tag                           string        `json:"tag"`
+	Async                         bool          `json:"async"`
+	WorkerCount                   int           `json:"worker_count"`
+	CacheMode                     string        `json:"cache_mode"`
+	WritebackCache                bool          `json:"writeback_cache"`
+	EventIdx                      bool          `json:"event_idx"`
+	MMIOReads                     uint64        `json:"mmio_reads"`
+	MMIOWrites                    uint64        `json:"mmio_writes"`
+	QueueNotifies                 []uint64      `json:"queue_notifies"`
+	KickPollLoops                 uint64        `json:"kick_poll_loops"`
+	KickPollHits                  uint64        `json:"kick_poll_hits"`
+	KickPollMisses                uint64        `json:"kick_poll_misses"`
+	KickPollWorks                 uint64        `json:"kick_poll_works"`
+	FUSERequests                  uint64        `json:"fuse_requests"`
+	InterruptRaises               uint64        `json:"interrupt_raises"`
+	IRQTransitions                uint64        `json:"irq_transitions"`
+	IRQHigh                       bool          `json:"irq_high"`
+	InterruptStatus               uint32        `json:"interrupt_status"`
+	QueueReady                    []bool        `json:"queue_ready"`
+	QueueLastAvail                []uint16      `json:"queue_last_avail"`
+	QueueAvailIdx                 []uint16      `json:"queue_avail_idx"`
+	QueueUsedIdx                  []uint16      `json:"queue_used_idx"`
+	QueueNoNotify                 []bool        `json:"queue_no_notify"`
+	FUSEOps                       []FUSEOpStats `json:"fuse_ops"`
+	Stages                        []TimingStats `json:"stages"`
+	BackingBytes                  uint64        `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes         uint64        `json:"backing_high_water_bytes,omitempty"`
+	BackingPhysicalBytes          uint64        `json:"backing_physical_bytes,omitempty"`
+	BackingMetadataBytes          uint64        `json:"backing_metadata_bytes,omitempty"`
+	BackingMetadataHighWaterBytes uint64        `json:"backing_metadata_high_water_bytes,omitempty"`
+	BackingReclaimError           string        `json:"backing_reclaim_error,omitempty"`
 }
 
 type FUSEOpStats struct {
@@ -509,41 +549,129 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 }
 
 func (f *FS) Close() error {
+	return f.closeWithin(2 * time.Second)
+}
+
+func (f *FS) closeWithin(timeout time.Duration) error {
 	if f == nil {
 		return nil
 	}
-	closedNow := false
-	f.closeOnce.Do(func() {
+	started := time.Now()
+	f.closeStart.Do(func() {
 		close(f.closed)
-		closedNow = true
-	})
-	if closedNow {
+		// Prevent a concurrent enqueue from adding workers after the wait starts.
+		f.workerOnce.Do(func() {})
 		f.mu.Lock()
 		f.kickPoll = false
 		f.kickPollActive = false
 		f.configGeneration++
 		f.mu.Unlock()
-	}
-	f.workerWG.Wait()
-	f.kickPollWG.Wait()
-	for {
-		select {
-		case work := <-f.workCh:
-			putFSReqBuffer(work.req, work.pooledReq)
-		default:
-			f.mu.Lock()
-			irq := f.irq
-			f.irq = nil
-			f.mem = nil
-			f.clearQueueCachesLocked()
-			f.interruptStatus = 0
-			f.irqHigh = false
-			f.mu.Unlock()
-			if irq != nil {
-				_ = irq.SetIRQ(f.IRQ, false)
+		f.beginCloseDone = make(chan struct{})
+		go func() {
+			if starter, ok := f.backend.(interface{ BeginClose() }); ok {
+				starter.BeginClose()
 			}
-			return nil
+			close(f.beginCloseDone)
+		}()
+		f.workersDone = make(chan struct{})
+		go func() {
+			f.workerWG.Wait()
+			f.kickPollWG.Wait()
+			close(f.workersDone)
+		}()
+	})
+	waitWithin := func(done <-chan struct{}, resource string) error {
+		remaining := timeout - time.Since(started)
+		if remaining <= 0 {
+			return &CloseIncompleteError{Resource: resource, Timeout: timeout}
 		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return nil
+		case <-timer.C:
+			return &CloseIncompleteError{Resource: resource, Timeout: timeout}
+		}
+	}
+	if err := waitWithin(f.beginCloseDone, "virtio-fs backend shutdown signal"); err != nil {
+		return err
+	}
+	if err := waitWithin(f.workersDone, "virtio-fs workers"); err != nil {
+		return err
+	}
+	f.cleanupOnce.Do(func() {
+		for {
+			select {
+			case work := <-f.workCh:
+				putFSReqBuffer(work.req, work.pooledReq)
+			default:
+				f.mu.Lock()
+				irq := f.irq
+				f.irq = nil
+				f.mem = nil
+				f.clearQueueCachesLocked()
+				f.interruptStatus = 0
+				f.irqHigh = false
+				f.mu.Unlock()
+				if irq != nil {
+					_ = irq.SetIRQ(f.IRQ, false)
+				}
+				return
+			}
+		}
+	})
+	remaining := timeout - time.Since(started)
+	if remaining <= 0 {
+		return &CloseIncompleteError{Resource: "virtio-fs backend", Timeout: timeout}
+	}
+	return f.closeBackendWithin(remaining)
+}
+
+func (f *FS) closeBackendWithin(timeout time.Duration) error {
+	f.closeMu.Lock()
+	if f.backendClosed {
+		err := f.backendCloseErr
+		f.closeMu.Unlock()
+		return err
+	}
+	if f.backendCloseDone == nil {
+		f.backendCloseDone = make(chan struct{})
+		done := f.backendCloseDone
+		go func() {
+			var err error
+			if closer, ok := f.backend.(interface{ Close() error }); ok {
+				err = closer.Close()
+			}
+			f.closeMu.Lock()
+			f.backendCloseErr = err
+			f.closeMu.Unlock()
+			close(done)
+		}()
+	}
+	done := f.backendCloseDone
+	f.closeMu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		f.closeMu.Lock()
+		if f.backendCloseDone != done {
+			f.closeMu.Unlock()
+			return &CloseIncompleteError{Resource: "virtio-fs backend retry", Timeout: timeout}
+		}
+		err := f.backendCloseErr
+		var incomplete *CloseIncompleteError
+		if errors.As(err, &incomplete) {
+			f.backendCloseDone = nil
+			f.backendCloseErr = nil
+		} else {
+			f.backendClosed = true
+		}
+		f.closeMu.Unlock()
+		return err
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "virtio-fs backend", Timeout: timeout}
 	}
 }
 
@@ -938,11 +1066,10 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 	}
 
 	for {
-		availFlags, availIdx, err := f.readAvailHeaderLocked(q)
+		_, availIdx, err := f.readAvailHeaderLocked(q)
 		if err != nil {
 			return nil, err
 		}
-		suppressInterrupt := availFlags&1 != 0
 		for q.lastAvailIdx != availIdx {
 			slot := q.lastAvailIdx % q.size
 			head, err := f.readAvailRingEntryLocked(q, slot)
@@ -952,7 +1079,7 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 			if f.Log != nil {
 				f.logf("queue-notify q=%d head=%d", qidx, head)
 			}
-			work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
+			work, err := f.prepareRequestLocked(qidx, q, head)
 			if err != nil {
 				return nil, err
 			}
@@ -1037,14 +1164,14 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 	return uint32(reply.Len()), true, nil
 }
 
-func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInterrupt bool) (fsWork, error) {
+func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16) (fsWork, error) {
 	var prepareStart time.Time
 	if f.RecordTiming != nil {
 		prepareStart = time.Now()
 	}
 	seq := f.nextWorkSeq[qidx]
 	f.nextWorkSeq[qidx]++
-	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration, suppressInterrupt: suppressInterrupt}
+	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration}
 	var descScratch [8]fsDesc
 	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
 	if err != nil {
@@ -1115,6 +1242,11 @@ func (f *FS) enqueueWorks(works []fsWork) {
 }
 
 func (f *FS) startKickPollerLocked() {
+	select {
+	case <-f.closed:
+		return
+	default:
+	}
 	if f.kickPollActive {
 		return
 	}
@@ -1267,11 +1399,22 @@ func (f *FS) startWorkers() {
 func (f *FS) runWorker() {
 	defer f.workerWG.Done()
 	for {
+		select {
+		case <-f.closed:
+			return
+		default:
+		}
 		var work *fsWork
 		select {
 		case <-f.closed:
 			return
 		case work = <-f.workCh:
+		}
+		select {
+		case <-f.closed:
+			putFSReqBuffer(work.req, work.pooledReq)
+			return
+		default:
 		}
 		reply, err := f.dispatchFUSE(work.req)
 		putFSReqBuffer(work.req, work.pooledReq)
@@ -1328,7 +1471,6 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 		q := &f.queues[qidx]
 		oldUsedIdx := q.usedIdx
 		wroteCompletion := false
-		interruptSuppressed := true
 		for index < len(completions) && completions[index].work.qidx == qidx {
 			completion := completions[index]
 			index++
@@ -1345,18 +1487,13 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 				return err
 			}
 			wroteCompletion = true
-			if !completion.work.suppressInterrupt {
-				interruptSuppressed = false
-			}
 		}
 		if !wroteCompletion || !f.isCompletingQueue(qidx) {
 			continue
 		}
-		shouldInterrupt := false
-		if f.driverFeatures&featureRingEventIdx != 0 {
-			shouldInterrupt = f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0)
-		} else {
-			shouldInterrupt = !interruptSuppressed
+		shouldInterrupt, err := f.shouldInterruptCompletionLocked(q, oldUsedIdx)
+		if err != nil {
+			return err
 		}
 		if shouldInterrupt {
 			f.interruptStatus |= fsInterruptVring
@@ -1400,8 +1537,12 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
 	if err := f.writeCompletionUsedLocked(q, work, reply); err != nil {
 		return err
 	}
-	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
-		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0) {
+	if f.isCompletingQueue(work.qidx) {
+		shouldInterrupt, err := f.shouldInterruptCompletionLocked(q, oldUsedIdx)
+		if err != nil {
+			return err
+		}
+		if !shouldInterrupt {
 			return nil
 		}
 		f.interruptStatus |= fsInterruptVring
@@ -1412,6 +1553,17 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
 		return f.updateIRQLocked()
 	}
 	return nil
+}
+
+func (f *FS) shouldInterruptCompletionLocked(q *queue, oldUsedIdx uint16) (bool, error) {
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		return f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0), nil
+	}
+	flags, _, err := f.readAvailHeaderLocked(q)
+	if err != nil {
+		return false, err
+	}
+	return flags&fsAvailNoInterrupt == 0, nil
 }
 
 func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply fsReply) error {
@@ -1494,6 +1646,10 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		return fsReply{}, fmt.Errorf("virtio-fs short request: %d", len(req))
 	}
 	opcode := binary.LittleEndian.Uint32(req[4:8])
+	tracker := f.backingUsageTracker
+	if fuseMayChangeBacking(opcode) {
+		defer tracker.TrackMutation()()
+	}
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
 	callerUID := binary.LittleEndian.Uint32(req[24:28])
@@ -1519,6 +1675,7 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		reqMajor := binary.LittleEndian.Uint32(req[40:44])
 		reqMinor := binary.LittleEndian.Uint32(req[44:48])
 		maxWrite, flags := f.backend.Init()
+		flags |= fuseCapDoReadDirPlus
 		if maxWrite == 0 {
 			maxWrite = 128 << 10
 		}
@@ -1795,9 +1952,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
 		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(nodeID, flags, true))
 		return reply(0, extra), nil
-	case fuseReadDir:
+	case fuseReadDir, fuseReadDirPlus:
 		if len(req) < fuseInHeaderSize+24 {
-			return fsReply{}, fmt.Errorf("virtio-fs READDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
@@ -1805,7 +1962,13 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if logEnabled {
 			f.logPathf("readdir", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
 		}
-		data, errno := f.backend.ReadDir(nodeID, fh, off, size)
+		var data []byte
+		var errno int32
+		if opcode == fuseReadDirPlus {
+			data, errno = f.readDirPlus(nodeID, fh, off, size)
+		} else {
+			data, errno = f.backend.ReadDir(nodeID, fh, off, size)
+		}
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
@@ -1843,9 +2006,7 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if logEnabled {
 			f.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
 		}
-		extra := make([]byte, fuseLKOutSize)
-		binary.LittleEndian.PutUint32(extra[16:20], linuxFUnlck)
-		return reply(0, extra), nil
+		return reply(-linuxENOSYS, nil), nil
 	case fuseSetLK, fuseSetLKW:
 		if len(req) < fuseInHeaderSize+fuseLKInSize {
 			return fsReply{}, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
@@ -1855,7 +2016,7 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if logEnabled {
 			f.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lockType))
 		}
-		return reply(0, nil), nil
+		return reply(-linuxENOSYS, nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
 		if logEnabled {
@@ -1897,6 +2058,18 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if be, ok := f.backend.(fsRenameBackend); ok {
 			newParent := binary.LittleEndian.Uint64(req[40:48])
 			flags := binary.LittleEndian.Uint32(req[48:52])
+			// The in-memory backend can exchange both directory entries
+			// atomically, but Linux's mounted FUSE path has exhibited stale
+			// dentry aliasing after a successful exchange. Refuse the operation
+			// until the kernel-cache coherence contract is implemented; an
+			// explicit unsupported result is safer than reporting success after
+			// data loss.
+			if flags&linuxRenameExchange != 0 {
+				// ENOSYS makes Linux permanently disable the entire RENAME2
+				// opcode for this mount. Reject only this flag so later
+				// RENAME_NOREPLACE requests continue reaching the backend.
+				return reply(-linuxEOPNOTSUPP, nil), nil
+			}
 			names := req[fuseInHeaderSize+16:]
 			split := bytesIndexByte(names, 0)
 			if split < 0 {
@@ -1944,6 +2117,23 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			return reply(errno, nil), nil
 		}
 		return reply(0, []byte(target)), nil
+	case fuseSetXattr:
+		if len(req) < fuseInHeaderSize+8 {
+			return fsReply{}, fmt.Errorf("virtio-fs SETXATTR too short")
+		}
+		size := binary.LittleEndian.Uint32(req[40:44])
+		flags := binary.LittleEndian.Uint32(req[44:48])
+		payload := req[fuseInHeaderSize+8:]
+		split := bytesIndexByte(payload, 0)
+		if split < 0 || uint64(split+1)+uint64(size) > uint64(len(payload)) {
+			return fsReply{}, fmt.Errorf("virtio-fs SETXATTR malformed payload")
+		}
+		name := string(payload[:split])
+		value := payload[split+1 : split+1+int(size)]
+		if be, ok := f.backend.(fsXattrMutationBackend); ok {
+			return reply(be.SetXattr(nodeID, name, value, flags), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseGetXattr:
 		if len(req) < fuseInHeaderSize+8 {
 			return fsReply{}, fmt.Errorf("virtio-fs GETXATTR too short")
@@ -1999,6 +2189,12 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			return fsReply{}, fmt.Errorf("virtio-fs missing xattr backend for LISTXATTR node=%d", nodeID)
 		}
 		return reply(0, nil), nil
+	case fuseRemoveXattr:
+		name := readCStringName(req[fuseInHeaderSize:])
+		if be, ok := f.backend.(fsXattrMutationBackend); ok {
+			return reply(be.RemoveXattr(nodeID, name), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseFlush:
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs FLUSH too short")
@@ -2021,7 +2217,12 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fusePoll:
-		return reply(0, make([]byte, 8)), nil
+		// Regular files are always ready for I/O and this device has no
+		// FUSE_NOTIFY_POLL implementation. ENOSYS makes the kernel remember
+		// that poll is unsupported and use its default regular-file mask.
+		// Returning an empty mask instead registers a waiter that can never be
+		// notified, which stalls io_uring reads indefinitely.
+		return reply(-linuxENOSYS, nil), nil
 	case fuseLseek:
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs LSEEK too short")
@@ -2122,6 +2323,18 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 	}
 }
 
+func fuseMayChangeBacking(opcode uint32) bool {
+	switch opcode {
+	case fuseLookup, fuseForget, fuseSetAttr, fuseSymlink, fuseMknod, fuseMkdir,
+		fuseUnlink, fuseRmDir, fuseRename, fuseRename2, fuseLink, fuseOpen,
+		fuseWrite, fuseRelease, fuseSetXattr, fuseRemoveXattr, fuseOpenDir,
+		fuseReleaseDir, fuseCreate, fuseTmpfile, fuseDestroy:
+		return true
+	default:
+		return false
+	}
+}
+
 func fuseOpcodeName(opcode uint32) string {
 	switch opcode {
 	case fuseLookup:
@@ -2162,10 +2375,14 @@ func fuseOpcodeName(opcode uint32) string {
 		return "RELEASE"
 	case fuseFsync:
 		return "FSYNC"
+	case fuseSetXattr:
+		return "SETXATTR"
 	case fuseGetXattr:
 		return "GETXATTR"
 	case fuseListXattr:
 		return "LISTXATTR"
+	case fuseRemoveXattr:
+		return "REMOVEXATTR"
 	case fuseFlush:
 		return "FLUSH"
 	case fuseInit:
@@ -2174,6 +2391,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "OPENDIR"
 	case fuseReadDir:
 		return "READDIR"
+	case fuseReadDirPlus:
+		return "READDIRPLUS"
 	case fuseReleaseDir:
 		return "RELEASEDIR"
 	case fuseFsyncDir:
@@ -2319,6 +2538,53 @@ func (f *FS) encodeFuseEntryOut(dst []byte, nodeID uint64) {
 	encodeFuseTTL(dst[24:32], dst[36:40], policy.AttrTTL)
 }
 
+func (f *FS) readDirPlus(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+	var out []byte
+	for {
+		entries, errno := f.backend.ReadDir(nodeID, fh, off, maxBytes)
+		if errno != 0 {
+			return nil, errno
+		}
+		if len(entries) == 0 {
+			return out, 0
+		}
+		for cursor := 0; cursor < len(entries); {
+			if len(entries)-cursor < fuseDirentBaseSize {
+				return nil, -linuxEIO
+			}
+			nameBytes := int(binary.LittleEndian.Uint32(entries[cursor+16 : cursor+20]))
+			direntBytes := align8(fuseDirentBaseSize + nameBytes)
+			if direntBytes > len(entries)-cursor {
+				return nil, -linuxEIO
+			}
+			plusBytes := align8(fuseDirentPlusBaseSize + nameBytes)
+			if len(out)+plusBytes > int(maxBytes) {
+				return out, 0
+			}
+			off = binary.LittleEndian.Uint64(entries[cursor+8 : cursor+16])
+			childID := binary.LittleEndian.Uint64(entries[cursor : cursor+8])
+			attr, attrErrno := f.backend.GetAttr(childID)
+			cursor += direntBytes
+			if attrErrno == -linuxENOENT {
+				continue
+			}
+			if attrErrno != 0 {
+				return nil, attrErrno
+			}
+			start := len(out)
+			out = append(out, make([]byte, plusBytes)...)
+			f.encodeFuseEntryOut(out[start:start+fuseEntryOutSize], childID)
+			encodeFuseAttr(out[start+40:start+fuseEntryOutSize], attr)
+			copy(out[start+fuseEntryOutSize:], entries[cursor-direntBytes:cursor])
+		}
+		if len(out) != 0 {
+			return out, 0
+		}
+		// Every entry in this page disappeared between READDIR and GETATTR.
+		// Continue from the last cookie instead of reporting a false EOF.
+	}
+}
+
 func encodeFuseAttrTTL(dst []byte, ttl time.Duration) {
 	encodeFuseTTL(dst[0:8], dst[8:12], ttl)
 }
@@ -2383,6 +2649,9 @@ func (f *FS) logPathf(op string, nodeID uint64, suffix string) {
 }
 
 func (f *FS) readIPAInto(addr uint64, dst []byte) error {
+	if f.mem == nil {
+		return fmt.Errorf("guest memory is detached")
+	}
 	if reader, ok := f.mem.(guestMemoryReaderInto); ok {
 		return reader.ReadIPAInto(addr, dst)
 	}
@@ -2397,6 +2666,9 @@ func (f *FS) readIPAInto(addr uint64, dst []byte) error {
 func (f *FS) writeIPAFrom(addr uint64, src []byte) error {
 	if len(src) == 0 {
 		return nil
+	}
+	if f.mem == nil {
+		return fmt.Errorf("guest memory is detached")
 	}
 	return f.mem.WriteIPA(addr, src)
 }
@@ -2626,6 +2898,29 @@ func (f *FS) IRQAsserted() bool {
 	return f.interruptStatus != 0 || f.irqHigh
 }
 
+// Poke asks the guest driver to rescan completed filesystem requests. It is a
+// recovery path for a guest that went to sleep across an interrupt-suppression
+// transition after the host had already published a used-ring entry.
+func (f *FS) Poke() error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.irq == nil {
+		return nil
+	}
+	f.interruptStatus |= fsInterruptVring
+	if f.irqHigh {
+		if err := f.irq.SetIRQ(f.IRQ, false); err != nil {
+			return err
+		}
+		f.irqHigh = false
+		f.irqTransitions++
+	}
+	return f.updateIRQLocked()
+}
+
 func (f *FS) Summary() string {
 	if f == nil {
 		return "virtio-fs=<nil>"
@@ -2694,7 +2989,7 @@ func (f *FS) Stats() FSStats {
 			stages = append(stages, stats)
 		}
 	}
-	return FSStats{
+	stats := FSStats{
 		Tag:             tag,
 		Async:           f.Async,
 		WorkerCount:     f.workerCount,
@@ -2721,6 +3016,59 @@ func (f *FS) Stats() FSStats {
 		FUSEOps:         ops,
 		Stages:          stages,
 	}
+	if provider, ok := f.backend.(interface {
+		BackingUsage() (uint64, uint64, uint64, error)
+	}); ok {
+		current, highWater, physical, usageErr := provider.BackingUsage()
+		stats.BackingBytes, stats.BackingHighWaterBytes = current, highWater
+		stats.BackingPhysicalBytes = physical
+		if usageErr != nil {
+			stats.BackingReclaimError = usageErr.Error()
+		}
+	}
+	if provider, ok := f.backend.(interface{ BackingMetadataUsage() (uint64, uint64) }); ok {
+		stats.BackingMetadataBytes, stats.BackingMetadataHighWaterBytes = provider.BackingMetadataUsage()
+	}
+	return stats
+}
+
+func (f *FS) BackingUsage() (current, highWater, physical uint64, reclaimErr error) {
+	if f == nil {
+		return 0, 0, 0, nil
+	}
+	f.mu.Lock()
+	backend := f.backend
+	f.mu.Unlock()
+	provider, ok := backend.(interface {
+		BackingUsage() (uint64, uint64, uint64, error)
+	})
+	if !ok {
+		return 0, 0, 0, nil
+	}
+	return provider.BackingUsage()
+}
+
+func (f *FS) BackingUsageTracker() *FSBackingUsageTracker {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.backingUsageTracker
+}
+
+func (f *FS) BackingMetadataUsage() (current, highWater uint64) {
+	if f == nil {
+		return 0, 0
+	}
+	f.mu.Lock()
+	backend := f.backend
+	f.mu.Unlock()
+	provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) })
+	if !ok {
+		return 0, 0
+	}
+	return provider.BackingMetadataUsage()
 }
 
 func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
@@ -2983,18 +3331,37 @@ type passthroughHandle struct {
 
 type imageFS struct {
 	root       string
+	dataStore  *imageDataStore
 	ownerUID   uint32
 	ownerGID   uint32
 	mapOwner   bool
 	debugPaths []string
 	debugLog   io.Writer
 
-	mu         sync.Mutex
-	nextNodeID uint64
-	nextHandle uint64
-	nodes      map[uint64]*imageNode
-	handles    map[uint64]imageHandle
-	dirHandles map[uint64][]dirEntry
+	mu                    sync.Mutex
+	nextNodeID            uint64
+	nextHandle            uint64
+	nodes                 map[uint64]*imageNode
+	handles               map[uint64]imageHandle
+	dirHandles            map[uint64][]dirEntry
+	dirHandleNodes        map[uint64]uint64
+	xattrBytes            uint64
+	metadataHighWater     uint64
+	retainedNodes         int
+	retainedHandles       int
+	retainedDirHandles    int
+	retainedEntries       int
+	retainedWhiteouts     int
+	dynamicMetadata       uint64
+	materializations      map[uint64]*imageDirMaterialization
+	materializationCtx    context.Context
+	materializationCancel context.CancelFunc
+	materializationWG     sync.WaitGroup
+	beginClose            sync.Once
+	closeStart            sync.Once
+	closeDone             chan struct{}
+	closeErr              error
+	closed                bool
 }
 
 type imageHandle struct {
@@ -3004,26 +3371,249 @@ type imageHandle struct {
 }
 
 type imageNode struct {
-	id            uint64
-	inode         uint64
-	parent        uint64
-	name          string
-	mode          fs.FileMode
-	rawMode       uint32
-	uid           uint32
-	gid           uint32
-	rdev          uint32
-	size          uint64
-	nlink         uint32
-	data          []byte
-	symlinkTarget string
-	entries       map[string]uint64
-	whiteouts     map[string]bool
-	entriesDone   bool
-	modTime       time.Time
-	abstractFile  imagefs.File
-	abstractDir   imagefs.Directory
-	abstractLink  imagefs.Symlink
+	id                uint64
+	inode             uint64
+	parent            uint64
+	name              string
+	mode              fs.FileMode
+	rawMode           uint32
+	uid               uint32
+	gid               uint32
+	rdev              uint32
+	size              uint64
+	nlink             uint32
+	data              sparseImageData
+	symlinkTarget     string
+	entries           map[string]uint64
+	whiteouts         map[string]bool
+	retainedEntries   int
+	retainedWhiteouts int
+	accountedMetadata uint64
+	entriesDone       bool
+	atime             time.Time
+	modTime           time.Time
+	ctime             time.Time
+	xattrs            map[string][]byte
+	abstractFile      imagefs.File
+	// lowerFile remains immutable after the first writable operation. data is
+	// a page overlay, so metadata changes and small writes do not eagerly copy
+	// the lower file or expand its sparse holes.
+	lowerFile    imagefs.File
+	lowerSize    uint64
+	abstractDir  imagefs.Directory
+	abstractLink imagefs.Symlink
+}
+
+const imageDataPageSize = uint64(4096)
+
+const (
+	imageXattrEntryOverhead   = 64
+	imageMaxXattrBytesPerNode = 256 << 10
+	imageMaxXattrBytes        = 16 << 20
+)
+
+// sparseImageData stores only runs of pages which have actually been written.
+// Both logical page indexes and allocation tokens are sequential for ordinary
+// writes, so an extent avoids one heap map entry per 4 KiB page while retaining
+// sparse/random-write semantics.
+type sparseImageData struct {
+	extents []imageDataExtent
+}
+
+type imageDataExtent struct {
+	page     uint64
+	location uint64
+	count    uint64
+}
+
+func (d sparseImageData) location(page uint64) (uint64, bool) {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) || page < d.extents[i].page {
+		return 0, false
+	}
+	extent := d.extents[i]
+	return extent.location + page - extent.page, true
+}
+
+func (d sparseImageData) nextDataPage(page uint64) (uint64, bool) {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) {
+		return 0, false
+	}
+	if page < d.extents[i].page {
+		return d.extents[i].page, true
+	}
+	return page, true
+}
+
+func (d sparseImageData) nextHolePage(page uint64) uint64 {
+	i := sort.Search(len(d.extents), func(i int) bool {
+		return d.extents[i].page+d.extents[i].count > page
+	})
+	if i >= len(d.extents) || page < d.extents[i].page {
+		return page
+	}
+	return d.extents[i].page + d.extents[i].count
+}
+
+func (d *sparseImageData) insert(page, location uint64) {
+	i := sort.Search(len(d.extents), func(i int) bool { return d.extents[i].page >= page })
+	if i > 0 {
+		previous := &d.extents[i-1]
+		if previous.page+previous.count == page && previous.location+previous.count == location {
+			previous.count++
+			if i < len(d.extents) && page+1 == d.extents[i].page && location+1 == d.extents[i].location {
+				previous.count += d.extents[i].count
+				d.extents = append(d.extents[:i], d.extents[i+1:]...)
+			}
+			return
+		}
+	}
+	if i < len(d.extents) && page+1 == d.extents[i].page && location+1 == d.extents[i].location {
+		d.extents[i].page = page
+		d.extents[i].location = location
+		d.extents[i].count++
+		return
+	}
+	d.extents = append(d.extents, imageDataExtent{})
+	copy(d.extents[i+1:], d.extents[i:])
+	d.extents[i] = imageDataExtent{page: page, location: location, count: 1}
+}
+
+func (d *sparseImageData) replace(page, location uint64) {
+	for i, extent := range d.extents {
+		if page < extent.page || page >= extent.page+extent.count {
+			continue
+		}
+		rebuilt := make([]imageDataExtent, 0, len(d.extents)+1)
+		rebuilt = append(rebuilt, d.extents[:i]...)
+		if left := page - extent.page; left != 0 {
+			rebuilt = append(rebuilt, imageDataExtent{page: extent.page, location: extent.location, count: left})
+		}
+		if right := extent.page + extent.count - page - 1; right != 0 {
+			rebuilt = append(rebuilt, imageDataExtent{page: page + 1, location: extent.location + (page - extent.page) + 1, count: right})
+		}
+		rebuilt = append(rebuilt, d.extents[i+1:]...)
+		d.extents = rebuilt
+		d.insert(page, location)
+		return
+	}
+	d.insert(page, location)
+}
+
+func (d sparseImageData) readAt(store *imageDataStore, dst []byte, off uint64) error {
+	for len(dst) > 0 {
+		pageIndex := off / imageDataPageSize
+		pageOffset := off % imageDataPageSize
+		n := min(len(dst), int(imageDataPageSize-pageOffset))
+		if location, ok := d.location(pageIndex); ok {
+			var page [imageDataPageSize]byte
+			if err := store.readPage(location, page[:]); err != nil {
+				return err
+			}
+			copy(dst[:n], page[pageOffset:pageOffset+uint64(n)])
+		}
+		dst = dst[n:]
+		off += uint64(n)
+	}
+	return nil
+}
+
+func (d *sparseImageData) writeAt(store *imageDataStore, src []byte, off uint64) (int, error) {
+	written := 0
+	for len(src) > 0 {
+		pageIndex := off / imageDataPageSize
+		pageOffset := off % imageDataPageSize
+		n := min(len(src), int(imageDataPageSize-pageOffset))
+		location, ok := d.location(pageIndex)
+		if !ok {
+			var page [imageDataPageSize]byte
+			copy(page[pageOffset:pageOffset+uint64(n)], src[:n])
+			var err error
+			location, err = store.allocatePage(page[:])
+			if err != nil {
+				return written, err
+			}
+			d.insert(pageIndex, location)
+		} else {
+			newLocation, err := store.writeAtCOW(location, pageOffset, src[:n])
+			if err != nil {
+				return written, err
+			}
+			if newLocation != location {
+				d.replace(pageIndex, newLocation)
+			}
+		}
+		src = src[n:]
+		off += uint64(n)
+		written += n
+	}
+	return written, nil
+}
+
+func (d *sparseImageData) truncate(store *imageDataStore, size uint64) error {
+	keepPages := size / imageDataPageSize
+	if size%imageDataPageSize != 0 {
+		keepPages++
+	}
+	kept := d.extents[:0]
+	for _, extent := range d.extents {
+		keep := min(extent.count, max(uint64(0), keepPages-min(keepPages, extent.page)))
+		if extent.page >= keepPages {
+			keep = 0
+		}
+		for page := keep; page < extent.count; page++ {
+			store.releasePage(extent.location + page)
+		}
+		if keep != 0 {
+			extent.count = keep
+			kept = append(kept, extent)
+		}
+	}
+	d.extents = kept
+	if size == 0 || size%imageDataPageSize == 0 {
+		return nil
+	}
+	pageIndex := size / imageDataPageSize
+	if location, ok := d.location(pageIndex); ok {
+		var zero [imageDataPageSize]byte
+		newLocation, err := store.writeAtCOW(location, size%imageDataPageSize, zero[:imageDataPageSize-size%imageDataPageSize])
+		if err != nil {
+			return err
+		}
+		if newLocation != location {
+			d.replace(pageIndex, newLocation)
+		}
+	}
+	return nil
+}
+
+func (d sparseImageData) release(store *imageDataStore) {
+	for _, extent := range d.extents {
+		for page := uint64(0); page < extent.count; page++ {
+			store.releasePage(extent.location + page)
+		}
+	}
+}
+
+func (d sparseImageData) allocatedBytes(size uint64) uint64 {
+	var allocated uint64
+	fullPages := size / imageDataPageSize
+	partialBytes := size % imageDataPageSize
+	for _, extent := range d.extents {
+		if extent.page < fullPages {
+			pages := min(extent.count, fullPages-extent.page)
+			allocated += pages * imageDataPageSize
+		}
+		if partialBytes != 0 && extent.page <= fullPages && fullPages-extent.page < extent.count {
+			allocated += partialBytes
+		}
+	}
+	return allocated
 }
 
 type dirEntry struct {
@@ -3066,19 +3656,25 @@ func NewImageFSWithOwner(root imagefs.Directory, statfsPath string, uid, gid uin
 }
 
 func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapOwner bool) FSBackend {
+	materializationCtx, materializationCancel := context.WithCancel(context.Background())
 	imgFS := &imageFS{
-		root:       statfsPath,
-		ownerUID:   uid,
-		ownerGID:   gid,
-		mapOwner:   mapOwner,
-		debugPaths: virtioFSDebugPathsFromEnv(),
-		debugLog:   os.Stderr,
-		nextNodeID: 2,
-		nextHandle: 1,
-		nodes:      map[uint64]*imageNode{},
-		handles:    map[uint64]imageHandle{},
-		dirHandles: map[uint64][]dirEntry{},
+		dataStore:             newImageDataStore(),
+		ownerUID:              uid,
+		ownerGID:              gid,
+		mapOwner:              mapOwner,
+		debugPaths:            virtioFSDebugPathsFromEnv(),
+		debugLog:              os.Stderr,
+		nextNodeID:            2,
+		nextHandle:            1,
+		nodes:                 map[uint64]*imageNode{},
+		handles:               map[uint64]imageHandle{},
+		dirHandles:            map[uint64][]dirEntry{},
+		dirHandleNodes:        map[uint64]uint64{},
+		retainedNodes:         1,
+		materializationCtx:    materializationCtx,
+		materializationCancel: materializationCancel,
 	}
+	imgFS.root = imgFS.dataStore.dir
 	if root == nil {
 		root = imagefs.NewHostFS("", nil)
 	}
@@ -3101,11 +3697,12 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		modTime:     rootModTime,
 		abstractDir: root,
 	}
+	imgFS.refreshImageNodeMetadataLocked(imgFS.nodes[1])
 	return imgFS
 }
 
 func (p *passthroughFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixLocks
+	return 128 << 10, 0
 }
 
 func (p *passthroughFS) SetWritebackCache(enabled bool) {
@@ -3848,7 +4445,7 @@ func (p *imageFS) SnapshotNodePaths() []string {
 
 func (p *imageFS) RestoreNodePaths(paths []string) error {
 	for _, nodePath := range paths {
-		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		nodePath = path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
 		if nodePath == "/" {
 			continue
 		}
@@ -3975,7 +4572,7 @@ func (p *imageFS) debugChildfLocked(op string, parent uint64, name string, forma
 }
 
 func (p *imageFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixLocks
+	return 128 << 10, 0
 }
 
 func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
@@ -4030,13 +4627,15 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		lowerDir := parentNode.abstractDir
+		lowerParent := parentNode
 		p.mu.Unlock()
 		entry, err := lowerDir.Lookup(name)
 		if err != nil {
+			errno := errnoFromError(err)
 			p.mu.Lock()
-			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.debugChildfLocked("lookup-lower-error", parent, name, "errno=%d", errno)
 			p.mu.Unlock()
-			return 0, FuseAttr{}, -linuxENOENT
+			return 0, FuseAttr{}, errno
 		}
 		p.mu.Lock()
 		parentNode = p.nodes[parent]
@@ -4061,7 +4660,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			p.mu.Unlock()
 			return child.id, attr, 0
 		}
-		if parentNode.abstractDir != lowerDir {
+		if parentNode != lowerParent {
 			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
 			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
@@ -4104,23 +4703,33 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 	if node.isDir() {
 		return 0, -linuxEISDIR
 	}
-	if errno := p.checkNodeAccessLocked(node, uid, gid, imageOpenAccessMask(flags)); errno != 0 {
-		return 0, errno
-	}
 	if flags&linuxOACCMODE != linuxORDONLY {
 		if errno := p.copyUpFileLocked(node); errno != 0 {
 			return 0, errno
 		}
 		if flags&linuxOTRUNC != 0 {
-			node.data = nil
+			node.data.release(p.dataStore)
+			node.data = sparseImageData{}
+			node.lowerFile = nil
+			node.lowerSize = 0
 			node.size = 0
-			node.modTime = time.Now()
+			if uid != 0 {
+				node.mode &^= fs.FileMode(0o6000)
+			}
+			now := time.Now()
+			node.modTime = now
+			node.ctime = now
+			p.refreshImageNodeMetadataLocked(node)
 		}
 	}
 	fh := p.nextHandle
 	p.nextHandle++
 	handle := imageHandle{nodeID: nodeID}
-	if openable, ok := node.abstractFile.(imagefs.OpenReaderFile); ok {
+	readerFile := node.abstractFile
+	if readerFile == nil {
+		readerFile = node.lowerFile
+	}
+	if openable, ok := readerFile.(imagefs.OpenReaderFile); ok {
 		reader, closer, err := openable.OpenReader()
 		if err != nil {
 			return 0, errnoFromError(err)
@@ -4129,6 +4738,7 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 		handle.closer = closer
 	}
 	p.handles[fh] = handle
+	p.noteImageHandleAddedLocked()
 	return fh, 0
 }
 
@@ -4136,6 +4746,10 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
 	delete(p.handles, fh)
+	p.compactImageHandleMapsLocked()
+	if ok {
+		p.collectImageNodeLocked(handle.nodeID)
+	}
 	p.mu.Unlock()
 	if ok && handle.closer != nil {
 		_ = handle.closer.Close()
@@ -4147,10 +4761,16 @@ func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
 }
 
 func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
+	if err := p.dataStore.sync(); err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
 func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
+	if err := p.dataStore.sync(); err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
@@ -4158,35 +4778,83 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
 	node := p.nodes[nodeID]
-	p.mu.Unlock()
 	if !ok || handle.nodeID != nodeID || node == nil {
+		p.mu.Unlock()
 		return nil, -linuxEBADF
 	}
 	if node.abstractFile == nil {
 		end := off + uint64(size)
 		if off >= node.size || size == 0 {
+			p.mu.Unlock()
 			return []byte{}, 0
 		}
 		if end > node.size {
 			end = node.size
 		}
-		return append([]byte(nil), node.data[off:end]...), 0
+		data := make([]byte, end-off)
+		if node.lowerFile != nil && off < node.lowerSize {
+			lowerEnd := min(end, node.lowerSize)
+			var err error
+			if handle.reader != nil {
+				var n int
+				n, err = handle.reader.ReadAt(data[:lowerEnd-off], int64(off))
+				if err != nil && err != io.EOF {
+					p.mu.Unlock()
+					return nil, errnoFromError(err)
+				}
+				if uint64(n) != lowerEnd-off {
+					p.mu.Unlock()
+					return nil, -linuxEIO
+				}
+			} else {
+				var lower []byte
+				lower, err = node.lowerFile.ReadAt(off, uint32(lowerEnd-off))
+				if err != nil {
+					p.mu.Unlock()
+					return nil, errnoFromError(err)
+				}
+				if uint64(len(lower)) != lowerEnd-off {
+					p.mu.Unlock()
+					return nil, -linuxEIO
+				}
+				copy(data, lower)
+			}
+		}
+		if err := node.data.readAt(p.dataStore, data, off); err != nil {
+			p.mu.Unlock()
+			return nil, errnoFromError(err)
+		}
+		node.atime = time.Now()
+		p.mu.Unlock()
+		return data, 0
 	}
+	abstractFile := node.abstractFile
+	p.mu.Unlock()
 	if handle.reader != nil {
 		buf := make([]byte, size)
 		n, err := handle.reader.ReadAt(buf, int64(off))
 		if err != nil && err != io.EOF {
 			return nil, errnoFromError(err)
 		}
+		p.mu.Lock()
+		if current := p.nodes[nodeID]; current != nil {
+			current.atime = time.Now()
+		}
+		p.mu.Unlock()
 		return buf[:n], 0
 	}
-	data, err := node.abstractFile.ReadAt(off, size)
+	data, err := abstractFile.ReadAt(off, size)
 	if err != nil {
 		return nil, errnoFromError(err)
 	}
 	if data == nil {
 		return []byte{}, 0
 	}
+	p.mu.Lock()
+	if current := p.nodes[nodeID]; current != nil {
+		current.atime = time.Now()
+	}
+	p.mu.Unlock()
 	return data, 0
 }
 
@@ -4194,22 +4862,59 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
 	node := p.nodes[nodeID]
-	p.mu.Unlock()
 	if !ok || handle.nodeID != nodeID || node == nil {
+		p.mu.Unlock()
 		return 0, -linuxEBADF
 	}
-	switch whence {
-	case 3:
-		if offset >= node.size {
-			return 0, -linuxENXIO
+	if offset >= node.size {
+		p.mu.Unlock()
+		return 0, -linuxENXIO
+	}
+	if node.abstractFile != nil || node.lowerFile != nil && offset < node.lowerSize {
+		size := node.size
+		lowerSize := node.lowerSize
+		if node.abstractFile != nil {
+			lowerSize = size
 		}
-		return offset, 0
-	case 4:
-		if offset >= node.size {
+		if offset < lowerSize {
+			p.mu.Unlock()
+			if whence == 3 {
+				return offset, 0
+			}
+			if whence == 4 {
+				return lowerSize, 0
+			}
+			return 0, -linuxEINVAL
+		}
+	}
+	switch whence {
+	case 3: // SEEK_DATA
+		page := offset / imageDataPageSize
+		if _, ok := node.data.location(page); ok {
+			p.mu.Unlock()
 			return offset, 0
 		}
-		return node.size, 0
+		if candidate, ok := node.data.nextDataPage(page + 1); ok && candidate*imageDataPageSize < node.size {
+			p.mu.Unlock()
+			return candidate * imageDataPageSize, 0
+		}
+		p.mu.Unlock()
+		return 0, -linuxENXIO
+	case 4: // SEEK_HOLE
+		page := offset / imageDataPageSize
+		if _, ok := node.data.location(page); !ok {
+			p.mu.Unlock()
+			return offset, 0
+		}
+		if candidate := node.data.nextHolePage(page); candidate*imageDataPageSize < node.size {
+			p.mu.Unlock()
+			return candidate * imageDataPageSize, 0
+		}
+		size := node.size
+		p.mu.Unlock()
+		return size, 0
 	default:
+		p.mu.Unlock()
 		return 0, -linuxEINVAL
 	}
 }
@@ -4243,14 +4948,16 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	fh := p.nextHandle
 	p.nextHandle++
 	p.dirHandles[fh] = entries
+	p.dirHandleNodes[fh] = nodeID
+	p.noteImageDirHandleAddedLocked()
 	return fh, 0
 }
 
 func (p *imageFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
 	p.mu.Lock()
-	entries := append([]dirEntry(nil), p.dirHandles[fh]...)
-	p.mu.Unlock()
-	if entries == nil {
+	defer p.mu.Unlock()
+	entries, ok := p.dirHandles[fh]
+	if !ok {
 		return nil, -linuxEBADF
 	}
 	var out []byte
@@ -4274,7 +4981,11 @@ func (p *imageFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]b
 
 func (p *imageFS) ReleaseDir(_ uint64, fh uint64) {
 	p.mu.Lock()
+	nodeID := p.dirHandleNodes[fh]
 	delete(p.dirHandles, fh)
+	delete(p.dirHandleNodes, fh)
+	p.compactImageDirHandleMapsLocked()
+	p.collectImageNodeLocked(nodeID)
 	p.mu.Unlock()
 }
 
@@ -4291,83 +5002,15 @@ func (p *imageFS) Readlink(nodeID uint64) (string, int32) {
 	return node.symlinkTarget, 0
 }
 
-const (
-	imageAccessExec  = 1
-	imageAccessWrite = 2
-	imageAccessRead  = 4
-)
-
-func imageOpenAccessMask(flags uint32) uint32 {
-	switch flags & linuxOACCMODE {
-	case linuxOWRONLY:
-		return imageAccessWrite
-	case linuxORDWR:
-		return imageAccessRead | imageAccessWrite
-	default:
-		if flags&linuxOTRUNC != 0 {
-			return imageAccessRead | imageAccessWrite
-		}
-		return imageAccessRead
+func (p *imageFS) inheritImageCreateLocked(parent *imageNode, mode uint32, gid uint32, directory bool) (uint32, uint32) {
+	if parent == nil || linuxModeBits(parent.mode)&0o2000 == 0 {
+		return mode, gid
 	}
-}
-
-func (p *imageFS) checkNodeAccessLocked(node *imageNode, uid uint32, gid uint32, mask uint32) int32 {
-	if node == nil {
-		return -linuxENOENT
+	gid = p.attr(parent).GID
+	if directory {
+		mode |= 0o2000
 	}
-	if mask == 0 || uid == 0 {
-		if uid == 0 && mask&imageAccessExec != 0 && !node.isDir() && p.attr(node).Mode&0o111 == 0 {
-			return -linuxEACCES
-		}
-		return 0
-	}
-	attr := p.attr(node)
-	perm := attr.Mode & linuxPermMask
-	var allowed uint32
-	switch {
-	case uid == attr.UID:
-		allowed = (perm >> 6) & 7
-	case gid == attr.GID:
-		allowed = (perm >> 3) & 7
-	default:
-		allowed = perm & 7
-	}
-	if allowed&mask != mask {
-		return -linuxEACCES
-	}
-	return 0
-}
-
-func (p *imageFS) checkParentMutationLocked(parent *imageNode, uid uint32, gid uint32) int32 {
-	return p.checkNodeAccessLocked(parent, uid, gid, imageAccessWrite|imageAccessExec)
-}
-
-func (p *imageFS) checkSetAttrLocked(node *imageNode, valid uint32, callerUID uint32, callerGID uint32) int32 {
-	if node == nil {
-		return -linuxENOENT
-	}
-	if callerUID == 0 {
-		return 0
-	}
-	attr := p.attr(node)
-	isOwner := callerUID == attr.UID
-	if valid&(fattrUID|fattrGID) != 0 {
-		return -linuxEPERM
-	}
-	if valid&fattrMode != 0 && !isOwner {
-		return -linuxEPERM
-	}
-	if valid&fattrSize != 0 {
-		if errno := p.checkNodeAccessLocked(node, callerUID, callerGID, imageAccessWrite); errno != 0 {
-			return errno
-		}
-	}
-	if valid&(fattrATime|fattrMTime) != 0 && !isOwner {
-		if errno := p.checkNodeAccessLocked(node, callerUID, callerGID, imageAccessWrite); errno != 0 {
-			return errno
-		}
-	}
-	return 0
+	return mode, gid
 }
 
 func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
@@ -4377,9 +5020,7 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return 0, FuseAttr{}, errno
-	}
+	mode, gid = p.inheritImageCreateLocked(parentNode, mode, gid, true)
 	var ok bool
 	name, ok = cleanChildName(name)
 	if !ok {
@@ -4390,6 +5031,7 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 		p.debugChildfLocked("mkdir-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	now := time.Now()
 	node := &imageNode{
 		id:      p.nextNodeID,
 		parent:  parent,
@@ -4398,11 +5040,17 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 		uid:     uid,
 		gid:     gid,
 		entries: map[string]uint64{},
+		atime:   now,
+		modTime: now,
+		ctime:   now,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
+	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
 
@@ -4413,9 +5061,7 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return 0, FuseAttr{}, errno
-	}
+	mode, gid = p.inheritImageCreateLocked(parentNode, mode, gid, false)
 	var ok bool
 	name, ok = cleanChildName(name)
 	if !ok {
@@ -4441,6 +5087,7 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	if parentNode.whiteouts != nil {
 		delete(parentNode.whiteouts, name)
 	}
+	now := time.Now()
 	node := &imageNode{
 		id:      p.nextNodeID,
 		parent:  parent,
@@ -4450,12 +5097,17 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 		uid:     uid,
 		gid:     gid,
 		rdev:    rdev,
-		modTime: time.Now(),
+		atime:   now,
+		modTime: now,
+		ctime:   now,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
+	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
 
@@ -4466,9 +5118,7 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return 0, FuseAttr{}, errno
-	}
+	_, gid = p.inheritImageCreateLocked(parentNode, 0, gid, false)
 	var ok bool
 	name, ok = cleanChildName(name)
 	if !ok {
@@ -4479,6 +5129,7 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 		p.debugChildfLocked("symlink-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	now := time.Now()
 	node := &imageNode{
 		id:            p.nextNodeID,
 		parent:        parent,
@@ -4488,11 +5139,16 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 		gid:           gid,
 		size:          uint64(len(target)),
 		symlinkTarget: target,
-		modTime:       time.Now(),
+		atime:         now,
+		modTime:       now,
+		ctime:         now,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
+	p.touchImageDirectoryLocked(parentNode, now)
 	return node.id, p.attr(node), 0
 }
 
@@ -4507,9 +5163,6 @@ func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string,
 	parentNode := p.nodes[newParent]
 	if node == nil || parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
-	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return 0, FuseAttr{}, errno
 	}
 	if node.isDir() {
 		return 0, FuseAttr{}, -linuxEPERM
@@ -4531,30 +5184,13 @@ func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string,
 			return 0, FuseAttr{}, errno
 		}
 	}
-	linked := &imageNode{
-		id:            p.nextNodeID,
-		inode:         p.imageNodeInodeLocked(node),
-		parent:        newParent,
-		name:          name,
-		mode:          node.mode,
-		rawMode:       node.rawMode,
-		uid:           node.uid,
-		gid:           node.gid,
-		rdev:          node.rdev,
-		size:          node.size,
-		data:          append([]byte(nil), node.data...),
-		symlinkTarget: node.symlinkTarget,
-		modTime:       node.modTime,
-	}
-	if node.isSymlink() {
-		linked.mode = fs.ModeSymlink | node.mode.Perm()
-	}
-	p.nextNodeID++
-	p.nodes[linked.id] = linked
-	p.registerImageNodeLinkLocked(linked)
-	p.refreshImageNodeLinksLocked(linked)
-	parentNode.entries[name] = linked.id
-	return linked.id, p.attr(linked), 0
+	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
+	now := time.Now()
+	node.ctime = now
+	p.touchImageDirectoryLocked(parentNode, now)
+	p.refreshImageNodeLinksLocked(node)
+	return node.id, p.attr(node), 0
 }
 
 func (p *imageFS) RmDir(parent uint64, name string) int32 {
@@ -4567,9 +5203,6 @@ func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uin
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return -linuxENOENT
-	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return errno
 	}
 	var ok bool
 	name, ok = cleanChildName(name)
@@ -4596,8 +5229,11 @@ func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uin
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
-	delete(p.nodes, childID)
+	p.collectImageNodeLocked(childID)
+	p.touchImageDirectoryLocked(parentNode, time.Now())
+	p.compactImageNodeMapsLocked(parentNode)
 	return 0
 }
 
@@ -4632,9 +5268,6 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 			p.debugChildfLocked("create-existing-dir", parent, name, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return 0, 0, FuseAttr{}, -linuxEISDIR
 		}
-		if errno := p.checkNodeAccessLocked(node, uid, gid, imageOpenAccessMask(flags)); errno != 0 {
-			return 0, 0, FuseAttr{}, errno
-		}
 		p.debugChildfLocked("create-open-existing", parent, name, "existing=%d flags=%#x", existingID, flags)
 		if flags&linuxOACCMODE != linuxORDONLY {
 			if errno := p.copyUpFileLocked(node); errno != 0 {
@@ -4643,22 +5276,31 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 			}
 			if flags&linuxOTRUNC != 0 {
 				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
-				node.data = nil
+				node.data.release(p.dataStore)
+				node.data = sparseImageData{}
+				node.lowerFile = nil
+				node.lowerSize = 0
 				node.size = 0
-				node.modTime = time.Now()
+				if uid != 0 {
+					node.mode &^= fs.FileMode(0o6000)
+				}
+				now := time.Now()
+				node.modTime = now
+				node.ctime = now
+				p.refreshImageNodeMetadataLocked(node)
 			}
 		}
 		fh := p.nextHandle
 		p.nextHandle++
 		p.handles[fh] = imageHandle{nodeID: node.id}
+		p.noteImageHandleAddedLocked()
 		return node.id, fh, p.attr(node), 0
 	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return 0, 0, FuseAttr{}, errno
-	}
+	mode, gid = p.inheritImageCreateLocked(parentNode, mode, gid, false)
 	if parentNode.whiteouts != nil {
 		delete(parentNode.whiteouts, name)
 	}
+	now := time.Now()
 	node := &imageNode{
 		id:      p.nextNodeID,
 		parent:  parent,
@@ -4666,15 +5308,21 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 		mode:    fs.FileMode(mode & linuxPermMask),
 		uid:     uid,
 		gid:     gid,
-		modTime: time.Now(),
+		atime:   now,
+		modTime: now,
+		ctime:   now,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parentNode.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parentNode)
+	p.touchImageDirectoryLocked(parentNode, now)
 	fh := p.nextHandle
 	p.nextHandle++
 	p.handles[fh] = imageHandle{nodeID: node.id}
+	p.noteImageHandleAddedLocked()
 	return node.id, fh, p.attr(node), 0
 }
 
@@ -4690,9 +5338,6 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	if !ok || handle.nodeID != nodeID || node == nil {
 		return 0, -linuxEBADF
 	}
-	if errno := p.checkNodeAccessLocked(node, uid, gid, imageAccessWrite); errno != 0 {
-		return 0, errno
-	}
 	if errno := p.copyUpFileLocked(node); errno != 0 {
 		return 0, errno
 	}
@@ -4700,59 +5345,39 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	if end < off || end > uint64(^uint(0)>>1) {
 		return 0, -linuxEFBIG
 	}
-	if errno := growImageNodeData(node, end); errno != 0 {
+	if errno := p.prepareImageOverlayWriteLocked(node, off, uint64(len(data))); errno != 0 {
 		return 0, errno
 	}
-	copy(node.data[off:end], data)
+	written, err := node.data.writeAt(p.dataStore, data, off)
+	p.refreshImageNodeMetadataLocked(node)
+	if err != nil {
+		if written > 0 && off+uint64(written) > node.size {
+			node.size = off + uint64(written)
+		}
+		return uint32(written), errnoFromError(err)
+	}
 	if end > node.size {
 		node.size = end
 	}
-	node.modTime = time.Now()
+	now := time.Now()
+	if uid != 0 && uint32(node.mode)&0o6000 != 0 {
+		node.mode &^= fs.FileMode(0o6000)
+	}
+	node.modTime = now
+	node.ctime = now
 	return uint32(len(data)), 0
-}
-
-func growImageNodeData(node *imageNode, size uint64) int32 {
-	if size <= uint64(len(node.data)) {
-		return 0
-	}
-	if size > uint64(^uint(0)>>1) {
-		return -linuxEFBIG
-	}
-	wantLen := int(size)
-	if size <= uint64(cap(node.data)) {
-		node.data = node.data[:wantLen]
-		return 0
-	}
-	newCap := cap(node.data)
-	if newCap < 4096 {
-		newCap = wantLen
-	}
-	for newCap < wantLen {
-		if newCap > int(^uint(0)>>1)/2 {
-			newCap = wantLen
-			break
-		}
-		newCap *= 2
-	}
-	grown := make([]byte, wantLen, newCap)
-	copy(grown, node.data)
-	node.data = grown
-	return 0
 }
 
 func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time) (FuseAttr, int32) {
 	return p.SetAttrForCaller(nodeID, valid, 0, size, mode, uid, gid, time.Time{}, mtime, 0, 0)
 }
 
-func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
+func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
-	}
-	if errno := p.checkSetAttrLocked(node, valid, callerUID, callerGID); errno != 0 {
-		return FuseAttr{}, errno
 	}
 	if !node.isDir() {
 		if errno := p.copyUpFileLocked(node); errno != 0 {
@@ -4766,6 +5391,9 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 			node.mode = (node.mode &^ fs.FileMode(linuxPermMask)) | fs.FileMode(mode&linuxPermMask)
 		}
 	}
+	if valid&(fattrUID|fattrGID) != 0 && valid&fattrMode == 0 {
+		node.mode &^= fs.FileMode(0o6000)
+	}
 	if valid&fattrUID != 0 {
 		node.uid = uid
 	}
@@ -4773,19 +5401,34 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 		node.gid = gid
 	}
 	if valid&fattrSize != 0 {
-		if size < uint64(len(node.data)) {
-			node.data = node.data[:size]
-		} else if size > uint64(len(node.data)) {
-			if errno := growImageNodeData(node, size); errno != 0 {
-				return FuseAttr{}, errno
-			}
+		if err := node.data.truncate(p.dataStore, size); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
+		if size < node.lowerSize {
+			node.lowerSize = size
 		}
 		node.size = size
+		p.refreshImageNodeMetadataLocked(node)
+		if callerUID != 0 {
+			node.mode &^= fs.FileMode(0o6000)
+		}
 	}
-	if valid&fattrMTime != 0 && !mtime.IsZero() {
+	now := time.Now()
+	if valid&fattrSize != 0 {
+		node.modTime = now
+	}
+	if valid&fattrATimeNow != 0 {
+		node.atime = now
+	} else if valid&fattrATime != 0 && !atime.IsZero() {
+		node.atime = atime
+	}
+	if valid&fattrMTimeNow != 0 {
+		node.modTime = now
+	} else if valid&fattrMTime != 0 && !mtime.IsZero() {
 		node.modTime = mtime
-	} else {
-		node.modTime = time.Now()
+	}
+	if valid&(fattrMode|fattrUID|fattrGID|fattrSize|fattrATime|fattrMTime|fattrATimeNow|fattrMTimeNow) != 0 {
+		node.ctime = now
 	}
 	return p.attr(node), 0
 }
@@ -4800,9 +5443,6 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return -linuxENOENT
-	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return errno
 	}
 	var ok bool
 	name, ok = cleanChildName(name)
@@ -4830,9 +5470,17 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
-	delete(p.nodes, childID)
-	p.unregisterImageNodeLinkLocked(child)
+	child.ctime = time.Now()
+	p.touchImageDirectoryLocked(parentNode, child.ctime)
+	if p.imageNodeReferenceCountLocked(childID) == 0 {
+		child.nlink = 0
+		p.collectImageNodeLocked(childID)
+	} else {
+		p.refreshImageNodeLinksLocked(child)
+	}
+	p.compactImageNodeMapsLocked(parentNode)
 	return 0
 }
 
@@ -4847,14 +5495,6 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	newParentNode := p.nodes[newParent]
 	if parentNode == nil || newParentNode == nil {
 		return -linuxENOENT
-	}
-	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
-		return errno
-	}
-	if parentNode != newParentNode {
-		if errno := p.checkParentMutationLocked(newParentNode, uid, gid); errno != 0 {
-			return errno
-		}
 	}
 	var ok bool
 	name, ok = cleanChildName(name)
@@ -4877,19 +5517,53 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		p.debugChildfLocked("rename-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
 	}
-	if existingID, exists := newParentNode.entries[newName]; exists && existingID != childID {
-		existing := p.nodes[existingID]
-		if existing != nil && existing.isDir() && !child.isDir() {
+	existingID, targetExists := newParentNode.entries[newName]
+	if flags&^(linuxRenameNoReplace|linuxRenameExchange) != 0 || flags == linuxRenameNoReplace|linuxRenameExchange {
+		return -linuxEINVAL
+	}
+	if flags&linuxRenameNoReplace != 0 && targetExists {
+		return -linuxEEXIST
+	}
+	if flags&linuxRenameExchange != 0 {
+		if !targetExists {
+			return -linuxENOENT
+		}
+		other := p.nodes[existingID]
+		if other == nil {
+			return -linuxENOENT
+		}
+		if existingID == childID {
+			return 0
+		}
+		parentNode.entries[name] = existingID
+		newParentNode.entries[newName] = childID
+		child.parent, child.name = newParent, newName
+		other.parent, other.name = parent, name
+		p.refreshImageNodeMetadataLocked(child)
+		p.refreshImageNodeMetadataLocked(other)
+		now := time.Now()
+		child.ctime, other.ctime = now, now
+		parentNode.modTime, parentNode.ctime = now, now
+		newParentNode.modTime, newParentNode.ctime = now, now
+		return 0
+	}
+	// POSIX requires renaming one hard link over another link to the same
+	// inode to succeed without removing either directory entry.
+	if targetExists && existingID == childID {
+		return 0
+	}
+	var replaced *imageNode
+	if existingID, exists := newParentNode.entries[newName]; exists {
+		replaced = p.nodes[existingID]
+		if replaced != nil && replaced.isDir() && !child.isDir() {
 			p.debugChildfLocked("rename-target-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return -linuxEISDIR
 		}
-		if existing != nil && !existing.isDir() && child.isDir() {
+		if replaced != nil && !replaced.isDir() && child.isDir() {
 			p.debugChildfLocked("rename-target-not-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxENOTDIR)
 			return -linuxENOTDIR
 		}
 		p.debugChildfLocked("rename-replace-target", newParent, newName, "existing=%d", existingID)
-		delete(p.nodes, existingID)
-		p.unregisterImageNodeLinkLocked(existing)
 	}
 	delete(parentNode.entries, name)
 	if parentNode.abstractDir != nil {
@@ -4897,14 +5571,33 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 			parentNode.whiteouts = map[string]bool{}
 		}
 		parentNode.whiteouts[name] = true
+		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	if newParentNode.whiteouts != nil {
 		delete(newParentNode.whiteouts, newName)
 	}
 	newParentNode.entries[newName] = childID
+	p.noteImageEntryAddedLocked(newParentNode)
 	child.parent = newParent
 	child.name = newName
-	child.modTime = time.Now()
+	p.refreshImageNodeMetadataLocked(child)
+	now := time.Now()
+	child.ctime = now
+	parentNode.modTime, parentNode.ctime = now, now
+	newParentNode.modTime, newParentNode.ctime = now, now
+	if replaced != nil {
+		if p.imageNodeReferenceCountLocked(replaced.id) == 0 {
+			replaced.nlink = 0
+			p.collectImageNodeLocked(replaced.id)
+		} else {
+			p.refreshImageNodeLinksLocked(replaced)
+		}
+	}
+	p.refreshImageNodeLinksLocked(child)
+	p.compactImageNodeMapsLocked(parentNode)
+	if newParentNode != parentNode {
+		p.compactImageNodeMapsLocked(newParentNode)
+	}
 	return 0
 }
 
@@ -4915,12 +5608,91 @@ func (p *imageFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64, uint
 	return hostStatFS(p.root)
 }
 
-func (p *imageFS) GetXattr(_ uint64, _ string) ([]byte, int32) {
-	return nil, -linuxENODATA
+func (p *imageFS) GetXattr(nodeID uint64, name string) ([]byte, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		return nil, -linuxENOENT
+	}
+	value, ok := node.xattrs[name]
+	if !ok {
+		return nil, -linuxENODATA
+	}
+	return append([]byte(nil), value...), 0
 }
 
-func (p *imageFS) ListXattr(_ uint64) ([]byte, int32) {
-	return nil, 0
+func (p *imageFS) ListXattr(nodeID uint64) ([]byte, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		return nil, -linuxENOENT
+	}
+	names := make([]string, 0, len(node.xattrs))
+	for name := range node.xattrs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var out []byte
+	for _, name := range names {
+		out = append(out, name...)
+		out = append(out, 0)
+	}
+	return out, 0
+}
+
+func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32 {
+	if name == "" || len(name) > 255 || len(value) > 64<<10 || flags&^uint32(3) != 0 || flags == 3 {
+		return -linuxEINVAL
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		return -linuxENOENT
+	}
+	_, exists := node.xattrs[name]
+	if flags&1 != 0 && exists {
+		return -linuxEEXIST
+	}
+	if flags&2 != 0 && !exists {
+		return -linuxENODATA
+	}
+	oldBytes := 0
+	if exists {
+		oldBytes = len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead
+	}
+	newBytes := len(name) + len(value) + imageXattrEntryOverhead
+	nodeBytes := imageNodeXattrBytes(node) - oldBytes + newBytes
+	if nodeBytes > imageMaxXattrBytesPerNode || int64(p.xattrBytes)-int64(oldBytes)+int64(newBytes) > imageMaxXattrBytes {
+		return -linuxENOSPC
+	}
+	if node.xattrs == nil {
+		node.xattrs = make(map[string][]byte)
+	}
+	node.xattrs[name] = append([]byte(nil), value...)
+	p.xattrBytes = uint64(int64(p.xattrBytes) - int64(oldBytes) + int64(newBytes))
+	p.refreshImageNodeMetadataLocked(node)
+	node.ctime = time.Now()
+	return 0
+}
+
+func (p *imageFS) RemoveXattr(nodeID uint64, name string) int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		return -linuxENOENT
+	}
+	if _, exists := node.xattrs[name]; !exists {
+		return -linuxENODATA
+	}
+	p.xattrBytes -= uint64(len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead)
+	delete(node.xattrs, name)
+	p.refreshImageNodeMetadataLocked(node)
+	node.ctime = time.Now()
+	return 0
 }
 
 func (p *imageFS) attr(node *imageNode) FuseAttr {
@@ -4961,7 +5733,12 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	}
 	nlink := uint32(1)
 	if isDir {
-		nlink = maxU32(2, 2+uint32(len(node.entries)))
+		nlink = 2
+		for _, childID := range node.entries {
+			if child := p.nodes[childID]; child != nil && child.isDir() {
+				nlink++
+			}
+		}
 	} else {
 		nlink = p.imageNodeLinkCountLocked(node)
 	}
@@ -4969,18 +5746,27 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	if p.mapOwner {
 		attrUID, attrGID = p.ownerUID, p.ownerGID
 	}
-	sec := uint64(modTime.Unix())
-	nsec := uint32(modTime.Nanosecond())
+	atime, ctime := node.atime, node.ctime
+	if atime.IsZero() {
+		atime = modTime
+	}
+	if ctime.IsZero() {
+		ctime = modTime
+	}
+	allocatedBytes := node.data.allocatedBytes(size)
+	if node.abstractFile != nil || node.lowerFile != nil {
+		allocatedBytes = size
+	}
 	return FuseAttr{
 		Ino:       p.imageNodeInodeLocked(node),
 		Size:      size,
-		Blocks:    uint64((size + 511) / 512),
-		ATimeSec:  sec,
-		MTimeSec:  sec,
-		CTimeSec:  sec,
-		ATimeNsec: nsec,
-		MTimeNsec: nsec,
-		CTimeNsec: nsec,
+		Blocks:    (allocatedBytes + 511) / 512,
+		ATimeSec:  uint64(atime.Unix()),
+		MTimeSec:  uint64(modTime.Unix()),
+		CTimeSec:  uint64(ctime.Unix()),
+		ATimeNsec: uint32(atime.Nanosecond()),
+		MTimeNsec: uint32(modTime.Nanosecond()),
+		CTimeNsec: uint32(ctime.Nanosecond()),
 		Mode:      mode,
 		NLink:     nlink,
 		UID:       attrUID,
@@ -4999,13 +5785,6 @@ func (p *imageFS) registerImageNodeLinkLocked(node *imageNode) {
 	}
 }
 
-func (p *imageFS) unregisterImageNodeLinkLocked(node *imageNode) {
-	if node == nil || node.isDir() {
-		return
-	}
-	p.refreshImageNodeLinksLocked(node)
-}
-
 func (p *imageFS) imageNodeLinkCountLocked(node *imageNode) uint32 {
 	if node == nil || node.isDir() {
 		return 1
@@ -5022,9 +5801,9 @@ func (p *imageFS) refreshImageNodeLinksLocked(node *imageNode) {
 	}
 	inode := p.imageNodeInodeLocked(node)
 	nlink := uint32(0)
-	for _, candidate := range p.nodes {
+	for id, candidate := range p.nodes {
 		if candidate != nil && !candidate.isDir() && p.imageNodeInodeLocked(candidate) == inode {
-			nlink++
+			nlink += p.imageNodeReferenceCountLocked(id)
 		}
 	}
 	if nlink == 0 {
@@ -5035,6 +5814,295 @@ func (p *imageFS) refreshImageNodeLinksLocked(node *imageNode) {
 			candidate.nlink = nlink
 		}
 	}
+}
+
+func (p *imageFS) imageNodeReferenceCountLocked(nodeID uint64) uint32 {
+	var count uint32
+	for _, candidate := range p.nodes {
+		if candidate == nil || !candidate.isDir() {
+			continue
+		}
+		for _, childID := range candidate.entries {
+			if childID == nodeID {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func (p *imageFS) imageNodeHasHandleLocked(nodeID uint64) bool {
+	for _, handle := range p.handles {
+		if handle.nodeID == nodeID {
+			return true
+		}
+	}
+	for _, handleNodeID := range p.dirHandleNodes {
+		if handleNodeID == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *imageFS) touchImageDirectoryLocked(node *imageNode, now time.Time) {
+	if node == nil || !node.isDir() {
+		return
+	}
+	node.modTime = now
+	node.ctime = now
+}
+
+func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
+	// The root has no parent directory entry, so its reference count is always
+	// zero. Releasing an open root directory must never collect it: persistent
+	// guest shells routinely open and close / while resolving paths.
+	if nodeID == 1 {
+		return
+	}
+	node := p.nodes[nodeID]
+	if node == nil {
+		return
+	}
+	// Regular-file link counts are maintained when directory entries change.
+	// Most Release calls therefore prove the node is still linked in O(1),
+	// instead of rescanning every directory after every close. Directories are
+	// not hard-linkable and remain on the conservative reference scan.
+	linked := node.nlink != 0
+	if node.isDir() {
+		linked = p.imageNodeReferenceCountLocked(nodeID) != 0
+	}
+	if !linked && !p.imageNodeHasHandleLocked(nodeID) {
+		if node := p.nodes[nodeID]; node != nil {
+			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
+			p.retainedEntries -= node.retainedEntries
+			p.retainedWhiteouts -= node.retainedWhiteouts
+			node.data.release(p.dataStore)
+			p.dynamicMetadata -= node.accountedMetadata
+		}
+		delete(p.nodes, nodeID)
+		p.compactImageNodesLocked()
+	}
+}
+
+func (p *imageFS) Close() error {
+	return p.closeWithin(2 * time.Second)
+}
+
+func (p *imageFS) BeginClose() {
+	if p == nil {
+		return
+	}
+	p.beginClose.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.materializationCancel()
+		for _, materialization := range p.materializations {
+			materialization.cancel()
+		}
+		p.mu.Unlock()
+	})
+}
+
+func (p *imageFS) closeWithin(timeout time.Duration) error {
+	if p == nil {
+		return nil
+	}
+	p.BeginClose()
+	p.closeStart.Do(func() {
+		p.mu.Lock()
+		p.closeDone = make(chan struct{})
+		done := p.closeDone
+		p.mu.Unlock()
+		// Legacy lower filesystems cannot always interrupt an in-flight host I/O
+		// operation. Keep ownership of both the worker and backing store until it
+		// actually returns, but do not make VM teardown wait without a bound.
+		go func() {
+			p.materializationWG.Wait()
+			p.closeErr = p.dataStore.close()
+			close(done)
+		}()
+	})
+	p.mu.Lock()
+	done := p.closeDone
+	p.mu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return p.closeErr
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "image filesystem lower operation", Timeout: timeout}
+	}
+}
+
+func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
+	if p == nil {
+		return 0, 0, 0, nil
+	}
+	return p.dataStore.usage()
+}
+
+func (p *imageFS) BackingCurrent() uint64 {
+	if p == nil {
+		return 0
+	}
+	p.dataStore.mu.Lock()
+	defer p.dataStore.mu.Unlock()
+	return p.dataStore.current
+}
+
+func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
+	if p == nil {
+		return 0, 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// This is deliberately accounting, not a guest quota. Empty files and page
+	// indexes consume host heap even when no backing blocks are allocated; make
+	// that pressure visible to the same host recovery telemetry as file data.
+	metadata := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles)*64 + uint64(p.retainedDirHandles)*64 + p.xattrBytes
+	metadata += uint64(p.retainedEntries+p.retainedWhiteouts) * 64
+	metadata += uint64(len(p.materializations)) * 128
+	metadata += p.dynamicMetadata
+	metadata += p.dataStore.metadataUsage()
+	if metadata > p.metadataHighWater {
+		p.metadataHighWater = metadata
+	}
+	return metadata, p.metadataHighWater
+}
+
+func (p *imageFS) noteImageNodeAddedLocked(node *imageNode) {
+	p.retainedNodes = max(p.retainedNodes, len(p.nodes))
+	p.refreshImageNodeMetadataLocked(node)
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) refreshImageNodeMetadataLocked(node *imageNode) {
+	if node == nil {
+		return
+	}
+	current := uint64(len(node.name)+len(node.symlinkTarget)) + uint64(cap(node.data.extents))*32
+	for _, value := range node.xattrs {
+		current += uint64(cap(value) - len(value))
+	}
+	if current >= node.accountedMetadata {
+		p.dynamicMetadata += current - node.accountedMetadata
+	} else {
+		p.dynamicMetadata -= node.accountedMetadata - current
+	}
+	node.accountedMetadata = current
+}
+
+func (p *imageFS) noteImageHandleAddedLocked() {
+	p.retainedHandles = max(p.retainedHandles, len(p.handles))
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageDirHandleAddedLocked() {
+	p.retainedDirHandles = max(p.retainedDirHandles, len(p.dirHandles))
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageEntryAddedLocked(node *imageNode) {
+	if node == nil || len(node.entries) <= node.retainedEntries {
+		return
+	}
+	p.retainedEntries += len(node.entries) - node.retainedEntries
+	node.retainedEntries = len(node.entries)
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) noteImageWhiteoutAddedLocked(node *imageNode) {
+	if node == nil || len(node.whiteouts) <= node.retainedWhiteouts {
+		return
+	}
+	p.retainedWhiteouts += len(node.whiteouts) - node.retainedWhiteouts
+	node.retainedWhiteouts = len(node.whiteouts)
+	p.bumpImageMetadataFloorLocked()
+}
+
+func (p *imageFS) compactImageNodeMapsLocked(node *imageNode) {
+	if node == nil {
+		return
+	}
+	if len(node.entries)*4 < node.retainedEntries && (node.retainedEntries >= 64 || len(node.entries) <= 4) {
+		rebuilt := make(map[string]uint64, len(node.entries))
+		for name, id := range node.entries {
+			rebuilt[name] = id
+		}
+		p.retainedEntries -= node.retainedEntries - len(rebuilt)
+		node.retainedEntries = len(rebuilt)
+		node.entries = rebuilt
+	}
+	if len(node.whiteouts)*4 < node.retainedWhiteouts && (node.retainedWhiteouts >= 64 || len(node.whiteouts) <= 4) {
+		rebuilt := make(map[string]bool, len(node.whiteouts))
+		for name, present := range node.whiteouts {
+			rebuilt[name] = present
+		}
+		p.retainedWhiteouts -= node.retainedWhiteouts - len(rebuilt)
+		node.retainedWhiteouts = len(rebuilt)
+		node.whiteouts = rebuilt
+	}
+}
+
+func (p *imageFS) compactImageNodesLocked() {
+	if len(p.nodes)*4 >= p.retainedNodes || p.retainedNodes < 64 && len(p.nodes) > 4 {
+		return
+	}
+	rebuilt := make(map[uint64]*imageNode, len(p.nodes))
+	for id, node := range p.nodes {
+		rebuilt[id] = node
+	}
+	p.nodes = rebuilt
+	p.retainedNodes = len(rebuilt)
+}
+
+func (p *imageFS) compactImageHandleMapsLocked() {
+	if len(p.handles)*4 >= p.retainedHandles || p.retainedHandles < 64 && !(len(p.handles) == 0 && p.retainedHandles >= 16) {
+		return
+	}
+	rebuilt := make(map[uint64]imageHandle, len(p.handles))
+	for id, handle := range p.handles {
+		rebuilt[id] = handle
+	}
+	p.handles = rebuilt
+	p.retainedHandles = len(rebuilt)
+}
+
+func (p *imageFS) compactImageDirHandleMapsLocked() {
+	if len(p.dirHandles)*4 >= p.retainedDirHandles || p.retainedDirHandles < 64 && !(len(p.dirHandles) == 0 && p.retainedDirHandles >= 16) {
+		return
+	}
+	handles := make(map[uint64][]dirEntry, len(p.dirHandles))
+	nodes := make(map[uint64]uint64, len(p.dirHandleNodes))
+	for id, entries := range p.dirHandles {
+		handles[id] = entries
+	}
+	for id, node := range p.dirHandleNodes {
+		nodes[id] = node
+	}
+	p.dirHandles = handles
+	p.dirHandleNodes = nodes
+	p.retainedDirHandles = len(handles)
+}
+
+func (p *imageFS) bumpImageMetadataFloorLocked() {
+	floor := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles+p.retainedDirHandles+p.retainedEntries+p.retainedWhiteouts)*64 + p.xattrBytes
+	if floor > p.metadataHighWater {
+		p.metadataHighWater = floor
+	}
+}
+
+func imageNodeXattrBytes(node *imageNode) int {
+	if node == nil {
+		return 0
+	}
+	total := 0
+	for name, value := range node.xattrs {
+		total += len(name) + len(value) + imageXattrEntryOverhead
+	}
+	return total
 }
 
 func (p *imageFS) imageNodeInodeLocked(node *imageNode) uint64 {
@@ -5106,8 +6174,10 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 		node.modTime = time.Unix(0, 0)
 	}
 	p.nodes[node.id] = node
+	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
 	parent.entries[name] = node.id
+	p.noteImageEntryAddedLocked(parent)
 	return node, 0
 }
 
@@ -5117,7 +6187,7 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 	}
 	ents, err := node.abstractDir.ReadDir()
 	if err != nil {
-		return nil, -linuxENOENT
+		return nil, errnoFromError(err)
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	for _, ent := range ents {
@@ -5132,7 +6202,7 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 		}
 		entry, err := node.abstractDir.Lookup(ent.Name)
 		if err != nil {
-			continue
+			return nil, -linuxEIO
 		}
 		if _, errno := p.createAbstractNode(node, ent.Name, entry); errno != 0 {
 			return nil, errno
@@ -5154,6 +6224,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 		return -linuxENOTDIR
 	}
 	lowerDir := node.abstractDir
+	lowerNode := node
 	if lowerDir == nil || node.entriesDone {
 		p.mu.Unlock()
 		return 0
@@ -5162,7 +6233,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 
 	ents, err := lowerDir.ReadDir()
 	if err != nil {
-		return -linuxENOENT
+		return errnoFromError(err)
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	type lowerEntry struct {
@@ -5176,7 +6247,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 		}
 		entry, err := lowerDir.Lookup(ent.Name)
 		if err != nil {
-			continue
+			return errnoFromError(err)
 		}
 		lowerEntries = append(lowerEntries, lowerEntry{name: ent.Name, entry: entry})
 	}
@@ -5187,7 +6258,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 	if node == nil {
 		return -linuxENOENT
 	}
-	if node.abstractDir != lowerDir {
+	if node != lowerNode {
 		return 0
 	}
 	if node.entriesDone {
@@ -5208,6 +6279,119 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 	return 0
 }
 
+type imageLowerEntry struct {
+	name  string
+	entry imagefs.Entry
+}
+
+type imageDirMaterialization struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	node   *imageNode
+	err    error
+}
+
+func readImageLowerEntries(ctx context.Context, lowerDir imagefs.Directory) ([]imageLowerEntry, error) {
+	ents, err := imagefs.ReadDirContext(ctx, lowerDir)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
+	entries := make([]imageLowerEntry, 0, len(ents))
+	for _, ent := range ents {
+		if ent.Name == "." || ent.Name == ".." {
+			continue
+		}
+		entry, err := imagefs.LookupContext(ctx, lowerDir, ent.Name)
+		if err != nil {
+			return nil, fmt.Errorf("lookup lower entry %q: %w", ent.Name, err)
+		}
+		entries = append(entries, imageLowerEntry{name: ent.Name, entry: entry})
+	}
+	return entries, nil
+}
+
+// materializeDirEntriesContext keeps potentially blocking lower-filesystem I/O
+// outside imageFS.mu. Legacy imagefs implementations do not accept a context,
+// so one background read may outlive a canceled caller. The in-flight record
+// prevents repeated cancellations from creating unbounded readers for the same
+// directory, and the eventual result is committed or discarded under the lock.
+func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		p.mu.Unlock()
+		return os.ErrNotExist
+	}
+	if !node.isDir() {
+		p.mu.Unlock()
+		return fmt.Errorf("%s is not a directory", p.pathForNode(nodeID))
+	}
+	lowerDir := node.abstractDir
+	if lowerDir == nil || node.entriesDone {
+		p.mu.Unlock()
+		return nil
+	}
+	if p.closed {
+		p.mu.Unlock()
+		return os.ErrClosed
+	}
+	materialization := p.materializations[nodeID]
+	if materialization == nil {
+		if p.materializations == nil {
+			p.materializations = make(map[uint64]*imageDirMaterialization)
+		}
+		materializationCtx, cancel := context.WithCancel(p.materializationCtx)
+		materialization = &imageDirMaterialization{done: make(chan struct{}), cancel: cancel, node: node}
+		p.materializations[nodeID] = materialization
+		p.materializationWG.Add(1)
+		go p.finishDirMaterialization(materializationCtx, nodeID, lowerDir, materialization)
+	}
+	p.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-materialization.done:
+		return materialization.err
+	}
+}
+
+func (p *imageFS) finishDirMaterialization(ctx context.Context, nodeID uint64, lowerDir imagefs.Directory, materialization *imageDirMaterialization) {
+	defer p.materializationWG.Done()
+	defer materialization.cancel()
+	entries, err := readImageLowerEntries(ctx, lowerDir)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if err == nil && node == materialization.node && !node.entriesDone {
+		for _, ent := range entries {
+			if node.whiteouts[ent.name] {
+				continue
+			}
+			if _, ok := node.entries[ent.name]; ok {
+				continue
+			}
+			if _, errno := p.createAbstractNode(node, ent.name, ent.entry); errno != 0 {
+				err = fmt.Errorf("materialize %s: errno %d", p.pathForNode(nodeID), errno)
+				break
+			}
+		}
+		if err == nil {
+			node.entriesDone = true
+		}
+	} else if err == nil && node == nil {
+		err = os.ErrNotExist
+	}
+	materialization.err = err
+	if p.materializations[nodeID] == materialization {
+		delete(p.materializations, nodeID)
+	}
+	close(materialization.done)
+}
+
 func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 	if node == nil {
 		return -linuxENOENT
@@ -5222,16 +6406,54 @@ func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 		return 0
 	}
 	size, mode := node.abstractFile.Stat()
-	data, err := node.abstractFile.ReadAt(0, uint32(size))
-	if err != nil {
-		return errnoFromError(err)
-	}
-	node.data = append(node.data[:0], data...)
-	node.size = uint64(len(node.data))
+	node.size = size
 	node.mode = mode
+	node.lowerFile = node.abstractFile
+	node.lowerSize = size
 	node.abstractFile = nil
 	if node.modTime.IsZero() {
 		node.modTime = time.Now()
+	}
+	return 0
+}
+
+// prepareImageOverlayWriteLocked materializes only partially overwritten lower
+// pages. Complete pages can be created directly from the write payload. This is
+// the page-level COW boundary that prevents a one-byte change from copying an
+// entire lower file (and from expanding sparse lower files).
+func (p *imageFS) prepareImageOverlayWriteLocked(node *imageNode, off, length uint64) int32 {
+	if node == nil || node.lowerFile == nil || length == 0 {
+		return 0
+	}
+	defer p.refreshImageNodeMetadataLocked(node)
+	end := off + length
+	if end < off {
+		return -linuxEFBIG
+	}
+	for cursor := off; cursor < end; {
+		page := cursor / imageDataPageSize
+		pageStart := page * imageDataPageSize
+		pageEnd := pageStart + imageDataPageSize
+		writeEnd := min(end, pageEnd)
+		fullPage := cursor == pageStart && writeEnd == pageEnd
+		if !fullPage {
+			if _, exists := node.data.location(page); !exists && pageStart < node.lowerSize {
+				visible := min(imageDataPageSize, node.lowerSize-pageStart)
+				data, err := node.lowerFile.ReadAt(pageStart, uint32(visible))
+				if err != nil {
+					return errnoFromError(err)
+				}
+				if uint64(len(data)) != visible {
+					return -linuxEIO
+				}
+				location, err := p.dataStore.allocatePage(data)
+				if err != nil {
+					return errnoFromError(err)
+				}
+				node.data.insert(page, location)
+			}
+		}
+		cursor = writeEnd
 	}
 	return 0
 }
@@ -5257,24 +6479,26 @@ const (
 )
 
 const (
-	linuxEPERM     = linuxabi.EPERM
-	linuxENOENT    = linuxabi.ENOENT
-	linuxENXIO     = linuxabi.ENXIO
-	linuxEIO       = linuxabi.EIO
-	linuxEBADF     = linuxabi.EBADF
-	linuxEACCES    = linuxabi.EACCES
-	linuxEPIPE     = linuxabi.EPIPE
-	linuxEEXIST    = linuxabi.EEXIST
-	linuxENOTDIR   = linuxabi.ENOTDIR
-	linuxEISDIR    = linuxabi.EISDIR
-	linuxEINVAL    = linuxabi.EINVAL
-	linuxENOTTY    = linuxabi.ENOTTY
-	linuxEFBIG     = linuxabi.EFBIG
-	linuxERANGE    = linuxabi.ERANGE
-	linuxENOSYS    = linuxabi.ENOSYS
-	linuxENOTEMPTY = linuxabi.ENOTEMPTY
-	linuxENODATA   = linuxabi.ENODATA
-	linuxETIMEDOUT = linuxabi.ETIMEDOUT
+	linuxEPERM      = linuxabi.EPERM
+	linuxENOENT     = linuxabi.ENOENT
+	linuxENXIO      = linuxabi.ENXIO
+	linuxEIO        = linuxabi.EIO
+	linuxEBADF      = linuxabi.EBADF
+	linuxEACCES     = linuxabi.EACCES
+	linuxEPIPE      = linuxabi.EPIPE
+	linuxEEXIST     = linuxabi.EEXIST
+	linuxENOTDIR    = linuxabi.ENOTDIR
+	linuxEISDIR     = linuxabi.EISDIR
+	linuxEINVAL     = linuxabi.EINVAL
+	linuxENOTTY     = linuxabi.ENOTTY
+	linuxEFBIG      = linuxabi.EFBIG
+	linuxENOSPC     = linuxabi.ENOSPC
+	linuxERANGE     = linuxabi.ERANGE
+	linuxENOSYS     = linuxabi.ENOSYS
+	linuxENOTEMPTY  = linuxabi.ENOTEMPTY
+	linuxENODATA    = linuxabi.ENODATA
+	linuxEOPNOTSUPP = linuxabi.EOPNOTSUPP
+	linuxETIMEDOUT  = linuxabi.ETIMEDOUT
 )
 
 func goModeToLinux(mode fs.FileMode) fs.FileMode {

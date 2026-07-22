@@ -194,16 +194,21 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	execReq := req
 	execReq.Kind = "exec_inline"
 	if err := s.sendExecMessage(managedagent.ExecRequest(id, execReq)); err != nil {
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, transcriptError(s.withPlatformSummary(err), s.serialOut.String(), s.transcript.String())
 	}
 	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
@@ -219,10 +224,12 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 func (s *ManagedSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	if err := s.sendExecMessage(managedagent.SyncRequest(id)); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -252,6 +259,8 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	id := s.nextExecID()
 	start := s.transcript.Len()
+	reader := s.transcript.RetainReader(start)
+	defer reader.Close()
 	if err := s.sendExecStart(id, req); err != nil {
 		return transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -270,7 +279,7 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 			return transcriptError(err, s.serialOut.String(), s.transcript.String())
 		}
 	}
-	err := s.streamExecEvents(ctx, start, id, onEvent)
+	err := s.streamExecEvents(ctx, start, id, reader, onEvent)
 	if cancelInputs != nil {
 		cancelInputs()
 		<-inputsDone
@@ -316,9 +325,10 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	return nil
 }
 
-func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id string, reader vmruntime.TranscriptReader, onEvent func(client.ExecEvent) error) error {
 	err := managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -371,9 +381,8 @@ func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
-		return ok
+	_, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }

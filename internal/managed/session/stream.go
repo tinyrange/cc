@@ -10,11 +10,12 @@ import (
 )
 
 type Transcript interface {
-	String() string
+	ReadFrom(offset int) (text string, next int)
 }
 
 type StreamExecOptions struct {
 	Transcript     Transcript
+	Reader         vmruntime.TranscriptReader
 	Start          int
 	ID             string
 	OnEvent        func(client.ExecEvent) error
@@ -43,6 +44,15 @@ type StreamExecStats struct {
 }
 
 func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
+	reader := opts.Reader
+	if reader == nil {
+		if retained, ok := opts.Transcript.(interface {
+			RetainReader(int) vmruntime.TranscriptReader
+		}); ok {
+			reader = retained.RetainReader(opts.Start)
+			defer reader.Close()
+		}
+	}
 	offset := opts.Start
 	var pending string
 	var stats StreamExecStats
@@ -56,16 +66,20 @@ func StreamExecEvents(ctx context.Context, opts StreamExecOptions) error {
 		stats.Loops++
 		observe(StreamExecObservation{Kind: "loop", Stats: stats})
 		text := ""
+		next := offset
 		readStart := time.Now()
 		if opts.Transcript != nil {
-			text = opts.Transcript.String()
+			text, next = opts.Transcript.ReadFrom(offset)
 		}
-		observe(StreamExecObservation{Kind: "transcript_string", Duration: time.Since(readStart), Stats: stats})
-		if offset < len(text) {
+		observe(StreamExecObservation{Kind: "transcript_read", Duration: time.Since(readStart), Stats: stats})
+		if len(text) > 0 {
 			stats.Reads++
 			appendStart := time.Now()
-			pending += text[offset:]
-			offset = len(text)
+			pending += text
+			offset = next
+			if reader != nil {
+				reader.Advance(next)
+			}
 			observe(StreamExecObservation{Kind: "append_pending", Duration: time.Since(appendStart), Stats: stats})
 			for {
 				lineStart := time.Now()

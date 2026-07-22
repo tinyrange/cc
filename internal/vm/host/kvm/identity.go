@@ -35,22 +35,37 @@ func ResolveRuntimeExecUser(runtimeName, user string) (string, error) {
 		return "0:0", nil
 	}
 	uidPart, gidPart, hasGID := strings.Cut(user, ":")
-	if uidPart == "" {
+	if !validRuntimeUserComponent(uidPart) {
 		return "", fmt.Errorf("invalid user %q", user)
 	}
-	if _, err := strconv.ParseUint(uidPart, 10, 32); err != nil {
-		return "", fmt.Errorf("%s runtime supports numeric users only: %q", runtimeName, user)
-	}
 	if hasGID {
-		if gidPart == "" {
+		if !validRuntimeUserComponent(gidPart) || strings.Contains(gidPart, ":") {
 			return "", fmt.Errorf("invalid user %q", user)
-		}
-		if _, err := strconv.ParseUint(gidPart, 10, 32); err != nil {
-			return "", fmt.Errorf("%s runtime supports numeric users only: %q", runtimeName, user)
 		}
 		return uidPart + ":" + gidPart, nil
 	}
+	if _, err := strconv.ParseUint(uidPart, 10, 32); err != nil {
+		return uidPart, nil
+	}
 	return uidPart + ":" + uidPart, nil
+}
+
+func validRuntimeUserComponent(value string) bool {
+	if value == "" || strings.ContainsAny(value, ":\r\n\x00") {
+		return false
+	}
+	numeric := true
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			numeric = false
+			break
+		}
+	}
+	if !numeric {
+		return true
+	}
+	_, err := strconv.ParseUint(value, 10, 32)
+	return err == nil
 }
 
 type runtimeIdentity struct {

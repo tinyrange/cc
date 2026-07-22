@@ -1,13 +1,22 @@
 package vmruntime
 
 import (
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 )
 
 const (
-	RootFSTag   = "rootfs"
+	// BusyBox treats a mount source named exactly "rootfs" as the kernel's
+	// synthetic root and omits it from targeted df lookups. Use a distinct
+	// virtio-fs tag so ordinary disk-space tools recognize the mounted guest
+	// filesystem.
+	RootFSTag   = "vmsh-rootfs"
 	EmulatorTag = "ccx3"
 	GuestCID    = 3
 	ControlPort = 10777
@@ -24,9 +33,44 @@ type DirectoryShare struct {
 	Cache    string
 }
 
+func CanonicalDirectoryShare(share DirectoryShare) (DirectoryShare, error) {
+	mount := strings.TrimSpace(share.Mount)
+	if mount == "" {
+		return DirectoryShare{}, fmt.Errorf("share mount path is required")
+	}
+	if !strings.HasPrefix(mount, "/") {
+		return DirectoryShare{}, fmt.Errorf("share mount path %q must be absolute", mount)
+	}
+	mount = path.Clean(mount)
+	if mount == "/" {
+		return DirectoryShare{}, fmt.Errorf("share mount path / cannot replace the VM root filesystem")
+	}
+	share.Mount = mount
+	return share, nil
+}
+
+func CloseShareMounts(shares []virtio.ShareMount) error {
+	var errs []error
+	for _, share := range shares {
+		if closer, ok := share.Backend.(interface{ Close() error }); ok {
+			errs = append(errs, closer.Close())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func CloseFSBackend(backend virtio.FSBackend) error {
+	if closer, ok := backend.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // RunRequest is the backend-neutral request shape for the managed guest runtime.
 type RunRequest struct {
 	Kernel            []byte
+	KernelRelease     string
+	ModuleSymvers     []byte
 	Init              []byte
 	AMD64EmulatorPath string
 	Modules           []alpine.Module

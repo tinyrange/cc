@@ -152,6 +152,73 @@ func TestLookupPathCleansInputAndReportsNonDirectory(t *testing.T) {
 	}
 }
 
+func TestImageFSPreservesTrailingSpaceNamesAcrossBackends(t *testing.T) {
+	t.Run("host", func(t *testing.T) {
+		rootDir := t.TempDir()
+		plainPath := filepath.Join(rootDir, "collision")
+		spacedPath := filepath.Join(rootDir, "collision ")
+		mustWriteFile(t, plainPath, "A")
+		mustWriteFile(t, spacedPath, "B")
+		plainInfo, plainErr := os.Stat(plainPath)
+		spacedInfo, spacedErr := os.Stat(spacedPath)
+		if plainErr == nil && spacedErr == nil && os.SameFile(plainInfo, spacedInfo) {
+			t.Skip("host filesystem aliases trailing-space names")
+		}
+		root := NewHostFS(rootDir, nil)
+		if got := readFile(t, root, "/collision"); got != "A" {
+			t.Fatalf("plain file = %q", got)
+		}
+		if got := readFile(t, root, "/collision "); got != "B" {
+			t.Fatalf("spaced file = %q", got)
+		}
+	})
+
+	t.Run("overlay", func(t *testing.T) {
+		overlay := NewOverlay(nil)
+		if err := overlay.AddFile("/collision", 0o644, []byte("A")); err != nil {
+			t.Fatal(err)
+		}
+		if err := overlay.AddFile("/collision ", 0o644, []byte("B")); err != nil {
+			t.Fatal(err)
+		}
+		if err := overlay.AddSymlink("/spaced-link", "collision "); err != nil {
+			t.Fatal(err)
+		}
+		root := overlay.Root()
+		if got := readFile(t, root, "/collision"); got != "A" {
+			t.Fatalf("plain file = %q", got)
+		}
+		if got := readFile(t, root, "/collision "); got != "B" {
+			t.Fatalf("spaced file = %q", got)
+		}
+		resolved, _, err := ResolvePath(root, "/spaced-link")
+		if err != nil || resolved != "/collision " {
+			t.Fatalf("spaced symlink resolved to %q, %v", resolved, err)
+		}
+	})
+
+	t.Run("tar", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		mustWriteTarFile(t, tw, "collision", "A")
+		mustWriteTarFile(t, tw, "collision ", "B")
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		tfs, err := NewTarFS(t.Context(), bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tfs.Close()
+		if got := readFile(t, tfs.Root(), "/collision"); got != "A" {
+			t.Fatalf("plain file = %q", got)
+		}
+		if got := readFile(t, tfs.Root(), "/collision "); got != "B" {
+			t.Fatalf("spaced file = %q", got)
+		}
+	})
+}
+
 func TestTarFSKeepsImplicitDirectoryChildrenWhenDirectoryHeaderAppearsLater(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

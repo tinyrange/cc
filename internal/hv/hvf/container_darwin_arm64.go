@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +171,7 @@ type ContainerSession struct {
 	serialOut   *arm64vm.SerialTranscript
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
+	balloon     *virtio.Balloon
 	rootFS      virtio.ShareMounter
 	fsdevs      []*virtio.FS
 	sendMu      sync.Mutex
@@ -249,13 +252,27 @@ func validateGuestUser(user string) error {
 		return nil
 	}
 	uidPart, gidPart, hasGID := strings.Cut(user, ":")
-	if uidPart == "" || !isUint32String(uidPart) {
-		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	if !validGuestUserComponent(uidPart) {
+		return fmt.Errorf("user must be a name or numeric uid, optionally followed by :group or :gid")
 	}
-	if hasGID && (gidPart == "" || !isUint32String(gidPart)) {
-		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	if hasGID && (!validGuestUserComponent(gidPart) || strings.Contains(gidPart, ":")) {
+		return fmt.Errorf("user must be a name or numeric uid, optionally followed by :group or :gid")
 	}
 	return nil
+}
+
+func validGuestUserComponent(value string) bool {
+	if value == "" || strings.ContainsAny(value, ":\r\n\x00") {
+		return false
+	}
+	numeric := true
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			numeric = false
+			break
+		}
+	}
+	return !numeric || isUint32String(value)
 }
 
 func isUint32String(value string) bool {
@@ -326,44 +343,84 @@ func (s *ContainerSession) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount) error {
+	return s.AddShares(ctx, []client.ShareMount{share})
+}
+
+func (s *ContainerSession) AddShares(ctx context.Context, requested []client.ShareMount) error {
 	_ = ctx
 	if s.rootFS == nil {
 		return fmt.Errorf("root filesystem does not support runtime shares")
 	}
-	key := strings.TrimSpace(share.Mount)
-	if key == "" {
-		return fmt.Errorf("share mount path is required")
-	}
 	s.shareMu.Lock()
-	if existing, ok := s.shares[key]; ok {
-		s.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
-			return nil
+	defer s.shareMu.Unlock()
+	prospective := make(map[string]client.ShareMount, len(s.shares)+len(requested))
+	for key, share := range s.shares {
+		prospective[key] = share
+	}
+	var mountsToAdd []virtio.ShareMount
+	var sharesToAdd []client.ShareMount
+	releasePrepared := true
+	defer func() {
+		if !releasePrepared {
+			return
 		}
-		return fmt.Errorf("share mount %q already exists", key)
+		for _, mount := range mountsToAdd {
+			if closer, ok := mount.Backend.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+	for _, rawShare := range requested {
+		share := rawShare
+		key := strings.TrimSpace(share.Mount)
+		if key == "" {
+			return fmt.Errorf("share mount path is required")
+		}
+		if !strings.HasPrefix(key, "/") {
+			return fmt.Errorf("share mount path %q must be absolute", key)
+		}
+		key = path.Clean(key)
+		if key == "/" {
+			return fmt.Errorf("share mount path / cannot replace the VM root filesystem")
+		}
+		share.Mount = key
+		if existing, ok := prospective[key]; ok {
+			if existing == share {
+				continue
+			}
+			return fmt.Errorf("share mount %q already exists", key)
+		}
+		mount, err := arm64vm.BuildShareMount(0, DirectoryShare{
+			Source: share.Source, Mount: share.Mount, Writable: share.Writable, MapOwner: share.MapOwner,
+			OwnerUID: share.OwnerUID, OwnerGID: share.OwnerGID, Cache: share.Cache,
+		})
+		if err != nil {
+			return err
+		}
+		prospective[key] = share
+		mountsToAdd = append(mountsToAdd, mount)
+		sharesToAdd = append(sharesToAdd, share)
 	}
-	s.shareMu.Unlock()
-	mount, err := arm64vm.BuildShareMount(0, DirectoryShare{
-		Source:   share.Source,
-		Mount:    share.Mount,
-		Writable: share.Writable,
-		MapOwner: share.MapOwner,
-		OwnerUID: share.OwnerUID,
-		OwnerGID: share.OwnerGID,
-		Cache:    share.Cache,
-	})
-	if err != nil {
+	if len(mountsToAdd) == 0 {
+		releasePrepared = false
+		return nil
+	}
+	if batch, ok := s.rootFS.(virtio.ShareBatchMounter); ok {
+		if err := batch.AddShares(mountsToAdd); err != nil {
+			return err
+		}
+	} else if len(mountsToAdd) > 1 {
+		return fmt.Errorf("root filesystem does not support atomic multi-share mutation")
+	} else if err := s.rootFS.AddShare(mountsToAdd[0]); err != nil {
 		return err
 	}
-	if err := s.rootFS.AddShare(mount); err != nil {
-		return err
-	}
-	s.shareMu.Lock()
 	if s.shares == nil {
 		s.shares = make(map[string]client.ShareMount)
 	}
-	s.shares[key] = share
-	s.shareMu.Unlock()
+	for _, share := range sharesToAdd {
+		s.shares[share.Mount] = share
+	}
+	releasePrepared = false
 	return nil
 }
 
@@ -379,6 +436,62 @@ func (s *ContainerSession) VirtioFSStats() []virtio.FSStats {
 		out = append(out, fsdev.Stats())
 	}
 	return out
+}
+
+func (s *ContainerSession) BackingUsage() (current, highWater, physical uint64, err error) {
+	if s == nil {
+		return 0, 0, 0, nil
+	}
+	var errs []error
+	for i, fsdev := range s.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		deviceCurrent, deviceHighWater, devicePhysical, deviceErr := fsdev.BackingUsage()
+		current += deviceCurrent
+		highWater += deviceHighWater
+		physical += devicePhysical
+		if deviceErr != nil {
+			errs = append(errs, fmt.Errorf("virtio-fs device %d: %w", i, deviceErr))
+		}
+	}
+	return current, highWater, physical, errors.Join(errs...)
+}
+
+func (s *ContainerSession) BackingMetadataUsage() (current, highWater uint64) {
+	if s == nil {
+		return 0, 0
+	}
+	for _, fsdev := range s.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		deviceCurrent, deviceHighWater := fsdev.BackingMetadataUsage()
+		current += deviceCurrent
+		highWater += deviceHighWater
+	}
+	return current, highWater
+}
+
+func (s *ContainerSession) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if s == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	if tracker := virtio.SharedFSBackingUsageTracker(s.fsdevs); tracker != nil {
+		return tracker.Snapshot()
+	}
+	data, dataHigh, physical, err := s.BackingUsage()
+	metadata, metadataHigh := s.BackingMetadataUsage()
+	combined := data + metadata
+	if combined < data {
+		combined = ^uint64(0)
+	}
+	return virtio.FSBackingUsageSnapshot{
+		DataBytes: data, DataHighWaterBytes: dataHigh,
+		MetadataBytes: metadata, MetadataHighWaterBytes: metadataHigh,
+		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
+		PhysicalBytes: physical, ReclaimError: err,
+	}
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -476,6 +589,8 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	execReq.User = user
 
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	var err error
 	if s.inlineExec {
@@ -493,6 +608,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return hasManagedExecBegin(text, id)
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec begin", err)
 	}
 	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
@@ -500,14 +618,20 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return hasManagedExecFirstByte(text, id)
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec first byte", err)
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
+		}
 		return client.ExecResponse{}, s.withControlDebug("wait for exec result", err)
 	}
 	timingLog("session.Exec waitForResult took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(segment))
@@ -551,13 +675,15 @@ func (s *ContainerSession) withControlDebug(op string, err error) error {
 func (s *ContainerSession) Flush(ctx context.Context) error {
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start := s.transcript.Len()
+	releaseTranscript := s.transcript.RetainFrom(start)
+	defer releaseTranscript()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.controlWriter(), managedagent.SyncRequest(id))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
 	}
-	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -586,21 +712,46 @@ func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, 
 		guestPath = "/"
 	}
 	if guestPath == "/" {
-		snapshotter, ok := s.rootFS.(interface {
+		if snapshotter, ok := s.rootFS.(interface {
 			RootSnapshot() (imagefs.Directory, error)
-		})
-		if !ok {
-			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		}); ok {
+			return snapshotter.RootSnapshot()
 		}
-		return snapshotter.RootSnapshot()
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
-	snapshotter, ok := s.rootFS.(interface {
+	if snapshotter, ok := s.rootFS.(interface {
 		RootSnapshotAt(string) (imagefs.Directory, error)
-	})
-	if !ok {
-		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
+	}); ok {
+		return snapshotter.RootSnapshotAt(guestPath)
 	}
-	return snapshotter.RootSnapshotAt(guestPath)
+	return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
+}
+
+func (s *ContainerSession) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	return s.RootSnapshotAtContext(ctx, "/")
+}
+
+func (s *ContainerSession) RootSnapshotAtContext(ctx context.Context, guestPath string) (imagefs.Directory, error) {
+	if s == nil || s.rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if strings.TrimSpace(guestPath) == "" {
+		guestPath = "/"
+	}
+	if guestPath == "/" {
+		if snapshotter, ok := s.rootFS.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
+		}); ok {
+			return snapshotter.RootSnapshotContext(ctx)
+		}
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
+	}
+	if snapshotter, ok := s.rootFS.(interface {
+		RootSnapshotAtContext(context.Context, string) (imagefs.Directory, error)
+	}); ok {
+		return snapshotter.RootSnapshotAtContext(ctx, guestPath)
+	}
+	return nil, fmt.Errorf("mount %q does not support cancelable snapshots", guestPath)
 }
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -655,6 +806,8 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	timing.Since(ctx, "exec.marshal_request", start)
 
 	transcriptStart := s.transcript.Len()
+	reader := s.transcript.RetainReader(transcriptStart)
+	defer reader.Close()
 	writeStart := time.Now()
 	s.sendMu.Lock()
 	err := managedagent.Send(s.controlWriter(), managedagent.ExecRequest(id, execReq))
@@ -675,7 +828,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	streamStart := time.Now()
-	err = s.streamExecEvents(ctx, transcriptStart, id, execStart, onEvent)
+	err = s.streamExecEvents(ctx, transcriptStart, id, reader, execStart, onEvent)
 	timing.Since(ctx, "exec.stream_events", streamStart)
 	timing.Since(ctx, "exec.total", execStart)
 	return err
@@ -695,10 +848,11 @@ func (s *ContainerSession) sendExecMessage(msg vmruntime.ManagedExecRequest) err
 	return managedagent.Send(s.controlWriter(), msg)
 }
 
-func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, execStart time.Time, onEvent func(client.ExecEvent) error) error {
+func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, reader vmruntime.TranscriptReader, execStart time.Time, onEvent func(client.ExecEvent) error) error {
 	guestPhases := map[string]int{}
 	return managedsession.StreamExecEvents(ctx, managedsession.StreamExecOptions{
 		Transcript: s.transcript,
+		Reader:     reader,
 		Start:      start,
 		ID:         id,
 		OnEvent:    onEvent,
@@ -757,9 +911,8 @@ func (s *ContainerSession) sendExecSignal(id, name string) error {
 func (s *ContainerSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
-		return ok
+	_, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
+		return strings.Contains(text, vmruntime.CommandExitMarkerPref+id+":")
 	})
 	return err == nil
 }
@@ -857,8 +1010,29 @@ func (s *ContainerSession) Close() error {
 	case <-time.After(15 * time.Second):
 		return fmt.Errorf("container session did not stop within 15s")
 	}
+	if s.transcript != nil {
+		_ = s.transcript.Close()
+	}
+	if s.serialOut != nil && s.serialOut != s.transcript {
+		_ = s.serialOut.Close()
+	}
 	exitTiming.Dump()
 	return nil
+}
+
+func (s *ContainerSession) SetBalloonMB(target uint64) error {
+	if s == nil || s.balloon == nil {
+		return fmt.Errorf("virtio balloon is unavailable")
+	}
+	return s.balloon.SetTargetPages(balloonTargetPages(target))
+}
+
+func (s *ContainerSession) BalloonState() (targetMB, actualMB uint64, driverReady bool) {
+	if s == nil || s.balloon == nil {
+		return 0, 0, false
+	}
+	target, actual, ready := s.balloon.State()
+	return uint64(target) * 4096 >> 20, uint64(actual) * 4096 >> 20, ready
 }
 
 func (s *ContainerSession) writeControlPayload(payload []byte) error {
@@ -1309,6 +1483,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			transcript:  controlTranscript,
 			serialOut:   serialOut,
 			vsock:       vsock,
+			balloon:     balloon,
 			rootFS:      rootFS,
 			fsdevs:      fsdevs,
 			shares:      shareState,

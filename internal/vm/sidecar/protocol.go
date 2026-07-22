@@ -1,15 +1,16 @@
 package sidecar
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 )
 
-const WorkerProtocolVersion = 1
+const WorkerProtocolVersion = 2
 
 const (
 	WorkerServiceControl   = "control"
@@ -29,6 +30,7 @@ const (
 	WorkerFrameExec         = "exec"
 	WorkerFrameAddShare     = "add_share"
 	WorkerFrameExecInput    = "exec_input"
+	WorkerFrameExecInputAck = "exec_input_ack"
 	WorkerFrameCancel       = "cancel"
 	WorkerFrameFlush        = "flush"
 	WorkerFrameConsole      = "console"
@@ -179,21 +181,55 @@ type WorkerCodec struct {
 	conn io.ReadWriteCloser
 	enc  *json.Encoder
 	dec  *json.Decoder
-	mu   sync.Mutex
+	send chan struct{}
 }
+
+type WorkerStreamWriteError struct {
+	Err error
+}
+
+func (e *WorkerStreamWriteError) Error() string {
+	return fmt.Sprintf("sidecar worker stream write failed and the connection was poisoned: %v", e.Err)
+}
+
+func (e *WorkerStreamWriteError) Unwrap() error { return e.Err }
 
 func NewWorkerCodec(conn io.ReadWriteCloser) *WorkerCodec {
 	return &WorkerCodec{
 		conn: conn,
 		enc:  json.NewEncoder(conn),
 		dec:  json.NewDecoder(conn),
+		send: make(chan struct{}, 1),
 	}
 }
 
 func (c *WorkerCodec) Send(frame WorkerFrame) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.enc.Encode(frame)
+	return c.SendContext(context.Background(), frame)
+}
+
+func (c *WorkerCodec) SendContext(ctx context.Context, frame WorkerFrame) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case c.send <- struct{}{}:
+		defer func() { <-c.send }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if conn, ok := c.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			if err := conn.SetWriteDeadline(deadline); err != nil {
+				return err
+			}
+			defer conn.SetWriteDeadline(time.Time{})
+		}
+	}
+	if err := c.enc.Encode(frame); err != nil {
+		_ = c.conn.Close()
+		return &WorkerStreamWriteError{Err: err}
+	}
+	return nil
 }
 
 func (c *WorkerCodec) Receive() (WorkerFrame, error) {

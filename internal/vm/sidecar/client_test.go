@@ -15,6 +15,22 @@ import (
 	"j5.nz/cc/client"
 )
 
+type closeProbeConn struct {
+	closed bool
+}
+
+func (*closeProbeConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*closeProbeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *closeProbeConn) Close() error {
+	c.closed = true
+	return nil
+}
+func (*closeProbeConn) LocalAddr() net.Addr              { return nil }
+func (*closeProbeConn) RemoteAddr() net.Addr             { return nil }
+func (*closeProbeConn) SetDeadline(time.Time) error      { return nil }
+func (*closeProbeConn) SetReadDeadline(time.Time) error  { return nil }
+func (*closeProbeConn) SetWriteDeadline(time.Time) error { return nil }
+
 func TestWorkerDialTarget(t *testing.T) {
 	_, err := workerDialTarget("tcp://127.0.0.1:1234")
 	var securityErr *WorkerSecurityError
@@ -38,6 +54,21 @@ func TestWorkerDialTarget(t *testing.T) {
 	if target.network != "unix" || target.address != "/tmp/worker.sock" || target.secure {
 		t.Fatalf("Unix target = %+v", target)
 	}
+}
+
+func TestCancelDeliveryFailureQuarantinesMultiplexedConnection(t *testing.T) {
+	conn := &closeProbeConn{}
+	worker := &Client{conn: conn, codec: NewWorkerCodec(conn)}
+	worker.codec.send <- struct{}{}
+	err := worker.abortRequest(42, context.Canceled)
+	var terminationErr *TerminationUnconfirmedError
+	if !errors.As(err, &terminationErr) || terminationErr.RequestID != 42 {
+		t.Fatalf("cancel error = %v, want request-scoped termination uncertainty", err)
+	}
+	if !conn.closed {
+		t.Fatal("uncertain request cancellation left the worker connection reusable")
+	}
+	<-worker.codec.send
 }
 
 func TestDialWorkerConnectionUsesContextForUnixAndTCP(t *testing.T) {
@@ -387,6 +418,61 @@ func TestWorkerClientMultiplexesControlWhileExecStreams(t *testing.T) {
 	}
 }
 
+func TestWorkerCallbackFailureCancelsRequest(t *testing.T) {
+	ln, endpoint := listenWorkerUnix(t)
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		codec := NewWorkerCodec(conn)
+		defer codec.Close()
+		if err := codec.Send(mustWorkerFrame(0, WorkerFrameHello, WorkerHello{Version: WorkerProtocolVersion})); err != nil {
+			serverErr <- err
+			return
+		}
+		execFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if err := codec.Send(mustWorkerFrame(execFrame.ID, WorkerFrameEvent, client.ExecEvent{Kind: "stdout", Output: "event"})); err != nil {
+			serverErr <- err
+			return
+		}
+		cancelFrame, err := codec.Receive()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if cancelFrame.Type != WorkerFrameCancel || cancelFrame.ID != execFrame.ID {
+			serverErr <- fmt.Errorf("callback abort frame = %+v", cancelFrame)
+			return
+		}
+		serverErr <- nil
+	}()
+
+	worker, err := DialWorker(t.Context(), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	callbackErr := errors.New("observer stopped")
+	err = worker.ExecStream(t.Context(), "vm", client.ExecRequest{Command: []string{"command"}}, nil, func(client.ExecEvent) error {
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("ExecStream error = %v, want callback error", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCancelingExecDoesNotDisruptConcurrentCall(t *testing.T) {
 	ln, endpoint := listenWorkerUnix(t)
 	defer ln.Close()
@@ -711,6 +797,45 @@ func TestClosePendingDoesNotBlockFullCall(t *testing.T) {
 	}
 	if _, err := c.nextFrame(t.Context(), call); !errors.Is(err, io.EOF) {
 		t.Fatalf("call error = %v, want connection EOF", err)
+	}
+}
+
+func TestExecInputWaitDoesNotConsumeCallFailure(t *testing.T) {
+	call := newWorkerCall()
+	waiting := make(chan bool, 1)
+	go func() { waiting <- (&Client{}).waitExecInputAck(t.Context(), call) }()
+	want := errors.New("connection failed")
+	call.finish(want)
+	if <-waiting {
+		t.Fatal("input acknowledgement succeeded after call failure")
+	}
+	if _, err := (&Client{}).nextFrame(t.Context(), call); !errors.Is(err, want) {
+		t.Fatalf("main call failure = %v, want %v", err, want)
+	}
+}
+
+func TestQueuedTerminalFrameWinsCallerCancellation(t *testing.T) {
+	call := newWorkerCall()
+	done := mustWorkerFrame(7, WorkerFrameDone, nil)
+	call.frames <- done
+	call.terminal.Do(func() { close(call.terminalReady) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	got, err := (&Client{}).nextFrame(ctx, call)
+	if err != nil || got.Type != WorkerFrameDone {
+		t.Fatalf("next frame = %+v, %v; want queued terminal response", got, err)
+	}
+}
+
+func TestQueuedTerminalFrameWinsLaterConnectionFailure(t *testing.T) {
+	call := newWorkerCall()
+	done := mustWorkerFrame(7, WorkerFrameDone, nil)
+	call.frames <- done
+	call.terminal.Do(func() { close(call.terminalReady) })
+	call.finish(errors.New("connection closed after terminal response"))
+	got, err := (&Client{}).nextFrame(t.Context(), call)
+	if err != nil || got.Type != WorkerFrameDone {
+		t.Fatalf("next frame = %+v, %v; want queued terminal response", got, err)
 	}
 }
 

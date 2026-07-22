@@ -143,19 +143,24 @@ func testResolverRoot(t *testing.T) imagefs.Directory {
 
 func TestControlRequest(t *testing.T) {
 	stdin := []byte("payload")
+	limits := &client.ArchiveLimits{MaxEntries: 12, MaxFileBytes: 34, MaxExpandedBytes: 56}
 	got := ControlRequest(client.ExecRequest{
-		Kind:      "fs_write",
-		RootDir:   "/root",
-		Path:      "/file",
-		Directory: true,
-		User:      "1000:1000",
-		Stdin:     stdin,
+		Kind:          "fs_write",
+		RootDir:       "/root",
+		Path:          "/file",
+		Directory:     true,
+		User:          "1000:1000",
+		Stdin:         stdin,
+		ArchiveLimits: limits,
 	}, "/work")
 	if got.Kind != "fs_write" || got.RootDir != "/root" || got.Path != "/file" || !got.Directory || got.User != "1000:1000" {
 		t.Fatalf("control request = %+v", got)
 	}
 	if got.WorkDir != "/work" {
 		t.Fatalf("workdir = %q", got.WorkDir)
+	}
+	if got.ArchiveLimits != limits {
+		t.Fatalf("archive limits were not preserved: %#v", got.ArchiveLimits)
 	}
 	stdin[0] = 'X'
 	if string(got.Stdin) != "payload" {

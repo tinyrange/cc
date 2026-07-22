@@ -389,6 +389,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			cancel: cancel, closeDone: closeDone, image: req.Image, baseEnv: baseEnv, workDir: workDir,
 			dmesg: req.Dmesg, uart: uart, control: res.conn, transcript: controlTranscript, serialOut: serialOut,
 			listener: listener, vsock: vsock, rootFS: rootFS, fsdevs: fsdevs, shares: shareState,
+			balloon:     balloon,
 			imageMounts: map[string]string{}, activeExecs: activeExecs,
 		}
 		timing.Since(ctx, "hvf.restore.total_ready", startTotal)

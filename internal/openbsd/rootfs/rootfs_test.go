@@ -110,6 +110,13 @@ func TestBuildManagedRootFromOpenBSDBaseSetCachesSeekableTar(t *testing.T) {
 	if !textHasLine(hosts, "10.42.0.2 cc-openbsd") {
 		t.Fatalf("default hosts does not contain default IP: %q", hosts)
 	}
+	localtime, err := imagefs.LookupPath(root, "/etc/localtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localtime.Symlink == nil || localtime.Symlink.Target() != "/usr/share/zoneinfo/UTC" {
+		t.Fatalf("OpenBSD localtime = %#v, want UTC symlink", localtime)
+	}
 }
 
 func TestBuildManagedRootFromOpenBSDBaseSetUsesGuestIPv4(t *testing.T) {

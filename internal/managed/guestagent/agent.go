@@ -17,11 +17,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/managed/protocol"
 )
@@ -42,6 +45,7 @@ type Options struct {
 	DialAddr     string
 	ConnectTries int
 	PTY          PTY
+	Context      context.Context
 }
 
 type PTY interface {
@@ -170,23 +174,136 @@ func (p Protocol) WriteTiming(w io.Writer, id, phase string, start time.Time) {
 type request = protocol.ManagedExecRequest
 
 type managedExec struct {
+	stdinMu      sync.Mutex
+	stdinWriteMu sync.Mutex
+	stdin        io.WriteCloser
+
+	processMu sync.Mutex
+	process   *os.Process
+	family    *ProcessFamily
+	pending   syscall.Signal
+	pty       *os.File
+	ptyImpl   PTY
+}
+
+// reconnectingGuestControl is the logical guest-to-host protocol writer. A
+// BSD control TCP connection can be replaced while commands are still alive;
+// their output must follow the replacement connection rather than remain tied
+// to the socket on which the command started.
+type reconnectingGuestControl struct {
+	ctx context.Context
+
 	mu      sync.Mutex
-	stdin   io.WriteCloser
-	process *os.Process
-	pty     *os.File
-	ptyImpl PTY
+	conn    net.Conn
+	changed chan struct{}
+}
+
+func newReconnectingGuestControl(ctx context.Context) *reconnectingGuestControl {
+	return &reconnectingGuestControl{ctx: ctx, changed: make(chan struct{})}
+}
+
+func (c *reconnectingGuestControl) signalChangedLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *reconnectingGuestControl) setConnection(conn net.Conn) {
+	c.mu.Lock()
+	c.conn = conn
+	c.signalChangedLocked()
+	c.mu.Unlock()
+}
+
+func (c *reconnectingGuestControl) clearConnection(conn net.Conn) {
+	c.mu.Lock()
+	if c.conn == conn {
+		c.conn = nil
+		c.signalChangedLocked()
+	}
+	c.mu.Unlock()
+}
+
+func (c *reconnectingGuestControl) connection() (net.Conn, error) {
+	for {
+		c.mu.Lock()
+		conn := c.conn
+		changed := c.changed
+		c.mu.Unlock()
+		if conn != nil {
+			return conn, nil
+		}
+		select {
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (c *reconnectingGuestControl) Write(data []byte) (int, error) {
+	for {
+		conn, err := c.connection()
+		if err != nil {
+			return 0, err
+		}
+		n, _ := conn.Write(data)
+		if n == len(data) {
+			return n, nil
+		}
+		c.clearConnection(conn)
+		_ = conn.Close()
+		// A partial protocol line on the failed physical connection is
+		// discarded with that connection. Resend the complete line after
+		// reconnect so the logical transcript always receives a valid frame.
+	}
 }
 
 func Run(opts Options) error {
 	opts = normalizeOptions(opts)
 	_ = os.Chdir("/")
-	conn, err := connectControl(opts)
-	if err != nil {
-		return err
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer conn.Close()
-	WriteProtocolLine(conn, ReadyMarker)
-	return commandLoop(opts, conn)
+	control := newReconnectingGuestControl(ctx)
+	active := NewActiveExecSet()
+	pending := NewPendingRequests[request]()
+	startOrphanReaper(ctx)
+	connected := false
+	for {
+		conn, err := connectControl(ctx, opts)
+		if err != nil {
+			if ctx.Err() != nil || !connected {
+				return err
+			}
+			writeConsole("ccx3-" + opts.Name + "-init: control reconnect failed; retrying: " + err.Error() + "\n")
+			continue
+		}
+		connected = true
+		// Write readiness before publishing the replacement connection so
+		// resumed command output cannot overtake the connection marker.
+		if _, err := io.WriteString(conn, ReadyMarker+"\n"); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		control.setConnection(conn)
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+			case <-done:
+			}
+		}()
+		err = commandLoop(opts, conn, control, active, pending)
+		close(done)
+		control.clearConnection(conn)
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		writeConsole("ccx3-" + opts.Name + "-init: control connection lost; reconnecting: " + err.Error() + "\n")
+	}
 }
 
 func WriteConsole(s string) {
@@ -206,23 +323,29 @@ func normalizeOptions(opts Options) Options {
 	return opts
 }
 
-func connectControl(opts Options) (net.Conn, error) {
+func connectControl(ctx context.Context, opts Options) (net.Conn, error) {
 	var last error
 	for i := 0; i < opts.ConnectTries; i++ {
-		conn, err := net.DialTimeout("tcp4", opts.DialAddr, time.Second)
+		dialCtx, cancel := context.WithTimeout(ctx, time.Second)
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp4", opts.DialAddr)
+		cancel()
 		if err == nil {
 			return conn, nil
 		}
 		last = err
-		time.Sleep(250 * time.Millisecond)
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	return nil, fmt.Errorf("connect control: %w", last)
 }
 
-func commandLoop(opts Options, control net.Conn) error {
-	reader := bufio.NewReader(control)
-	active := NewActiveExecSet()
-	pending := NewPendingRequests[request]()
+func commandLoop(opts Options, conn net.Conn, control io.Writer, active *ActiveExecSet, pending *PendingRequests[request]) error {
+	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -240,26 +363,37 @@ func commandLoop(opts Options, control net.Conn) error {
 		if req.Kind == "" {
 			req.Kind = "exec"
 		}
+		if requestStartsWork(req.Kind) {
+			if err := validateGuestUser(req.User); err != nil {
+				proto := DefaultProtocol()
+				proto.WriteBegin(control, req.ID)
+				writeErr(opts, control, req.ID, err)
+				proto.WriteExit(control, req.ID, 126)
+				continue
+			}
+		}
 		switch req.Kind {
 		case "exec":
 			if req.ID == "" || len(req.Command) == 0 {
 				continue
 			}
 			if len(req.Stdin) != 0 {
-				startExecWithReader(opts, control, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil, func() {})
+				startManagedExec(opts, control, active, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil)
 				continue
 			}
 			if req.TTY || req.ControlFD {
 				stdinR, stdinW := io.Pipe()
 				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
-				active.Add(req.ID, managed)
-				go runExec(opts, control, req, stdinR, managed, func() {
-					_ = managed.close()
-					active.Delete(req.ID)
-				})
+				startManagedExec(opts, control, active, req, stdinR, managed)
 				continue
 			}
-			pending.Put(req.ID, req)
+			// Start streamed commands before their first stdin message. Keeping
+			// them pending made a signal race with stdin_close: the signal could
+			// be discarded before the command became active, leaving it running
+			// indefinitely. EOF remains explicit and is delivered by stdin_close.
+			stdinR, stdinW := io.Pipe()
+			managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
+			startManagedExec(opts, control, active, req, stdinR, managed)
 		case "sync":
 			go runSync(control, req.ID)
 		case "fs_mkdir":
@@ -285,11 +419,7 @@ func commandLoop(opts Options, control net.Conn) error {
 			if pendingOK {
 				stdinR, stdinW := io.Pipe()
 				managed := &managedExec{stdin: stdinW, ptyImpl: opts.PTY}
-				active.Add(req.ID, managed)
-				go runExec(opts, control, pendingReq, stdinR, managed, func() {
-					_ = managed.close()
-					active.Delete(req.ID)
-				})
+				startManagedExec(opts, control, active, pendingReq, stdinR, managed)
 				_ = managed.write(req.Stdin)
 				continue
 			}
@@ -301,7 +431,7 @@ func commandLoop(opts Options, control net.Conn) error {
 		case "stdin_close":
 			pendingReq, pendingOK := pending.Take(req.ID)
 			if pendingOK {
-				startExecWithReader(opts, control, pendingReq, io.NopCloser(bytes.NewReader(nil)), nil, func() {})
+				startManagedExec(opts, control, active, pendingReq, io.NopCloser(bytes.NewReader(nil)), nil)
 				continue
 			}
 			_ = HandleActiveControl(active, ActiveControlRequest{
@@ -309,11 +439,19 @@ func commandLoop(opts Options, control net.Conn) error {
 				ID:   req.ID,
 			})
 		case "signal":
-			_ = HandleActiveControl(active, ActiveControlRequest{
+			if req.ControlID != "" && active.ControlAcknowledged(req.ID, req.ControlID) {
+				WriteProtocolLine(control, protocol.ControlAckPrefix+req.ControlID)
+				continue
+			}
+			result := HandleActiveControl(active, ActiveControlRequest{
 				Kind:   req.Kind,
 				ID:     req.ID,
 				Signal: req.Signal,
 			})
+			if req.ControlID != "" && result.Found && result.Err == nil {
+				active.AcknowledgeControl(req.ID, req.ControlID)
+				WriteProtocolLine(control, protocol.ControlAckPrefix+req.ControlID)
+			}
 		case "resize":
 			_ = HandleActiveControl(active, ActiveControlRequest{
 				Kind: req.Kind,
@@ -325,42 +463,70 @@ func commandLoop(opts Options, control net.Conn) error {
 	}
 }
 
+func requestStartsWork(kind string) bool {
+	switch kind {
+	case "exec", "sync", "fs_mkdir", "fs_write", "fs_extract", "fs_archive":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRootUserRequest(user string) bool {
+	switch strings.ToLower(strings.TrimSpace(user)) {
+	case "", "root", "0", "0:0", "root:root", "root:wheel":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *managedExec) write(data []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.stdin == nil {
+	m.stdinWriteMu.Lock()
+	defer m.stdinWriteMu.Unlock()
+	m.stdinMu.Lock()
+	stdin := m.stdin
+	m.stdinMu.Unlock()
+	if stdin == nil {
 		return fmt.Errorf("stdin is closed")
 	}
-	_, err := m.stdin.Write(data)
+	_, err := stdin.Write(data)
 	return err
 }
 
 func (m *managedExec) close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.stdin == nil {
+	m.stdinMu.Lock()
+	stdin := m.stdin
+	m.stdin = nil
+	m.stdinMu.Unlock()
+	if stdin == nil {
 		return nil
 	}
-	err := m.stdin.Close()
-	m.stdin = nil
-	return err
+	return stdin.Close()
 }
 
-func (m *managedExec) setProcess(p *os.Process) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *managedExec) setProcess(p *os.Process, family *ProcessFamily) {
+	m.processMu.Lock()
 	m.process = p
+	m.family = family
+	pending := m.pending
+	m.pending = 0
+	m.processMu.Unlock()
+	if pending != 0 {
+		_ = signalProcessGroup(p, pending)
+		_ = family.Signal(pending)
+	}
 }
 
 func (m *managedExec) setPTY(pty *os.File) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	m.pty = pty
 }
 
 func (m *managedExec) resize(cols, rows int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.processMu.Lock()
+	defer m.processMu.Unlock()
 	if m.ptyImpl == nil {
 		return nil
 	}
@@ -394,34 +560,85 @@ func (m *managedExec) signal(name string) error {
 	if err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.process == nil {
-		return fmt.Errorf("process is not started")
+	// A streamed stdin reader keeps os/exec's copy goroutine alive. SIGKILL
+	// guarantees that the command cannot consume more input, so close it before
+	// waiting for the process; otherwise Wait can retain a killed command until
+	// the control connection happens to close stdin separately.
+	if sig == syscall.SIGKILL {
+		_ = m.close()
 	}
-	if m.process.Pid > 0 {
-		if err := syscall.Kill(-m.process.Pid, sig); err == nil || errors.Is(err, syscall.ESRCH) {
+	m.processMu.Lock()
+	if m.process == nil {
+		if m.pending == 0 || sig == syscall.SIGKILL {
+			m.pending = sig
+		}
+		m.processMu.Unlock()
+		return nil
+	}
+	process := m.process
+	family := m.family
+	m.processMu.Unlock()
+	// Deliver the requested signal to the command's process group first. A
+	// descendant tracker is best-effort bookkeeping for processes which escaped
+	// that group; it must not delay or prevent the ordinary command lifecycle.
+	groupErr := signalProcessGroup(process, sig)
+	if family != nil {
+		err = family.Signal(sig)
+	}
+	if err == nil {
+		err = groupErr
+	}
+	if family != nil {
+		// Refresh once more after the group signal to catch a child which raced
+		// with the first process-table snapshot.
+		_ = family.Signal(sig)
+	}
+	return err
+}
+
+func signalProcessGroup(process *os.Process, sig syscall.Signal) error {
+	if process.Pid > 0 {
+		if err := syscall.Kill(-process.Pid, sig); err == nil || errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
 	}
-	return m.process.Signal(sig)
+	return process.Signal(sig)
 }
 
-func startExecWithReader(opts Options, control net.Conn, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
-	go runExec(opts, control, req, stdin, managed, cleanup)
+func startManagedExec(opts Options, control io.Writer, active *ActiveExecSet, req request, stdin io.ReadCloser, managed *managedExec) {
+	if managed == nil {
+		managed = &managedExec{ptyImpl: opts.PTY}
+	}
+	closePending := active.Add(req.ID, managed)
+	// The request's input sink is usable once it is registered. Advertise that
+	// protocol state before the worker runs so the host can safely send input or
+	// EOF without relying on guest scheduler timing.
+	DefaultProtocol().WriteTiming(control, req.ID, "input_ready", time.Now())
+	if closePending {
+		_ = managed.close()
+	}
+	go runExec(opts, control, req, stdin, managed, func() {
+		_ = managed.close()
+		active.Delete(req.ID)
+	})
 }
 
 func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
 	defer cleanup()
 	proto := DefaultProtocol()
 	proto.WriteBegin(control, req.ID)
-	cmd := exec.Command(req.Command[0], req.Command[1:]...)
-	if req.WorkDir != "" {
-		cmd.Dir = rootPath(req.RootDir, req.WorkDir)
+	if err := validateExecWorkDir(req.RootDir, req.WorkDir); err != nil {
+		if managed != nil {
+			_ = managed.close()
+		}
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		writeErr(opts, control, req.ID, fmt.Errorf("invalid workdir: %w", err))
+		proto.WriteExit(control, req.ID, 126)
+		return
 	}
-	if len(req.Env) != 0 {
-		cmd.Env = req.Env
-	}
+	cmd := execCommand(req)
 	var controlR, controlW *os.File
 	if req.ControlFD {
 		var err error
@@ -437,7 +654,7 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
 	}
 	var wg sync.WaitGroup
-	var stdoutW, stderrW *io.PipeWriter
+	var stdoutR, stdoutW, stderrR, stderrW *os.File
 	var ptyMaster, ptySlave *os.File
 	if req.TTY && opts.PTY != nil {
 		var err error
@@ -475,10 +692,34 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		}
 	} else {
 		cmd.Stdin = stdin
-		stdoutR, stdoutPipeW := io.Pipe()
-		stderrR, stderrPipeW := io.Pipe()
-		stdoutW = stdoutPipeW
-		stderrW = stderrPipeW
+		var err error
+		stdoutR, stdoutW, err = os.Pipe()
+		if err == nil {
+			stderrR, stderrW, err = os.Pipe()
+		}
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			if controlR != nil {
+				_ = controlR.Close()
+			}
+			if controlW != nil {
+				_ = controlW.Close()
+			}
+			if stdoutR != nil {
+				_ = stdoutR.Close()
+			}
+			if stdoutW != nil {
+				_ = stdoutW.Close()
+			}
+			writeErr(opts, control, req.ID, fmt.Errorf("open output pipes: %w", err))
+			proto.WriteExit(control, req.ID, 126)
+			return
+		}
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -490,7 +731,14 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		wg.Add(1)
 		go copyMarked(&wg, control, proto.ControlMarkerPrefix, req.ID, controlR)
 	}
-	if err := cmd.Start(); err != nil {
+	preparedFamily, prepareErr := PrepareProcessFamily(cmd, req.ID)
+	if prepareErr != nil {
+		writeErr(opts, control, req.ID, fmt.Errorf("prepare command containment: %w", prepareErr))
+		proto.WriteExit(control, req.ID, 126)
+		return
+	}
+	if err := startManagedCommand(cmd); err != nil {
+		preparedFamily.Abort()
 		if managed != nil {
 			_ = managed.close()
 		}
@@ -513,6 +761,12 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 			_ = ptySlave.Close()
 		}
 		wg.Wait()
+		if stdoutR != nil {
+			_ = stdoutR.Close()
+		}
+		if stderrR != nil {
+			_ = stderrR.Close()
+		}
 		writeErr(opts, control, req.ID, err)
 		proto.WriteExit(control, req.ID, 126)
 		return
@@ -520,10 +774,19 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 	if controlW != nil {
 		_ = controlW.Close()
 	}
+	family := preparedFamily.Start(cmd.Process.Pid)
 	if managed != nil {
-		managed.setProcess(cmd.Process)
+		managed.setProcess(cmd.Process, family)
 	}
-	waitErr := cmd.Wait()
+	waitErr := waitManagedCommand(cmd)
+	if managed != nil {
+		managed.processMu.Lock()
+		family = managed.family
+		managed.processMu.Unlock()
+	}
+	if family != nil {
+		family.Terminate()
+	}
 	if stdin != nil {
 		_ = stdin.Close()
 	}
@@ -540,19 +803,94 @@ func runExec(opts Options, control io.Writer, req request, stdin io.ReadCloser, 
 		_ = ptyMaster.Close()
 	}
 	wg.Wait()
+	if stdoutR != nil {
+		_ = stdoutR.Close()
+	}
+	if stderrR != nil {
+		_ = stderrR.Close()
+	}
 	if controlR != nil {
 		_ = controlR.Close()
 	}
 	code := 0
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			code = exitErr.ExitCode()
+			code = ProcessExitCode(cmd.ProcessState, exitErr.ExitCode())
 		} else {
 			writeErr(opts, control, req.ID, waitErr)
 			code = 126
 		}
 	}
 	proto.WriteExit(control, req.ID, code)
+}
+
+func ProcessExitCode(state *os.ProcessState, fallback int) int {
+	if state == nil {
+		return fallback
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return fallback
+	}
+	return 128 + int(status.Signal())
+}
+
+func validateExecWorkDir(rootDir, workDir string) error {
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	path := rootPath(rootDir, workDir)
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	return nil
+}
+
+func execCommand(req request) *exec.Cmd {
+	name := req.Command[0]
+	cmd := exec.Command(name, req.Command[1:]...)
+	if !strings.ContainsRune(name, filepath.Separator) {
+		if pathValue, ok := environmentValue(req.Env, "PATH"); ok {
+			path, err := lookPath(name, pathValue)
+			cmd.Path = path
+			cmd.Err = err
+		}
+	}
+	if req.WorkDir != "" {
+		cmd.Dir = rootPath(req.RootDir, req.WorkDir)
+	}
+	if len(req.Env) != 0 {
+		cmd.Env = req.Env
+	}
+	return cmd
+}
+
+func environmentValue(env []string, name string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		key, value, ok := strings.Cut(env[i], "=")
+		if ok && key == name {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func lookPath(name, pathValue string) (string, error) {
+	for _, dir := range filepath.SplitList(pathValue) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s", exec.ErrNotFound, name)
 }
 
 func runSync(control io.Writer, id string) {
@@ -657,6 +995,7 @@ func archivePath(control io.Writer, id, rootDir, src string) error {
 func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
+	hardlinks := make(map[string]string)
 	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -685,23 +1024,187 @@ func WritePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 			return err
 		}
 		header.Name = filepath.ToSlash(rel)
-		if err := tw.WriteHeader(header); err != nil {
+		header.Format = tar.FormatPAX
+		xattrs, err := archiveXattrs(filePath)
+		if err != nil {
 			return err
 		}
-		if !info.Mode().IsRegular() {
+		if len(xattrs) != 0 {
+			header.PAXRecords = xattrs
+		}
+		if info.Mode().IsRegular() {
+			if key, ok := archiveHardlinkKey(info); ok {
+				if first, exists := hardlinks[key]; exists {
+					header.Typeflag = tar.TypeLink
+					header.Linkname = first
+					header.Size = 0
+				} else {
+					hardlinks[key] = header.Name
+				}
+			}
+		}
+		if !info.Mode().IsRegular() || header.Typeflag == tar.TypeLink {
+			if err := tw.WriteHeader(header); err != nil {
+				return err
+			}
 			return nil
 		}
 		file, err := os.Open(filePath)
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(tw, file)
+		exts, sparse := archiveSparseExtents(file, info.Size())
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if sparse {
+			physical := int64(0)
+			mapValues := make([]string, 0, len(exts)*2)
+			for _, extent := range exts {
+				physical += extent.length
+				mapValues = append(mapValues, strconv.FormatInt(extent.offset, 10), strconv.FormatInt(extent.length, 10))
+			}
+			if header.PAXRecords == nil {
+				header.PAXRecords = make(map[string]string)
+			}
+			header.PAXRecords["VMSH.sparse.numblocks"] = strconv.Itoa(len(exts))
+			header.PAXRecords["VMSH.sparse.map"] = strings.Join(mapValues, ",")
+			header.PAXRecords["VMSH.sparse.size"] = strconv.FormatInt(info.Size(), 10)
+			header.Size = physical
+		}
+		if err := tw.WriteHeader(header); err != nil {
+			_ = file.Close()
+			return err
+		}
+		var copyErr error
+		if sparse {
+			for _, extent := range exts {
+				if _, err := file.Seek(extent.offset, io.SeekStart); err != nil {
+					copyErr = err
+					break
+				}
+				if _, err := io.CopyN(tw, file, extent.length); err != nil {
+					copyErr = err
+					break
+				}
+			}
+		} else {
+			_, copyErr = io.Copy(tw, file)
+		}
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
 		}
 		return closeErr
 	})
+}
+
+type archiveSparseExtent struct {
+	offset int64
+	length int64
+}
+
+func archiveSparseExtents(file *os.File, size int64) ([]archiveSparseExtent, bool) {
+	if size <= 0 {
+		return nil, false
+	}
+	var extents []archiveSparseExtent
+	for offset := int64(0); offset < size; {
+		data, err := archiveSeekData(int(file.Fd()), offset)
+		if errors.Is(err, syscall.ENXIO) {
+			break
+		}
+		if err != nil || data < offset || data >= size {
+			return nil, false
+		}
+		hole, err := archiveSeekHole(int(file.Fd()), data)
+		if err != nil || hole <= data {
+			return nil, false
+		}
+		if hole > size {
+			hole = size
+		}
+		extents = append(extents, archiveSparseExtent{offset: data, length: hole - data})
+		offset = hole
+	}
+	physical := int64(0)
+	for _, extent := range extents {
+		physical += extent.length
+	}
+	return extents, physical < size
+}
+
+const archiveXattrPrefix = "VMSH.xattr."
+
+func archiveXattrs(path string) (map[string]string, error) {
+	size, err := archiveListXattrs(path, nil)
+	if err != nil {
+		if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list extended attributes for %q: %w", path, err)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	names := make([]byte, size)
+	size, err = archiveListXattrs(path, names)
+	if err != nil {
+		return nil, fmt.Errorf("list extended attributes for %q: %w", path, err)
+	}
+	records := make(map[string]string)
+	for _, name := range strings.Split(string(names[:size]), "\x00") {
+		// Artifacts cross trust and VM boundaries. Preserve the portable user
+		// namespace, but never replay security, trusted, or system metadata
+		// supplied by another filesystem.
+		if !strings.HasPrefix(name, "user.") {
+			continue
+		}
+		valueSize, err := archiveGetXattr(path, name, nil)
+		if err != nil {
+			return nil, fmt.Errorf("read extended attribute %q for %q: %w", name, path, err)
+		}
+		value := make([]byte, valueSize)
+		valueSize, err = archiveGetXattr(path, name, value)
+		if err != nil {
+			return nil, fmt.Errorf("read extended attribute %q for %q: %w", name, path, err)
+		}
+		key := archiveXattrPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+		records[key] = base64.StdEncoding.EncodeToString(value[:valueSize])
+	}
+	return records, nil
+}
+
+func archiveHardlinkKey(info os.FileInfo) (string, bool) {
+	value := reflect.ValueOf(info.Sys())
+	if value.Kind() == reflect.Pointer {
+		value = value.Elem()
+	}
+	if !value.IsValid() || value.Kind() != reflect.Struct {
+		return "", false
+	}
+	dev, devOK := archiveStatField(value.FieldByName("Dev"))
+	ino, inoOK := archiveStatField(value.FieldByName("Ino"))
+	if !devOK || !inoOK || ino == 0 {
+		return "", false
+	}
+	return fmt.Sprintf("%d:%d", dev, ino), true
+}
+
+func archiveStatField(value reflect.Value) (uint64, bool) {
+	if !value.IsValid() {
+		return 0, false
+	}
+	switch value.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return value.Uint(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		integer := value.Int()
+		return uint64(integer), integer >= 0
+	default:
+		return 0, false
+	}
 }
 
 func extractTarToPath(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, limits *client.ArchiveLimits) error {
@@ -712,6 +1215,14 @@ var ErrUnsafeTarExtractionPath = errors.New("unsafe tar extraction path")
 
 func ExtractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 	return ExtractTarToPathContext(context.Background(), r, rootDir, dst, dstDir, nil)
+}
+
+// ArchiveOwnership applies one caller-selected guest identity to every entry
+// published by an archive extraction. Tar header ownership is intentionally
+// ignored because archives can cross trust and VM boundaries.
+type ArchiveOwnership struct {
+	UID int
+	GID int
 }
 
 type ArchiveLimitError struct {
@@ -740,6 +1251,10 @@ func ArchiveContext(parent context.Context, limits *client.ArchiveLimits) (conte
 }
 
 func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, requested *client.ArchiveLimits) error {
+	return ExtractTarToPathContextWithOwnership(ctx, r, rootDir, dst, dstDir, requested, nil)
+}
+
+func ExtractTarToPathContextWithOwnership(ctx context.Context, r io.Reader, rootDir, dst string, dstDir bool, requested *client.ArchiveLimits, owner *ArchiveOwnership) error {
 	if strings.TrimSpace(dst) == "" {
 		return fmt.Errorf("destination path is required")
 	}
@@ -759,7 +1274,9 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		}()
 		defer close(stopClose)
 	}
+	dstExisted := false
 	if info, err := os.Lstat(dst); err == nil {
+		dstExisted = true
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: destination is a symlink: %s", ErrUnsafeTarExtractionPath, dst)
 		}
@@ -773,8 +1290,17 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 	if dstDir {
 		extractionRoot = dst
 	}
-	if err := os.MkdirAll(extractionRoot, 0o755); err != nil {
+	extractionBoundary, err := nearestExistingTarParent(extractionRoot)
+	if err != nil {
 		return err
+	}
+	if err := ensureTarParents(extractionBoundary, extractionRoot, owner); err != nil {
+		return err
+	}
+	if dstDir && !dstExisted {
+		if err := applyArchiveOwnership(extractionRoot, false, owner); err != nil {
+			return err
+		}
 	}
 	tr := tar.NewReader(r)
 	sawEntry := false
@@ -803,21 +1329,32 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 		if header.Size < 0 {
 			return fmt.Errorf("archive entry %q has negative size", header.Name)
 		}
-		entryBytes := uint64(header.Size)
+		logicalSize, sizeErr := archiveLogicalSize(header)
+		if sizeErr != nil {
+			return sizeErr
+		}
+		entryBytes := uint64(logicalSize)
 		if entryBytes > limits.MaxFileBytes {
 			return &ArchiveLimitError{Resource: "file bytes", Limit: limits.MaxFileBytes, Actual: entryBytes}
 		}
 		if entryBytes > limits.MaxExpandedBytes-expanded {
 			return &ArchiveLimitError{Resource: "expanded bytes", Limit: limits.MaxExpandedBytes, Actual: expanded + entryBytes}
 		}
-		expanded += entryBytes
+		metadataBytes, metadataErr := archiveHeaderMetadataBytes(header)
+		if metadataErr != nil {
+			return metadataErr
+		}
+		if metadataBytes > limits.MaxExpandedBytes-expanded-entryBytes {
+			return &ArchiveLimitError{Resource: "expanded bytes", Limit: limits.MaxExpandedBytes, Actual: expanded + entryBytes + metadataBytes}
+		}
+		expanded += entryBytes + metadataBytes
 		target, err := tarTarget(dst, dstDir, header.Name)
 		if err != nil {
 			return err
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := ensureTarTargetCompatible(target, true); err != nil {
@@ -827,9 +1364,15 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				return err
 			}
 			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
+			if err := applyArchiveOwnership(target, false, owner); err != nil {
+				return err
+			}
+			if err := applyArchiveXattrs(target, false, header); err != nil {
+				return err
+			}
 			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
 		case tar.TypeSymlink:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := validateTarSymlinkTarget(extractionRoot, target, header.Linkname); err != nil {
@@ -844,8 +1387,17 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
+			if err := applyArchiveOwnership(target, true, owner); err != nil {
+				return err
+			}
+			if err := applyArchiveXattrs(target, true, header); err != nil {
+				return err
+			}
+			if err := setArchiveTimes(target, header.ModTime, true); err != nil {
+				return err
+			}
 		case tar.TypeReg, tar.TypeRegA:
-			if err := ensureTarParents(extractionRoot, filepath.Dir(target)); err != nil {
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
 				return err
 			}
 			if err := ensureTarTargetCompatible(target, false); err != nil {
@@ -856,7 +1408,7 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				return err
 			}
 			tmpName := file.Name()
-			_, copyErr := io.Copy(file, contextReader{ctx: ctx, r: tr})
+			copyErr := copyTarRegularFile(ctx, file, tr, header)
 			closeErr := file.Close()
 			if copyErr != nil {
 				_ = os.Remove(tmpName)
@@ -869,6 +1421,10 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				_ = os.Remove(tmpName)
 				return closeErr
 			}
+			if err := applyArchiveOwnership(tmpName, false, owner); err != nil {
+				_ = os.Remove(tmpName)
+				return err
+			}
 			perm := os.FileMode(header.Mode).Perm()
 			if err := os.Chmod(tmpName, perm); err != nil {
 				_ = os.Remove(tmpName)
@@ -878,12 +1434,194 @@ func ExtractTarToPathContext(ctx context.Context, r io.Reader, rootDir, dst stri
 				_ = os.Remove(tmpName)
 				return err
 			}
+			if err := applyArchiveXattrs(tmpName, false, header); err != nil {
+				_ = os.Remove(tmpName)
+				return err
+			}
 			if err := os.Rename(tmpName, target); err != nil {
 				_ = os.Remove(tmpName)
 				return err
 			}
+		case tar.TypeLink:
+			if err := ensureTarParents(extractionRoot, filepath.Dir(target), owner); err != nil {
+				return err
+			}
+			source, err := tarTarget(dst, dstDir, header.Linkname)
+			if err != nil {
+				return fmt.Errorf("%w: hard link %q: %v", ErrUnsafeTarExtractionPath, header.Name, err)
+			}
+			sourceInfo, err := os.Lstat(source)
+			if err != nil {
+				return fmt.Errorf("hard link source %q: %w", header.Linkname, err)
+			}
+			if !sourceInfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: hard link source is not a regular file: %s", ErrUnsafeTarExtractionPath, source)
+			}
+			if err := ensureTarTargetCompatible(target, false); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Link(source, target); err != nil {
+				return err
+			}
+			// Some FUSE clients retain the pre-link attributes for an inode even
+			// when LINK returns the updated entry. A no-op setattr makes the new
+			// link count visible without changing archive metadata.
+			if err := os.Chmod(source, sourceInfo.Mode().Perm()); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func archiveHeaderMetadataBytes(header *tar.Header) (uint64, error) {
+	var total uint64
+	for key, encoded := range header.PAXRecords {
+		if !strings.HasPrefix(key, archiveXattrPrefix) {
+			continue
+		}
+		name, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, archiveXattrPrefix))
+		if err != nil {
+			return 0, fmt.Errorf("archive entry %q has an invalid extended attribute name", header.Name)
+		}
+		value, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return 0, fmt.Errorf("archive entry %q has an invalid extended attribute value", header.Name)
+		}
+		addition := uint64(len(name) + len(value) + 64)
+		if addition > math.MaxUint64-total {
+			return 0, fmt.Errorf("archive entry %q metadata is too large", header.Name)
+		}
+		total += addition
+	}
+	return total, nil
+}
+
+func copyTarRegularFile(ctx context.Context, file *os.File, tr *tar.Reader, header *tar.Header) error {
+	exts, logicalSize, sparse, err := archiveSparseMap(header)
+	if err != nil {
+		return err
+	}
+	reader := contextReader{ctx: ctx, r: tr}
+	if !sparse {
+		_, err := io.Copy(file, reader)
+		return err
+	}
+	for _, extent := range exts {
+		if extent.offset < 0 || extent.length < 0 || extent.offset > logicalSize-extent.length {
+			return fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		if _, err := file.Seek(extent.offset, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(file, reader, extent.length); err != nil {
+			return err
+		}
+	}
+	return file.Truncate(logicalSize)
+}
+
+func archiveSparseMap(header *tar.Header) ([]archiveSparseExtent, int64, bool, error) {
+	if header == nil || header.PAXRecords == nil {
+		return nil, 0, false, nil
+	}
+	encodedSize, present := header.PAXRecords["VMSH.sparse.size"]
+	if !present {
+		return nil, 0, false, nil
+	}
+	logicalSize, sizeErr := strconv.ParseInt(encodedSize, 10, 64)
+	if sizeErr != nil || logicalSize < 0 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse size", header.Name)
+	}
+	count, err := strconv.Atoi(header.PAXRecords["VMSH.sparse.numblocks"])
+	if err != nil || count < 0 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse extent count", header.Name)
+	}
+	values := []string{}
+	if encoded := header.PAXRecords["VMSH.sparse.map"]; encoded != "" {
+		values = strings.Split(encoded, ",")
+	}
+	if len(values) != count*2 {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+	}
+	exts := make([]archiveSparseExtent, 0, count)
+	var physicalSize int64
+	var previousEnd int64
+	for i := 0; i < len(values); i += 2 {
+		offset, offsetErr := strconv.ParseInt(values[i], 10, 64)
+		length, lengthErr := strconv.ParseInt(values[i+1], 10, 64)
+		if offsetErr != nil || lengthErr != nil || offset < 0 || length < 0 {
+			return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		if offset < previousEnd || offset > logicalSize-length || physicalSize > header.Size-length {
+			return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse map", header.Name)
+		}
+		physicalSize += length
+		previousEnd = offset + length
+		exts = append(exts, archiveSparseExtent{offset: offset, length: length})
+	}
+	if physicalSize != header.Size {
+		return nil, 0, false, fmt.Errorf("archive entry %q has an invalid sparse payload size", header.Name)
+	}
+	return exts, logicalSize, true, nil
+}
+
+func archiveLogicalSize(header *tar.Header) (int64, error) {
+	_, logicalSize, sparse, err := archiveSparseMap(header)
+	if err != nil {
+		return 0, err
+	}
+	if sparse {
+		return logicalSize, nil
+	}
+	return header.Size, nil
+}
+
+func applyArchiveXattrs(path string, symlink bool, header *tar.Header) error {
+	if header == nil {
+		return nil
+	}
+	for key, encoded := range header.PAXRecords {
+		if !strings.HasPrefix(key, archiveXattrPrefix) {
+			continue
+		}
+		name, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(key, archiveXattrPrefix))
+		if err != nil || !bytes.HasPrefix(name, []byte("user.")) || bytes.IndexByte(name, 0) >= 0 {
+			return fmt.Errorf("archive entry %q has an invalid extended attribute name", header.Name)
+		}
+		value, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return fmt.Errorf("archive entry %q has an invalid extended attribute value", header.Name)
+		}
+		err = archiveSetXattr(path, string(name), value, symlink)
+		if err != nil {
+			return fmt.Errorf("restore extended attribute %q for %q: %w", string(name), path, err)
+		}
+	}
+	return nil
+}
+
+func setArchiveTimes(path string, timestamp time.Time, symlink bool) error {
+	if !symlink {
+		return os.Chtimes(path, timestamp, timestamp)
+	}
+	times := []unix.Timespec{
+		{Sec: timestamp.Unix(), Nsec: int64(timestamp.Nanosecond())},
+		{Sec: timestamp.Unix(), Nsec: int64(timestamp.Nanosecond())},
+	}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, path, times, unix.AT_SYMLINK_NOFOLLOW)
+}
+
+func applyArchiveOwnership(target string, symlink bool, owner *ArchiveOwnership) error {
+	if owner == nil {
+		return nil
+	}
+	if symlink {
+		return os.Lchown(target, owner.UID, owner.GID)
+	}
+	return os.Chown(target, owner.UID, owner.GID)
 }
 
 type resolvedArchiveLimits struct {
@@ -963,10 +1701,20 @@ func ensureTarTargetCompatible(target string, incomingDir bool) error {
 	}
 }
 
-func ensureTarParents(root, parent string) error {
+func ensureTarParents(root, parent string, owner *ArchiveOwnership) error {
 	rel, err := filepath.Rel(root, parent)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("%w: target parent escapes destination: %s", ErrUnsafeTarExtractionPath, parent)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: target parent is a symlink: %s", ErrUnsafeTarExtractionPath, root)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("tar target parent is not a directory: %s", root)
 	}
 	if rel == "." {
 		return nil
@@ -977,6 +1725,9 @@ func ensureTarParents(root, parent string) error {
 		info, err := os.Lstat(current)
 		if os.IsNotExist(err) {
 			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+			if err := applyArchiveOwnership(current, false, owner); err != nil {
 				return err
 			}
 			continue
@@ -992,6 +1743,22 @@ func ensureTarParents(root, parent string) error {
 		}
 	}
 	return nil
+}
+
+func nearestExistingTarParent(parent string) (string, error) {
+	current := filepath.Clean(parent)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			return current, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return "", fmt.Errorf("no existing parent for tar target %s", parent)
+		}
+		current = next
+	}
 }
 
 func validateTarSymlinkTarget(root, target, linkname string) error {
@@ -1102,11 +1869,11 @@ func writeConsole(s string) {
 }
 
 func rootPath(rootDir, name string) string {
-	cleanRoot := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(rootDir), "/"))
+	cleanRoot := filepath.Clean("/" + strings.TrimPrefix(rootDir, "/"))
 	if cleanRoot == "/" {
 		cleanRoot = ""
 	}
-	cleanName := filepath.Clean("/" + strings.TrimPrefix(strings.TrimSpace(name), "/"))
+	cleanName := filepath.Clean("/" + strings.TrimPrefix(name, "/"))
 	return filepath.Join(cleanRoot, cleanName)
 }
 

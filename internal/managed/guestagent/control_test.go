@@ -95,6 +95,22 @@ func TestPendingRequestsStoresAndConsumesByID(t *testing.T) {
 	}
 }
 
+func TestActiveExecControlAcknowledgements(t *testing.T) {
+	active := NewActiveExecSet()
+	active.Add("7", &fakeActiveExec{})
+	if active.ControlAcknowledged("7", "signal-1") {
+		t.Fatal("new control was already acknowledged")
+	}
+	active.AcknowledgeControl("7", "signal-1")
+	if !active.ControlAcknowledged("7", "signal-1") {
+		t.Fatal("acknowledged control was forgotten")
+	}
+	active.Delete("7")
+	if active.ControlAcknowledged("7", "signal-1") {
+		t.Fatal("deleted exec retained control acknowledgements")
+	}
+}
+
 type fakeActiveExec struct {
 	stdin  string
 	closed bool

@@ -46,6 +46,29 @@ func TestPortForwardFloodIsRejectedBeforeConnectionWorkers(t *testing.T) {
 		}
 	}
 }
+
+func TestPeerFramesRequireCompletedTXChecksums(t *testing.T) {
+	withSwitch := &netstackVirtioBackend{runtime: &networkRuntime{txHook: func([]byte) bool { return true }}}
+	peerFrame := make([]byte, 14)
+	copy(peerFrame[:6], []byte{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x03})
+	if !withSwitch.NeedsTXChecksum(peerFrame) {
+		t.Fatal("peer-bound frame was allowed onto the virtual switch with an unfinished checksum")
+	}
+	gatewayFrame := make([]byte, 14)
+	copy(gatewayFrame[:6], defaultGatewayMACBytes)
+	if withSwitch.NeedsTXChecksum(gatewayFrame) {
+		t.Fatal("netstack-bound frame unnecessarily requested checksum completion")
+	}
+}
+
+func TestPeerFramesConsumedBeforeNetstackDelivery(t *testing.T) {
+	backend := &netstackVirtioBackend{runtime: &networkRuntime{
+		txHook: func([]byte) bool { return true },
+	}}
+	if err := backend.HandleTxPacket(make([]byte, 14)); err != nil {
+		t.Fatalf("consumed peer frame reached detached netstack: %v", err)
+	}
+}
 func TestNetworkRuntimeCloseTerminatesIdleActiveForward(t *testing.T) {
 	runtimeConn, peerConn := net.Pipe()
 	defer peerConn.Close()

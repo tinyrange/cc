@@ -30,9 +30,28 @@ type Client struct {
 // enough for its bounded delivery queue to fill.
 var ErrWorkerCallOverflow = errors.New("sidecar worker call frame buffer overflow")
 
+type TerminationUnconfirmedError struct {
+	RequestID uint64
+	Cause     error
+}
+
+func (e *TerminationUnconfirmedError) Error() string {
+	return fmt.Sprintf("sidecar request %d termination is unconfirmed; worker connection was quarantined: %v", e.RequestID, e.Cause)
+}
+
+func (e *TerminationUnconfirmedError) Unwrap() error { return e.Cause }
+
 type workerCall struct {
-	frames chan WorkerFrame
-	done   chan error
+	frames        chan WorkerFrame
+	done          chan struct{}
+	inputAck      chan struct{}
+	abort         sync.Once
+	aborting      chan struct{}
+	terminal      sync.Once
+	terminalReady chan struct{}
+	finishOnce    sync.Once
+	errMu         sync.Mutex
+	err           error
 }
 
 type WorkerRequirements struct {
@@ -59,22 +78,34 @@ func (e *MissingWorkerCapabilityError) Error() string {
 
 func newWorkerCall() *workerCall {
 	return &workerCall{
-		frames: make(chan WorkerFrame, 256),
-		done:   make(chan error, 1),
+		frames:        make(chan WorkerFrame, 256),
+		done:          make(chan struct{}),
+		inputAck:      make(chan struct{}, 1),
+		aborting:      make(chan struct{}),
+		terminalReady: make(chan struct{}),
 	}
 }
 
 func (c *workerCall) finish(err error) {
-	select {
-	case c.done <- err:
-	default:
-	}
+	c.finishOnce.Do(func() {
+		c.errMu.Lock()
+		c.err = err
+		c.errMu.Unlock()
+		close(c.done)
+	})
+}
+
+func (c *workerCall) result() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	return c.err
 }
 
 const (
-	workerConnectTimeout = 5 * time.Second
-	workerRetryDelay     = 10 * time.Millisecond
-	workerHelloTimeout   = 5 * time.Second
+	workerConnectTimeout        = 5 * time.Second
+	workerRetryDelay            = 10 * time.Millisecond
+	workerHelloTimeout          = 5 * time.Second
+	workerCancelDeliveryTimeout = time.Second
 )
 
 func DialWorker(ctx context.Context, socketPath string) (*Client, error) {
@@ -285,13 +316,23 @@ func (c *Client) receiveLoop() {
 		if call == nil {
 			continue
 		}
+		if frame.Type == WorkerFrameExecInputAck {
+			select {
+			case call.inputAck <- struct{}{}:
+			default:
+			}
+			continue
+		}
 		select {
 		case call.frames <- frame:
+			if frame.Type == WorkerFrameDone || frame.Type == WorkerFrameError {
+				call.terminal.Do(func() { close(call.terminalReady) })
+			}
 		default:
 			err := fmt.Errorf("%w for request %d", ErrWorkerCallOverflow, frame.ID)
-			if c.failCall(frame.ID, call, err) {
-				id := frame.ID
-				go func() { _ = c.sendCancel(id) }()
+			id := frame.ID
+			if call.beginAbort() {
+				go c.finishAbortLiveCall(id, call, err)
 			}
 		}
 	}
@@ -455,30 +496,24 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 	if err != nil {
 		return err
 	}
-	if err := c.codec.Send(frame); err != nil {
+	if err := c.codec.SendContext(ctx, frame); err != nil {
 		return err
 	}
 
-	var stopInputs chan struct{}
+	var stopInputs context.CancelFunc
 	if inputs != nil {
-		stopInputs = make(chan struct{})
-		defer close(stopInputs)
-		go c.forwardExecInputs(requestID, inputs, stopInputs)
+		var inputCtx context.Context
+		inputCtx, stopInputs = context.WithCancel(ctx)
+		defer stopInputs()
+		go c.forwardExecInputs(inputCtx, requestID, call, inputs)
 	}
-
-	cancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.sendCancel(requestID)
-		case <-cancelDone:
-		}
-	}()
-	defer close(cancelDone)
 
 	for {
 		got, err := c.nextFrame(ctx, call)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.abortRequest(requestID, ctx.Err())
+			}
 			return err
 		}
 		switch got.Type {
@@ -487,23 +522,17 @@ func (c *Client) ExecStream(ctx context.Context, id string, req client.ExecReque
 			if err := got.DecodePayload(&workerErr); err != nil {
 				return err
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			return fmt.Errorf("%s", workerErr.Error)
 		case WorkerFrameDone:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			return nil
 		case WorkerFrameEvent:
 			var event client.ExecEvent
 			if err := got.DecodePayload(&event); err != nil {
-				return err
+				return c.abortRequest(requestID, err)
 			}
 			if onEvent != nil {
 				if err := onEvent(event); err != nil {
-					return err
+					return c.abortRequest(requestID, err)
 				}
 			}
 		}
@@ -524,27 +553,19 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 	}
 	defer c.unregisterCall(id)
 
-	cancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.sendCancel(id)
-		case <-cancelDone:
-		}
-	}()
-	defer func() {
-		close(cancelDone)
-	}()
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
 	if err != nil {
 		return err
 	}
-	if err := c.codec.Send(frame); err != nil {
+	if err := c.codec.SendContext(ctx, frame); err != nil {
 		return err
 	}
 	for {
 		got, err := c.nextFrame(ctx, call)
 		if err != nil {
+			if ctx.Err() != nil {
+				return c.abortRequest(id, ctx.Err())
+			}
 			return err
 		}
 		switch got.Type {
@@ -562,7 +583,7 @@ func (c *Client) call(ctx context.Context, frameType string, payload any, onFram
 		default:
 			if onFrame != nil {
 				if err := onFrame(got); err != nil {
-					return err
+					return c.abortRequest(id, err)
 				}
 			}
 		}
@@ -574,18 +595,36 @@ func (c *Client) nextFrame(ctx context.Context, call *workerCall) (WorkerFrame, 
 		ctx = context.Background()
 	}
 	select {
-	case err := <-call.done:
-		return WorkerFrame{}, err
+	case <-call.aborting:
+		<-call.done
+		return WorkerFrame{}, call.result()
 	default:
 	}
 	select {
+	case <-call.terminalReady:
+		return <-call.frames, nil
+	default:
+	}
+	select {
+	case <-call.done:
+		return WorkerFrame{}, call.result()
+	default:
+	}
+	select {
+	case <-call.aborting:
+		<-call.done
+		return WorkerFrame{}, call.result()
+	case <-call.terminalReady:
+		return <-call.frames, nil
 	case <-ctx.Done():
-		return WorkerFrame{}, ctx.Err()
-	case err := <-call.done:
-		if ctx.Err() != nil {
-			return WorkerFrame{}, ctx.Err()
+		select {
+		case <-call.terminalReady:
+			return <-call.frames, nil
+		default:
 		}
-		return WorkerFrame{}, err
+		return WorkerFrame{}, ctx.Err()
+	case <-call.done:
+		return WorkerFrame{}, call.result()
 	case frame := <-call.frames:
 		return frame, nil
 	}
@@ -598,34 +637,103 @@ func (c *Client) nextID() uint64 {
 	return c.next
 }
 
-func (c *Client) forwardExecInputs(id uint64, inputs <-chan client.ExecInput, stop <-chan struct{}) {
+func (c *Client) forwardExecInputs(ctx context.Context, id uint64, call *workerCall, inputs <-chan client.ExecInput) {
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			return
 		case input, ok := <-inputs:
 			if !ok {
 				frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Closed: true})
-				if err == nil {
-					_ = c.codec.Send(frame)
+				if err != nil {
+					c.abortLiveCall(id, call, err)
+					return
 				}
+				if err := c.codec.SendContext(ctx, frame); err != nil {
+					if ctx.Err() == nil {
+						c.abortLiveCall(id, call, err)
+					}
+					return
+				}
+				c.waitExecInputAck(ctx, call)
 				return
 			}
 			frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Input: input})
 			if err != nil {
+				c.abortLiveCall(id, call, err)
 				return
 			}
-			if err := c.codec.Send(frame); err != nil {
+			if err := c.codec.SendContext(ctx, frame); err != nil {
+				if ctx.Err() == nil {
+					c.abortLiveCall(id, call, err)
+				}
+				return
+			}
+			if !c.waitExecInputAck(ctx, call) {
 				return
 			}
 		}
 	}
 }
 
+func (c *Client) waitExecInputAck(ctx context.Context, call *workerCall) bool {
+	select {
+	case <-call.inputAck:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-call.done:
+		return false
+	}
+}
+
 func (c *Client) sendCancel(id uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), workerCancelDeliveryTimeout)
+	defer cancel()
+	return c.sendCancelContext(ctx, id)
+}
+
+func (c *Client) sendCancelContext(ctx context.Context, id uint64) error {
 	frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameCancel, WorkerCancelRequest{})
 	if err != nil {
 		return err
 	}
-	return c.codec.Send(frame)
+	return c.codec.SendContext(ctx, frame)
+}
+
+func (c *Client) quarantineCancellation(id uint64, cause error) error {
+	err := &TerminationUnconfirmedError{RequestID: id, Cause: cause}
+	c.closePending(err)
+	_ = c.conn.Close()
+	return err
+}
+
+// abortRequest is the single ownership transition for every local request
+// failure. Once cancel delivery is uncertain, the worker may still be mutating
+// a VM and the multiplexed stream is no longer safe to reuse.
+func (c *Client) abortRequest(id uint64, cause error) error {
+	if err := c.sendCancel(id); err != nil {
+		return errors.Join(cause, c.quarantineCancellation(id, err))
+	}
+	return cause
+}
+
+func (c *Client) abortLiveCall(id uint64, call *workerCall, cause error) {
+	if call.beginAbort() {
+		c.finishAbortLiveCall(id, call, cause)
+	}
+}
+
+func (c *workerCall) beginAbort() bool {
+	started := false
+	c.abort.Do(func() {
+		close(c.aborting)
+		started = true
+	})
+	return started
+}
+
+func (c *Client) finishAbortLiveCall(id uint64, call *workerCall, cause error) {
+	err := c.abortRequest(id, cause)
+	c.failCall(id, call, err)
 }

@@ -9,12 +9,17 @@ import (
 	"j5.nz/cc/client"
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/vm/builtin"
+	"j5.nz/cc/internal/vm/mounts"
 )
 
 func (h *sidecarVMHost) startBuiltinGuestStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, bool, error) {
 	profile, ok := builtinGuestForImage(req.Image)
 	if !ok {
 		return nil, false, nil
+	}
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, true, err
 	}
 	networkID := req.ID
 	req.Image = profile.Canonical
@@ -36,13 +41,17 @@ func (h *sidecarVMHost) startBuiltinGuestStream(ctx context.Context, req client.
 	}
 	resources := combineSidecarResources(builtinSidecarResources(profile), netResources)
 	resources.networkIPv4 = state.NetworkIPv4
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), true, nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), true, nil
 }
 
 func (h *sidecarVMHost) startBuiltinGuestBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, bool, error) {
 	profile, ok := builtinGuestForImage(req.Image)
 	if !ok {
 		return nil, false, nil
+	}
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, true, err
 	}
 	networkID := req.ID
 	req.Image = profile.Canonical
@@ -64,7 +73,7 @@ func (h *sidecarVMHost) startBuiltinGuestBlankStream(ctx context.Context, req cl
 	}
 	resources := combineSidecarResources(builtinSidecarResources(profile), netResources)
 	resources.networkIPv4 = state.NetworkIPv4
-	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, resources), true, nil
+	return newSidecarInstance(DefaultInstanceID, sidecar, req.Image, mountState, resources), true, nil
 }
 
 func builtinSidecarResources(profile managedguest.Profile) sidecarStartResources {

@@ -111,15 +111,27 @@ func TestForwardInputsClosesStdinOnce(t *testing.T) {
 	close(inputs)
 
 	var got []protocol.ManagedExecRequest
-	ForwardInputs(context.Background(), "2", inputs, func(req protocol.ManagedExecRequest) error {
+	if err := ForwardInputs(context.Background(), "2", inputs, func(req protocol.ManagedExecRequest) error {
 		got = append(got, req)
 		return nil
-	})
+	}); err != nil {
+		t.Fatalf("ForwardInputs: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("messages = %d, want 2: %+v", len(got), got)
 	}
 	if got[0].Kind != "stdin" || string(got[0].Stdin) != "a" || got[1].Kind != "stdin_close" {
 		t.Fatalf("messages = %+v", got)
+	}
+}
+
+func TestForwardInputsReportsSendFailure(t *testing.T) {
+	inputs := make(chan client.ExecInput, 1)
+	inputs <- client.ExecInput{Kind: "signal", Signal: "TERM"}
+	want := errors.New("control delivery failed")
+	err := ForwardInputs(context.Background(), "2", inputs, func(protocol.ManagedExecRequest) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("ForwardInputs error = %v, want %v", err, want)
 	}
 }
 

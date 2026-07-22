@@ -48,6 +48,10 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	mountState, err := mounts.NewState(req.Shares)
+	if err != nil {
+		return nil, err
+	}
 	totalStart := time.Now()
 	defer func() { timing.Since(ctx, "startup.total_ready", totalStart) }()
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
@@ -114,6 +118,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
 	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	stageStart = time.Now()
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	timing.Since(ctx, "startup.initramfs", stageStart)
@@ -144,7 +151,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		rootFS: rootFS,
 		fsdevs: fsdevs,
 		dmesg:  req.Dmesg,
-		mounts: mounts.NewState(req.Shares),
+		mounts: mountState,
 	}, nil
 }
 
@@ -158,9 +165,11 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Image:           req.Image,
 			InitSystem:      req.InitSystem,
 			Kernel:          req.Kernel,
+			Shares:          append([]client.ShareMount(nil), req.Shares...),
 			Network:         req.Network,
 			KernelModules:   append([]string(nil), req.KernelModules...),
 			MemoryMB:        req.MemoryMB,
+			BalloonMB:       req.BalloonMB,
 			CPUs:            req.CPUs,
 			NestedVirt:      req.NestedVirt,
 			Dmesg:           req.Dmesg,
@@ -217,6 +226,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.WorkDir = "/"
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = arm64vm.SnapshotBase
+	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return nil, fmt.Errorf("read kernel metadata: %w", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
@@ -361,6 +373,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if qemuX8664 != "" {
 		initCfg.EmulatorTag = vmruntime.EmulatorTag
 	}
+	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+		return client.ExecResponse{}, fmt.Errorf("read kernel metadata: %w", err)
+	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build initramfs: %w", err)
@@ -444,7 +459,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		if err := mounts.AddRuntimeShares(ctx, inst, shares); err != nil {
 			return client.ExecResponse{}, err
 		}
-		return inst.Exec(ctx, runExecRequest(req))
+		return inst.Exec(ctx, runningVMExecRequest(req))
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
@@ -489,7 +504,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		if err := mounts.AddRuntimeShares(ctx, inst, shares); err != nil {
 			return err
 		}
-		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+		return inst.ExecStream(ctx, runningVMExecRequest(req), inputs, onEvent)
 	}
 
 	if err := execplan.CheckAlternateImageExec(inst); err != nil {
@@ -559,7 +574,7 @@ type linuxInstance struct {
 	rootFS virtio.ShareMounter
 	fsdevs []*virtio.FS
 	dmesg  bool
-	mounts mounts.State
+	mounts *mounts.State
 }
 
 func linuxARM64Capabilities() guestCapabilities {
@@ -575,6 +590,34 @@ func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
 	return virtioFSStats(i.fsdevs)
 }
 
+func (i *linuxInstance) BackingUsage() (uint64, uint64, uint64, error) {
+	if i == nil {
+		return 0, 0, 0, nil
+	}
+	return virtioFSBackingUsage(i.fsdevs)
+}
+
+func (i *linuxInstance) BackingMetadataUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingMetadataUsage(i.fsdevs)
+}
+
+func (i *linuxInstance) BackingCombinedUsage() (uint64, uint64) {
+	if i == nil {
+		return 0, 0
+	}
+	return virtioFSBackingCombinedUsage(i.fsdevs)
+}
+
+func (i *linuxInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
+	if i == nil {
+		return virtio.FSBackingUsageSnapshot{}
+	}
+	return virtioFSBackingSnapshot(i.fsdevs)
+}
+
 func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil {
 		return client.ExecRequest{}, fmt.Errorf("instance is not running")
@@ -583,11 +626,15 @@ func (i *linuxInstance) resolveExecRequest(req client.ExecRequest) (client.ExecR
 }
 
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	return i.AddShares(ctx, []client.ShareMount{share})
+}
+
+func (i *linuxInstance) AddShares(ctx context.Context, shares []client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "shares", nil)
+		return mounts.AddRuntimeShareMount(nil, nil, nil, client.ShareMount{}, "shares", nil)
 	}
-	return i.mounts.AddShare(i.rootFS, share, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
+	return i.mounts.AddShares(i.rootFS, shares, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
 		return mounts.BuildRuntimeDirectoryShare(share, arm64vm.BuildShareMount)
 	})
 }

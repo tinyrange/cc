@@ -2,12 +2,17 @@
 
 package kvm
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
 
 const (
 	acpiPM1EventPort   = 0x400
 	acpiPM1ControlPort = 0x404
 )
+
+var errGuestPoweroff = errors.New("guest requested ACPI poweroff")
 
 type ACPIPM struct {
 	mu      sync.Mutex
@@ -36,6 +41,9 @@ func (p *ACPIPM) HandleIO(ioExit IOExit) (bool, error) {
 		end := start + int(ioExit.Size)
 		if ioExit.Write {
 			p.write(port, ioExit.Data[start:end])
+			if p.control&(1<<13) != 0 && (p.control>>10)&7 == 5 {
+				return true, errGuestPoweroff
+			}
 			continue
 		}
 		p.read(ioExit.Data[start:end], port)

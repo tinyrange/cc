@@ -182,6 +182,12 @@ func TestBalloonAtTargetTracksGuestAcknowledgement(t *testing.T) {
 	if !dev.AtTarget() {
 		t.Fatal("balloon should be at its acknowledged target")
 	}
+	if err := dev.SetTargetPages(50); err != nil {
+		t.Fatalf("lower target: %v", err)
+	}
+	if dev.AtTarget() {
+		t.Fatal("balloon incorrectly reported a deflation request as acknowledged")
+	}
 }
 
 func TestBalloonSnapshotRoundTripsCompactInflatedPages(t *testing.T) {

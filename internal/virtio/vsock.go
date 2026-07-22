@@ -45,6 +45,7 @@ type Vsock struct {
 	GuestCID uint64
 
 	mu               sync.Mutex
+	creditCond       *sync.Cond
 	mem              GuestMemory
 	irq              IRQController
 	backend          VsockBackend
@@ -76,13 +77,14 @@ type vsockConnKey struct {
 }
 
 type vsockConnection struct {
-	key       vsockConnKey
-	state     int
-	peerAlloc uint32
-	peerCnt   uint32
-	txCnt     uint32
-	rxCnt     uint32
-	backend   VsockConn
+	key                  vsockConnKey
+	state                int
+	peerAlloc            uint32
+	peerCnt              uint32
+	txCnt                uint32
+	rxCnt                uint32
+	creditRequestPending bool
+	backend              VsockConn
 }
 
 const (
@@ -101,6 +103,7 @@ func NewVsock(base, size uint64, irq uint32, guestCID uint64, backend VsockBacke
 		backend:  backend,
 		closed:   make(chan struct{}),
 	}
+	v.creditCond = sync.NewCond(&v.mu)
 	v.resetLocked()
 	return v
 }
@@ -274,6 +277,9 @@ func (v *Vsock) Close() error {
 		}
 		delete(v.connections, key)
 	}
+	if v.creditCond != nil {
+		v.creditCond.Broadcast()
+	}
 	v.mu.Unlock()
 	v.wg.Wait()
 	return nil
@@ -288,16 +294,31 @@ func (v *Vsock) Poke() error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	// A backend read can queue a packet just before the guest replenishes the
+	// RX ring. If the corresponding queue notification is missed, merely
+	// raising an interrupt leaves that packet pending forever because there is
+	// no used descriptor for the guest to discover. Retry delivery before the
+	// wakeup so periodic keepalives make forward progress.
+	if err := v.processRXLocked(); err != nil {
+		return err
+	}
 	if v.irq == nil {
 		return nil
 	}
-	if v.interruptStatus != 0 {
-		return v.updateIRQLocked()
+	// Report an actual vring interrupt so the guest driver rescans completed
+	// receive buffers. A bare line pulse with interruptStatus clear is handled
+	// as a spurious interrupt and cannot recover a missed queue wakeup.
+	v.interruptStatus |= vsockInterruptVring
+	// Reasserting an already-high level does not produce a new wakeup on every
+	// hypervisor. Pulse it low first while retaining the pending device status.
+	if v.irqHigh {
+		if err := v.irq.SetIRQ(v.IRQ, false); err != nil {
+			return err
+		}
+		v.irqHigh = false
+		v.irqTransitions++
 	}
-	if err := v.irq.SetIRQ(v.IRQ, true); err != nil {
-		return err
-	}
-	return v.irq.SetIRQ(v.IRQ, false)
+	return v.updateIRQLocked()
 }
 
 func (v *Vsock) Summary() string {
@@ -506,6 +527,10 @@ func (v *Vsock) handleCreditUpdateLocked(hdr vsockHeader) {
 	}
 	conn.peerAlloc = hdr.BufAlloc
 	conn.peerCnt = hdr.FwdCnt
+	conn.creditRequestPending = false
+	if v.creditCond != nil {
+		v.creditCond.Broadcast()
+	}
 }
 
 func (v *Vsock) handleCreditRequestLocked(hdr vsockHeader) {
@@ -554,14 +579,42 @@ func (v *Vsock) readFromBackend(conn VsockConn, key vsockConnKey) {
 		if n == 0 {
 			continue
 		}
-		v.mu.Lock()
-		state, ok := v.connections[key]
-		if ok && state.state == vsockConnStateConnected {
-			v.sendDataLocked(state, buf[:n])
+		for offset := 0; offset < n; {
+			v.mu.Lock()
+			state, ok := v.connections[key]
+			if !ok || state.state != vsockConnStateConnected {
+				v.mu.Unlock()
+				return
+			}
+			credit := vsockPeerCredit(state)
+			if credit == 0 {
+				v.sendCreditRequestLocked(state)
+				_ = v.processRXLocked()
+				v.creditCond.Wait()
+				v.mu.Unlock()
+				continue
+			}
+			chunk := n - offset
+			if uint32(chunk) > credit {
+				chunk = int(credit)
+			}
+			v.sendDataLocked(state, buf[offset:offset+chunk])
 			_ = v.processRXLocked()
+			v.mu.Unlock()
+			offset += chunk
 		}
-		v.mu.Unlock()
 	}
+}
+
+func vsockPeerCredit(conn *vsockConnection) uint32 {
+	if conn == nil || conn.peerAlloc == 0 {
+		return 0
+	}
+	used := conn.txCnt - conn.peerCnt
+	if used >= conn.peerAlloc {
+		return 0
+	}
+	return conn.peerAlloc - used
 }
 
 func (v *Vsock) processRXLocked() error {
@@ -637,6 +690,23 @@ func (v *Vsock) sendCreditUpdateLocked(conn *vsockConnection) {
 		DstPort:  conn.key.remotePort,
 		Type:     vsockTypeStream,
 		Op:       vsockOpCreditUpdate,
+		BufAlloc: vsockDefaultBufSize,
+		FwdCnt:   conn.rxCnt,
+	}))
+}
+
+func (v *Vsock) sendCreditRequestLocked(conn *vsockConnection) {
+	if conn.creditRequestPending {
+		return
+	}
+	conn.creditRequestPending = true
+	v.queueRxPacketLocked(encodeVsockHeader(vsockHeader{
+		SrcCID:   VSockCIDHost,
+		DstCID:   v.GuestCID,
+		SrcPort:  conn.key.localPort,
+		DstPort:  conn.key.remotePort,
+		Type:     vsockTypeStream,
+		Op:       vsockOpCreditRequest,
 		BufAlloc: vsockDefaultBufSize,
 		FwdCnt:   conn.rxCnt,
 	}))
@@ -790,6 +860,9 @@ func (v *Vsock) resetLocked() {
 	v.queues = [3]queue{}
 	v.connections = make(map[vsockConnKey]*vsockConnection)
 	v.pendingRx = nil
+	if v.creditCond != nil {
+		v.creditCond.Broadcast()
+	}
 }
 
 type SimpleVsockBackend struct {

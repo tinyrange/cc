@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ const defaultGatewayMAC = "02:42:0a:2a:00:01"
 const defaultForwardConnections = 32
 const defaultTotalForwardConnections = 128
 
+var defaultGatewayMACBytes = []byte{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x01}
+
 type PortForwardRuntimeStats struct {
 	Active   int64
 	Rejected uint64
@@ -36,7 +39,7 @@ type networkRuntime struct {
 	stack           *netstack.NetStack
 	iface           *netstack.NetworkInterface
 	dev             *virtio.Net
-	txHook          func([]byte)
+	txHook          func([]byte) bool
 	mu              sync.Mutex
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -64,7 +67,7 @@ type networkDeviceConfig struct {
 	Base    uint64
 	Size    uint64
 	IRQ     uint32
-	TXHook  func([]byte)
+	TXHook  func([]byte) bool
 	RXHook  func([]byte) error
 	Cleanup func()
 }
@@ -156,11 +159,7 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 	rxHook := cfg.RXHook
 	if rxHook == nil {
 		rxHook = func(frame []byte) error {
-			copied := append([]byte(nil), frame...)
-			go func() {
-				_ = dev.EnqueueRxPacketOwned(copied)
-			}()
-			return nil
+			return dev.EnqueueRxPacket(frame)
 		}
 	}
 	iface.AttachVirtioBackend(func(frame []byte) error {
@@ -177,13 +176,26 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 }
 
 func (b *netstackVirtioBackend) HandleTxPacket(packet []byte) error {
-	if b == nil || b.runtime == nil || b.runtime.stack == nil {
+	if b == nil || b.runtime == nil {
 		return fmt.Errorf("network runtime is not attached")
 	}
 	if b.runtime.txHook != nil {
-		b.runtime.txHook(packet)
+		if b.runtime.txHook(packet) {
+			return nil
+		}
+	}
+	if b.runtime.stack == nil {
+		return fmt.Errorf("network runtime is not attached")
 	}
 	return b.runtime.ifaceDeliver(packet)
+}
+
+func (b *netstackVirtioBackend) NeedsTXChecksum(packet []byte) bool {
+	return b != nil && b.runtime != nil && b.runtime.txHook != nil && !frameTargetsDefaultGateway(packet)
+}
+
+func frameTargetsDefaultGateway(frame []byte) bool {
+	return len(frame) >= 6 && bytes.Equal(frame[:6], defaultGatewayMACBytes)
 }
 
 func (n *networkRuntime) ifaceDeliver(packet []byte) error {

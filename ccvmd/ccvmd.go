@@ -21,6 +21,7 @@ type ServerOptions struct {
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
 	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
 	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
+	CompleteRequest        func(string, uint64, RuntimeView)
 }
 
 // ServerAuthentication is a validated transport authentication policy for a
@@ -54,6 +55,7 @@ type RuntimeView interface {
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
+	SetInstanceBalloon(string, uint64) error
 }
 
 func Main(args []string) {
@@ -89,6 +91,11 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 				return nil
 			}
 			return opts.NormalizeRunRequest(req, runtimeViewAdapter{runtime})
+		},
+		CompleteRequest: func(id string, token uint64, runtime internal.RuntimeView) {
+			if opts.CompleteRequest != nil {
+				opts.CompleteRequest(id, token, runtimeViewAdapter{runtime})
+			}
 		},
 		RegisterHandlers: func(mux *http.ServeMux, runtime internal.RuntimeView) {
 			if opts.RegisterHandlers != nil {

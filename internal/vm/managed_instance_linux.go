@@ -27,6 +27,7 @@ type managedInstance struct {
 	user           func(string) (string, error)
 	missingRootErr string
 	netOnce        sync.Once
+	netMu          sync.RWMutex
 }
 
 func (i *managedInstance) core() *managedInstanceCore {
@@ -101,10 +102,19 @@ func (i *managedInstance) NetworkIPv4() string {
 	if i == nil {
 		return ""
 	}
+	i.netMu.RLock()
+	defer i.netMu.RUnlock()
 	return networkGuestAddress(i.network)
 }
 
 func (i *managedInstance) RootSnapshot() (imagefs.Directory, error) {
+	return i.RootSnapshotContext(context.Background())
+}
+
+func (i *managedInstance) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if i == nil {
 		return nil, fmt.Errorf("instance is not running")
 	}
@@ -122,9 +132,12 @@ func (i *managedInstance) closeNetwork() {
 		return
 	}
 	i.netOnce.Do(func() {
-		if i.network != nil {
-			_ = i.network.Close()
-			i.network = nil
+		i.netMu.Lock()
+		network := i.network
+		i.network = nil
+		i.netMu.Unlock()
+		if network != nil {
+			_ = network.Close()
 		}
 	})
 }

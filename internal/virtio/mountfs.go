@@ -1,6 +1,8 @@
 package virtio
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,15 +36,272 @@ type mountedFS struct {
 	writebackCache bool
 	debugPaths     []string
 	debugLog       io.Writer
+	closing        bool
+	closeMu        sync.Mutex
+	closeStart     sync.Once
+	closeBackends  []FSBackend
+	closeStates    []mountedBackendCloseState
+	closeBeginDone chan struct{}
 
-	mu         sync.RWMutex
-	nextNodeID uint64
-	nextInode  uint64
-	nextHandle uint64
-	nodes      map[uint64]*mountedNode
-	pathToNode map[string]uint64
-	inodes     map[mountedBackendInode]uint64
-	handles    map[uint64]*mountedHandle
+	mu                       sync.RWMutex
+	nextNodeID               uint64
+	nextInode                uint64
+	nextHandle               uint64
+	nodes                    map[uint64]*mountedNode
+	pathToNode               map[string]uint64
+	pathRefs                 map[uint64]uint64
+	backendNodes             map[mountedBackendNode]uint64
+	inodes                   map[mountedBackendInode]uint64
+	handles                  map[uint64]*mountedHandle
+	backingDataHighWater     uint64
+	backingMetadataHighWater uint64
+}
+
+type mountedBackendCloseState struct {
+	done   chan struct{}
+	err    error
+	closed bool
+}
+
+func (m *mountedFS) distinctBackends() []FSBackend {
+	m.mu.RLock()
+	backends := make([]FSBackend, 0, len(m.mounts)+1)
+	if m.root != nil {
+		backends = append(backends, m.root)
+	}
+	for _, mount := range m.mounts {
+		duplicate := false
+		for _, existing := range backends {
+			if sameFSBackend(existing, mount.backend) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && mount.backend != nil {
+			backends = append(backends, mount.backend)
+		}
+	}
+	m.mu.RUnlock()
+	return backends
+}
+
+func sameFSBackend(a, b FSBackend) bool {
+	if a == nil || b == nil || reflect.TypeOf(a) != reflect.TypeOf(b) {
+		return a == nil && b == nil
+	}
+	typ := reflect.TypeOf(a)
+	if typ.Comparable() {
+		return reflect.ValueOf(a).Interface() == reflect.ValueOf(b).Interface()
+	}
+	return backendPointer(a) != 0 && backendPointer(a) == backendPointer(b)
+}
+
+// BackingUsage forwards optional backing-store telemetry through the mount
+// router. Each distinct backend is counted once even when it is mounted at
+// multiple guest paths.
+func (m *mountedFS) BackingUsage() (current, highWater, physical uint64, reclaimErr error) {
+	var errs []error
+	componentHighWater := uint64(0)
+	for _, backend := range m.distinctBackends() {
+		provider, ok := backend.(interface {
+			BackingUsage() (uint64, uint64, uint64, error)
+		})
+		if !ok {
+			continue
+		}
+		backendCurrent, backendHighWater, backendPhysical, err := provider.BackingUsage()
+		current += backendCurrent
+		componentHighWater = max(componentHighWater, backendHighWater)
+		physical += backendPhysical
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	m.mu.Lock()
+	observed := max(current, componentHighWater)
+	if observed > m.backingDataHighWater {
+		m.backingDataHighWater = observed
+	}
+	highWater = m.backingDataHighWater
+	m.mu.Unlock()
+	return current, highWater, physical, errors.Join(errs...)
+}
+
+func (m *mountedFS) BackingCurrent() (current uint64) {
+	for _, backend := range m.distinctBackends() {
+		if provider, ok := backend.(interface{ BackingCurrent() uint64 }); ok {
+			current += provider.BackingCurrent()
+			continue
+		}
+		if provider, ok := backend.(interface {
+			BackingUsage() (uint64, uint64, uint64, error)
+		}); ok {
+			value, _, _, _ := provider.BackingUsage()
+			current += value
+		}
+	}
+	return current
+}
+
+// BackingMetadataUsage forwards metadata telemetry independently from backing
+// data. Keeping the two peaks separate matters: their maxima need not occur at
+// the same time, so adding them invents a combined high-water value that was
+// never observed.
+func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
+	componentHighWater := uint64(0)
+	for _, backend := range m.distinctBackends() {
+		provider, ok := backend.(interface{ BackingMetadataUsage() (uint64, uint64) })
+		if !ok {
+			continue
+		}
+		backendCurrent, backendHighWater := provider.BackingMetadataUsage()
+		current += backendCurrent
+		componentHighWater = max(componentHighWater, backendHighWater)
+	}
+	m.mu.Lock()
+	observed := max(current, componentHighWater)
+	if observed > m.backingMetadataHighWater {
+		m.backingMetadataHighWater = observed
+	}
+	highWater = m.backingMetadataHighWater
+	m.mu.Unlock()
+	return current, highWater
+}
+
+// Close deterministically releases the root and every distinct mounted
+// backend. Virtio FS may call this from more than one shutdown path, so the
+// ownership boundary is idempotent.
+func (m *mountedFS) Close() error {
+	return m.closeWithin(2 * time.Second)
+}
+
+func (m *mountedFS) closeWithin(timeout time.Duration) error {
+	if m == nil {
+		return nil
+	}
+	started := time.Now()
+	m.BeginClose()
+	remaining := timeout - time.Since(started)
+	if remaining <= 0 {
+		return &CloseIncompleteError{Resource: "mounted filesystem shutdown signal", Timeout: timeout}
+	}
+	timer := time.NewTimer(remaining)
+	select {
+	case <-m.closeBeginDone:
+		timer.Stop()
+	case <-timer.C:
+		return &CloseIncompleteError{Resource: "mounted filesystem shutdown signal", Timeout: timeout}
+	}
+
+	type attempt struct {
+		index int
+		done  chan struct{}
+	}
+	m.closeMu.Lock()
+	attempts := make([]attempt, 0, len(m.closeBackends))
+	for i, backend := range m.closeBackends {
+		state := &m.closeStates[i]
+		if state.closed {
+			continue
+		}
+		if state.done == nil {
+			state.done = make(chan struct{})
+			done := state.done
+			go func(state *mountedBackendCloseState, backend FSBackend) {
+				var err error
+				if closer, ok := backend.(interface{ Close() error }); ok {
+					err = closer.Close()
+				}
+				m.closeMu.Lock()
+				state.err = err
+				m.closeMu.Unlock()
+				close(done)
+			}(state, backend)
+		}
+		attempts = append(attempts, attempt{index: i, done: state.done})
+	}
+	m.closeMu.Unlock()
+
+	deadline := started.Add(timeout)
+	for _, attempt := range attempts {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return &CloseIncompleteError{Resource: "mounted filesystem backends", Timeout: timeout}
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-attempt.done:
+			timer.Stop()
+		case <-timer.C:
+			return &CloseIncompleteError{Resource: "mounted filesystem backends", Timeout: timeout}
+		}
+	}
+
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	var errs []error
+	for i := range m.closeStates {
+		state := &m.closeStates[i]
+		if state.closed {
+			if state.err != nil {
+				errs = append(errs, state.err)
+			}
+			continue
+		}
+		var ownedAttempt chan struct{}
+		for _, attempt := range attempts {
+			if attempt.index == i {
+				ownedAttempt = attempt.done
+				break
+			}
+		}
+		if state.done != ownedAttempt {
+			errs = append(errs, &CloseIncompleteError{Resource: "mounted filesystem backend retry", Timeout: timeout})
+			continue
+		}
+		var incomplete *CloseIncompleteError
+		if errors.As(state.err, &incomplete) {
+			errs = append(errs, state.err)
+			state.done = nil
+			state.err = nil
+			continue
+		}
+		state.closed = true
+		if state.err != nil {
+			errs = append(errs, state.err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *mountedFS) BeginClose() {
+	if m == nil {
+		return
+	}
+	m.closeStart.Do(func() {
+		m.mu.Lock()
+		m.closing = true
+		m.mu.Unlock()
+		m.closeBackends = m.distinctBackends()
+		m.closeStates = make([]mountedBackendCloseState, len(m.closeBackends))
+		m.closeBeginDone = make(chan struct{})
+		var wg sync.WaitGroup
+		for _, backend := range m.closeBackends {
+			starter, ok := backend.(interface{ BeginClose() })
+			if !ok {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				starter.BeginClose()
+			}()
+		}
+		go func() {
+			wg.Wait()
+			close(m.closeBeginDone)
+		}()
+	})
 }
 
 type shareMount struct {
@@ -58,19 +317,29 @@ type mountedNode struct {
 	backend         FSBackend
 	backendNodeID   uint64
 	backendResolved bool
+	backendRoute    string
 }
 
 type mountedHandle struct {
 	backend FSBackend
+	route   string
 	nodeID  uint64
 	fh      uint64
 	dir     bool
+	entries []dirEntry
 }
 
 type mountedBackendInode struct {
 	backendType string
 	backendPtr  uintptr
 	inode       uint64
+}
+
+type mountedBackendNode struct {
+	backendType string
+	backendPtr  uintptr
+	route       string
+	nodeID      uint64
 }
 
 func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
@@ -80,7 +349,10 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 	mounts := make([]shareMount, 0, len(shares))
 	for _, share := range shares {
 		mountPath := cleanMountPath(share.GuestPath)
-		if mountPath == "/" || share.Backend == nil {
+		if share.Backend == nil {
+			continue
+		}
+		if mountPath == "/" {
 			continue
 		}
 		mounts = append(mounts, shareMount{
@@ -107,9 +379,11 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 		nodes: map[uint64]*mountedNode{
 			1: {id: 1, path: "/"},
 		},
-		pathToNode: map[string]uint64{"/": 1},
-		inodes:     map[mountedBackendInode]uint64{},
-		handles:    map[uint64]*mountedHandle{},
+		pathToNode:   map[string]uint64{"/": 1},
+		pathRefs:     map[uint64]uint64{1: 1},
+		backendNodes: map[mountedBackendNode]uint64{},
+		inodes:       map[mountedBackendInode]uint64{},
+		handles:      map[uint64]*mountedHandle{},
 	}
 }
 
@@ -117,8 +391,16 @@ type ShareMounter interface {
 	AddShare(ShareMount) error
 }
 
+type ShareBatchMounter interface {
+	AddShares([]ShareMount) error
+}
+
 func (m *mountedFS) RootSnapshot() (imagefs.Directory, error) {
 	return m.RootSnapshotAt("/")
+}
+
+func (m *mountedFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory, error) {
+	return m.RootSnapshotAtContext(ctx, "/")
 }
 
 func (m *mountedFS) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
@@ -131,69 +413,111 @@ func (m *mountedFS) RootSnapshotAt(guestPath string) (imagefs.Directory, error) 
 		}
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	for i := range m.mounts {
-		mount := &m.mounts[i]
-		if mount.path != guestPath {
+		if m.mounts[i].path != guestPath {
 			continue
 		}
-		if snap, ok := mount.backend.(interface {
+		backend := m.mounts[i].backend
+		m.mu.RUnlock()
+		if snap, ok := backend.(interface {
 			RootSnapshot() (imagefs.Directory, error)
 		}); ok {
 			return snap.RootSnapshot()
 		}
 		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
 	}
+	m.mu.RUnlock()
+	return nil, fmt.Errorf("mount %q is not available", guestPath)
+}
+
+func (m *mountedFS) RootSnapshotAtContext(ctx context.Context, guestPath string) (imagefs.Directory, error) {
+	guestPath = cleanMountPath(guestPath)
+	if guestPath == "/" {
+		if snap, ok := m.root.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
+		}); ok {
+			return snap.RootSnapshotContext(ctx)
+		}
+		return nil, fmt.Errorf("root filesystem does not support cancelable snapshots")
+	}
+	m.mu.RLock()
+	for i := range m.mounts {
+		mount := &m.mounts[i]
+		if mount.path != guestPath {
+			continue
+		}
+		backend := mount.backend
+		m.mu.RUnlock()
+		if snap, ok := backend.(interface {
+			RootSnapshotContext(context.Context) (imagefs.Directory, error)
+		}); ok {
+			return snap.RootSnapshotContext(ctx)
+		}
+		return nil, fmt.Errorf("mount %q does not support cancelable snapshots", guestPath)
+	}
+	m.mu.RUnlock()
 	return nil, fmt.Errorf("mount %q is not available", guestPath)
 }
 
 func (m *mountedFS) AddShare(share ShareMount) error {
-	mountPath := cleanMountPath(share.GuestPath)
-	if mountPath == "/" {
-		return nil
-	}
-	if share.Backend == nil {
-		return nil
-	}
+	return m.AddShares([]ShareMount{share})
+}
+
+func (m *mountedFS) AddShares(shares []ShareMount) error {
 	m.mu.RLock()
 	writebackCache := m.writebackCache
 	m.mu.RUnlock()
-	if be, ok := share.Backend.(fsWritebackCacheBackend); ok {
-		be.SetWritebackCache(writebackCache)
+	prepared := make([]shareMount, 0, len(shares))
+	for _, share := range shares {
+		mountPath := cleanMountPath(share.GuestPath)
+		if mountPath == "/" || share.Backend == nil {
+			continue
+		}
+		if be, ok := share.Backend.(fsWritebackCacheBackend); ok {
+			be.SetWritebackCache(writebackCache)
+		}
+		prepared = append(prepared, shareMount{path: mountPath, backend: share.Backend, writable: share.Writable, cache: normalizeMountCacheMode(share.CacheMode)})
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	for _, existing := range m.mounts {
-		if existing.path != mountPath {
+	if m.closing {
+		return fmt.Errorf("mounted filesystem is closing; share ownership remains with the caller")
+	}
+	combined := append(append([]shareMount(nil), m.mounts...), prepared...)
+	seen := make(map[string]shareMount, len(combined))
+	for _, mount := range combined {
+		if existing, ok := seen[mount.path]; ok {
+			if existing.writable != mount.writable || !sameFSBackend(existing.backend, mount.backend) || existing.cache != mount.cache {
+				return fmt.Errorf("mount path %q is already in use", mount.path)
+			}
 			continue
 		}
-		if existing.writable != share.Writable || existing.backend != share.Backend || existing.cache != normalizeMountCacheMode(share.CacheMode) {
-			return fmt.Errorf("mount path %q is already in use", mountPath)
-		}
-		return nil
+		seen[mount.path] = mount
 	}
-
-	m.mounts = append(m.mounts, shareMount{
-		path:     mountPath,
-		backend:  share.Backend,
-		writable: share.Writable,
-		cache:    normalizeMountCacheMode(share.CacheMode),
-	})
+	m.mounts = m.mounts[:0]
+	for _, mount := range seen {
+		m.mounts = append(m.mounts, mount)
+	}
 	sort.Slice(m.mounts, func(i, j int) bool {
 		if len(m.mounts[i].path) == len(m.mounts[j].path) {
 			return m.mounts[i].path < m.mounts[j].path
 		}
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
-	for existingPath, id := range m.pathToNode {
-		if existingPath != mountPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(mountPath, "/")+"/") {
-			continue
+	for _, mount := range prepared {
+		removed := make(map[uint64]struct{})
+		for existingPath, id := range m.pathToNode {
+			if existingPath != mount.path && !strings.HasPrefix(existingPath, strings.TrimSuffix(mount.path, "/")+"/") {
+				continue
+			}
+			m.unbindPathLocked(existingPath)
+			removed[id] = struct{}{}
 		}
-		delete(m.pathToNode, existingPath)
-		delete(m.nodes, id)
+		for id := range removed {
+			m.deleteNodeIfDetachedLocked(id)
+		}
 	}
 	return nil
 }
@@ -239,11 +563,13 @@ func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
 	if mount := m.mountForPath(node.path); mount != nil {
 		return cachePolicyForMode(mount.cache)
 	}
-	return cachePolicyForMode(fsCacheAggressive)
+	// Root mutations all pass through this FUSE mount, and hard links share one
+	// FUSE node. The kernel can therefore update cached inode metadata coherently
+	// while directory traversal retains the batched READDIRPLUS results.
+	return FSCachePolicy{Mode: fsCacheNormal, EntryTTL: 60 * time.Second, AttrTTL: 60 * time.Second}
 }
 
 func cleanMountPath(value string) string {
-	value = strings.TrimSpace(value)
 	if value == "" {
 		return "/"
 	}
@@ -261,11 +587,22 @@ func (m *mountedFS) SnapshotNodePaths() []string {
 		ids = append(ids, int(id))
 	}
 	sort.Ints(ids)
-	paths := make([]string, 0, len(ids))
+	paths := make([]string, 0, len(m.pathToNode))
 	for _, id := range ids {
-		if node := m.nodes[uint64(id)]; node != nil && node.path != "" {
-			paths = append(paths, node.path)
+		nodeID := uint64(id)
+		node := m.nodes[nodeID]
+		if node == nil || node.path == "" {
+			continue
 		}
+		paths = append(paths, node.path)
+		var aliases []string
+		for nodePath, mappedID := range m.pathToNode {
+			if mappedID == nodeID && nodePath != node.path {
+				aliases = append(aliases, nodePath)
+			}
+		}
+		sort.Strings(aliases)
+		paths = append(paths, aliases...)
 	}
 	m.mu.RUnlock()
 	return paths
@@ -273,7 +610,7 @@ func (m *mountedFS) SnapshotNodePaths() []string {
 
 func (m *mountedFS) RestoreNodePaths(paths []string) error {
 	for _, nodePath := range paths {
-		nodePath = path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(nodePath), "/"))
+		nodePath = path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
 		if nodePath == "/" {
 			continue
 		}
@@ -313,12 +650,8 @@ func (m *mountedFS) restoreNodePath(nodePath string) error {
 			}
 		}
 	}
-	if node := m.node(childID); node == nil || node.path != nodePath {
-		got := ""
-		if node != nil {
-			got = node.path
-		}
-		return fmt.Errorf("restore mountedfs node %q: got node %d path %q", nodePath, childID, got)
+	if mappedID := m.nodeIDForPath(nodePath); mappedID != childID {
+		return fmt.Errorf("restore mountedfs node %q: mapped to node %d, want %d", nodePath, mappedID, childID)
 	}
 	return nil
 }
@@ -404,15 +737,16 @@ func (m *mountedFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid u
 	if errno != 0 {
 		return 0, errno
 	}
-	return m.storeHandle(backend, backendNodeID, fh, false), 0
+	return m.storeHandle(node.path, backend, backendNodeID, fh, false, nil), 0
 }
 
-func (m *mountedFS) Release(_ uint64, fh uint64) {
+func (m *mountedFS) Release(nodeID uint64, fh uint64) {
 	handle := m.takeHandle(fh, false)
 	if handle == nil {
 		return
 	}
 	handle.backend.Release(handle.nodeID, handle.fh)
+	m.collectDetachedNode(nodeID)
 }
 
 func (m *mountedFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
@@ -455,6 +789,38 @@ func (m *mountedFS) ListXattr(nodeID uint64) ([]byte, int32) {
 	return xattrBackend.ListXattr(backendNodeID)
 }
 
+func (m *mountedFS) SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32 {
+	node := m.node(nodeID)
+	if node == nil {
+		return -linuxENOENT
+	}
+	backend, backendNodeID, errno := m.resolveBackendNodeCached(node.path)
+	if errno != 0 {
+		return errno
+	}
+	xattrBackend, ok := backend.(fsXattrMutationBackend)
+	if !ok {
+		return -linuxabi.ENOSYS
+	}
+	return xattrBackend.SetXattr(backendNodeID, name, value, flags)
+}
+
+func (m *mountedFS) RemoveXattr(nodeID uint64, name string) int32 {
+	node := m.node(nodeID)
+	if node == nil {
+		return -linuxENOENT
+	}
+	backend, backendNodeID, errno := m.resolveBackendNodeCached(node.path)
+	if errno != 0 {
+		return errno
+	}
+	xattrBackend, ok := backend.(fsXattrMutationBackend)
+	if !ok {
+		return -linuxabi.ENOSYS
+	}
+	return xattrBackend.RemoveXattr(backendNodeID, name)
+}
+
 func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 	node := m.node(nodeID)
 	if node == nil {
@@ -466,32 +832,44 @@ func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 		if errno != 0 {
 			return 0, errno
 		}
-		return m.storeHandle(backend, backendNodeID, fh, true), 0
+		entries, errno := m.snapshotDirEntries(node, backend, backendNodeID, fh)
+		if errno != 0 {
+			backend.ReleaseDir(backendNodeID, fh)
+			return 0, errno
+		}
+		return m.storeHandle(node.path, backend, backendNodeID, fh, true, entries), 0
 	}
 	if errno != -linuxENOENT || !m.isSyntheticPath(node.path) {
 		return 0, errno
 	}
-	return m.storeHandle(nil, 0, 0, true), 0
+	entries, errno := m.snapshotDirEntries(node, nil, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return m.storeHandle(node.path, nil, 0, 0, true, entries), 0
 }
 
 func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
-	node := m.node(nodeID)
-	if node == nil {
+	if m.node(nodeID) == nil {
 		return nil, -linuxENOENT
 	}
 	handle := m.handle(fh, true)
 	if handle == nil {
 		return nil, -linuxEBADF
 	}
+	return encodeDirEntries(handle.entries, off, maxBytes), 0
+}
+
+func (m *mountedFS) snapshotDirEntries(node *mountedNode, backend FSBackend, backendNodeID uint64, fh uint64) ([]dirEntry, int32) {
 
 	entries := []dirEntry{
-		{name: ".", typ: dirTypeDir, ino: nodeID},
+		{name: ".", typ: dirTypeDir, ino: node.id},
 		{name: "..", typ: dirTypeDir, ino: m.ensureNode(parentPath(node.path))},
 	}
 
 	names := map[string]dirEntry{}
-	if handle.backend != nil {
-		children, errno := m.readBackendDir(handle.backend, handle.nodeID, handle.fh)
+	if backend != nil {
+		children, errno := m.readBackendDir(backend, backendNodeID, fh)
 		if errno != 0 {
 			return nil, errno
 		}
@@ -500,7 +878,7 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 				continue
 			}
 			childPath := path.Join(node.path, child.name)
-			childID := m.ensureResolvedNode(childPath, handle.backend, child.ino)
+			childID := m.ensureResolvedNode(childPath, backend, child.ino)
 			child.ino = childID
 			names[child.name] = child
 		}
@@ -517,15 +895,16 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 	for _, name := range sorted {
 		entries = append(entries, names[name])
 	}
-	return encodeDirEntries(entries, off, maxBytes), 0
+	return entries, 0
 }
 
-func (m *mountedFS) ReleaseDir(_ uint64, fh uint64) {
+func (m *mountedFS) ReleaseDir(nodeID uint64, fh uint64) {
 	handle := m.takeHandle(fh, true)
 	if handle == nil || handle.backend == nil {
 		return
 	}
 	handle.backend.ReleaseDir(handle.nodeID, handle.fh)
+	m.collectDetachedNode(nodeID)
 }
 
 func (m *mountedFS) Readlink(nodeID uint64) (string, int32) {
@@ -666,11 +1045,11 @@ func (m *mountedFS) LinkForCaller(nodeID uint64, newParent uint64, newName strin
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	newBackend, newParentID, newMount, errno := m.resolveBackendNode(parentNode.path)
+	_, newParentID, newMount, errno := m.resolveBackendNode(parentNode.path)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	if !sameWritableMount(mount, newMount) || backend != newBackend {
+	if !sameWritableMount(mount, newMount) {
 		return 0, FuseAttr{}, -linuxEXDEV
 	}
 	linkBackend, ok := backend.(fsLinkBackend)
@@ -781,7 +1160,7 @@ func (m *mountedFS) CreateForCaller(parent uint64, name string, flags uint32, mo
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
 	attr = m.backendAttr(backend, backendNodeID, attr)
-	return id, m.storeHandle(backend, backendNodeID, fh, false), attr, 0
+	return id, m.storeHandle(childPath, backend, backendNodeID, fh, false, nil), attr, 0
 }
 
 func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32) {
@@ -909,12 +1288,12 @@ func (m *mountedFS) RenameForCaller(parent uint64, name string, newParent uint64
 		m.debugPathf("rename-error", oldPath, "resolve_old_parent_errno=%d", errno)
 		return errno
 	}
-	newBackend, newParentID, newMount, errno := m.resolveBackendNode(newParentNode.path)
+	_, newParentID, newMount, errno := m.resolveBackendNode(newParentNode.path)
 	if errno != 0 {
 		m.debugPathf("rename-error", newPath, "resolve_new_parent_errno=%d", errno)
 		return errno
 	}
-	if !sameWritableMount(oldMount, newMount) || oldBackend != newBackend {
+	if !sameWritableMount(oldMount, newMount) {
 		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEXDEV)
 		return -linuxEXDEV
 	}
@@ -1007,7 +1386,10 @@ func (m *mountedFS) resolveAttr(node *mountedNode) (FuseAttr, int32) {
 	if m.isSyntheticPath(node.path) {
 		return syntheticDirAttr(), 0
 	}
-	backend, nodeID, errno := m.resolveBackendNodeCached(node.path)
+	backend, nodeID, errno := node.backend, node.backendNodeID, int32(0)
+	if !node.backendResolved {
+		backend, nodeID, errno = m.resolveBackendNodeCached(node.path)
+	}
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
@@ -1168,11 +1550,23 @@ func (m *mountedFS) mountChildren(parent string) []string {
 }
 
 func (m *mountedFS) readBackendDir(backend FSBackend, nodeID uint64, fh uint64) ([]dirEntry, int32) {
-	data, errno := backend.ReadDir(nodeID, fh, 0, 1<<20)
-	if errno != 0 {
-		return nil, errno
+	var entries []dirEntry
+	offset := uint64(0)
+	for {
+		data, errno := backend.ReadDir(nodeID, fh, offset, 1<<20)
+		if errno != 0 {
+			return nil, errno
+		}
+		if len(data) == 0 {
+			return entries, 0
+		}
+		page, next, ok := decodeDirEntries(data)
+		if !ok || len(page) == 0 || next <= offset {
+			return nil, -linuxEIO
+		}
+		entries = append(entries, page...)
+		offset = next
 	}
-	return decodeDirEntries(data), 0
 }
 
 func encodeDirEntries(entries []dirEntry, off uint64, maxBytes uint32) []byte {
@@ -1195,21 +1589,23 @@ func encodeDirEntries(entries []dirEntry, off uint64, maxBytes uint32) []byte {
 	return out
 }
 
-func decodeDirEntries(data []byte) []dirEntry {
+func decodeDirEntries(data []byte) ([]dirEntry, uint64, bool) {
 	var entries []dirEntry
+	var next uint64
 	for len(data) >= fuseDirentBaseSize {
 		ino := readLE64(data[0:8])
+		next = readLE64(data[8:16])
 		nameLen := int(readLE32(data[16:20]))
 		typ := readLE32(data[20:24])
 		reclen := align8(fuseDirentBaseSize + nameLen)
 		if nameLen < 0 || len(data) < reclen {
-			break
+			return nil, 0, false
 		}
 		name := string(data[24 : 24+nameLen])
 		entries = append(entries, dirEntry{name: name, typ: typ, ino: ino})
 		data = data[reclen:]
 	}
-	return entries
+	return entries, next, len(data) == 0
 }
 
 func backendLookupPath(backend FSBackend, guestPath string) (uint64, FuseAttr, int32) {
@@ -1261,11 +1657,21 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 	guestPath = cleanMountPath(guestPath)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var key mountedBackendNode
+	if backend != nil {
+		key = m.backendNodeKeyLocked(guestPath, backend, backendNodeID)
+		if id := m.backendNodes[key]; id != 0 {
+			m.bindPathLocked(guestPath, id)
+			return id
+		}
+	}
 	if id, ok := m.pathToNode[guestPath]; ok {
 		if node := m.nodes[id]; node != nil && backend != nil {
 			node.backend = backend
 			node.backendNodeID = backendNodeID
 			node.backendResolved = true
+			node.backendRoute = m.backendRouteForPathLocked(guestPath)
+			m.backendNodes[key] = id
 		}
 		return id
 	}
@@ -1277,9 +1683,76 @@ func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, back
 		backend:         backend,
 		backendNodeID:   backendNodeID,
 		backendResolved: backend != nil,
+		backendRoute:    m.backendRouteForPathLocked(guestPath),
 	}
-	m.pathToNode[guestPath] = id
+	m.bindPathLocked(guestPath, id)
+	if backend != nil {
+		m.backendNodes[key] = id
+	}
 	return id
+}
+
+func (m *mountedFS) bindPathLocked(guestPath string, nodeID uint64) {
+	var detached uint64
+	if oldID, ok := m.pathToNode[guestPath]; ok {
+		if oldID == nodeID {
+			return
+		}
+		if m.pathRefs[oldID] > 1 {
+			m.pathRefs[oldID]--
+		} else {
+			delete(m.pathRefs, oldID)
+			detached = oldID
+		}
+	}
+	m.pathToNode[guestPath] = nodeID
+	m.pathRefs[nodeID]++
+	if detached != 0 {
+		m.deleteNodeIfDetachedLocked(detached)
+	}
+}
+
+func (m *mountedFS) unbindPathLocked(guestPath string) uint64 {
+	nodeID, ok := m.pathToNode[guestPath]
+	if !ok {
+		return 0
+	}
+	delete(m.pathToNode, guestPath)
+	if m.pathRefs[nodeID] > 1 {
+		m.pathRefs[nodeID]--
+		if node := m.nodes[nodeID]; node != nil && node.path == guestPath {
+			for remainingPath, remainingID := range m.pathToNode {
+				if remainingID == nodeID {
+					node.path = remainingPath
+					break
+				}
+			}
+		}
+	} else {
+		delete(m.pathRefs, nodeID)
+	}
+	return nodeID
+}
+
+func (m *mountedFS) deleteNodeIfDetachedLocked(nodeID uint64) {
+	if m.pathRefs[nodeID] != 0 || m.nodeHasHandleLocked(m.nodes[nodeID]) {
+		return
+	}
+	for key, mappedID := range m.backendNodes {
+		if mappedID == nodeID {
+			delete(m.backendNodes, key)
+		}
+	}
+	delete(m.nodes, nodeID)
+}
+
+func (m *mountedFS) backendNodeKeyLocked(guestPath string, backend FSBackend, backendNodeID uint64) mountedBackendNode {
+	return mountedBackendNode{
+		backendType: reflect.TypeOf(backend).String(),
+		backendPtr:  backendPointer(backend),
+		route:       m.backendRouteForPathLocked(guestPath),
+		nodeID:      backendNodeID,
+	}
 }
 
 func (m *mountedFS) nodeForPath(guestPath string) *mountedNode {
@@ -1294,13 +1767,42 @@ func (m *mountedFS) removeNode(guestPath string) {
 	m.debugPathf("cache-remove", guestPath, "")
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	removed := make(map[uint64]struct{})
 	for existingPath, id := range m.pathToNode {
 		if existingPath != guestPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(guestPath, "/")+"/") {
 			continue
 		}
-		delete(m.pathToNode, existingPath)
-		delete(m.nodes, id)
+		m.unbindPathLocked(existingPath)
+		removed[id] = struct{}{}
 	}
+	for id := range removed {
+		m.deleteNodeIfDetachedLocked(id)
+	}
+}
+
+func (m *mountedFS) nodeHasHandleLocked(node *mountedNode) bool {
+	if node == nil || !node.backendResolved {
+		return false
+	}
+	for _, handle := range m.handles {
+		if handle.route == node.backendRoute && handle.nodeID == node.backendNodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mountedFS) collectDetachedNode(nodeID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node := m.nodes[nodeID]
+	if node == nil || m.nodeHasHandleLocked(node) {
+		return
+	}
+	if m.pathRefs[nodeID] != 0 {
+		return
+	}
+	delete(m.nodes, nodeID)
 }
 
 func (m *mountedFS) renameNode(oldPath, newPath string) {
@@ -1317,23 +1819,35 @@ func (m *mountedFS) renameNode(oldPath, newPath string) {
 		}
 		suffix := strings.TrimPrefix(existingPath, oldPath)
 		updates[cleanMountPath(newPath+suffix)] = id
-		delete(m.pathToNode, existingPath)
+		m.unbindPathLocked(existingPath)
 	}
 	for updatedPath, id := range updates {
-		m.pathToNode[updatedPath] = id
+		m.bindPathLocked(updatedPath, id)
 		if node := m.nodes[id]; node != nil {
 			node.path = updatedPath
 		}
 	}
 }
 
-func (m *mountedFS) storeHandle(backend FSBackend, nodeID uint64, fh uint64, dir bool) uint64 {
+func (m *mountedFS) storeHandle(guestPath string, backend FSBackend, nodeID uint64, fh uint64, dir bool, entries []dirEntry) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := m.nextHandle
 	m.nextHandle++
-	m.handles[id] = &mountedHandle{backend: backend, nodeID: nodeID, fh: fh, dir: dir}
+	m.handles[id] = &mountedHandle{backend: backend, route: m.backendRouteForPathLocked(guestPath), nodeID: nodeID, fh: fh, dir: dir, entries: entries}
 	return id
+}
+
+func (m *mountedFS) backendRouteForPathLocked(guestPath string) string {
+	guestPath = cleanMountPath(guestPath)
+	best := "/"
+	for i := range m.mounts {
+		mount := &m.mounts[i]
+		if (guestPath == mount.path || strings.HasPrefix(guestPath, mount.path+"/")) && len(mount.path) > len(best) {
+			best = mount.path
+		}
+	}
+	return best
 }
 
 func (m *mountedFS) handle(id uint64, dir bool) *mountedHandle {

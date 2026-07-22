@@ -64,6 +64,18 @@ func sessionExitError(err error) error {
 }
 
 func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predicate func(string) bool) (string, error) {
+	return s.waitForTranscriptMode(ctx, start, "", false, predicate)
+}
+
+func (s *ManagedSession) waitForTranscriptCommand(ctx context.Context, start int, commandID string, predicate func(string) bool) (string, error) {
+	return s.waitForTranscriptMode(ctx, start, commandID, false, predicate)
+}
+
+func (s *ManagedSession) waitForTranscriptCommandEvent(ctx context.Context, start int, commandID string, predicate func(string) bool) (string, error) {
+	return s.waitForTranscriptMode(ctx, start, commandID, true, predicate)
+}
+
+func (s *ManagedSession) waitForTranscriptMode(ctx context.Context, start int, commandID string, beforeExit bool, predicate func(string) bool) (string, error) {
 	if s == nil || s.transcript == nil {
 		return "", fmt.Errorf("managed session is not running")
 	}
@@ -76,7 +88,15 @@ func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predi
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		segment, err := s.transcript.WaitFor(waitCtx, start, predicate)
+		var segment string
+		var err error
+		if commandID == "" {
+			segment, err = s.transcript.WaitFor(waitCtx, start, predicate)
+		} else if beforeExit {
+			segment, err = s.transcript.WaitForCommandEvent(waitCtx, start, commandID, predicate)
+		} else {
+			segment, err = s.transcript.WaitForCommand(waitCtx, start, commandID, predicate)
+		}
 		resultCh <- result{segment: segment, err: err}
 	}()
 
@@ -91,7 +111,16 @@ func (s *ManagedSession) waitForTranscript(ctx context.Context, start int, predi
 		// final bounded parse instead of randomly choosing a false timeout.
 		finalCtx, cancelFinal := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancelFinal()
-		if segment, err := s.transcript.WaitFor(finalCtx, start, predicate); err == nil {
+		var segment string
+		var err error
+		if commandID == "" {
+			segment, err = s.transcript.WaitFor(finalCtx, start, predicate)
+		} else if beforeExit {
+			segment, err = s.transcript.WaitForCommandEvent(finalCtx, start, commandID, predicate)
+		} else {
+			segment, err = s.transcript.WaitForCommand(finalCtx, start, commandID, predicate)
+		}
+		if err == nil {
 			return segment, nil
 		}
 		return "", ctx.Err()

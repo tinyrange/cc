@@ -187,7 +187,7 @@ func RunManagedExecWithFSNetAndBalloon(ctx context.Context, kernel []byte, initr
 	if err := managedagent.SendExec(control, execID, req); err != nil {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
-	segment, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
+	segment, err := controlTranscript.WaitForCommand(runCtx, 0, execID, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, execID, dmesg)
 		return ok
 	})
@@ -236,6 +236,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 	}()
 
 	var exit Exit
+	acpiPM := NewACPIPM()
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -248,6 +249,15 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 		}
 		switch exit.Reason {
 		case ExitIO:
+			if handled, err := acpiPM.HandleIO(exit.IO); handled {
+				if errors.Is(err, errGuestPoweroff) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				break
+			}
 			if err := handleBootIO(uart, exit.IO); err != nil {
 				return err
 			}
@@ -282,6 +292,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 	errCh := make(chan error, len(vm.vcpus))
 	var wg sync.WaitGroup
 	var exitMu sync.Mutex
+	acpiPM := NewACPIPM()
 	for index := range vm.vcpus {
 		wg.Add(1)
 		go func(index int) {
@@ -307,9 +318,13 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 					return
 				}
 				exitMu.Lock()
-				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, balloon, netdev, serialOut, exit)
+				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, balloon, netdev, acpiPM, serialOut, exit)
 				exitMu.Unlock()
 				if err != nil {
+					if errors.Is(err, errGuestPoweroff) {
+						reportRunErr(errCh, cancel, nil)
+						return
+					}
 					reportRunErr(errCh, cancel, err)
 					return
 				}
@@ -403,9 +418,12 @@ func reportRunErr(errCh chan<- error, cancel context.CancelFunc, err error) {
 	}
 }
 
-func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript, exit Exit) error {
+func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, acpiPM *ACPIPM, serialOut *vmruntime.SerialTranscript, exit Exit) error {
 	switch exit.Reason {
 	case ExitIO:
+		if handled, err := acpiPM.HandleIO(exit.IO); handled {
+			return err
+		}
 		if err := handleBootIO(uart, exit.IO); err != nil {
 			return err
 		}

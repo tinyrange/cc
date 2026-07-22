@@ -29,6 +29,8 @@ import (
 const (
 	snapshotTriggerMagic        = 0x43535833534e4150
 	snapshotTriggerSerialMarker = "__CCX3_SNAPSHOT__"
+	ia32TSCDeadlineMSR          = 0x000006e0
+	kvmClockHostTSC             = 1 << 3
 )
 
 var kvmSnapshotMSRs = []uint32{
@@ -36,6 +38,7 @@ var kvmSnapshotMSRs = []uint32{
 	ia32BIOSSignIDMSR,
 	ia32MiscEnableMSR,
 	ia32TSCAuxMSR,
+	ia32TSCDeadlineMSR,
 	0x00000174, // IA32_SYSENTER_CS
 	0x00000175, // IA32_SYSENTER_ESP
 	0x00000176, // IA32_SYSENTER_EIP
@@ -524,6 +527,8 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		control:    control,
 		listener:   listener,
 		vsock:      vsock,
+		balloon:    balloon,
+		fsdevs:     fsdevs,
 		bootWriter: bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()
@@ -589,7 +594,14 @@ func restoreManagedVMFromSnapshot(manifest kvmSnapshotManifest, memPath string, 
 		closeVMWithFS(vm, fsdevs)
 		return nil, nil, nil, serialOut, fmt.Errorf("restore KVM pit: %w", err)
 	}
-	if err := setClock(vm.vmfd, &manifest.Clock); err != nil {
+	restoredClock := manifest.Clock
+	// host_tsc is an observation from KVM_GET_CLOCK, not a portable clock
+	// origin. Replaying it after a later restore can leave LAPIC timers and the
+	// guest scheduler based on an obsolete host TSC. Preserve guest time while
+	// asking KVM to rebase it against the current host.
+	restoredClock.Flags &^= kvmClockHostTSC
+	restoredClock.HostTSC = 0
+	if err := setClock(vm.vmfd, &restoredClock); err != nil {
 		closeVMWithFS(vm, fsdevs)
 		return nil, nil, nil, serialOut, fmt.Errorf("restore KVM clock: %w", err)
 	}
@@ -730,7 +742,17 @@ func restoreKVMVCPU(vm *VM, index int, state kvmSnapshotVCPU) error {
 	if err := setSRegs(vcpu.fd, &state.SRegs); err != nil {
 		return fmt.Errorf("restore KVM sregs: %w", err)
 	}
-	if err := restoreKVMMSRs(vcpu.fd, state.MSRs); err != nil {
+	var deadlineMSR *kvmMSREntry
+	regularMSRs := make([]kvmMSREntry, 0, len(state.MSRs))
+	for i := range state.MSRs {
+		if state.MSRs[i].Index == ia32TSCDeadlineMSR {
+			entry := state.MSRs[i]
+			deadlineMSR = &entry
+			continue
+		}
+		regularMSRs = append(regularMSRs, state.MSRs[i])
+	}
+	if err := restoreKVMMSRs(vcpu.fd, regularMSRs); err != nil {
 		return err
 	}
 	if err := setFPU(vcpu.fd, &state.FPU); err != nil {
@@ -760,6 +782,13 @@ func restoreKVMVCPU(vm *VM, index int, state kvmSnapshotVCPU) error {
 	}
 	if err := setRegs(vcpu.fd, &state.Regs); err != nil {
 		return fmt.Errorf("restore KVM regs: %w", err)
+	}
+	// KVM derives deadline-timer state from both the LAPIC and this MSR. Write
+	// the deadline after restoring the LAPIC so it cannot be reset by SET_LAPIC.
+	if deadlineMSR != nil {
+		if err := setVCPUMSR(vcpu.fd, deadlineMSR.Index, deadlineMSR.Data); err != nil {
+			return fmt.Errorf("restore KVM TSC deadline: %w", err)
+		}
 	}
 	return nil
 }

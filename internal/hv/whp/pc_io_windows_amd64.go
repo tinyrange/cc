@@ -3,9 +3,12 @@
 package whp
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
+
+var errGuestPoweroff = errors.New("guest requested ACPI poweroff")
 
 const (
 	i8042DataPort   = 0x60
@@ -241,6 +244,9 @@ func (p *ACPIPM) WriteIO(port uint16, data []byte) (bool, error) {
 		shift := 8 * (port - acpiPM1ControlPort)
 		shiftedMask := mask << shift
 		p.control = (p.control &^ shiftedMask) | ((value << shift) & shiftedMask)
+		if p.control&(1<<13) != 0 && (p.control>>10)&7 == 5 {
+			return true, errGuestPoweroff
+		}
 	}
 	return true, nil
 }

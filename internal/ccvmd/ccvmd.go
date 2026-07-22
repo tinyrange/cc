@@ -103,6 +103,7 @@ type ServerOptions struct {
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
 	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
 	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
+	CompleteRequest        func(string, uint64, RuntimeView)
 }
 
 type RuntimeView interface {
@@ -110,6 +111,14 @@ type RuntimeView interface {
 	RunStreamIn(context.Context, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
+	SetInstanceBalloon(string, uint64) error
+}
+
+func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
+	if s == nil || s.vms == nil {
+		return fmt.Errorf("runtime is not available")
+	}
+	return s.vms.SetInstanceBalloon(id, targetMB)
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -656,8 +665,13 @@ type workerActiveExec struct {
 	once   sync.Once
 	mu     sync.Mutex
 	cond   *sync.Cond
-	queue  []client.ExecInput
+	queue  []workerQueuedExecInput
 	closed bool
+}
+
+type workerQueuedExecInput struct {
+	input     client.ExecInput
+	delivered chan struct{}
 }
 
 type workerOperationRegistry struct {
@@ -674,6 +688,10 @@ func newWorkerOperationRegistry() *workerOperationRegistry {
 }
 
 func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(context.Context)) {
+	r.startWithCleanup(frameID, vmID, run, nil)
+}
+
+func (r *workerOperationRegistry) startWithCleanup(frameID uint64, vmID string, run func(context.Context), cleanup func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var previous <-chan struct{}
 	var done chan struct{}
@@ -688,6 +706,9 @@ func (r *workerOperationRegistry) start(frameID uint64, vmID string, run func(co
 
 	go func() {
 		defer cancel()
+		if cleanup != nil {
+			defer cleanup()
+		}
 		defer func() {
 			r.mu.Lock()
 			delete(r.active, frameID)
@@ -741,9 +762,10 @@ func workerVMKey(id string) string {
 }
 
 const (
-	workerExecInputQueueCapacity = 64
-	workerExecStdinQueueLimit    = 56
-	workerExecControlQueueLimit  = workerExecInputQueueCapacity - 1
+	workerExecInputQueueCapacity   = 64
+	workerExecStdinQueueLimit      = 56
+	workerExecControlQueueLimit    = workerExecInputQueueCapacity - 1
+	workerExecInputDeliveryTimeout = 5 * time.Second
 )
 
 var (
@@ -757,7 +779,7 @@ func newWorkerActiveExec(cancel context.CancelFunc, withInputs bool) *workerActi
 		exec.inputs = make(chan client.ExecInput, 16)
 		exec.done = make(chan struct{})
 		exec.cond = sync.NewCond(&exec.mu)
-		exec.queue = make([]client.ExecInput, 0, workerExecInputQueueCapacity)
+		exec.queue = make([]workerQueuedExecInput, 0, workerExecInputQueueCapacity)
 	}
 	return exec
 }
@@ -778,13 +800,18 @@ func (e *workerActiveExec) closeInputs() {
 }
 
 func (e *workerActiveExec) sendInput(input client.ExecInput) error {
+	_, err := e.sendInputWithDelivery(input)
+	return err
+}
+
+func (e *workerActiveExec) sendInputWithDelivery(input client.ExecInput) (<-chan struct{}, error) {
 	if e == nil || e.inputs == nil {
-		return errWorkerExecInputsClosed
+		return nil, errWorkerExecInputsClosed
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return errWorkerExecInputsClosed
+		return nil, errWorkerExecInputsClosed
 	}
 	limit := workerExecControlQueueLimit
 	if input.Kind == "stdin" {
@@ -793,14 +820,15 @@ func (e *workerActiveExec) sendInput(input client.ExecInput) error {
 		limit = workerExecInputQueueCapacity
 	}
 	if len(e.queue) >= limit {
-		return errWorkerExecInputOverflow
+		return nil, errWorkerExecInputOverflow
 	}
 	if input.Kind == "stdin_close" {
 		e.closed = true
 	}
-	e.queue = append(e.queue, input)
+	delivered := make(chan struct{})
+	e.queue = append(e.queue, workerQueuedExecInput{input: input, delivered: delivered})
 	e.cond.Signal()
-	return nil
+	return delivered, nil
 }
 
 func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) error {
@@ -815,6 +843,21 @@ func enqueueWorkerExecInput(exec *workerActiveExec, input client.ExecInput) erro
 	return err
 }
 
+func acknowledgeWorkerExecInput(codec *vm.WorkerCodec, id uint64, exec *workerActiveExec, delivered <-chan struct{}) error {
+	timer := time.NewTimer(workerExecInputDeliveryTimeout)
+	defer timer.Stop()
+	select {
+	case <-delivered:
+		return sendWorkerPayload(codec, id, vm.WorkerFrameExecInputAck, map[string]string{"status": "delivered"})
+	case <-timer.C:
+		if exec.cancel != nil {
+			exec.cancel()
+		}
+		exec.closeInputs()
+		return fmt.Errorf("worker exec input was not consumed within %s", workerExecInputDeliveryTimeout)
+	}
+}
+
 func (e *workerActiveExec) forwardInputs() {
 	defer close(e.inputs)
 	for {
@@ -826,17 +869,20 @@ func (e *workerActiveExec) forwardInputs() {
 			e.mu.Unlock()
 			return
 		}
-		input := e.queue[0]
+		queued := e.queue[0]
 		copy(e.queue, e.queue[1:])
-		e.queue[len(e.queue)-1] = client.ExecInput{}
+		e.queue[len(e.queue)-1] = workerQueuedExecInput{}
 		e.queue = e.queue[:len(e.queue)-1]
 		e.mu.Unlock()
-		if input.Kind == "stdin_close" {
+		if queued.input.Kind == "stdin_close" {
+			close(queued.delivered)
 			return
 		}
 		select {
-		case e.inputs <- input:
+		case e.inputs <- queued.input:
+			close(queued.delivered)
 		case <-e.done:
+			close(queued.delivered)
 			return
 		}
 	}
@@ -873,7 +919,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+			operations.startWithCleanup(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
 				state, err := srvState.vms.StartStream(ctx, req, func(event client.BootEvent) error {
 					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
 				})
@@ -882,6 +928,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					return
 				}
 				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+			}, func() {
+				if opts.CompleteRequest != nil {
+					opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+				}
 			})
 		case vm.WorkerFrameStartBlank:
 			var req client.StartInstanceRequest
@@ -897,7 +947,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					continue
 				}
 			}
-			operations.start(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
+			operations.startWithCleanup(frame.ID, workerVMKey(req.ID), func(ctx context.Context) {
 				state, err := srvState.vms.StartBlankStream(ctx, req, func(event client.BootEvent) error {
 					return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
 				})
@@ -906,6 +956,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 					return
 				}
 				_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+			}, func() {
+				if opts.CompleteRequest != nil {
+					opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+				}
 			})
 		case vm.WorkerFrameStatus:
 			var req vm.WorkerStatusRequest
@@ -993,10 +1047,28 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server, opts ServerOpti
 				continue
 			}
 			if req.Closed {
-				_ = enqueueWorkerExecInput(exec, client.ExecInput{Kind: "stdin_close"})
+				delivered, err := exec.sendInputWithDelivery(client.ExecInput{Kind: "stdin_close"})
+				if err == nil {
+					go func(id uint64, delivered <-chan struct{}) {
+						if err := acknowledgeWorkerExecInput(codec, id, exec, delivered); err != nil {
+							_ = sendWorkerError(codec, id, err)
+						}
+					}(frame.ID, delivered)
+				}
+				if err != nil {
+					_ = sendWorkerError(codec, frame.ID, err)
+				}
 				continue
 			}
-			if err := enqueueWorkerExecInput(exec, req.Input); errors.Is(err, errWorkerExecInputOverflow) {
+			delivered, err := exec.sendInputWithDelivery(req.Input)
+			if err == nil {
+				go func(id uint64, delivered <-chan struct{}) {
+					if err := acknowledgeWorkerExecInput(codec, id, exec, delivered); err != nil {
+						_ = sendWorkerError(codec, id, err)
+					}
+				}(frame.ID, delivered)
+			}
+			if err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 			}
 		case vm.WorkerFrameCancel:
@@ -1653,6 +1725,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if closer, ok := root.(interface{ Close() error }); ok {
+			defer func() { _ = closer.Close() }()
+		}
 		var opts oci.SaveOptions
 		if sourceImage == "" {
 			sourceImage = requestedImage
@@ -1685,6 +1760,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
+		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
 		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
@@ -1833,6 +1911,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+		}
 		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
@@ -1978,6 +2059,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 		}
+		if opts.CompleteRequest != nil {
+			defer opts.CompleteRequest(req.ID, req.PolicyToken, srvState)
+		}
 		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if req.Image != "" && !builtInBSDImage {
 			if _, err := srvState.images.Open(req.Image); err != nil {
@@ -2025,12 +2109,15 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		Handler: func(ws *websocket.Conn) {
 			ws.MaxPayloadBytes = maxWebSocketMessageBytes
 			_ = ws.SetDeadline(time.Time{})
-			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			serveRunRequestWebSocket(ws, srvState, opts.NormalizeRunRequest, opts.CompleteRequest, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 				runCtx, cancel := runRequestContext(ctx, req)
 				defer cancel()
 				if err := srvState.vms.RunStream(runCtx, req, inputs, onEvent); err != nil {
 					if req.TimeoutSeconds > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 						if eventErr := onEvent(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)}); eventErr != nil {
+							return eventErr
+						}
+						if eventErr := onEvent(client.ExecEvent{Kind: "timeout"}); eventErr != nil {
 							return eventErr
 						}
 						return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 124})
@@ -2249,7 +2336,7 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}
 }
 
-func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize func(*client.RunRequest, RuntimeView) error, complete func(string, uint64, RuntimeView), runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
 	defer ws.Close()
 
 	var req client.RunRequest
@@ -2262,6 +2349,9 @@ func serveRunRequestWebSocket(ws *websocket.Conn, runtime RuntimeView, normalize
 			_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
 			return
 		}
+	}
+	if complete != nil {
+		defer complete(req.ID, req.PolicyToken, runtime)
 	}
 
 	inputs := make(chan client.ExecInput, 16)
@@ -2338,6 +2428,9 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
 	err := manager.RunStream(ctx, req, nil, func(event client.ExecEvent) error {
 		event = sanitizeExecEventForJSON(event)
 		if err := enc.Encode(event); err != nil {
@@ -2351,6 +2444,7 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	if err != nil {
 		if req.TimeoutSeconds > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			_ = enc.Encode(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)})
+			_ = enc.Encode(client.ExecEvent{Kind: "timeout"})
 			_ = enc.Encode(client.ExecEvent{Kind: "exit", ExitCode: 124})
 			if flusher != nil {
 				flusher.Flush()

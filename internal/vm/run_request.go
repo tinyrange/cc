@@ -39,6 +39,12 @@ func runExecRequest(req client.RunRequest) client.ExecRequest {
 	}
 }
 
+func runningVMExecRequest(req client.RunRequest) client.ExecRequest {
+	execReq := runExecRequest(req)
+	execReq.SkipResolve = true
+	return execReq
+}
+
 func mergeImageRunEnv(base, overrides []string, _ bool) []string {
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }

@@ -201,6 +201,22 @@ func (b *FSRemoteBackend) ListXattr(nodeID uint64) ([]byte, int32) {
 	return resp.Bytes, resp.Errno
 }
 
+func (b *FSRemoteBackend) SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32 {
+	resp, err := b.call(fsRPCRequest{Op: "setxattr", NodeID: nodeID, Name: name, Data: value, Flags: flags})
+	if err != nil {
+		return -linuxEIO
+	}
+	return resp.Errno
+}
+
+func (b *FSRemoteBackend) RemoveXattr(nodeID uint64, name string) int32 {
+	resp, err := b.call(fsRPCRequest{Op: "removexattr", NodeID: nodeID, Name: name})
+	if err != nil {
+		return -linuxEIO
+	}
+	return resp.Errno
+}
+
 func (b *FSRemoteBackend) Flush(nodeID uint64, fh uint64, lockOwner uint64) int32 {
 	resp, err := b.call(fsRPCRequest{Op: "flush", NodeID: nodeID, FH: fh, LockOwner: lockOwner})
 	if err != nil {
@@ -383,6 +399,20 @@ func handleFSRPCRequest(backend FSBackend, req fsRPCRequest) fsRPCResponse {
 			break
 		}
 		resp.Bytes, resp.Errno = be.ListXattr(req.NodeID)
+	case "setxattr":
+		be, ok := backend.(fsXattrMutationBackend)
+		if !ok {
+			resp.Errno = -linuxENOSYS
+			break
+		}
+		resp.Errno = be.SetXattr(req.NodeID, req.Name, req.Data, req.Flags)
+	case "removexattr":
+		be, ok := backend.(fsXattrMutationBackend)
+		if !ok {
+			resp.Errno = -linuxENOSYS
+			break
+		}
+		resp.Errno = be.RemoveXattr(req.NodeID, req.Name)
 	case "flush":
 		be, ok := backend.(fsFlushBackend)
 		if !ok {

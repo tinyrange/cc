@@ -127,7 +127,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	if err := managedagent.SendExec(control, execID, req); err != nil {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
-	segment, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
+	segment, err := controlTranscript.WaitForCommand(runCtx, 0, execID, func(text string) bool {
 		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, execID, dmesg)
 		return ok
 	})
@@ -240,6 +240,9 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 		switch exit.Reason {
 		case runVPExitReasonX64IoPortAccess:
 			if err := vm.emulateIO(&raw); err != nil {
+				if errors.Is(err, errGuestPoweroff) {
+					return nil
+				}
 				io := raw.ioPortAccess()
 				return fmt.Errorf("emulate io at rip=%#x port=%#x: %w", exit.RIP, io.Port, err)
 			}

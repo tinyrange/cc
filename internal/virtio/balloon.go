@@ -117,7 +117,15 @@ func (b *Balloon) SetTargetPages(pages uint32) error {
 func (b *Balloon) AtTarget() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.actualPages >= b.numPages
+	return b.actualPages == b.numPages
+}
+
+// State reports the requested size, the size acknowledged by the guest
+// driver, and whether that driver has completed virtio initialization.
+func (b *Balloon) State() (targetPages, actualPages uint32, driverReady bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.numPages, b.actualPages, b.status&balloonDriverOK != 0
 }
 
 func (b *Balloon) Read(addr uint64, size int) (uint64, error) {
