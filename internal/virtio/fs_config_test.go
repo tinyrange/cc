@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+type recordingFSDispatcher struct {
+	request []byte
+}
+
+func (d *recordingFSDispatcher) Dispatch(raw []byte) (fsDispatchResult, error) {
+	d.request = append(d.request[:0], raw...)
+	return fsDispatchResult{opcode: fuseGetAttr, unique: 99}, nil
+}
+
+func dispatchFUSEForTest(device *FS, raw []byte) (fsReply, error) {
+	result, err := device.dispatcher.Dispatch(raw)
+	return result.reply, err
+}
+
 func TestVirtioFSKickPollingRequiresExplicitOptIn(t *testing.T) {
 	t.Setenv("CCX3_VIRTIOFS_KICK_POLL", "")
 	if resolveVirtioFSKickPoll() {
@@ -19,6 +33,24 @@ func TestVirtioFSKickPollingRequiresExplicitOptIn(t *testing.T) {
 	t.Setenv("CCX3_VIRTIOFS_KICK_POLL", "invalid")
 	if resolveVirtioFSKickPoll() {
 		t.Fatal("invalid virtio-fs kick polling setting enabled polling")
+	}
+}
+
+func TestVirtioFSQueueTreatsRequestsAsOpaque(t *testing.T) {
+	dev := NewFS(0, 0, 0, "test", nil)
+	dispatcher := &recordingFSDispatcher{}
+	dev.dispatcher = dispatcher
+	raw := []byte{0xff, 0x00, 0x7f, 0x80, 0x01}
+
+	if err := dev.processWorksInline([]fsWork{{
+		qidx:       fsQueueRequest,
+		generation: dev.configGeneration,
+		req:        append([]byte(nil), raw...),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if string(dispatcher.request) != string(raw) {
+		t.Fatalf("dispatcher received %x, want %x", dispatcher.request, raw)
 	}
 }
 
@@ -69,10 +101,11 @@ func TestVirtioFSPokeRaisesVringIRQ(t *testing.T) {
 func TestVirtioFSPollReportsUnsupportedWithoutNotifications(t *testing.T) {
 	const unique = 42
 	req := make([]byte, fuseInHeaderSize+32)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
 	binary.LittleEndian.PutUint32(req[4:8], fusePoll)
 	binary.LittleEndian.PutUint64(req[8:16], unique)
 
-	reply, err := (&FS{}).dispatchFUSE(req)
+	reply, err := dispatchFUSEForTest(NewFS(0, 0, 0, "test", nil), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +127,9 @@ func TestVirtioFSReadDirPlusBatchesDirectoryAttributes(t *testing.T) {
 	defer backend.ReleaseDir(1, fh)
 
 	initReq := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(initReq[0:4], uint32(len(initReq)))
 	binary.LittleEndian.PutUint32(initReq[4:8], fuseInit)
-	initReply, err := (&FS{backend: backend}).dispatchFUSE(initReq)
+	initReply, err := dispatchFUSEForTest(NewFS(0, 0, 0, "test", backend), initReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,12 +138,13 @@ func TestVirtioFSReadDirPlusBatchesDirectoryAttributes(t *testing.T) {
 	}
 
 	req := make([]byte, fuseInHeaderSize+24)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
 	binary.LittleEndian.PutUint32(req[4:8], fuseReadDirPlus)
 	binary.LittleEndian.PutUint64(req[8:16], 42)
 	binary.LittleEndian.PutUint64(req[16:24], 1)
 	binary.LittleEndian.PutUint64(req[40:48], fh)
 	binary.LittleEndian.PutUint32(req[56:60], 4096)
-	reply, err := (&FS{backend: backend}).dispatchFUSE(req)
+	reply, err := dispatchFUSEForTest(NewFS(0, 0, 0, "test", backend), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,13 +183,14 @@ func TestVirtioFSMountedExchangeFailsInsteadOfReportingUnsafeSuccess(t *testing.
 		backend.Release(nodeID, fh)
 	}
 	req := make([]byte, fuseInHeaderSize+16+len("left\x00right\x00"))
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
 	binary.LittleEndian.PutUint32(req[4:8], fuseRename2)
 	binary.LittleEndian.PutUint64(req[16:24], 1)
 	binary.LittleEndian.PutUint64(req[40:48], 1)
 	binary.LittleEndian.PutUint32(req[48:52], linuxRenameExchange)
 	copy(req[fuseInHeaderSize+16:], "left\x00right\x00")
 
-	reply, err := (&FS{backend: backend}).dispatchFUSE(req)
+	reply, err := dispatchFUSEForTest(NewFS(0, 0, 0, "test", backend), req)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,8 +36,8 @@ func AttachFSBackingUsageTracker(devices []*FS) *FSBackingUsageTracker {
 			continue
 		}
 		device.mu.Lock()
-		tracker.backends = append(tracker.backends, device.backend)
-		device.backingUsageTracker = tracker
+		tracker.backends = append(tracker.backends, device.filesystemBackend())
+		device.filesystem.backingUsageTracker = tracker
 		device.mu.Unlock()
 	}
 	tracker.Sample()

@@ -226,7 +226,7 @@ func (v *Vsock) RestoreState(state MMIOState) error {
 
 func (f *FS) SnapshotState() MMIOState {
 	f.mu.Lock()
-	backend := f.backend
+	backend := f.filesystemBackend()
 	state := MMIOState{
 		DeviceFeatureSel: f.deviceFeatureSel,
 		DriverFeatureSel: f.driverFeatureSel,
@@ -259,7 +259,7 @@ func (f *FS) RestoreState(state MMIOState) error {
 		f.mu.Unlock()
 		return err
 	}
-	backend := f.backend
+	backend := f.filesystemBackend()
 	f.mu.Unlock()
 	if restorer, ok := backend.(interface{ RestoreNodePaths([]string) error }); ok {
 		if err := restorer.RestoreNodePaths(state.BackendPaths); err != nil {
