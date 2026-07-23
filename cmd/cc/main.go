@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -285,11 +286,31 @@ func handleVMCommand(api ccAPI, args []string) error {
 		}
 		return printJSON(statuses)
 	case "start":
-		if len(args) != 3 {
-			return fmt.Errorf("usage: cc vm start <name> <image>")
+		fs := flag.NewFlagSet("cc vm start", flag.ContinueOnError)
+		vnc := fs.Bool("vnc", false, "Enable the loopback VNC server")
+		vncListen := fs.String("vnc-listen", "127.0.0.1:0", "Loopback VNC listen address")
+		displaySize := fs.String("display", "1280x720", "Display size WIDTHxHEIGHT")
+		initSystem := fs.String("init", "", "Guest init system")
+		timeout := fs.Duration("timeout", 0, "VM boot timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		state, err := api.CreateInstanceStreamWithID(args[1], client.CreateInstanceRequest{
-			Image: args[2],
+		if fs.NArg() != 2 {
+			return fmt.Errorf("usage: cc vm start [--vnc] [--vnc-listen ADDRESS] [--display WIDTHxHEIGHT] [--init SYSTEM] <name> <image>")
+		}
+		var display *client.DisplayConfig
+		if *vnc {
+			width, height, err := parseDisplaySize(*displaySize)
+			if err != nil {
+				return err
+			}
+			display = &client.DisplayConfig{Width: width, Height: height, VNCListen: *vncListen}
+		}
+		state, err := api.CreateInstanceStreamWithID(fs.Arg(0), client.CreateInstanceRequest{
+			Image:          fs.Arg(1),
+			InitSystem:     *initSystem,
+			Display:        display,
+			TimeoutSeconds: timeout.Seconds(),
 		}, bootEventReporter(os.Stderr))
 		if err != nil {
 			return err
@@ -455,6 +476,22 @@ func parsePortForwardSpec(spec string) (client.PortForward, error) {
 		HostPort:  hostPort,
 		GuestPort: guestPort,
 	}, nil
+}
+
+func parseDisplaySize(value string) (uint32, uint32, error) {
+	widthText, heightText, ok := strings.Cut(strings.ToLower(strings.TrimSpace(value)), "x")
+	if !ok {
+		return 0, 0, fmt.Errorf("display size %q must be WIDTHxHEIGHT", value)
+	}
+	width, err := strconv.ParseUint(widthText, 10, 32)
+	if err != nil || width == 0 {
+		return 0, 0, fmt.Errorf("invalid display width %q", widthText)
+	}
+	height, err := strconv.ParseUint(heightText, 10, 32)
+	if err != nil || height == 0 {
+		return 0, 0, fmt.Errorf("invalid display height %q", heightText)
+	}
+	return uint32(width), uint32(height), nil
 }
 
 func parseTCPPort(value, label string) (int, error) {

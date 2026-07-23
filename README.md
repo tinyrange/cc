@@ -97,6 +97,7 @@ cd cc
 go run ./internal/cmd/build-guestinit
 go build ./cmd/cc
 go build ./cmd/ccvm
+go build ./cmd/glass
 ```
 
 For a throwaway local build:
@@ -106,6 +107,7 @@ tmp="$(mktemp -d)"
 go run ./internal/cmd/build-guestinit
 go build -o "$tmp/cc" ./cmd/cc
 go build -o "$tmp/ccvm" ./cmd/ccvm
+go build -o "$tmp/glass" ./cmd/glass
 ```
 
 ## CLI Usage
@@ -164,6 +166,27 @@ cc -ccvm ./ccvm vm status work-b
 cc -ccvm ./ccvm vm stop work-a
 cc -ccvm ./ccvm vm stop work-b
 ```
+
+Linux/amd64 KVM can expose a graphical VM through cc's loopback VNC server.
+The returned JSON includes `display.vnc_address`; `glass` is a command-line VNC
+client for probes, screenshots, and input automation:
+
+```sh
+state=$(cc vm start --vnc --display 1280x720 --init systemd --timeout 2m desktop desktop)
+address=$(printf '%s\n' "$state" | jq -r .display.vnc_address)
+glass probe "$address"
+glass capture "$address" desktop.png
+glass resize "$address" 1440 900
+glass clipboard-set "$address" 'copied from the viewer'
+glass clipboard-get "$address"
+```
+
+The VNC address uses an automatically assigned port unless `--vnc-listen` is
+set. Glass supports RFB desktop resizing, UTF-8 clipboard text in both
+directions, Hextile framebuffer updates, keyboard and absolute-pointer input.
+V1 accepts loopback addresses only and does not authenticate clients.
+See `fixtures/glass-desktop` for the reproducible XFCE image and end-to-end
+test.
 
 Port forwarding is available for named VMs with a `HOST_PORT:GUEST_PORT`
 mapping:

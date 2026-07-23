@@ -889,7 +889,7 @@
       },
       "CapabilitiesResponse": {
         "type": "object",
-        "required": ["host", "vm_supported", "supports_multi_image_exec", "supports_nested_virtualization", "requires_privileged_ccx3"],
+        "required": ["host", "vm_supported", "supports_multi_image_exec", "supports_nested_virtualization", "supports_display", "requires_privileged_ccx3"],
         "properties": {
           "host": { "type": "string" },
           "backend": { "type": "string" },
@@ -902,6 +902,7 @@
           "resource_limits": { "type": "array", "items": { "type": "string" } },
           "supports_multi_image_exec": { "type": "boolean" },
           "supports_nested_virtualization": { "type": "boolean" },
+          "supports_display": { "type": "boolean" },
           "requires_privileged_ccx3": { "type": "boolean" },
           "notes": { "type": "array", "items": { "type": "string" } }
         }
@@ -1096,6 +1097,23 @@
           "max_forward_connections": { "type": "integer" }
         }
       },
+      "DisplayConfig": {
+        "type": "object",
+        "properties": {
+          "width": { "type": "integer", "format": "uint32" },
+          "height": { "type": "integer", "format": "uint32" },
+          "vnc_listen": { "type": "string", "description": "Loopback listen address for the VNC server." }
+        }
+      },
+      "DisplayState": {
+        "type": "object",
+        "required": ["width", "height"],
+        "properties": {
+          "width": { "type": "integer", "format": "uint32" },
+          "height": { "type": "integer", "format": "uint32" },
+          "vnc_address": { "type": "string" }
+        }
+      },
       "PortForward": {
         "type": "object",
         "properties": {
@@ -1123,6 +1141,7 @@
           "kernel": { "type": "string" },
           "shares": { "type": "array", "items": { "$ref": "#/components/schemas/ShareMount" } },
           "network": { "$ref": "#/components/schemas/NetworkConfig" },
+          "display": { "$ref": "#/components/schemas/DisplayConfig" },
           "kernel_modules": { "type": "array", "items": { "type": "string" } },
           "memory_mb": { "type": "integer", "format": "uint64" },
           "balloon_mb": { "type": "integer", "format": "uint64" },
@@ -1153,6 +1172,7 @@
           "nested_virtualization": { "type": "boolean" },
           "started_at": { "type": "string" },
           "network_ipv4": { "type": "string" },
+          "display": { "$ref": "#/components/schemas/DisplayState" },
           "error": { "type": "string" }
         }
       },

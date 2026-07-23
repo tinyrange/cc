@@ -30,6 +30,18 @@ const (
 	BalloonSize = 0x1000
 	BalloonIRQ  = 10
 
+	GPUBase = 0xd000b000
+	GPUSize = 0x1000
+	GPUIRQ  = 11
+
+	KeyboardBase = 0xd000c000
+	KeyboardSize = 0x1000
+	KeyboardIRQ  = 12
+
+	PointerBase = 0xd000d000
+	PointerSize = 0x1000
+	PointerIRQ  = 13
+
 	RootFSTag   = vmruntime.RootFSTag
 	EmulatorTag = vmruntime.EmulatorTag
 	GuestCID    = vmruntime.GuestCID

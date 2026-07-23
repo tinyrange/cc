@@ -16,10 +16,12 @@ const (
 	// synthetic root and omits it from targeted df lookups. Use a distinct
 	// virtio-fs tag so ordinary disk-space tools recognize the mounted guest
 	// filesystem.
-	RootFSTag   = "vmsh-rootfs"
-	EmulatorTag = "ccx3"
-	GuestCID    = 3
-	ControlPort = 10777
+	RootFSTag     = "vmsh-rootfs"
+	EmulatorTag   = "ccx3"
+	GuestCID      = 3
+	ControlPort   = 10777
+	ClipboardPort = 10778
+	DisplayPort   = 10779
 )
 
 // DirectoryShare describes a host directory exposed inside the guest.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"net"
 	"runtime"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/rfb"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -101,6 +104,94 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 		t.Fatalf("host exec-in-stream calls = %+v", got)
 	} else if got[0].req.ID == "" || got[0].req.ID == "alpha" || got[0].req.ID == inst.execStreamReqs[0].ID || got[0].req.ID == inst.execStreamReqs[1].ID {
 		t.Fatalf("alternate exec stream id = %q, previous ids = %q/%q", got[0].req.ID, inst.execStreamReqs[0].ID, inst.execStreamReqs[1].ID)
+	}
+}
+
+func TestManagerDisplayListenerLifecycle(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{
+		Backend:         "fake",
+		MaxVMs:          1,
+		SupportsDisplay: true,
+	})
+	framebuffer, err := virtio.NewFramebuffer(64, 48)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &displayFakeInstance{
+		fakeInstance: newFakeInstance(),
+		desktop: &virtio.Desktop{
+			Framebuffer: framebuffer,
+			GPU:         virtio.NewGPU(0, 0x1000, 1, framebuffer),
+			Keyboard:    virtio.NewKeyboardInput(0, 0x1000, 2),
+			Pointer:     virtio.NewAbsolutePointerInput(0, 0x1000, 3, 64, 48),
+		},
+	}
+	host.queueInstance(inst)
+	manager := testManager(host)
+
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+		ID:    "external-display",
+		Image: "alpine",
+		Display: &client.DisplayConfig{
+			VNCListen: "0.0.0.0:0",
+		},
+	}); err == nil {
+		t.Fatal("non-loopback display listener was accepted")
+	}
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{
+		ID:          "snapshot-display",
+		Image:       "alpine",
+		SnapshotDir: t.TempDir(),
+		Display:     &client.DisplayConfig{},
+	}); err == nil {
+		t.Fatal("display-enabled startup snapshot was accepted")
+	}
+
+	state, err := manager.Start(ctx, client.CreateInstanceRequest{
+		ID:      "desktop",
+		Image:   "alpine",
+		Display: &client.DisplayConfig{Width: 64, Height: 48},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Display == nil || state.Display.Width != 64 || state.Display.Height != 48 || state.Display.VNCAddress == "" {
+		t.Fatalf("display state = %+v", state.Display)
+	}
+	rfbClient, err := rfb.Dial(ctx, state.Display.VNCAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if width, height := rfbClient.Size(); width != 64 || height != 48 {
+		t.Fatalf("RFB size = %dx%d, want 64x48", width, height)
+	}
+	if err := rfbClient.Resize(80, 60); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rfbClient.ReadUpdate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state = manager.StatusOf("desktop")
+	if state.Display == nil || state.Display.Width != 80 || state.Display.Height != 60 {
+		t.Fatalf("resized display state = %+v", state.Display)
+	}
+	address := state.Display.VNCAddress
+	if err := manager.ShutdownInstance(ctx, "desktop"); err != nil {
+		t.Fatal(err)
+	}
+	readCtx, cancelRead := context.WithTimeout(ctx, time.Second)
+	defer cancelRead()
+	if err := rfbClient.RequestUpdate(image.Rect(0, 0, 64, 48), false); err == nil {
+		if _, err := rfbClient.ReadUpdate(readCtx); err == nil {
+			t.Fatal("active RFB viewer remained connected after VM shutdown")
+		}
+	}
+	_ = rfbClient.Close()
+	conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("VNC listener remained reachable after VM shutdown")
 	}
 }
 
@@ -1581,6 +1672,15 @@ func (i *flakyCloseInstance) Close() error {
 		return i.firstErr
 	}
 	return i.fakeInstance.Close()
+}
+
+type displayFakeInstance struct {
+	*fakeInstance
+	desktop *virtio.Desktop
+}
+
+func (i *displayFakeInstance) Desktop() *virtio.Desktop {
+	return i.desktop
 }
 
 func newFakeInstance() *fakeInstance {

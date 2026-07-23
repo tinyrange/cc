@@ -69,7 +69,11 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
+	if req.Display != nil {
+		configVars = append(configVars, linuxDisplayConfigVars...)
+	}
+	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +104,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		workDir = "/"
 	}
 	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
+	initCfg.InitSystem = req.InitSystem
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
@@ -122,6 +127,8 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
 			BalloonMB:       req.BalloonMB,
+			DisplayWidth:    displayWidth(req.Display),
+			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -167,6 +174,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Kernel:          req.Kernel,
 			Shares:          append([]client.ShareMount(nil), req.Shares...),
 			Network:         req.Network,
+			Display:         req.Display,
 			KernelModules:   append([]string(nil), req.KernelModules...),
 			MemoryMB:        req.MemoryMB,
 			BalloonMB:       req.BalloonMB,
@@ -197,7 +205,11 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		}
 		image = withLinuxRuntimeMountDirs(image)
 	}
-	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
+	if req.Display != nil {
+		configVars = append(configVars, linuxDisplayConfigVars...)
+	}
+	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -246,6 +258,8 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			FSDevices:       fsdevs,
 			NetDevice:       networkDevice(network),
 			BalloonMB:       req.BalloonMB,
+			DisplayWidth:    displayWidth(req.Display),
+			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -702,6 +716,17 @@ func (i *linuxInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 	return virtioFSBackingSnapshot(i.fsdevs)
 }
 
+func (i *linuxInstance) Desktop() *virtio.Desktop {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	provider, _ := i.session.(interface{ Desktop() *virtio.Desktop })
+	if provider == nil {
+		return nil
+	}
+	return provider.Desktop()
+}
+
 func (i *linuxInstance) SetBalloonMB(target uint64) error {
 	if i == nil || i.session == nil {
 		return fmt.Errorf("running instance has no managed session")
@@ -806,6 +831,26 @@ func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 	return vars
 }
 
+var linuxDisplayConfigVars = []string{
+	"CONFIG_DRM_VIRTIO_GPU",
+	"CONFIG_VIRTIO_INPUT",
+	"CONFIG_INPUT_EVDEV",
+}
+
+func displayWidth(config *client.DisplayConfig) uint32 {
+	if config == nil {
+		return 0
+	}
+	return config.Width
+}
+
+func displayHeight(config *client.DisplayConfig) uint32 {
+	if config == nil {
+		return 0
+	}
+	return config.Height
+}
+
 func linuxRuntimeExtraConfigVars(names []string) []string {
 	aliases := map[string]string{
 		"bridge":        "CONFIG_BRIDGE",
@@ -862,6 +907,9 @@ func linuxRuntimeModuleMap() map[string]string {
 		"CONFIG_HW_RANDOM":                      "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO":               "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 		"CONFIG_VIRTIO_NET":                     "kernel/drivers/net/virtio_net.ko.gz",
+		"CONFIG_DRM_VIRTIO_GPU":                 "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.gz",
+		"CONFIG_VIRTIO_INPUT":                   "kernel/drivers/virtio/virtio_input.ko.gz",
+		"CONFIG_INPUT_EVDEV":                    "kernel/drivers/input/evdev.ko.gz",
 		"CONFIG_BINFMT_MISC":                    "kernel/fs/binfmt_misc.ko.gz",
 		"CONFIG_OVERLAY_FS":                     "kernel/fs/overlayfs/overlay.ko.gz",
 		"CONFIG_BRIDGE":                         "kernel/net/bridge/bridge.ko.gz",

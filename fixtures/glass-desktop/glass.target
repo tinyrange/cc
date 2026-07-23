@@ -1,0 +1,6 @@
+[Unit]
+Description=Minimal cc glass desktop
+DefaultDependencies=no
+Wants=ccx3-stage2.service glass-desktop.service
+After=ccx3-stage2.service
+AllowIsolate=yes

@@ -341,12 +341,25 @@ type CapabilitiesResponse struct {
 	ResourceLimits         []string `json:"resource_limits,omitempty"`
 	SupportsMultiImageExec bool     `json:"supports_multi_image_exec"`
 	SupportsNestedVirt     bool     `json:"supports_nested_virtualization"`
+	SupportsDisplay        bool     `json:"supports_display"`
 	RequiresPrivilegedCCX3 bool     `json:"requires_privileged_ccx3"`
 	Notes                  []string `json:"notes,omitempty"`
 	MemoryCapacityMB       uint64   `json:"memory_capacity_mb,omitempty"`
 	MemoryReservedMB       uint64   `json:"memory_reserved_mb,omitempty"`
 	CPUCapacity            int      `json:"cpu_capacity,omitempty"`
 	CPUReserved            int      `json:"cpu_reserved,omitempty"`
+}
+
+type DisplayConfig struct {
+	Width     uint32 `json:"width,omitempty"`
+	Height    uint32 `json:"height,omitempty"`
+	VNCListen string `json:"vnc_listen,omitempty"`
+}
+
+type DisplayState struct {
+	Width      uint32 `json:"width"`
+	Height     uint32 `json:"height"`
+	VNCAddress string `json:"vnc_address,omitempty"`
 }
 
 type CreateInstanceRequest struct {
@@ -356,6 +369,7 @@ type CreateInstanceRequest struct {
 	Kernel          string         `json:"kernel,omitempty"`
 	Shares          []ShareMount   `json:"shares,omitempty"`
 	Network         *NetworkConfig `json:"network,omitempty"`
+	Display         *DisplayConfig `json:"display,omitempty"`
 	KernelModules   []string       `json:"kernel_modules,omitempty"`
 	MemoryMB        uint64         `json:"memory_mb,omitempty"`
 	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
@@ -375,6 +389,7 @@ type StartInstanceRequest struct {
 	Kernel          string         `json:"kernel,omitempty"`
 	Shares          []ShareMount   `json:"shares,omitempty"`
 	Network         *NetworkConfig `json:"network,omitempty"`
+	Display         *DisplayConfig `json:"display,omitempty"`
 	KernelModules   []string       `json:"kernel_modules,omitempty"`
 	MemoryMB        uint64         `json:"memory_mb,omitempty"`
 	BalloonMB       uint64         `json:"balloon_mb,omitempty"`
@@ -388,32 +403,33 @@ type StartInstanceRequest struct {
 }
 
 type InstanceState struct {
-	ID                            string `json:"id,omitempty"`
-	Status                        string `json:"status"`
-	Image                         string `json:"image,omitempty"`
-	InitSystem                    string `json:"init,omitempty"`
-	Kernel                        string `json:"kernel,omitempty"`
-	MemoryMB                      uint64 `json:"memory_mb,omitempty"`
-	BalloonMB                     uint64 `json:"balloon_mb,omitempty"`
-	BalloonActualMB               uint64 `json:"balloon_actual_mb,omitempty"`
-	BalloonStatus                 string `json:"balloon_status,omitempty"`
-	CPUs                          int    `json:"cpus,omitempty"`
-	NestedVirt                    bool   `json:"nested_virtualization,omitempty"`
-	StartedAt                     string `json:"started_at,omitempty"`
-	NetworkIPv4                   string `json:"network_ipv4,omitempty"`
-	BackingBytes                  uint64 `json:"backing_bytes,omitempty"`
-	BackingHighWaterBytes         uint64 `json:"backing_high_water_bytes,omitempty"`
-	BackingDataBytes              uint64 `json:"backing_data_bytes,omitempty"`
-	BackingDataHighWaterBytes     uint64 `json:"backing_data_high_water_bytes,omitempty"`
-	BackingMetadataBytes          uint64 `json:"backing_metadata_bytes,omitempty"`
-	BackingMetadataHighWaterBytes uint64 `json:"backing_metadata_high_water_bytes,omitempty"`
-	BackingPhysicalBytes          uint64 `json:"backing_physical_bytes,omitempty"`
-	BackingReclaimError           string `json:"backing_reclaim_error,omitempty"`
-	BackingUsageStale             bool   `json:"backing_usage_stale,omitempty"`
-	BackingActiveMutations        uint64 `json:"backing_active_mutations,omitempty"`
-	Error                         string `json:"error,omitempty"`
-	ExitedAt                      string `json:"exited_at,omitempty"`
-	ExitReason                    string `json:"exit_reason,omitempty"`
+	ID                            string        `json:"id,omitempty"`
+	Status                        string        `json:"status"`
+	Image                         string        `json:"image,omitempty"`
+	InitSystem                    string        `json:"init,omitempty"`
+	Kernel                        string        `json:"kernel,omitempty"`
+	MemoryMB                      uint64        `json:"memory_mb,omitempty"`
+	BalloonMB                     uint64        `json:"balloon_mb,omitempty"`
+	BalloonActualMB               uint64        `json:"balloon_actual_mb,omitempty"`
+	BalloonStatus                 string        `json:"balloon_status,omitempty"`
+	CPUs                          int           `json:"cpus,omitempty"`
+	NestedVirt                    bool          `json:"nested_virtualization,omitempty"`
+	StartedAt                     string        `json:"started_at,omitempty"`
+	NetworkIPv4                   string        `json:"network_ipv4,omitempty"`
+	Display                       *DisplayState `json:"display,omitempty"`
+	BackingBytes                  uint64        `json:"backing_bytes,omitempty"`
+	BackingHighWaterBytes         uint64        `json:"backing_high_water_bytes,omitempty"`
+	BackingDataBytes              uint64        `json:"backing_data_bytes,omitempty"`
+	BackingDataHighWaterBytes     uint64        `json:"backing_data_high_water_bytes,omitempty"`
+	BackingMetadataBytes          uint64        `json:"backing_metadata_bytes,omitempty"`
+	BackingMetadataHighWaterBytes uint64        `json:"backing_metadata_high_water_bytes,omitempty"`
+	BackingPhysicalBytes          uint64        `json:"backing_physical_bytes,omitempty"`
+	BackingReclaimError           string        `json:"backing_reclaim_error,omitempty"`
+	BackingUsageStale             bool          `json:"backing_usage_stale,omitempty"`
+	BackingActiveMutations        uint64        `json:"backing_active_mutations,omitempty"`
+	Error                         string        `json:"error,omitempty"`
+	ExitedAt                      string        `json:"exited_at,omitempty"`
+	ExitReason                    string        `json:"exit_reason,omitempty"`
 }
 
 type ConsoleHistoryResponse struct {
