@@ -209,15 +209,15 @@ func RunManagedExecWithFSNetAndBalloon(ctx context.Context, kernel []byte, initr
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
-	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut, nil)
+	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, balloon, netdev, nil, serialOut, nil)
 }
 
-func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
+func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, extra []virtio.MMIODevice, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
 	if vm != nil && len(vm.vcpus) > 1 {
 		if snapshot != nil {
 			return fmt.Errorf("KVM startup snapshots currently support only one vCPU")
 		}
-		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut)
+		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, balloon, netdev, extra, serialOut)
 	}
 	runtime.LockOSThread()
 	// This loop always runs in a dedicated goroutine. Leave it locked so the
@@ -267,7 +267,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 			} else if handled {
 				break
 			}
-			if err := handleBootMMIO(vm, fsdevs, vsock, rng, balloon, netdev, exit.MMIO); err != nil {
+			if err := handleBootMMIOForVCPUWithExtra(vm, 0, fsdevs, vsock, rng, balloon, netdev, extra, exit.MMIO); err != nil {
 				return err
 			}
 		case ExitShutdown:
@@ -284,7 +284,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 	}
 }
 
-func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
+func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, extra []virtio.MMIODevice, serialOut *vmruntime.SerialTranscript) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sampler := startKVMRegisterSampler(runCtx, vm)
@@ -318,7 +318,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 					return
 				}
 				exitMu.Lock()
-				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, balloon, netdev, acpiPM, serialOut, exit)
+				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, balloon, netdev, extra, acpiPM, serialOut, exit)
 				exitMu.Unlock()
 				if err != nil {
 					if errors.Is(err, errGuestPoweroff) {
@@ -418,7 +418,7 @@ func reportRunErr(errCh chan<- error, cancel context.CancelFunc, err error) {
 	}
 }
 
-func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, acpiPM *ACPIPM, serialOut *vmruntime.SerialTranscript, exit Exit) error {
+func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, extra []virtio.MMIODevice, acpiPM *ACPIPM, serialOut *vmruntime.SerialTranscript, exit Exit) error {
 	switch exit.Reason {
 	case ExitIO:
 		if handled, err := acpiPM.HandleIO(exit.IO); handled {
@@ -428,7 +428,7 @@ func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*v
 			return err
 		}
 	case ExitMMIO:
-		if err := handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, balloon, netdev, exit.MMIO); err != nil {
+		if err := handleBootMMIOForVCPUWithExtra(vm, vcpuIndex, fsdevs, vsock, rng, balloon, netdev, extra, exit.MMIO); err != nil {
 			return err
 		}
 	case ExitHLT:

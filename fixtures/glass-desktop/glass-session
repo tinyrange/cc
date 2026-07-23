@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+install -d -o 1000 -g 1000 -m 0700 /run/user/1000
+install -d -m 0755 /run/dbus
+rm -f /tmp/.X0-lock
+rm -f /tmp/.X11-unix/X0
+
+/usr/bin/dbus-daemon --system --nofork --nopidfile &
+dbus_pid=$!
+/usr/lib/xorg/Xorg :0 \
+    -noreset \
+    -nolisten tcp \
+    -novtswitch \
+    -sharevts \
+    -logfile /var/log/glass-Xorg.log &
+xorg_pid=$!
+
+cleanup() {
+    kill "$xorg_pid" 2>/dev/null || true
+    kill "$dbus_pid" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+attempt=0
+while [ ! -S /tmp/.X11-unix/X0 ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then
+        echo "glass: Xorg did not create display :0" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+attempt=0
+while [ ! -S /run/dbus/system_bus_socket ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then
+        echo "glass: D-Bus did not create the system bus socket" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+exec setpriv --reuid=1000 --regid=1000 --clear-groups env \
+    DISPLAY=:0 \
+    HOME=/home/glass \
+    USER=glass \
+    XDG_RUNTIME_DIR=/run/user/1000 \
+    dbus-run-session -- sh -c '
+        xfconf-query -c xfce4-session -p /general/SaveOnExit -n -t bool -s false || true
+        /usr/local/bin/glass-clipboard &
+        /usr/local/bin/glass-resize &
+        exec startxfce4
+    '

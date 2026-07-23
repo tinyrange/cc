@@ -20,27 +20,32 @@ import (
 )
 
 type ManagedSession struct {
-	cancel     context.CancelFunc
-	done       *sessionDone
-	control    io.ReadWriteCloser
-	listener   io.Closer
-	vsock      *virtio.Vsock
-	balloon    *virtio.Balloon
-	fsdevs     []*virtio.FS
-	bootWriter *vmruntime.BootEventWriter
-	transcript *vmruntime.SerialTranscript
-	serialOut  *vmruntime.SerialTranscript
-	cleanup    func()
-	sendMu     sync.Mutex
-	nextID     atomic.Uint64
-	dmesg      bool
-	inlineExec bool
+	cancel            context.CancelFunc
+	done              *sessionDone
+	control           io.ReadWriteCloser
+	listener          io.Closer
+	clipboardListener io.Closer
+	displayListener   io.Closer
+	vsock             *virtio.Vsock
+	balloon           *virtio.Balloon
+	desktop           *virtio.Desktop
+	fsdevs            []*virtio.FS
+	bootWriter        *vmruntime.BootEventWriter
+	transcript        *vmruntime.SerialTranscript
+	serialOut         *vmruntime.SerialTranscript
+	cleanup           func()
+	sendMu            sync.Mutex
+	nextID            atomic.Uint64
+	dmesg             bool
+	inlineExec        bool
 }
 
 type ManagedSessionOptions struct {
 	SnapshotDir     string
 	RestoreSnapshot string
 	BalloonMB       uint64
+	DisplayWidth    uint32
+	DisplayHeight   uint32
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -53,6 +58,9 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 
 func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	if strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "" {
+		if opts.DisplayWidth != 0 || opts.DisplayHeight != 0 {
+			return nil, fmt.Errorf("display-enabled VMs do not support startup snapshots")
+		}
 		if cpus > 1 {
 			return nil, fmt.Errorf("KVM startup snapshots currently support only one vCPU")
 		}
@@ -72,6 +80,37 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	balloon := virtio.NewBalloon(amd64vm.BalloonBase, amd64vm.BalloonSize, amd64vm.BalloonIRQ)
+	var desktop *virtio.Desktop
+	var displayDevices []virtio.MMIODevice
+	var clipboardListener virtio.VsockListener
+	var displayListener virtio.VsockListener
+	if opts.DisplayWidth != 0 || opts.DisplayHeight != 0 {
+		framebuffer, err := virtio.NewFramebuffer(int(opts.DisplayWidth), int(opts.DisplayHeight))
+		if err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("create display: %w", err)
+		}
+		gpu := virtio.NewGPU(amd64vm.GPUBase, amd64vm.GPUSize, amd64vm.GPUIRQ, framebuffer)
+		keyboard := virtio.NewKeyboardInput(amd64vm.KeyboardBase, amd64vm.KeyboardSize, amd64vm.KeyboardIRQ)
+		pointer := virtio.NewAbsolutePointerInput(amd64vm.PointerBase, amd64vm.PointerSize, amd64vm.PointerIRQ, opts.DisplayWidth, opts.DisplayHeight)
+		clipboard := virtio.NewClipboard()
+		clipboardListener, err = backend.Listen(vmruntime.ClipboardPort)
+		if err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("listen for guest clipboard bridge: %w", err)
+		}
+		desktop = &virtio.Desktop{Framebuffer: framebuffer, GPU: gpu, Keyboard: keyboard, Pointer: pointer, Clipboard: clipboard}
+		displayListener, err = backend.Listen(vmruntime.DisplayPort)
+		if err != nil {
+			_ = clipboardListener.Close()
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("listen for guest display bridge: %w", err)
+		}
+		displayDevices = []virtio.MMIODevice{gpu, keyboard, pointer}
+	}
 	if targetPages := balloonTargetPages(opts.BalloonMB); targetPages != 0 {
 		if err := balloon.SetTargetPages(targetPages); err != nil {
 			_ = listener.Close()
@@ -127,6 +166,14 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	if netdev != nil {
 		netdev.Attach(vm, vm)
 	}
+	for _, device := range displayDevices {
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			typed.Attach(vm, vm)
+		case *virtio.Input:
+			typed.Attach(vm, vm)
+		}
+	}
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
@@ -134,6 +181,13 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(balloon.Base, balloon.IRQ))
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
+	if desktop != nil {
+		extraCmdline = append(extraCmdline,
+			amd64vm.VirtioMMIODeviceArg(amd64vm.GPUBase, amd64vm.GPUIRQ),
+			amd64vm.VirtioMMIODeviceArg(amd64vm.KeyboardBase, amd64vm.KeyboardIRQ),
+			amd64vm.VirtioMMIODeviceArg(amd64vm.PointerBase, amd64vm.PointerIRQ),
+		)
 	}
 	extraCmdline = append(extraCmdline, linuxKVMHostKernelArgs()...)
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
@@ -162,9 +216,15 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
+	if clipboardListener != nil {
+		go serveClipboardConnections(runCtx, clipboardListener, desktop.Clipboard)
+	}
+	if displayListener != nil {
+		go serveDisplayConnections(runCtx, displayListener, desktop)
+	}
 	done := newSessionDone()
 	go func() {
-		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, serialOut, snapshot)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, displayDevices, serialOut, snapshot)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
@@ -234,14 +294,17 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 
 	return &ManagedSession{
-		cancel:     cancel,
-		done:       done,
-		control:    control,
-		listener:   listener,
-		vsock:      vsock,
-		balloon:    balloon,
-		fsdevs:     fsdevs,
-		bootWriter: bootWriter,
+		cancel:            cancel,
+		done:              done,
+		control:           control,
+		listener:          listener,
+		clipboardListener: clipboardListener,
+		displayListener:   displayListener,
+		vsock:             vsock,
+		balloon:           balloon,
+		desktop:           desktop,
+		fsdevs:            fsdevs,
+		bootWriter:        bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()
 		},
@@ -264,6 +327,13 @@ func (s *ManagedSession) BalloonState() (targetMB, actualMB uint64, driverReady 
 	}
 	target, actual, ready := s.balloon.State()
 	return uint64(target) * 4096 >> 20, uint64(actual) * 4096 >> 20, ready
+}
+
+func (s *ManagedSession) Desktop() *virtio.Desktop {
+	if s == nil {
+		return nil
+	}
+	return s.desktop
 }
 
 func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -358,6 +428,12 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+	if s.clipboardListener != nil {
+		_ = s.clipboardListener.Close()
+	}
+	if s.displayListener != nil {
+		_ = s.displayListener.Close()
 	}
 	if s.vsock != nil {
 		_ = s.vsock.Close()

@@ -96,11 +96,12 @@ func (h *inProcessVMHost) HostCapabilities(context.Context) Capabilities {
 		caps = h.capabilities()
 	}
 	return Capabilities{
-		Backend:       caps.Backend,
-		MaxVMs:        caps.MaxInstances,
-		Locality:      "in-process",
-		SupportsFSRPC: false,
-		SupportsL2:    len(caps.NetworkModes) > 0,
+		Backend:         caps.Backend,
+		MaxVMs:          caps.MaxInstances,
+		Locality:        "in-process",
+		SupportsFSRPC:   false,
+		SupportsL2:      len(caps.NetworkModes) > 0,
+		SupportsDisplay: caps.SupportsDisplay,
 	}
 }
 
@@ -178,6 +179,7 @@ func (h *placementVMHost) HostCapabilities(ctx context.Context) Capabilities {
 		}
 		caps.SupportsFSRPC = caps.SupportsFSRPC || hostCaps.SupportsFSRPC
 		caps.SupportsL2 = caps.SupportsL2 || hostCaps.SupportsL2
+		caps.SupportsDisplay = caps.SupportsDisplay || hostCaps.SupportsDisplay
 	}
 	if !allLimited {
 		caps.MaxVMs = 0
@@ -200,7 +202,10 @@ func (h *placementVMHost) Start(ctx context.Context, req client.CreateInstanceRe
 }
 
 func (h *placementVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image)})
+	host, err := h.reserveHost(ctx, placementRequirements{
+		requiresL2:      networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image),
+		requiresDisplay: req.Display != nil,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +222,10 @@ func (h *placementVMHost) StartBlank(ctx context.Context, req client.StartInstan
 }
 
 func (h *placementVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image)})
+	host, err := h.reserveHost(ctx, placementRequirements{
+		requiresL2:      networkEnabled(req.Network) && !isBuiltinBSDImageName(req.Image),
+		requiresDisplay: req.Display != nil,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +278,8 @@ func (h *placementVMHost) ExecInInstanceStream(ctx context.Context, inst Instanc
 }
 
 type placementRequirements struct {
-	requiresL2 bool
+	requiresL2      bool
+	requiresDisplay bool
 }
 
 func (h *placementVMHost) reserveHost(ctx context.Context, req placementRequirements) (VMHost, error) {
@@ -283,6 +292,10 @@ func (h *placementVMHost) reserveHost(ctx context.Context, req placementRequirem
 			skipped = append(skipped, firstNonEmpty(caps.Locality, caps.Backend, "unknown"))
 			continue
 		}
+		if req.requiresDisplay && !caps.SupportsDisplay {
+			skipped = append(skipped, firstNonEmpty(caps.Locality, caps.Backend, "unknown"))
+			continue
+		}
 		if caps.MaxVMs <= 0 || h.running[host] < caps.MaxVMs {
 			h.running[host]++
 			return host, nil
@@ -290,6 +303,9 @@ func (h *placementVMHost) reserveHost(ctx context.Context, req placementRequirem
 	}
 	if req.requiresL2 && len(skipped) != 0 {
 		return nil, fmt.Errorf("no VM host with coordinator L2 capacity available")
+	}
+	if req.requiresDisplay && len(skipped) != 0 {
+		return nil, fmt.Errorf("no VM host with graphical display support available")
 	}
 	return nil, fmt.Errorf("no VM host capacity available")
 }
@@ -399,6 +415,14 @@ func (i *hostedInstance) VirtioFSStats() []virtio.FSStats {
 		return nil
 	}
 	return provider.VirtioFSStats()
+}
+
+func (i *hostedInstance) Desktop() *virtio.Desktop {
+	provider, ok := i.Instance.(interface{ Desktop() *virtio.Desktop })
+	if !ok {
+		return nil
+	}
+	return provider.Desktop()
 }
 
 func (i *hostedInstance) AllowServiceProxyPort(ctx context.Context, port int) error {

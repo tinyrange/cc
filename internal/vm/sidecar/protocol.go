@@ -49,11 +49,12 @@ type WorkerHello struct {
 }
 
 type HostCapabilities struct {
-	Backend       string
-	MaxVMs        int
-	Locality      string
-	SupportsFSRPC bool
-	SupportsL2    bool
+	Backend         string
+	MaxVMs          int
+	Locality        string
+	SupportsFSRPC   bool
+	SupportsL2      bool
+	SupportsDisplay bool
 }
 
 type WorkerStartRequest struct {

@@ -258,63 +258,42 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virti
 }
 
 func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, mmio MMIOExit) error {
+	return handleBootMMIOForVCPUWithExtra(vm, vcpuIndex, fsdevs, vsock, rng, balloon, netdev, nil, mmio)
+}
+
+func handleBootMMIOForVCPUWithExtra(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, balloon *virtio.Balloon, netdev *virtio.Net, extra []virtio.MMIODevice, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
-		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
+		if fsdev == nil {
 			continue
 		}
-		if mmio.Write {
-			return fsdev.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
-		}
-		value, err := fsdev.Read(mmio.Addr, int(mmio.Len))
-		if err != nil {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, fsdev, mmio); handled {
 			return err
 		}
-		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
-		return nil
 	}
-	if vsock != nil && vsock.Contains(mmio.Addr, int(mmio.Len)) {
-		if mmio.Write {
-			return vsock.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
-		}
-		value, err := vsock.Read(mmio.Addr, int(mmio.Len))
-		if err != nil {
+	if vsock != nil {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, vsock, mmio); handled {
 			return err
 		}
-		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
-		return nil
 	}
-	if rng != nil && rng.Contains(mmio.Addr, int(mmio.Len)) {
-		if mmio.Write {
-			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
-		}
-		value, err := rng.Read(mmio.Addr, int(mmio.Len))
-		if err != nil {
+	if rng != nil {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, rng, mmio); handled {
 			return err
 		}
-		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
-		return nil
 	}
-	if balloon != nil && balloon.Contains(mmio.Addr, int(mmio.Len)) {
-		if mmio.Write {
-			return balloon.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
-		}
-		value, err := balloon.Read(mmio.Addr, int(mmio.Len))
-		if err != nil {
+	if balloon != nil {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, balloon, mmio); handled {
 			return err
 		}
-		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
-		return nil
 	}
-	if netdev != nil && netdev.Contains(mmio.Addr, int(mmio.Len)) {
-		if mmio.Write {
-			return netdev.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
-		}
-		value, err := netdev.Read(mmio.Addr, int(mmio.Len))
-		if err != nil {
+	if netdev != nil {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, netdev, mmio); handled {
 			return err
 		}
-		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
-		return nil
+	}
+	for _, device := range extra {
+		if handled, err := handleBootMMIODevice(vm, vcpuIndex, device, mmio); handled {
+			return err
+		}
 	}
 	if offset, ok := bootHPETOffset(mmio.Addr, mmio.Len); ok {
 		if mmio.Write {
@@ -324,6 +303,21 @@ func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *vi
 		return nil
 	}
 	return fmt.Errorf("unhandled mmio addr=%#x len=%d write=%v", mmio.Addr, mmio.Len, mmio.Write)
+}
+
+func handleBootMMIODevice(vm *VM, vcpuIndex int, device virtio.MMIODevice, mmio MMIOExit) (bool, error) {
+	if device == nil || !device.Contains(mmio.Addr, int(mmio.Len)) {
+		return false, nil
+	}
+	if mmio.Write {
+		return true, device.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+	}
+	value, err := device.Read(mmio.Addr, int(mmio.Len))
+	if err != nil {
+		return true, err
+	}
+	vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
+	return true, nil
 }
 
 func bootHPETOffset(addr uint64, size uint32) (uint64, bool) {

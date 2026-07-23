@@ -14,6 +14,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/rfb"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/builtin"
 	vmhost "j5.nz/cc/internal/vm/host"
@@ -97,6 +98,10 @@ type instanceBackingSnapshotProvider interface {
 	BackingSnapshot() virtio.FSBackingUsageSnapshot
 }
 
+type instanceDesktopProvider interface {
+	Desktop() *virtio.Desktop
+}
+
 type Manager struct {
 	mu            sync.Mutex
 	host          VMHost
@@ -146,6 +151,9 @@ type Machine struct {
 	exitedAt                 time.Time
 	stopping                 bool
 	stop                     *machineStopOperation
+	display                  *client.DisplayState
+	vncListener              net.Listener
+	vncServer                *rfb.Server
 }
 
 type machineStopOperation struct {
@@ -208,6 +216,9 @@ func HostCapabilities() client.CapabilitiesResponse {
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
+	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		caps.SupportsDisplay = true
 	}
 	if runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
 		caps.MaxInstances = 1
@@ -272,6 +283,63 @@ func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequ
 	return m.StartInstanceStream(ctx, id, req, onEvent)
 }
 
+func normalizeDisplayConfig(config *client.DisplayConfig) (*client.DisplayConfig, error) {
+	if config == nil {
+		return nil, nil
+	}
+	normalized := *config
+	if normalized.Width == 0 {
+		normalized.Width = 1280
+	}
+	if normalized.Height == 0 {
+		normalized.Height = 720
+	}
+	if normalized.Width > 8192 || normalized.Height > 8192 {
+		return nil, fmt.Errorf("display dimensions %dx%d exceed 8192x8192", normalized.Width, normalized.Height)
+	}
+	address := strings.TrimSpace(normalized.VNCListen)
+	if address == "" {
+		address = "127.0.0.1:0"
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid VNC listen address %q: %w", address, err)
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("VNC v1 only supports a loopback listen address, got %q", address)
+	}
+	normalized.VNCListen = net.JoinHostPort(host, port)
+	return &normalized, nil
+}
+
+func startVNCServer(instance Instance, id string, config *client.DisplayConfig) (*client.DisplayState, net.Listener, *rfb.Server, error) {
+	if config == nil {
+		return nil, nil, nil, nil
+	}
+	provider, ok := instance.(instanceDesktopProvider)
+	if !ok || provider.Desktop() == nil {
+		return nil, nil, nil, fmt.Errorf("VM backend does not support graphical displays")
+	}
+	listener, err := net.Listen("tcp", config.VNCListen)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("listen for VNC on %s: %w", config.VNCListen, err)
+	}
+	server := &rfb.Server{Desktop: provider.Desktop(), Name: "cc " + id}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	return &client.DisplayState{
+		Width:      config.Width,
+		Height:     config.Height,
+		VNCAddress: listener.Addr().String(),
+	}, listener, server, nil
+}
+
 func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
 	id = instanceID(id)
 	req.ID = id
@@ -280,6 +348,14 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	}
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
+	}
+	display, err := normalizeDisplayConfig(req.Display)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Display = display
+	if display != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
+		return client.InstanceState{}, fmt.Errorf("display-enabled VMs do not support startup snapshots")
 	}
 	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
 	if err != nil {
@@ -332,18 +408,27 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
+	displayState, vncListener, vncServer, err := startVNCServer(inst, id, display)
+	if err != nil {
+		closeErr := inst.Close()
+		m.finishStart(id, start)
+		return client.InstanceState{}, errors.Join(err, closeErr)
+	}
 
 	machine := &Machine{
-		id:         id,
-		image:      req.Image,
-		initSystem: req.InitSystem,
-		kernel:     req.Kernel,
-		memoryMB:   req.MemoryMB,
-		balloonMB:  req.BalloonMB,
-		cpus:       req.CPUs,
-		nestedVirt: req.NestedVirt,
-		startedAt:  time.Now().UTC(),
-		instance:   inst,
+		id:          id,
+		image:       req.Image,
+		initSystem:  req.InitSystem,
+		kernel:      req.Kernel,
+		memoryMB:    req.MemoryMB,
+		balloonMB:   req.BalloonMB,
+		cpus:        req.CPUs,
+		nestedVirt:  req.NestedVirt,
+		startedAt:   time.Now().UTC(),
+		instance:    inst,
+		display:     displayState,
+		vncListener: vncListener,
+		vncServer:   vncServer,
 	}
 
 	m.mu.Lock()
@@ -355,6 +440,10 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		delete(m.networkLeases, id)
 		m.mu.Unlock()
 		cancelStart()
+		if vncListener != nil {
+			_ = vncListener.Close()
+		}
+		_ = vncServer.Close()
 		start.cleanupErr = inst.Close()
 		close(start.done)
 		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
@@ -397,6 +486,14 @@ func (m *Manager) StartBlankInstanceStream(
 	req.ID = id
 	if err := normalizeResources(&req.MemoryMB, &req.BalloonMB, &req.CPUs); err != nil {
 		return client.InstanceState{}, err
+	}
+	display, err := normalizeDisplayConfig(req.Display)
+	if err != nil {
+		return client.InstanceState{}, err
+	}
+	req.Display = display
+	if display != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
+		return client.InstanceState{}, fmt.Errorf("display-enabled VMs do not support startup snapshots")
 	}
 	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
 	if err != nil {
@@ -462,18 +559,27 @@ func (m *Manager) StartBlankInstanceStream(
 			return client.InstanceState{}, errors.Join(err, start.cleanupErr)
 		}
 	}
+	displayState, vncListener, vncServer, err := startVNCServer(inst, id, display)
+	if err != nil {
+		closeErr := inst.Close()
+		m.finishStart(id, start)
+		return client.InstanceState{}, errors.Join(err, closeErr)
+	}
 
 	machine := &Machine{
-		id:         id,
-		image:      req.Image,
-		initSystem: req.InitSystem,
-		kernel:     req.Kernel,
-		memoryMB:   req.MemoryMB,
-		balloonMB:  req.BalloonMB,
-		cpus:       req.CPUs,
-		nestedVirt: req.NestedVirt,
-		startedAt:  time.Now().UTC(),
-		instance:   inst,
+		id:          id,
+		image:       req.Image,
+		initSystem:  req.InitSystem,
+		kernel:      req.Kernel,
+		memoryMB:    req.MemoryMB,
+		balloonMB:   req.BalloonMB,
+		cpus:        req.CPUs,
+		nestedVirt:  req.NestedVirt,
+		startedAt:   time.Now().UTC(),
+		instance:    inst,
+		display:     displayState,
+		vncListener: vncListener,
+		vncServer:   vncServer,
 	}
 
 	m.mu.Lock()
@@ -485,6 +591,10 @@ func (m *Manager) StartBlankInstanceStream(
 		delete(m.networkLeases, id)
 		m.mu.Unlock()
 		cancelStart()
+		if vncListener != nil {
+			_ = vncListener.Close()
+		}
+		_ = vncServer.Close()
 		start.cleanupErr = inst.Close()
 		close(start.done)
 		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
@@ -643,7 +753,14 @@ func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
 	// Closing the instance is the recovery mechanism for a backend balloon
 	// request which has stopped making progress. Do not wait behind balloonMu:
 	// Close must be allowed to tear down the device and make that request return.
-	err := machine.instance.Close()
+	var vncErr error
+	if machine.vncListener != nil {
+		vncErr = machine.vncListener.Close()
+	}
+	if errors.Is(vncErr, net.ErrClosed) {
+		vncErr = nil
+	}
+	err := errors.Join(vncErr, machine.vncServer.Close(), machine.instance.Close())
 	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
@@ -1077,6 +1194,7 @@ type managerStatusSnapshot struct {
 	backingCombinedProvider instanceBackingCombinedUsageProvider
 	backingSnapshotProvider instanceBackingSnapshotProvider
 	balloonProvider         instanceBalloonStateProvider
+	displayFramebuffer      *virtio.Framebuffer
 }
 
 func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
@@ -1107,6 +1225,7 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 		CPUs:       machine.cpus,
 		NestedVirt: machine.nestedVirt,
 		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
+		Display:    machine.display,
 	}
 	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
 	if machine.stopping {
@@ -1134,12 +1253,22 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 		snapshot.state.BalloonMB = 0
 		snapshot.state.BalloonStatus = "unsupported"
 	}
+	if provider, ok := machine.instance.(instanceDesktopProvider); ok && provider.Desktop() != nil {
+		snapshot.displayFramebuffer = provider.Desktop().Framebuffer
+	}
 	return snapshot
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.backingSnapshotProvider == nil && snapshot.balloonProvider == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.backingSnapshotProvider == nil && snapshot.balloonProvider == nil && snapshot.displayFramebuffer == nil {
 		return snapshot.state
+	}
+	if snapshot.state.Display != nil && snapshot.displayFramebuffer != nil {
+		width, height := snapshot.displayFramebuffer.Size()
+		display := *snapshot.state.Display
+		display.Width = uint32(width)
+		display.Height = uint32(height)
+		snapshot.state.Display = &display
 	}
 	if snapshot.provider != nil {
 		snapshot.state.NetworkIPv4 = snapshot.provider.NetworkIPv4()
@@ -1242,6 +1371,10 @@ func saturatingUint64Add(a, b uint64) uint64 {
 
 func (m *Manager) watch(machine *Machine) {
 	err := machine.instance.Wait()
+	if machine.vncListener != nil {
+		_ = machine.vncListener.Close()
+	}
+	_ = machine.vncServer.Close()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
