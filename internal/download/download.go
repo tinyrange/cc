@@ -260,11 +260,6 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 
 func (w *bytesWriter) Bytes() []byte { return w.data }
 
-func IsLimit(err error) bool {
-	var target *LimitError
-	return errors.As(err, &target)
-}
-
 func FilesystemBudget(path string) (int64, error) {
 	probe := path
 	for {

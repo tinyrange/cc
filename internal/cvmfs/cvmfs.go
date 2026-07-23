@@ -1488,27 +1488,6 @@ func (r *repository) fetchCatalogDB(hash string) ([]byte, error) {
 	return download.ReadAllReader(ctx, zr, r.client.expandedObjectBudget())
 }
 
-func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) {
-	suffix := ""
-	if partial {
-		suffix = "P"
-	}
-	raw, err := r.fetchCompressedObject(hash, suffix)
-	if err != nil {
-		return nil, err
-	}
-	zr, err := zlib.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
-	defer zr.Close()
-	ctx := r.client.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return download.ReadAllReader(ctx, zr, r.client.expandedObjectBudget())
-}
-
 func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) {
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
 	if cachePath != "" {
@@ -1937,10 +1916,6 @@ func isWithinPrefix(candidate, prefix string) bool {
 
 func stringifyHash(hash []byte) string {
 	return fmt.Sprintf("%x", hash)
-}
-
-func CVMFSObjectCachePath(cacheDir, hash, suffix string) string {
-	return cvmfsObjectCachePath(cacheDir, hash, suffix)
 }
 
 func cvmfsFileCachePath(cacheDir, repo, filePath string) string {

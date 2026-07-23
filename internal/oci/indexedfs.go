@@ -3,7 +3,6 @@ package oci
 import (
 	"archive/tar"
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -456,10 +455,6 @@ func (l *indexedSymlink) ModTime() time.Time      { return l.modTime }
 func (l *indexedSymlink) Target() string          { return l.target }
 func (l *indexedSymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
 func (l *indexedSymlink) RDev() uint32            { return l.rdev }
-
-func writeLayerTar(dstPath, mediaType string, blob []byte) error {
-	return writeLayerTarFromReader(dstPath, mediaType, bytes.NewReader(blob))
-}
 
 func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {

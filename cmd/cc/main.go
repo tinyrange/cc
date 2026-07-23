@@ -773,22 +773,6 @@ func validateServerHello(hello client.ServerHello, cacheDir string) error {
 	return nil
 }
 
-func stopDaemon(statePath string) error {
-	state, err := readDaemonState(statePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	api := newClient(state.Addr)
-	if err := api.Shutdown(); err != nil {
-		_ = os.Remove(statePath)
-		return err
-	}
-	return os.Remove(statePath)
-}
-
 func newClient(addr string) *client.Client {
 	return client.NewClientContext("http://"+addr, func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)

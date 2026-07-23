@@ -995,70 +995,6 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	return nil
 }
 
-func (f *FS) processQueueLocked(qidx int) error {
-	q := &f.queues[qidx]
-	if !q.ready || q.size == 0 || f.mem == nil {
-		return nil
-	}
-
-	oldUsedIdx := q.usedIdx
-	interruptNeeded := false
-	availFlags := uint16(0)
-	for {
-		flags, availIdx, err := f.readAvailHeaderLocked(q)
-		if err != nil {
-			return err
-		}
-		availFlags = flags
-		for q.lastAvailIdx != availIdx {
-			slot := q.lastAvailIdx % q.size
-			head, err := f.readAvailRingEntryLocked(q, slot)
-			if err != nil {
-				return err
-			}
-			if f.Log != nil {
-				f.logf("queue-notify q=%d head=%d", qidx, head)
-			}
-			usedLen, reply, err := f.handleRequestLocked(q, head)
-			if err != nil {
-				return err
-			}
-			if reply {
-				if err := f.writeUsedLocked(q, head, usedLen); err != nil {
-					return err
-				}
-				if f.Log != nil {
-					f.logf("used-ring q=%d head=%d len=%d", qidx, head, usedLen)
-				}
-				interruptNeeded = true
-			}
-			q.lastAvailIdx++
-		}
-		if f.driverFeatures&featureRingEventIdx == 0 {
-			break
-		}
-		if err := f.writeAvailEventLocked(q); err != nil {
-			return err
-		}
-		_, latestAvailIdx, err := f.readAvailHeaderLocked(q)
-		if err != nil {
-			return err
-		}
-		if q.lastAvailIdx == latestAvailIdx {
-			break
-		}
-	}
-	if interruptNeeded && f.isCompletingQueue(qidx) && f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
-		f.interruptStatus |= fsInterruptVring
-		f.interruptRaises++
-		if f.Log != nil {
-			f.logf("interrupt-raise status=%#x", f.interruptStatus)
-		}
-		return f.updateIRQLocked()
-	}
-	return nil
-}
-
 func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error) {
 	q := &f.queues[qidx]
 	if !q.ready || q.size == 0 || f.mem == nil {
@@ -1101,67 +1037,6 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 		}
 	}
 	return works, nil
-}
-
-func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
-	var descScratch [8]fsDesc
-	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
-	if err != nil {
-		return 0, false, err
-	}
-	var reqScratch [4]fsDesc
-	var respScratch [4]fsDesc
-	reqDescs := reqScratch[:0]
-	respDescs := respScratch[:0]
-	for _, d := range descs {
-		if d.write {
-			respDescs = append(respDescs, d)
-			continue
-		}
-		if len(respDescs) != 0 {
-			return 0, false, fmt.Errorf("virtio-fs descriptor order invalid")
-		}
-		reqDescs = append(reqDescs, d)
-	}
-	if len(reqDescs) == 0 {
-		return 0, false, fmt.Errorf("virtio-fs missing request descriptors")
-	}
-	reqLen := 0
-	for _, d := range reqDescs {
-		reqLen += int(d.length)
-	}
-	var reqStack [4096]byte
-	var req []byte
-	if reqLen <= len(reqStack) {
-		req = reqStack[:reqLen]
-	} else {
-		req = make([]byte, reqLen)
-	}
-	reqOff := 0
-	for _, d := range reqDescs {
-		if err := f.readIPAInto(d.addr, req[reqOff:reqOff+int(d.length)]); err != nil {
-			return 0, false, err
-		}
-		reqOff += int(d.length)
-	}
-	reply, err := f.dispatchFUSEReplyLocked(req)
-	if err != nil {
-		return 0, false, err
-	}
-	if !reply.ok {
-		return 0, false, nil
-	}
-	var work fsWork
-	work.respCount = len(respDescs)
-	if len(respDescs) <= len(work.respDescs) {
-		copy(work.respDescs[:], respDescs)
-	} else {
-		work.respExtra = append([]fsDesc(nil), respDescs...)
-	}
-	if err := f.writeReplyToResponseDescsLocked(work, reply); err != nil {
-		return 0, false, err
-	}
-	return uint32(reply.Len()), true, nil
 }
 
 func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16) (fsWork, error) {
@@ -1627,18 +1502,6 @@ func (w *fsWork) responseDesc(index int) fsDesc {
 		return w.respExtra[index]
 	}
 	return w.respDescs[index]
-}
-
-func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
-	reply, err := f.dispatchFUSEReplyLocked(req)
-	if err != nil || !reply.ok {
-		return nil, err
-	}
-	return reply.Bytes(), nil
-}
-
-func (f *FS) dispatchFUSEReplyLocked(req []byte) (fsReply, error) {
-	return f.dispatchFUSE(req)
 }
 
 func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
@@ -4267,17 +4130,6 @@ func (p *passthroughFS) hostAndGuestPath(nodeID uint64) (string, string, int32) 
 	return filepath.Join(p.root, filepath.FromSlash(strings.TrimPrefix(guest, "/"))), guest, 0
 }
 
-func (p *passthroughFS) guestPathForHost(host string) string {
-	if p.root == "" {
-		return "/"
-	}
-	rel, err := filepath.Rel(p.root, host)
-	if err != nil || rel == "." {
-		return "/"
-	}
-	return "/" + filepath.ToSlash(rel)
-}
-
 func joinGuestChild(parentGuest, rel string) string {
 	if rel == "" {
 		return path.Clean(parentGuest)
@@ -6179,37 +6031,6 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 	parent.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parent)
 	return node, 0
-}
-
-func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt, int32) {
-	if node.abstractDir == nil {
-		return nil, 0
-	}
-	ents, err := node.abstractDir.ReadDir()
-	if err != nil {
-		return nil, errnoFromError(err)
-	}
-	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
-	for _, ent := range ents {
-		if ent.Name == "." || ent.Name == ".." {
-			continue
-		}
-		if node.whiteouts[ent.Name] {
-			continue
-		}
-		if _, ok := node.entries[ent.Name]; ok {
-			continue
-		}
-		entry, err := node.abstractDir.Lookup(ent.Name)
-		if err != nil {
-			return nil, -linuxEIO
-		}
-		if _, errno := p.createAbstractNode(node, ent.Name, entry); errno != 0 {
-			return nil, errno
-		}
-	}
-	node.entriesDone = true
-	return ents, 0
 }
 
 func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {

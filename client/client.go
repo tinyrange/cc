@@ -722,18 +722,6 @@ func (s *execStreamState) finish() error {
 	return s.terminalErr
 }
 
-func currentWebSocketSendError(sendErr <-chan error) error {
-	if sendErr == nil {
-		return nil
-	}
-	select {
-	case err := <-sendErr:
-		return err
-	default:
-		return nil
-	}
-}
-
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 	return c.RunEventsContext(context.Background(), req)
 }
@@ -999,10 +987,6 @@ func (c *Client) RunVMContext(ctx context.Context, req StartVMRequest) (RunVMRes
 	})
 }
 
-func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error {
-	return c.postJSONExpectOKContext(context.Background(), path, reqBody, respBody)
-}
-
 func (c *Client) postJSONExpectOKContext(ctx context.Context, path string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {
@@ -1066,10 +1050,6 @@ func contextOrBackground(ctx context.Context) context.Context {
 	return ctx
 }
 
-func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error, terminalStatus string) error {
-	return c.postJSONProgressStreamContext(context.Background(), path, reqBody, onEvent, terminalStatus)
-}
-
 func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string, reqBody any, onEvent func(ProgressEvent) error, terminalStatus string) error {
 	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
 	if err != nil {
@@ -1103,10 +1083,6 @@ func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string,
 			return nil
 		}
 	}
-}
-
-func (c *Client) postJSONBootStream(path string, reqBody any, onEvent func(BootEvent) error) (InstanceState, error) {
-	return c.postJSONBootStreamContext(context.Background(), path, reqBody, onEvent)
 }
 
 func (c *Client) postJSONBootStreamContext(ctx context.Context, path string, reqBody any, onEvent func(BootEvent) error) (InstanceState, error) {
@@ -1172,10 +1148,6 @@ func (c *Client) postJSONExecStream(ctx context.Context, path string, reqBody an
 			}
 		}
 	}
-}
-
-func (c *Client) postJSONStream(path string, reqBody any) (*http.Response, error) {
-	return c.postJSONStreamContext(context.Background(), path, reqBody)
 }
 
 func (c *Client) postJSONStreamContext(ctx context.Context, path string, reqBody any) (*http.Response, error) {

@@ -2410,19 +2410,6 @@ func wantsProgressStream(r *http.Request) bool {
 	return r.Header.Get("Accept") == "application/x-ndjson"
 }
 
-func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(w)
-	if resp.Output != "" {
-		_ = enc.Encode(client.ExecEvent{Kind: "output", Output: resp.Output})
-	}
-	_ = enc.Encode(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
 func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm.Manager, req client.RunRequest) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
