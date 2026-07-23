@@ -123,76 +123,10 @@ var (
 
 const (
 	defaultPacketCapacity   = 64*1024 + tcpHeaderLen
-	maxTCPPacketPoolSize    = 256*1024 + tcpHeaderLen
-	maxIPv4PacketPoolSize   = 256*1024 + ipv4HeaderLen
 	maxEthernetFramePoolLen = 256*1024 + ethernetHeaderLen
 )
 
-var (
-	tcpPacketPool = sync.Pool{
-		New: func() any {
-			return make([]byte, 0, defaultPacketCapacity)
-		},
-	}
-	ipv4PacketPool = sync.Pool{
-		New: func() any {
-			return make([]byte, 0, defaultPacketCapacity)
-		},
-	}
-	ethernetFramePool = newByteSlicePool(defaultPacketCapacity+ethernetHeaderLen, maxEthernetFramePoolLen)
-)
-
-func getTCPPacketBuffer(payloadLen int) []byte {
-	total := tcpHeaderLen + payloadLen
-	if total <= 0 {
-		total = tcpHeaderLen
-	}
-	if total > maxTCPPacketPoolSize {
-		return make([]byte, total)
-	}
-	raw := tcpPacketPool.Get().([]byte)
-	if cap(raw) < total {
-		tcpPacketPool.Put(raw[:0])
-		return make([]byte, total)
-	}
-	return raw[:total]
-}
-
-func putTCPPacketBuffer(buf []byte) {
-	if buf == nil {
-		return
-	}
-	if cap(buf) > maxTCPPacketPoolSize {
-		return
-	}
-	tcpPacketPool.Put(buf[:0])
-}
-
-func getIPv4PacketBuffer(payloadLen int) []byte {
-	total := ipv4HeaderLen + payloadLen
-	if total <= 0 {
-		total = ipv4HeaderLen
-	}
-	if total > maxIPv4PacketPoolSize {
-		return make([]byte, total)
-	}
-	raw := ipv4PacketPool.Get().([]byte)
-	if cap(raw) < total {
-		ipv4PacketPool.Put(raw[:0])
-		return make([]byte, total)
-	}
-	return raw[:total]
-}
-
-func putIPv4PacketBuffer(buf []byte) {
-	if buf == nil {
-		return
-	}
-	if cap(buf) > maxIPv4PacketPoolSize {
-		return
-	}
-	ipv4PacketPool.Put(buf[:0])
-}
+var ethernetFramePool = newByteSlicePool(defaultPacketCapacity+ethernetHeaderLen, maxEthernetFramePoolLen)
 
 func getEthernetFrameBuffer(payloadLen int) []byte {
 	total := ethernetHeaderLen + payloadLen
@@ -735,10 +669,6 @@ func (ns *NetStack) sendFrame(frame []byte) error {
 // Ethernet handling and MAC learning.
 ////////////////////////////////////////////////////////////////////////////////
 
-func (ns *NetStack) handleEthernetFrame(frame []byte) error {
-	return ns.handleEthernetFrameWithReuse(frame, false)
-}
-
 func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe bool) error {
 	dst := net.HardwareAddr(frame[:6])
 	src := net.HardwareAddr(frame[6:12])
@@ -1052,37 +982,6 @@ func parseIPv4Header(data []byte) (ipv4Header, error) {
 	return h, nil
 }
 
-// buildIPv4Packet allocates and writes a basic IPv4 packet with the given
-// protocol and payload.
-func buildIPv4Packet(
-	src, dst net.IP,
-	protocol protocolNumber,
-	payload []byte,
-) []byte {
-	packet := make([]byte, ipv4HeaderLen+len(payload))
-	return buildIPv4PacketInto(packet, src, dst, protocol, payload)
-}
-
-// buildIPv4PacketInto writes an IPv4 packet into buf (if large enough) and
-// returns the slice to the written packet.
-func buildIPv4PacketInto(
-	buf []byte,
-	src, dst net.IP,
-	protocol protocolNumber,
-	payload []byte,
-) []byte {
-	totalLen := ipv4HeaderLen + len(payload)
-	if cap(buf) < totalLen {
-		buf = make([]byte, totalLen)
-	}
-	packet := buf[:totalLen]
-
-	buildIPv4HeaderInto(packet[:ipv4HeaderLen], src, dst, protocol, len(payload))
-
-	copy(packet[ipv4HeaderLen:], payload)
-	return packet
-}
-
 func buildEthernetHeaderInto(buf []byte, dstMac, srcMac macAddr, etherType etherType) {
 	if len(buf) < ethernetHeaderLen {
 		panic("buildEthernetHeaderInto: buffer too small")
@@ -1267,11 +1166,6 @@ type udpServiceProxyConn struct {
 }
 
 const udpServiceProxyIdleTimeout = 30 * time.Second
-
-// handleUDP parses the UDP header and enqueues payloads to bound endpoints.
-func (ns *NetStack) handleUDP(h ipv4Header, payload []byte) error {
-	return ns.handleUDPWithReuse(h, payload, false)
-}
 
 func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsafe bool) error {
 	if len(payload) < 8 {
@@ -1859,11 +1753,6 @@ type tcpConn struct {
 	congCtrl *tcpCongestionControl
 	dupAcks  int // duplicate ACK counter for fast retransmit
 
-	// Delayed ACK
-	delayedAckTimer *time.Timer
-	delayedAckMu    sync.Mutex
-	unackedSegs     int // segments received without ACK
-
 	// Nagle algorithm
 	nagleEnabled bool   // whether Nagle is active
 	nagleBuf     []byte // pending small write
@@ -2405,49 +2294,8 @@ func (c *tcpConn) sendFin() {
 	c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagFIN|tcpFlagACK, nil)
 }
 
-// Delayed ACK constants.
-const delayedAckTimeout = 50 * time.Millisecond
-const delayedAckMaxSegs = 2
-
-// scheduleAck implements delayed ACK: ACK immediately on 2nd segment or after timeout.
-func (c *tcpConn) scheduleAck() {
-	c.delayedAckMu.Lock()
-	defer c.delayedAckMu.Unlock()
-
-	c.unackedSegs++
-
-	if c.unackedSegs >= delayedAckMaxSegs {
-		// Send ACK immediately for every 2nd segment
-		c.unackedSegs = 0
-		if c.delayedAckTimer != nil {
-			c.delayedAckTimer.Stop()
-			c.delayedAckTimer = nil
-		}
-		go c.sendAck()
-		return
-	}
-
-	// First segment: start delayed ACK timer
-	if c.delayedAckTimer == nil {
-		c.delayedAckTimer = time.AfterFunc(delayedAckTimeout, func() {
-			c.delayedAckMu.Lock()
-			c.unackedSegs = 0
-			c.delayedAckTimer = nil
-			c.delayedAckMu.Unlock()
-			c.sendAck()
-		})
-	}
-}
-
-// sendAckImmediate sends an ACK immediately, canceling any delayed ACK timer.
+// sendAckImmediate sends an ACK immediately.
 func (c *tcpConn) sendAckImmediate() {
-	c.delayedAckMu.Lock()
-	c.unackedSegs = 0
-	if c.delayedAckTimer != nil {
-		c.delayedAckTimer.Stop()
-		c.delayedAckTimer = nil
-	}
-	c.delayedAckMu.Unlock()
 	c.sendAck()
 }
 
@@ -3013,7 +2861,6 @@ func (c *tcpConn) Close() error {
 
 	// Stop timers
 	c.stopRetxTimer()
-	c.stopDelayedAckTimer()
 
 	// Clear buffers
 	if c.sendBuf != nil {
@@ -3049,17 +2896,6 @@ func (c *tcpConn) CloseWrite() error {
 	c.mu.Unlock()
 	c.sendFin()
 	return nil
-}
-
-// stopDelayedAckTimer stops the delayed ACK timer.
-func (c *tcpConn) stopDelayedAckTimer() {
-	c.delayedAckMu.Lock()
-	defer c.delayedAckMu.Unlock()
-
-	if c.delayedAckTimer != nil {
-		c.delayedAckTimer.Stop()
-		c.delayedAckTimer = nil
-	}
 }
 
 func (c *tcpConn) LocalAddr() net.Addr {
@@ -3165,14 +3001,6 @@ func (c *tcpConn) logStallSnapshot(reason string) {
 		"retxCount", snap.RetxCount,
 		"oooSegs", snap.OOOSegments,
 	)
-}
-
-func (c *tcpConn) sendRST() error {
-	c.mu.Lock()
-	seq := c.hostSeq
-	ack := c.guestSeq
-	c.mu.Unlock()
-	return c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagRST, nil)
 }
 
 // sendTCPPacket crafts and transmits a TCP segment to the guest.

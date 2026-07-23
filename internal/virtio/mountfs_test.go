@@ -707,10 +707,6 @@ func BenchmarkImageFSSameBytesSingleFile(b *testing.B) {
 	}
 }
 
-func zeroTime() time.Time {
-	return time.Time{}
-}
-
 func imageBackend(t *testing.T, files map[string]string) FSBackend {
 	t.Helper()
 	overlay := imagefs.NewOverlay(nil)

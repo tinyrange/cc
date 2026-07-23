@@ -1,7 +1,6 @@
 package oci
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"compress/gzip"
@@ -1812,110 +1811,6 @@ func parseAuthenticate(value string) (map[string]string, error) {
 	return ret, nil
 }
 
-func applyLayer(rootfsDir, mediaType string, blob []byte, entries map[string]fsmeta.Entry) error {
-	var src io.Reader = bytes.NewReader(blob)
-	if isGzipMediaType(mediaType, blob) {
-		gzr, err := gzip.NewReader(src)
-		if err != nil {
-			return fmt.Errorf("open gzip layer: %w", err)
-		}
-		defer gzr.Close()
-		src = gzr
-	}
-	tr := tar.NewReader(src)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read layer tar: %w", err)
-		}
-
-		name, err := sanitizeArchivePath(hdr.Name)
-		if err != nil {
-			return err
-		}
-		base := path.Base(name)
-		dir := path.Dir(name)
-		hostPath := filepath.Join(rootfsDir, filepath.FromSlash(name))
-
-		if base == ".wh..wh..opq" {
-			opaqueDir := filepath.Join(rootfsDir, filepath.FromSlash(dir))
-			if err := clearDirectoryContents(opaqueDir); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-			opaquePrefix := fsmeta.Normalize(dir)
-			for key := range entries {
-				if key != opaquePrefix && strings.HasPrefix(key, opaquePrefix+"/") {
-					delete(entries, key)
-				}
-			}
-			continue
-		}
-		if strings.HasPrefix(base, ".wh.") {
-			deletedName := path.Join(dir, strings.TrimPrefix(base, ".wh."))
-			deleted := filepath.Join(rootfsDir, filepath.FromSlash(deletedName))
-			if err := os.RemoveAll(deleted); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("apply whiteout %s: %w", deleted, err)
-			}
-			delete(entries, fsmeta.Normalize(deletedName))
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(hostPath), 0o755); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(hostPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(hostPath, hdr.FileInfo().Mode().Perm()); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			f, err := os.OpenFile(hostPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, hdr.FileInfo().Mode().Perm())
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				_ = f.Close()
-				return err
-			}
-			if err := f.Close(); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			target := fsmeta.NormalizeSymlinkTarget(hdr.Linkname)
-			if err := os.Symlink(target, hostPath); err != nil {
-				return err
-			}
-		case tar.TypeLink:
-			target, err := sanitizeArchivePath(hdr.Linkname)
-			if err != nil {
-				return err
-			}
-			if err := os.Link(filepath.Join(rootfsDir, filepath.FromSlash(target)), hostPath); err != nil {
-				return err
-			}
-		case tar.TypeXGlobalHeader:
-		default:
-			return fmt.Errorf("unsupported layer entry type %d for %s", hdr.Typeflag, name)
-		}
-		meta := fsmeta.Entry{
-			UID:  uint32(hdr.Uid),
-			GID:  uint32(hdr.Gid),
-			Mode: fsmeta.LinuxModeFromTarHeader(hdr),
-		}
-		if hdr.Typeflag == tar.TypeSymlink {
-			meta.LinkTarget = fsmeta.NormalizeSymlinkTarget(hdr.Linkname)
-		}
-		entries[fsmeta.Normalize(name)] = meta
-	}
-}
-
 func sanitizeArchivePath(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -1928,28 +1823,8 @@ func sanitizeArchivePath(name string) (string, error) {
 	return name, nil
 }
 
-func clearDirectoryContents(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func isManifestMediaType(mediaType string) bool {
 	return strings.Contains(mediaType, "manifest.v1+json") || strings.Contains(mediaType, "manifest.v2+json")
-}
-
-func isGzipMediaType(mediaType string, blob []byte) bool {
-	if strings.Contains(mediaType, "gzip") {
-		return true
-	}
-	return len(blob) >= 2 && blob[0] == 0x1f && blob[1] == 0x8b
 }
 
 func digestToFileName(digest string) string {

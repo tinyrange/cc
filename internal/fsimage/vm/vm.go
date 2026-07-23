@@ -469,13 +469,6 @@ func (vm *VirtualMemory) WriteAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
-// Buffer pool for WriteSparseTo to reduce allocations
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 4096) // Default page size, will be resized if needed
-	},
-}
-
 // Large buffer pool for batching consecutive pages (default 2MB = 512 pages of 4KB)
 var batchBufferPool = sync.Pool{
 	New: func() interface{} {

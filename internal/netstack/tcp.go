@@ -185,17 +185,6 @@ func (sb *tcpSendBuffer) oldest() (tcpSendSegment, bool) {
 	return sb.segments[0], true
 }
 
-// markRetransmitted updates the retx count and timestamp for the oldest segment.
-func (sb *tcpSendBuffer) markRetransmitted() {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-
-	if len(sb.segments) > 0 {
-		sb.segments[0].retxCount++
-		sb.segments[0].sentAt = time.Now()
-	}
-}
-
 // markRetransmittedN updates the retx count and timestamp for the oldest n segments.
 func (sb *tcpSendBuffer) markRetransmittedN(n int) {
 	sb.mu.Lock()
@@ -531,32 +520,11 @@ func (cc *tcpCongestionControl) onTimeout() {
 	cc.dupAcks = 0
 }
 
-// onNewAckAfterFastRetransmit is called when new data is acked during fast recovery.
-func (cc *tcpCongestionControl) onNewAckAfterFastRetransmit() {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	// Deflate cwnd to ssthresh
-	cc.cwnd = cc.ssthresh
-	cc.dupAcks = 0
-}
-
 // getCwnd returns the current congestion window.
 func (cc *tcpCongestionControl) getCwnd() uint32 {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return cc.cwnd
-}
-
-// effectiveWindow returns the minimum of cwnd and peer's advertised window.
-func (cc *tcpCongestionControl) effectiveWindow(peerWnd uint32) uint32 {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	if cc.cwnd < peerWnd {
-		return cc.cwnd
-	}
-	return peerWnd
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -576,11 +544,6 @@ func seqLTE(a, b uint32) bool {
 // seqGT returns true if a > b (handling wraparound).
 func seqGT(a, b uint32) bool {
 	return int32(a-b) > 0
-}
-
-// seqGTE returns true if a >= b (handling wraparound).
-func seqGTE(a, b uint32) bool {
-	return int32(a-b) >= 0
 }
 
 // seqOverlap returns true if [aStart, aEnd) overlaps with [bStart, bEnd).

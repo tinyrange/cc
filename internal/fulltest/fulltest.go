@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1246,15 +1245,4 @@ func Summary(result RunResult, w io.Writer) int {
 		return 1
 	}
 	return 0
-}
-
-func ParsePositiveInt(value string, fallback int) int {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 {
-		return fallback
-	}
-	return n
 }
