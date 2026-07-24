@@ -62,6 +62,24 @@ func TestConfigurePackageManagersDoesNotDisableAptPipelining(t *testing.T) {
 	}
 }
 
+func TestConfigureDevicePermissionsMakesFuseAvailableToGuestUsers(t *testing.T) {
+	devRoot := t.TempDir()
+	fusePath := filepath.Join(devRoot, "fuse")
+	if err := os.WriteFile(fusePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	configureDevicePermissions(devRoot)
+
+	info, err := os.Stat(fusePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o666 {
+		t.Fatalf("/dev/fuse permissions = %#o, want 0666", got)
+	}
+}
+
 func TestInstallModuleSymversUsesKernelBuildPath(t *testing.T) {
 	root := t.TempDir()
 	release := "6.18.39-0-virt"

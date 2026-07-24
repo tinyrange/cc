@@ -36,6 +36,10 @@ func HasFatalBootText(text string) bool               { return vmruntime.HasFata
 func ParseInitDurationMarker(text string) (int, bool) { return vmruntime.ParseInitDurationMarker(text) }
 
 func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) ([]byte, error) {
+	var snapshotMMIOBase uint64
+	if strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "" {
+		snapshotMMIOBase = SnapshotBase
+	}
 	return BuildInitramfs(req.Init, req.Modules, GuestInitConfig{
 		Env:               append([]string(nil), baseEnv...),
 		WorkDir:           workDir,
@@ -54,7 +58,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		ExitMarkerPrefix:  CommandExitMarkerPref,
 		PrecopyAMD64Root:  strings.TrimSpace(os.Getenv("CCX3_BENCH_PRECOPY_AMD64_ROOT")) != "",
 		Network:           req.Network,
-		SnapshotMMIOBase:  SnapshotBase,
+		SnapshotMMIOBase:  snapshotMMIOBase,
 		UnixTime:          req.UnixTime,
 		KernelRelease:     req.KernelRelease,
 		ModuleSymvers:     req.ModuleSymvers,
@@ -94,7 +98,7 @@ func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.Share
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
 		rootFSOwned = true
 	}
-	shares := make([]virtio.ShareMount, 0, len(req.Shares))
+	shares := append([]virtio.ShareMount(nil), req.Mounts...)
 	for i, share := range req.Shares {
 		mount, err := BuildShareMount(i, share)
 		if err != nil {

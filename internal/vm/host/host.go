@@ -503,6 +503,16 @@ func (i *hostedInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 	}
 }
 
+func (i *hostedInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
+	provider, ok := i.Instance.(interface {
+		PersistentFSStatus() []virtio.PersistentFSStatus
+	})
+	if !ok {
+		return nil
+	}
+	return provider.PersistentFSStatus()
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil

@@ -47,6 +47,9 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 {
+		return nil, fmt.Errorf("persistent image mounts are not yet supported on windows/amd64")
+	}
 	mountState, err := mounts.NewState(req.Shares)
 	if err != nil {
 		return nil, err
@@ -183,6 +186,9 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 {
+		return nil, fmt.Errorf("persistent image mounts are not yet supported on windows/amd64")
+	}
 	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}

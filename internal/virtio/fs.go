@@ -2115,6 +2115,17 @@ func (f *FS) BackingMetadataUsage() (current, highWater uint64) {
 	return provider.BackingMetadataUsage()
 }
 
+func (f *FS) PersistentFSStatus() []PersistentFSStatus {
+	if f == nil {
+		return nil
+	}
+	backend := f.filesystemBackend()
+	if provider, ok := backend.(interface{ PersistentFSStatus() []PersistentFSStatus }); ok {
+		return provider.PersistentFSStatus()
+	}
+	return nil
+}
+
 func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
 	count := stat.count.Load()
 	if count == 0 {

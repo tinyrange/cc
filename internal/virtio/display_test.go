@@ -214,6 +214,60 @@ func TestInputDeliversOrderedEventsToPostedBuffers(t *testing.T) {
 	}
 }
 
+func TestAbsolutePointerReportsMouseWheel(t *testing.T) {
+	mem := make(testGuestMemory, 64<<10)
+	input := NewAbsolutePointerInput(0x1000, 0x1000, 11, 800, 600)
+	input.Attach(mem, &testIRQ{})
+
+	eventTypes := input.eventBitmapLocked(0)
+	if eventTypes[inputEventRel/8]&(1<<(inputEventRel%8)) == 0 {
+		t.Fatal("pointer does not advertise relative events")
+	}
+	relativeEvents := input.eventBitmapLocked(inputEventRel)
+	if relativeEvents[inputRelWheel/8]&(1<<(inputRelWheel%8)) == 0 {
+		t.Fatal("pointer does not advertise a vertical wheel")
+	}
+
+	q := &input.queues[inputQueueEvent]
+	q.size = 16
+	q.ready = true
+	q.descAddr = 0x2000
+	q.availAddr = 0x3000
+	q.usedAddr = 0x3800
+	for index := uint16(0); index < q.size; index++ {
+		writeDesc(mem, q.descAddr+uint64(index)*16, 0x4000+uint64(index)*8, 8, descFWrite, 0)
+		binary.LittleEndian.PutUint16(mem[q.availAddr+4+uint64(index)*2:], index)
+	}
+	binary.LittleEndian.PutUint16(mem[q.availAddr+2:], q.size)
+
+	// RFB button four is one wheel-up step. The matching release must not
+	// generate a second step.
+	if err := input.PointerEvent(400, 300, 8, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.PointerEvent(400, 300, 0, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.PointerEvent(400, 300, 16, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.PointerEvent(400, 300, 0, 16); err != nil {
+		t.Fatal(err)
+	}
+
+	var wheelEvents []int32
+	for index := uint16(0); index < q.usedIdx; index++ {
+		event := mem[0x4000+uint64(index)*8:]
+		if binary.LittleEndian.Uint16(event) == inputEventRel &&
+			binary.LittleEndian.Uint16(event[2:]) == inputRelWheel {
+			wheelEvents = append(wheelEvents, int32(binary.LittleEndian.Uint32(event[4:])))
+		}
+	}
+	if len(wheelEvents) != 2 || wheelEvents[0] != 1 || wheelEvents[1] != -1 {
+		t.Fatalf("wheel events = %v, want [1 -1]", wheelEvents)
+	}
+}
+
 func TestFramebufferIncrementalSnapshot(t *testing.T) {
 	framebuffer, err := NewFramebuffer(4, 3)
 	if err != nil {

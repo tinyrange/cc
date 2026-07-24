@@ -8,7 +8,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"j5.nz/cc/internal/fsmeta"
@@ -86,6 +88,109 @@ type Entry struct {
 type DirEnt struct {
 	Name string
 	Mode fs.FileMode
+}
+
+// Namespace is an immutable, process-wide index of every node in an image.
+// Node IDs are stable for the lifetime of the namespace and may be shared by
+// any number of VM-specific copy-on-write filesystems.
+type Namespace struct {
+	Nodes []*NamespaceNode
+
+	cacheMu sync.Mutex
+	cache   map[any]any
+}
+
+type NamespaceNode struct {
+	ID       uint64
+	Parent   uint64
+	Name     string
+	Entry    Entry
+	Children map[string]uint64
+}
+
+type NamespaceDirectory interface {
+	Directory
+	Namespace() *Namespace
+}
+
+func DirectoryNamespace(root Directory) *Namespace {
+	if indexed, ok := root.(NamespaceDirectory); ok {
+		return indexed.Namespace()
+	}
+	return nil
+}
+
+// Cached lets backend implementations attach derived immutable indexes to the
+// namespace without introducing a dependency from imagefs back to a backend.
+func (n *Namespace) Cached(key any, build func() any) any {
+	if n == nil {
+		return build()
+	}
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	if value := n.cache[key]; value != nil {
+		return value
+	}
+	if n.cache == nil {
+		n.cache = make(map[any]any)
+	}
+	value := build()
+	n.cache[key] = value
+	return value
+}
+
+func BuildNamespace(root Directory) (*Namespace, error) {
+	if root == nil {
+		return nil, fmt.Errorf("root filesystem is nil")
+	}
+	namespace := &Namespace{Nodes: []*NamespaceNode{nil}}
+	rootNode := &NamespaceNode{
+		ID:       1,
+		Parent:   1,
+		Name:     "/",
+		Entry:    Entry{Dir: root},
+		Children: make(map[string]uint64),
+	}
+	namespace.Nodes = append(namespace.Nodes, rootNode)
+	var addDirectory func(*NamespaceNode, Directory) error
+	addDirectory = func(parent *NamespaceNode, directory Directory) error {
+		entries, err := directory.ReadDir()
+		if err != nil {
+			return err
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		for _, dirent := range entries {
+			if dirent.Name == "." || dirent.Name == ".." {
+				continue
+			}
+			entry, err := directory.Lookup(dirent.Name)
+			if err != nil {
+				return fmt.Errorf("lookup %q: %w", dirent.Name, err)
+			}
+			id := uint64(len(namespace.Nodes))
+			node := &NamespaceNode{
+				ID:     id,
+				Parent: parent.ID,
+				Name:   dirent.Name,
+				Entry:  entry,
+			}
+			if entry.Dir != nil {
+				node.Children = make(map[string]uint64)
+			}
+			namespace.Nodes = append(namespace.Nodes, node)
+			parent.Children[dirent.Name] = id
+			if entry.Dir != nil {
+				if err := addDirectory(node, entry.Dir); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := addDirectory(rootNode, root); err != nil {
+		return nil, err
+	}
+	return namespace, nil
 }
 
 func NewHostFS(root string, meta map[string]fsmeta.Entry) Directory {

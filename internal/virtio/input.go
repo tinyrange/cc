@@ -24,9 +24,11 @@ const (
 
 	inputEventSyn = 0x00
 	inputEventKey = 0x01
+	inputEventRel = 0x02
 	inputEventAbs = 0x03
 
 	inputSynReport = 0
+	inputRelWheel  = 0x08
 	inputAbsX      = 0
 	inputAbsY      = 1
 	inputBtnLeft   = 0x110
@@ -298,6 +300,16 @@ func (i *Input) PointerEvent(x, y uint32, buttons uint8, previous uint8) error {
 		}
 		events = append(events, InputEvent{Type: inputEventKey, Code: button.code, Value: value})
 	}
+	// RFB represents vertical wheel movement as momentary presses of buttons
+	// four and five. Linux expects those pulses as relative wheel events rather
+	// than ordinary buttons. Report only the rising edge because viewers send a
+	// matching release after each wheel step.
+	if buttons&8 != 0 && previous&8 == 0 {
+		events = append(events, InputEvent{Type: inputEventRel, Code: inputRelWheel, Value: 1})
+	}
+	if buttons&16 != 0 && previous&16 == 0 {
+		events = append(events, InputEvent{Type: inputEventRel, Code: inputRelWheel, Value: -1})
+	}
 	events = append(events, InputEvent{Type: inputEventSyn, Code: inputSynReport})
 
 	// A viewer can report pointer motion faster than the guest replenishes its
@@ -456,6 +468,7 @@ func (i *Input) eventBitmapLocked(eventType byte) []byte {
 		setInputBit(bitmap, inputEventSyn)
 		setInputBit(bitmap, inputEventKey)
 		if i.Kind == InputAbsolutePointer {
+			setInputBit(bitmap, inputEventRel)
 			setInputBit(bitmap, inputEventAbs)
 		}
 		return bitmap
@@ -472,6 +485,12 @@ func (i *Input) eventBitmapLocked(eventType byte) []byte {
 		setInputBit(bitmap, inputBtnRight)
 		setInputBit(bitmap, inputBtnMiddle)
 		return bitmap
+	case inputEventRel:
+		if i.Kind == InputAbsolutePointer {
+			bitmap := make([]byte, inputRelWheel/8+1)
+			setInputBit(bitmap, inputRelWheel)
+			return bitmap
+		}
 	case inputEventAbs:
 		if i.Kind == InputAbsolutePointer {
 			bitmap := make([]byte, 1)

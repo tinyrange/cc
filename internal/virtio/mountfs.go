@@ -168,6 +168,16 @@ func (m *mountedFS) BackingMetadataUsage() (current, highWater uint64) {
 	return current, highWater
 }
 
+func (m *mountedFS) PersistentFSStatus() []PersistentFSStatus {
+	var statuses []PersistentFSStatus
+	for _, backend := range m.distinctBackends() {
+		if provider, ok := backend.(interface{ PersistentFSStatus() []PersistentFSStatus }); ok {
+			statuses = append(statuses, provider.PersistentFSStatus()...)
+		}
+	}
+	return statuses
+}
+
 // Close deterministically releases the root and every distinct mounted
 // backend. Virtio FS may call this from more than one shutdown path, so the
 // ownership boundary is idempotent.

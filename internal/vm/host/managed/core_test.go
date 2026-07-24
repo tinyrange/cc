@@ -44,6 +44,29 @@ func TestCoreUnsupportedExtensionsUseCapabilities(t *testing.T) {
 	}
 }
 
+func TestCoreUsesConfiguredDefaultUserWithoutOverridingExplicitUser(t *testing.T) {
+	inst := NewCore(Config{DefaultUser: "jovyan"})
+	resolved, err := inst.ExecRequest(client.ExecRequest{Command: []string{"/bin/true"}, SkipResolve: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.User != "jovyan" {
+		t.Fatalf("default user = %q", resolved.User)
+	}
+
+	resolved, err = inst.ExecRequest(client.ExecRequest{
+		Command:     []string{"/bin/true"},
+		SkipResolve: true,
+		User:        "root",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.User != "root" {
+		t.Fatalf("explicit user = %q", resolved.User)
+	}
+}
+
 type helperSession struct{}
 
 func (s *helperSession) Exec(context.Context, client.ExecRequest) (client.ExecResponse, error) {

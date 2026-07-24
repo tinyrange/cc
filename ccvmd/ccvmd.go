@@ -3,6 +3,7 @@ package ccvmd
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net/http"
 
 	"j5.nz/cc/client"
@@ -15,6 +16,7 @@ type ServerOptions struct {
 	TokenPath              string
 	Authentication         *ServerAuthentication
 	Persistent             bool
+	StartupWriter          io.Writer
 	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
@@ -72,8 +74,9 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 			}
 			return opts.Authentication.internal
 		}(),
-		Persistent: opts.Persistent,
-		OnStartup:  opts.OnStartup,
+		Persistent:    opts.Persistent,
+		StartupWriter: opts.StartupWriter,
+		OnStartup:     opts.OnStartup,
 		NormalizeCreateRequest: func(req *client.CreateInstanceRequest, runtime internal.RuntimeView) error {
 			if opts.NormalizeCreateRequest == nil {
 				return nil

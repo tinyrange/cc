@@ -1084,6 +1084,42 @@
           "cache": { "type": "string" }
         }
       },
+      "PersistentMount": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "description": "Validated store name beneath the daemon's persistent storage root." },
+          "mount": { "type": "string", "description": "Absolute image directory to overlay. If omitted, cc resolves the configured image user's home." },
+          "owner_uid": { "type": "integer", "format": "uint32" },
+          "owner_gid": { "type": "integer", "format": "uint32" },
+          "map_owner": { "type": "boolean" }
+        }
+      },
+      "PersistentMountState": {
+        "type": "object",
+        "required": ["name", "mount", "format_version", "sequence", "durable_sequence"],
+        "properties": {
+          "name": { "type": "string" },
+          "mount": { "type": "string" },
+          "format_version": { "type": "integer", "format": "uint32" },
+          "lower_id": { "type": "string" },
+          "previous_lower_id": { "type": "string" },
+          "sequence": { "type": "integer", "format": "uint64" },
+          "durable_sequence": { "type": "integer", "format": "uint64" },
+          "upper_logical_bytes": { "type": "integer", "format": "uint64" },
+          "upper_data_bytes": { "type": "integer", "format": "uint64" },
+          "upper_physical_bytes": { "type": "integer", "format": "uint64" },
+          "wal_bytes": { "type": "integer", "format": "uint64" },
+          "staging_bytes": { "type": "integer", "format": "uint64" },
+          "trash_bytes": { "type": "integer", "format": "uint64" },
+          "recovery_status": { "type": "string" },
+          "quarantine_path": { "type": "string" },
+          "discarded_bytes": { "type": "integer", "format": "uint64" },
+          "last_checkpoint": { "type": "string" },
+          "last_error": { "type": "string" },
+          "host_free_bytes": { "type": "integer", "format": "uint64" }
+        }
+      },
       "NetworkConfig": {
         "type": "object",
         "properties": {
@@ -1137,9 +1173,11 @@
         "properties": {
           "id": { "type": "string" },
           "image": { "type": "string" },
+          "default_user": { "type": "string", "description": "Default guest user for commands. An explicit per-command user takes precedence." },
           "init": { "type": "string" },
           "kernel": { "type": "string" },
           "shares": { "type": "array", "items": { "$ref": "#/components/schemas/ShareMount" } },
+          "persistent_mounts": { "type": "array", "items": { "$ref": "#/components/schemas/PersistentMount" } },
           "network": { "$ref": "#/components/schemas/NetworkConfig" },
           "display": { "$ref": "#/components/schemas/DisplayConfig" },
           "kernel_modules": { "type": "array", "items": { "type": "string" } },
@@ -1173,6 +1211,7 @@
           "started_at": { "type": "string" },
           "network_ipv4": { "type": "string" },
           "display": { "$ref": "#/components/schemas/DisplayState" },
+          "persistent_mounts": { "type": "array", "items": { "$ref": "#/components/schemas/PersistentMountState" } },
           "error": { "type": "string" }
         }
       },

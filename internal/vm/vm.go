@@ -98,6 +98,10 @@ type instanceBackingSnapshotProvider interface {
 	BackingSnapshot() virtio.FSBackingUsageSnapshot
 }
 
+type instancePersistentFSStatusProvider interface {
+	PersistentFSStatus() []virtio.PersistentFSStatus
+}
+
 type instanceDesktopProvider interface {
 	Desktop() *virtio.Desktop
 }
@@ -217,7 +221,8 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
 	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+	if (runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")) ||
+		(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") {
 		caps.SupportsDisplay = true
 	}
 	if runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
@@ -1193,6 +1198,7 @@ type managerStatusSnapshot struct {
 	backingMetadataProvider instanceBackingMetadataUsageProvider
 	backingCombinedProvider instanceBackingCombinedUsageProvider
 	backingSnapshotProvider instanceBackingSnapshotProvider
+	persistentFSProvider    instancePersistentFSStatusProvider
 	balloonProvider         instanceBalloonStateProvider
 	displayFramebuffer      *virtio.Framebuffer
 }
@@ -1247,6 +1253,9 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	if provider, ok := machine.instance.(instanceBackingSnapshotProvider); ok {
 		snapshot.backingSnapshotProvider = provider
 	}
+	if provider, ok := machine.instance.(instancePersistentFSStatusProvider); ok {
+		snapshot.persistentFSProvider = provider
+	}
 	if provider, ok := machine.instance.(instanceBalloonStateProvider); ok {
 		snapshot.balloonProvider = provider
 	} else {
@@ -1260,7 +1269,7 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 }
 
 func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.InstanceState {
-	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.backingSnapshotProvider == nil && snapshot.balloonProvider == nil && snapshot.displayFramebuffer == nil {
+	if snapshot.provider == nil && snapshot.backingProvider == nil && snapshot.backingMetadataProvider == nil && snapshot.backingCombinedProvider == nil && snapshot.backingSnapshotProvider == nil && snapshot.persistentFSProvider == nil && snapshot.balloonProvider == nil && snapshot.displayFramebuffer == nil {
 		return snapshot.state
 	}
 	if snapshot.state.Display != nil && snapshot.displayFramebuffer != nil {
@@ -1332,6 +1341,34 @@ func (m *Manager) resolveStatusSnapshot(snapshot managerStatusSnapshot) client.I
 		snapshot.machine.backingMu.Unlock()
 		if usage.ReclaimError != nil {
 			snapshot.state.BackingReclaimError = usage.ReclaimError.Error()
+		}
+	}
+	if snapshot.persistentFSProvider != nil {
+		for _, status := range snapshot.persistentFSProvider.PersistentFSStatus() {
+			state := client.PersistentMountState{
+				Name:               status.Name,
+				Mount:              status.Mount,
+				FormatVersion:      status.FormatVersion,
+				LowerID:            status.LowerID,
+				PreviousLowerID:    status.PreviousLowerID,
+				Sequence:           status.Sequence,
+				DurableSequence:    status.DurableSequence,
+				UpperLogicalBytes:  status.UpperLogicalBytes,
+				UpperDataBytes:     status.UpperDataBytes,
+				UpperPhysicalBytes: status.UpperPhysicalBytes,
+				WALBytes:           status.WALBytes,
+				StagingBytes:       status.StagingBytes,
+				TrashBytes:         status.TrashBytes,
+				RecoveryStatus:     status.RecoveryStatus,
+				QuarantinePath:     status.QuarantinePath,
+				DiscardedBytes:     status.DiscardedBytes,
+				LastError:          status.LastError,
+				HostFreeBytes:      status.HostFreeBytes,
+			}
+			if !status.LastCheckpoint.IsZero() {
+				state.LastCheckpoint = status.LastCheckpoint.Format(time.RFC3339Nano)
+			}
+			snapshot.state.PersistentMounts = append(snapshot.state.PersistentMounts, state)
 		}
 	}
 	if snapshot.balloonProvider != nil {

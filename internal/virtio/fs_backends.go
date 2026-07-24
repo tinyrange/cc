@@ -44,18 +44,23 @@ type passthroughHandle struct {
 }
 
 type imageFS struct {
-	root       string
-	dataStore  *imageDataStore
-	ownerUID   uint32
-	ownerGID   uint32
-	mapOwner   bool
-	debugPaths []string
-	debugLog   io.Writer
+	root            string
+	dataStore       *imageDataStore
+	persistent      *persistentImageStore
+	persistentLower imagefs.Directory
+	persistentNodes map[uint64]struct{}
+	ownerUID        uint32
+	ownerGID        uint32
+	mapOwner        bool
+	debugPaths      []string
+	debugLog        io.Writer
 
 	mu                    sync.Mutex
 	nextNodeID            uint64
 	nextHandle            uint64
+	baseNodes             []*imageNode
 	nodes                 map[uint64]*imageNode
+	removedNodes          map[uint64]struct{}
 	handles               map[uint64]imageHandle
 	dirHandles            map[uint64][]dirEntry
 	dirHandleNodes        map[uint64]uint64
@@ -109,13 +114,19 @@ type imageNode struct {
 	ctime             time.Time
 	xattrs            map[string][]byte
 	abstractFile      imagefs.File
-	// lowerFile remains immutable after the first writable operation. data is
-	// a page overlay, so metadata changes and small writes do not eagerly copy
-	// the lower file or expand its sparse holes.
-	lowerFile    imagefs.File
-	lowerSize    uint64
-	abstractDir  imagefs.Directory
-	abstractLink imagefs.Symlink
+	// Ephemeral imageFS uses a page overlay. Persistent imageFS materializes
+	// the lower file once on its first data mutation, then writes its stable
+	// inode-addressed upper file in place.
+	lowerFile              imagefs.File
+	lowerSize              uint64
+	persistentLowerPath    string
+	persistentIndependent  bool
+	persistentLowerMissing bool
+	abstractDir            imagefs.Directory
+	abstractLink           imagefs.Symlink
+	// baseDirEntries is the immutable, sorted directory view shared by every
+	// VM using the same image namespace. A copy-on-write node clears it.
+	baseDirEntries []dirEntry
 }
 
 const imageDataPageSize = uint64(4096)
@@ -381,10 +392,10 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		nextNodeID:            2,
 		nextHandle:            1,
 		nodes:                 map[uint64]*imageNode{},
+		removedNodes:          map[uint64]struct{}{},
 		handles:               map[uint64]imageHandle{},
 		dirHandles:            map[uint64][]dirEntry{},
 		dirHandleNodes:        map[uint64]uint64{},
-		retainedNodes:         1,
 		materializationCtx:    materializationCtx,
 		materializationCancel: materializationCancel,
 	}
@@ -392,6 +403,12 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 	if root == nil {
 		root = imagefs.NewHostFS("", nil)
 	}
+	if namespace := imagefs.DirectoryNamespace(root); namespace != nil {
+		imgFS.baseNodes = cachedImageNamespace(namespace)
+		imgFS.nextNodeID = uint64(len(imgFS.baseNodes))
+		return imgFS
+	}
+	imgFS.nextNodeID = 2
 	rootMode := fs.ModeDir | root.Stat()
 	rootUID, rootGID := root.Owner()
 	rootRDev := root.RDev()
@@ -411,8 +428,176 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		modTime:     rootModTime,
 		abstractDir: root,
 	}
-	imgFS.refreshImageNodeMetadataLocked(imgFS.nodes[1])
+	imgFS.noteImageNodeAddedLocked(imgFS.nodes[1])
 	return imgFS
+}
+
+var imageNamespaceCacheKey byte
+
+func cachedImageNamespace(namespace *imagefs.Namespace) []*imageNode {
+	value := namespace.Cached(&imageNamespaceCacheKey, func() any {
+		nodes := make([]*imageNode, len(namespace.Nodes))
+		for id := 1; id < len(namespace.Nodes); id++ {
+			source := namespace.Nodes[id]
+			if source == nil {
+				continue
+			}
+			node := imageNodeFromEntry(source.ID, source.Parent, source.Name, source.Entry)
+			node.entries = source.Children
+			node.entriesDone = true
+			nodes[id] = node
+		}
+		for id := 1; id < len(nodes); id++ {
+			node := nodes[id]
+			if node == nil || !node.isDir() {
+				continue
+			}
+			entries := make([]dirEntry, 0, len(node.entries)+2)
+			entries = append(entries,
+				dirEntry{name: ".", typ: dirTypeDir, ino: node.id},
+				dirEntry{name: "..", typ: dirTypeDir, ino: node.parent},
+			)
+			names := make([]string, 0, len(node.entries))
+			for name := range node.entries {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				child := nodes[node.entries[name]]
+				entries = append(entries, dirEntry{name: name, typ: imageNodeDirType(child), ino: child.id})
+				if child != nil && child.isDir() {
+					node.nlink++
+				}
+			}
+			node.nlink += 2
+			node.baseDirEntries = entries
+		}
+		return nodes
+	})
+	return value.([]*imageNode)
+}
+
+func imageNodeFromEntry(id, parent uint64, name string, entry imagefs.Entry) *imageNode {
+	node := &imageNode{
+		id:      id,
+		parent:  parent,
+		name:    name,
+		entries: map[string]uint64{},
+		modTime: time.Unix(0, 0),
+	}
+	switch {
+	case entry.Dir != nil:
+		node.abstractDir = entry.Dir
+		node.mode = fs.ModeDir | entry.Dir.Stat()
+		node.modTime = entry.Dir.ModTime()
+		node.uid, node.gid = entry.Dir.Owner()
+		node.rdev = entry.Dir.RDev()
+	case entry.File != nil:
+		node.abstractFile = entry.File
+		node.size, node.mode = entry.File.Stat()
+		node.modTime = entry.File.ModTime()
+		node.uid, node.gid = entry.File.Owner()
+		node.rdev = entry.File.RDev()
+	case entry.Symlink != nil:
+		node.abstractLink = entry.Symlink
+		node.mode = fs.ModeSymlink | entry.Symlink.Stat().Perm()
+		node.symlinkTarget = entry.Symlink.Target()
+		node.size = uint64(len(node.symlinkTarget))
+		node.modTime = entry.Symlink.ModTime()
+		node.uid, node.gid = entry.Symlink.Owner()
+		node.rdev = entry.Symlink.RDev()
+	}
+	if node.modTime.IsZero() {
+		node.modTime = time.Unix(0, 0)
+	}
+	if !node.isDir() {
+		node.nlink = 1
+	}
+	return node
+}
+
+func (p *imageFS) imageNodeLocked(id uint64) *imageNode {
+	if node := p.nodes[id]; node != nil {
+		return node
+	}
+	if _, removed := p.removedNodes[id]; removed {
+		return nil
+	}
+	if id < uint64(len(p.baseNodes)) {
+		return p.baseNodes[id]
+	}
+	return nil
+}
+
+func (p *imageFS) mutableImageNodeLocked(id uint64) *imageNode {
+	if node := p.nodes[id]; node != nil {
+		p.rememberPersistentLowerPathLocked(node)
+		p.markPersistentNodeLocked(node)
+		return node
+	}
+	base := p.imageNodeLocked(id)
+	if base == nil {
+		return nil
+	}
+	node := *base
+	node.entries = cloneStringUint64Map(base.entries)
+	node.whiteouts = cloneStringBoolMap(base.whiteouts)
+	node.xattrs = cloneXattrMap(base.xattrs)
+	node.data.extents = append([]imageDataExtent(nil), base.data.extents...)
+	node.baseDirEntries = nil
+	node.retainedEntries = len(node.entries)
+	node.retainedWhiteouts = len(node.whiteouts)
+	node.accountedMetadata = 0
+	p.rememberPersistentLowerPathLocked(&node)
+	p.nodes[id] = &node
+	p.retainedEntries += node.retainedEntries
+	p.retainedWhiteouts += node.retainedWhiteouts
+	p.noteImageNodeAddedLocked(&node)
+	p.markPersistentNodeLocked(&node)
+	return &node
+}
+
+func (p *imageFS) rememberPersistentLowerPathLocked(node *imageNode) {
+	if p == nil || p.persistent == nil || node == nil || node.persistentLowerPath != "" {
+		return
+	}
+	if node.abstractDir == nil && node.abstractFile == nil && node.abstractLink == nil && node.lowerFile == nil {
+		return
+	}
+	node.persistentLowerPath = p.pathForNode(node.id)
+}
+
+func cloneStringUint64Map(source map[string]uint64) map[string]uint64 {
+	if len(source) == 0 {
+		return map[string]uint64{}
+	}
+	clone := make(map[string]uint64, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func cloneStringBoolMap(source map[string]bool) map[string]bool {
+	if len(source) == 0 {
+		return nil
+	}
+	clone := make(map[string]bool, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func cloneXattrMap(source map[string][]byte) map[string][]byte {
+	if len(source) == 0 {
+		return nil
+	}
+	clone := make(map[string][]byte, len(source))
+	for key, value := range source {
+		clone[key] = append([]byte(nil), value...)
+	}
+	return clone
 }
 
 func (p *passthroughFS) Init() (uint32, uint32) {
@@ -1105,7 +1290,7 @@ func (p *passthroughFS) fileAttr(nodeID uint64, hostPath string, info os.FileInf
 }
 
 func (p *imageFS) pathForNode(id uint64) string {
-	node := p.nodes[id]
+	node := p.imageNodeLocked(id)
 	if node == nil {
 		return ""
 	}
@@ -1115,7 +1300,7 @@ func (p *imageFS) pathForNode(id uint64) string {
 	var parts []string
 	for node != nil && node.id != 1 {
 		parts = append(parts, node.name)
-		node = p.nodes[node.parent]
+		node = p.imageNodeLocked(node.parent)
 	}
 	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
 		parts[i], parts[j] = parts[j], parts[i]
@@ -1188,12 +1373,23 @@ func (p *imageFS) restoreNodePath(nodePath string) error {
 func (p *imageFS) nodeIDForPath(nodePath string) (uint64, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for id := range p.nodes {
-		if p.pathForNode(id) == nodePath {
-			return id, true
-		}
+	clean := path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
+	nodeID := uint64(1)
+	if clean == "/" {
+		return nodeID, p.imageNodeLocked(nodeID) != nil
 	}
-	return 0, false
+	for _, part := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
+		node := p.imageNodeLocked(nodeID)
+		if node == nil || !node.isDir() || node.whiteouts[part] {
+			return 0, false
+		}
+		next, ok := node.entries[part]
+		if !ok || p.imageNodeLocked(next) == nil {
+			return 0, false
+		}
+		nodeID = next
+	}
+	return nodeID, true
 }
 
 func virtioFSDebugPathsFromEnv() []string {
@@ -1281,7 +1477,7 @@ func (p *imageFS) Init() (uint32, uint32) {
 func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
 	}
@@ -1290,7 +1486,7 @@ func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 
 func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxENOENT
@@ -1301,7 +1497,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 		p.mu.Unlock()
 		return parentNode.id, attr, 0
 	case "..":
-		node := p.nodes[parentNode.parent]
+		node := p.imageNodeLocked(parentNode.parent)
 		if node == nil {
 			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
@@ -1324,6 +1520,11 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
 		}
+		if parentNode.entriesDone {
+			p.debugChildfLocked("lookup-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
 		if parentNode.abstractDir == nil {
 			p.debugChildfLocked("lookup-miss", parent, name, "errno=%d", -linuxENOENT)
 			p.mu.Unlock()
@@ -1341,7 +1542,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			return 0, FuseAttr{}, errno
 		}
 		p.mu.Lock()
-		parentNode = p.nodes[parent]
+		parentNode = p.imageNodeLocked(parent)
 		if parentNode == nil {
 			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
@@ -1352,7 +1553,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		if existingID, exists := parentNode.entries[name]; exists {
-			child := p.nodes[existingID]
+			child := p.imageNodeLocked(existingID)
 			if child == nil {
 				p.debugChildfLocked("lookup-stale-node", parent, name, "node=%d errno=%d", existingID, -linuxENOENT)
 				p.mu.Unlock()
@@ -1379,7 +1580,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 		p.mu.Unlock()
 		return child.id, attr, 0
 	}
-	child := p.nodes[childID]
+	child := p.imageNodeLocked(childID)
 	if child == nil {
 		p.debugChildfLocked("lookup-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		p.mu.Unlock()
@@ -1398,7 +1599,7 @@ func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uint32) (uint64, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return 0, -linuxENOENT
 	}
@@ -1407,14 +1608,21 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 		return 0, -linuxEISDIR
 	}
 	if flags&linuxOACCMODE != linuxORDONLY {
+		node = p.mutableImageNodeLocked(nodeID)
+		if node == nil {
+			return 0, -linuxENOENT
+		}
 		if errno := p.copyUpFileLocked(node); errno != 0 {
 			return 0, errno
 		}
 		if flags&linuxOTRUNC != 0 {
-			node.data.release(p.dataStore)
+			if err := p.releaseImageDataLocked(node); err != nil {
+				return 0, errnoFromError(err)
+			}
 			node.data = sparseImageData{}
 			node.lowerFile = nil
 			node.lowerSize = 0
+			node.persistentIndependent = p.persistent != nil
 			node.size = 0
 			if uid != 0 {
 				node.mode &^= fs.FileMode(0o6000)
@@ -1423,6 +1631,9 @@ func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uin
 			node.modTime = now
 			node.ctime = now
 			p.refreshImageNodeMetadataLocked(node)
+			if errno := p.commitPersistentMutationLocked(); errno != 0 {
+				return 0, errno
+			}
 		}
 	}
 	fh := p.nextHandle
@@ -1460,10 +1671,32 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 }
 
 func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
+	p.mu.Lock()
+	err := p.flushPersistentLocked(false)
+	p.mu.Unlock()
+	if err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
-func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
+func (p *imageFS) Fsync(nodeID uint64, _ uint64, _ uint32) int32 {
+	p.mu.Lock()
+	if p.persistent != nil {
+		err := p.persistent.syncData(nodeID)
+		if err == nil {
+			err = p.flushPersistentLocked(true)
+		}
+		if err == nil {
+			err = p.maybeCheckpointPersistentLocked()
+		}
+		p.mu.Unlock()
+		if err != nil {
+			return errnoFromError(err)
+		}
+		return 0
+	}
+	p.mu.Unlock()
 	if err := p.dataStore.sync(); err != nil {
 		return errnoFromError(err)
 	}
@@ -1471,6 +1704,19 @@ func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
 }
 
 func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
+	p.mu.Lock()
+	if p.persistent != nil {
+		err := p.flushPersistentLocked(true)
+		if err == nil {
+			err = p.maybeCheckpointPersistentLocked()
+		}
+		p.mu.Unlock()
+		if err != nil {
+			return errnoFromError(err)
+		}
+		return 0
+	}
+	p.mu.Unlock()
 	if err := p.dataStore.sync(); err != nil {
 		return errnoFromError(err)
 	}
@@ -1480,10 +1726,14 @@ func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
 func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if !ok || handle.nodeID != nodeID || node == nil {
 		p.mu.Unlock()
 		return nil, -linuxEBADF
+	}
+	if node.persistentLowerMissing {
+		p.mu.Unlock()
+		return nil, -linuxEIO
 	}
 	if node.abstractFile == nil {
 		end := off + uint64(size)
@@ -1523,11 +1773,13 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 				copy(data, lower)
 			}
 		}
-		if err := node.data.readAt(p.dataStore, data, off); err != nil {
+		if err := p.readImageDataLocked(node, data, off); err != nil {
 			p.mu.Unlock()
 			return nil, errnoFromError(err)
 		}
-		node.atime = time.Now()
+		if current := p.mutableImageNodeLocked(nodeID); current != nil {
+			current.atime = time.Now()
+		}
 		p.mu.Unlock()
 		return data, 0
 	}
@@ -1540,7 +1792,7 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 			return nil, errnoFromError(err)
 		}
 		p.mu.Lock()
-		if current := p.nodes[nodeID]; current != nil {
+		if current := p.mutableImageNodeLocked(nodeID); current != nil {
 			current.atime = time.Now()
 		}
 		p.mu.Unlock()
@@ -1554,7 +1806,7 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 		return []byte{}, 0
 	}
 	p.mu.Lock()
-	if current := p.nodes[nodeID]; current != nil {
+	if current := p.mutableImageNodeLocked(nodeID); current != nil {
 		current.atime = time.Now()
 	}
 	p.mu.Unlock()
@@ -1564,7 +1816,7 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
 	p.mu.Lock()
 	handle, ok := p.handles[fh]
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if !ok || handle.nodeID != nodeID || node == nil {
 		p.mu.Unlock()
 		return 0, -linuxEBADF
@@ -1628,25 +1880,28 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return 0, -linuxENOENT
 	}
 	if !node.isDir() {
 		return 0, -linuxENOTDIR
 	}
-	entries := []dirEntry{
-		{name: ".", typ: dirTypeDir, ino: node.id},
-		{name: "..", typ: dirTypeDir, ino: node.parent},
-	}
-	names := make([]string, 0, len(node.entries))
-	for name := range node.entries {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		child := p.nodes[node.entries[name]]
-		entries = append(entries, dirEntry{name: name, typ: p.dirType(child), ino: child.id})
+	entries := node.baseDirEntries
+	if entries == nil {
+		entries = []dirEntry{
+			{name: ".", typ: dirTypeDir, ino: node.id},
+			{name: "..", typ: dirTypeDir, ino: node.parent},
+		}
+		names := make([]string, 0, len(node.entries))
+		for name := range node.entries {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			child := p.imageNodeLocked(node.entries[name])
+			entries = append(entries, dirEntry{name: name, typ: p.dirType(child), ino: child.id})
+		}
 	}
 	fh := p.nextHandle
 	p.nextHandle++
@@ -1695,7 +1950,7 @@ func (p *imageFS) ReleaseDir(_ uint64, fh uint64) {
 func (p *imageFS) Readlink(nodeID uint64) (string, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return "", -linuxENOENT
 	}
@@ -1719,7 +1974,7 @@ func (p *imageFS) inheritImageCreateLocked(parent *imageNode, mode uint32, gid u
 func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
@@ -1734,6 +1989,7 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 		p.debugChildfLocked("mkdir-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	parentNode = p.mutableImageNodeLocked(parent)
 	now := time.Now()
 	node := &imageNode{
 		id:      p.nextNodeID,
@@ -1751,16 +2007,20 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 	p.nodes[node.id] = node
 	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
-	parentNode.entries[name] = node.id
+	p.markPersistentNodeLocked(node)
+	p.setPersistentDirentLocked(parentNode, name, node.id)
 	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
 	return node.id, p.attr(node), 0
 }
 
 func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
@@ -1779,7 +2039,7 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 		return 0, FuseAttr{}, -linuxEINVAL
 	}
 	if existingID, exists := parentNode.entries[name]; exists {
-		existing := p.nodes[existingID]
+		existing := p.imageNodeLocked(existingID)
 		if existing == nil {
 			p.debugChildfLocked("mknod-stale-existing", parent, name, "existing=%d errno=%d", existingID, -linuxENOENT)
 			return 0, FuseAttr{}, -linuxENOENT
@@ -1787,8 +2047,9 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 		p.debugChildfLocked("mknod-exists", parent, name, "existing=%d existing_dir=%v errno=%d", existingID, existing.isDir(), -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	parentNode = p.mutableImageNodeLocked(parent)
 	if parentNode.whiteouts != nil {
-		delete(parentNode.whiteouts, name)
+		p.deletePersistentWhiteoutLocked(parentNode, name)
 	}
 	now := time.Now()
 	node := &imageNode{
@@ -1808,16 +2069,20 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	p.nodes[node.id] = node
 	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
-	parentNode.entries[name] = node.id
+	p.markPersistentNodeLocked(node)
+	p.setPersistentDirentLocked(parentNode, name, node.id)
 	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
 	return node.id, p.attr(node), 0
 }
 
 func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
@@ -1832,6 +2097,7 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 		p.debugChildfLocked("symlink-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	parentNode = p.mutableImageNodeLocked(parent)
 	now := time.Now()
 	node := &imageNode{
 		id:            p.nextNodeID,
@@ -1849,9 +2115,13 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	p.nextNodeID++
 	p.nodes[node.id] = node
 	p.noteImageNodeAddedLocked(node)
-	parentNode.entries[name] = node.id
+	p.markPersistentNodeLocked(node)
+	p.setPersistentDirentLocked(parentNode, name, node.id)
 	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
 	return node.id, p.attr(node), 0
 }
 
@@ -1862,8 +2132,8 @@ func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64,
 func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
-	parentNode := p.nodes[newParent]
+	node := p.imageNodeLocked(nodeID)
+	parentNode := p.imageNodeLocked(newParent)
 	if node == nil || parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
@@ -1879,20 +2149,30 @@ func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string,
 		p.debugChildfLocked("link-exists", newParent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
+	node = p.mutableImageNodeLocked(nodeID)
+	parentNode = p.mutableImageNodeLocked(newParent)
 	if parentNode.whiteouts != nil {
-		delete(parentNode.whiteouts, name)
+		p.deletePersistentWhiteoutLocked(parentNode, name)
 	}
 	if node.abstractFile != nil {
 		if errno := p.copyUpFileLocked(node); errno != 0 {
 			return 0, FuseAttr{}, errno
 		}
 	}
-	parentNode.entries[name] = node.id
+	if p.persistent != nil && node.lowerFile != nil {
+		if errno := p.materializePersistentLowerFileLocked(node); errno != 0 {
+			return 0, FuseAttr{}, errno
+		}
+	}
+	p.setPersistentDirentLocked(parentNode, name, node.id)
 	p.noteImageEntryAddedLocked(parentNode)
 	now := time.Now()
 	node.ctime = now
 	p.touchImageDirectoryLocked(parentNode, now)
 	p.refreshImageNodeLinksLocked(node)
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
 	return node.id, p.attr(node), 0
 }
 
@@ -1903,7 +2183,7 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return -linuxENOENT
 	}
@@ -1918,7 +2198,7 @@ func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uin
 		p.debugChildfLocked("rmdir-miss", parent, name, "errno=%d", -linuxENOENT)
 		return -linuxENOENT
 	}
-	child := p.nodes[childID]
+	child := p.imageNodeLocked(childID)
 	if child == nil {
 		return -linuxENOENT
 	}
@@ -1926,18 +2206,16 @@ func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uin
 		p.debugChildfLocked("rmdir-not-empty", parent, name, "node=%d entries=%d errno=%d", childID, len(child.entries), -linuxENOTEMPTY)
 		return -linuxENOTEMPTY
 	}
-	delete(parentNode.entries, name)
+	parentNode = p.mutableImageNodeLocked(parent)
+	p.deletePersistentDirentLocked(parentNode, name)
 	if parentNode.abstractDir != nil {
-		if parentNode.whiteouts == nil {
-			parentNode.whiteouts = map[string]bool{}
-		}
-		parentNode.whiteouts[name] = true
+		p.setPersistentWhiteoutLocked(parentNode, name)
 		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	p.collectImageNodeLocked(childID)
 	p.touchImageDirectoryLocked(parentNode, time.Now())
 	p.compactImageNodeMapsLocked(parentNode)
-	return 0
+	return p.commitPersistentMutationLocked()
 }
 
 func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
@@ -1947,7 +2225,7 @@ func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, 
 func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return 0, 0, FuseAttr{}, -linuxENOENT
 	}
@@ -1962,7 +2240,7 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 			p.debugChildfLocked("create-excl-exists", parent, name, "existing=%d errno=%d", existingID, -linuxEEXIST)
 			return 0, 0, FuseAttr{}, -linuxEEXIST
 		}
-		node := p.nodes[existingID]
+		node := p.imageNodeLocked(existingID)
 		if node == nil {
 			p.debugChildfLocked("create-stale-existing", parent, name, "existing=%d errno=%d", existingID, -linuxENOENT)
 			return 0, 0, FuseAttr{}, -linuxENOENT
@@ -1973,16 +2251,20 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 		}
 		p.debugChildfLocked("create-open-existing", parent, name, "existing=%d flags=%#x", existingID, flags)
 		if flags&linuxOACCMODE != linuxORDONLY {
+			node = p.mutableImageNodeLocked(existingID)
 			if errno := p.copyUpFileLocked(node); errno != 0 {
 				p.debugChildfLocked("create-copyup-error", parent, name, "existing=%d errno=%d", existingID, errno)
 				return 0, 0, FuseAttr{}, errno
 			}
 			if flags&linuxOTRUNC != 0 {
 				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
-				node.data.release(p.dataStore)
+				if err := p.releaseImageDataLocked(node); err != nil {
+					return 0, 0, FuseAttr{}, errnoFromError(err)
+				}
 				node.data = sparseImageData{}
 				node.lowerFile = nil
 				node.lowerSize = 0
+				node.persistentIndependent = p.persistent != nil
 				node.size = 0
 				if uid != 0 {
 					node.mode &^= fs.FileMode(0o6000)
@@ -1991,6 +2273,9 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 				node.modTime = now
 				node.ctime = now
 				p.refreshImageNodeMetadataLocked(node)
+				if errno := p.commitPersistentMutationLocked(); errno != 0 {
+					return 0, 0, FuseAttr{}, errno
+				}
 			}
 		}
 		fh := p.nextHandle
@@ -1999,9 +2284,10 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 		p.noteImageHandleAddedLocked()
 		return node.id, fh, p.attr(node), 0
 	}
+	parentNode = p.mutableImageNodeLocked(parent)
 	mode, gid = p.inheritImageCreateLocked(parentNode, mode, gid, false)
 	if parentNode.whiteouts != nil {
-		delete(parentNode.whiteouts, name)
+		p.deletePersistentWhiteoutLocked(parentNode, name)
 	}
 	now := time.Now()
 	node := &imageNode{
@@ -2019,13 +2305,17 @@ func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode
 	p.nodes[node.id] = node
 	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
-	parentNode.entries[name] = node.id
+	p.markPersistentNodeLocked(node)
+	p.setPersistentDirentLocked(parentNode, name, node.id)
 	p.noteImageEntryAddedLocked(parentNode)
 	p.touchImageDirectoryLocked(parentNode, now)
 	fh := p.nextHandle
 	p.nextHandle++
 	p.handles[fh] = imageHandle{nodeID: node.id}
 	p.noteImageHandleAddedLocked()
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return 0, 0, FuseAttr{}, errno
+	}
 	return node.id, fh, p.attr(node), 0
 }
 
@@ -2037,7 +2327,7 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	handle, ok := p.handles[fh]
-	node := p.nodes[nodeID]
+	node := p.mutableImageNodeLocked(nodeID)
 	if !ok || handle.nodeID != nodeID || node == nil {
 		return 0, -linuxEBADF
 	}
@@ -2051,12 +2341,13 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	if errno := p.prepareImageOverlayWriteLocked(node, off, uint64(len(data))); errno != 0 {
 		return 0, errno
 	}
-	written, err := node.data.writeAt(p.dataStore, data, off)
+	written, err := p.writeImageDataLocked(node, data, off)
 	p.refreshImageNodeMetadataLocked(node)
 	if err != nil {
 		if written > 0 && off+uint64(written) > node.size {
 			node.size = off + uint64(written)
 		}
+		p.refreshPersistentUsageLocked(node)
 		return uint32(written), errnoFromError(err)
 	}
 	if end > node.size {
@@ -2068,6 +2359,7 @@ func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []by
 	}
 	node.modTime = now
 	node.ctime = now
+	p.refreshPersistentUsageLocked(node)
 	return uint32(len(data)), 0
 }
 
@@ -2078,7 +2370,7 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.mutableImageNodeLocked(nodeID)
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
 	}
@@ -2104,13 +2396,24 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 		node.gid = gid
 	}
 	if valid&fattrSize != 0 {
-		if err := node.data.truncate(p.dataStore, size); err != nil {
+		if p.persistent != nil && node.lowerFile != nil && size != 0 {
+			if errno := p.materializePersistentLowerFileLocked(node); errno != 0 {
+				return FuseAttr{}, errno
+			}
+		}
+		if p.persistent != nil && node.lowerFile != nil && size == 0 {
+			node.lowerFile = nil
+			node.lowerSize = 0
+			node.persistentIndependent = true
+		}
+		if err := p.truncateImageDataLocked(node, size); err != nil {
 			return FuseAttr{}, errnoFromError(err)
 		}
 		if size < node.lowerSize {
 			node.lowerSize = size
 		}
 		node.size = size
+		p.refreshPersistentUsageLocked(node)
 		p.refreshImageNodeMetadataLocked(node)
 		if callerUID != 0 {
 			node.mode &^= fs.FileMode(0o6000)
@@ -2133,6 +2436,9 @@ func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size u
 	if valid&(fattrMode|fattrUID|fattrGID|fattrSize|fattrATime|fattrMTime|fattrATimeNow|fattrMTimeNow) != 0 {
 		node.ctime = now
 	}
+	if errno := p.commitPersistentMutationLocked(); errno != 0 {
+		return FuseAttr{}, errno
+	}
 	return p.attr(node), 0
 }
 
@@ -2143,7 +2449,7 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
+	parentNode := p.imageNodeLocked(parent)
 	if parentNode == nil {
 		return -linuxENOENT
 	}
@@ -2157,7 +2463,7 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 		p.debugChildfLocked("unlink-miss", parent, name, "errno=%d", -linuxENOENT)
 		return -linuxENOENT
 	}
-	child := p.nodes[childID]
+	child := p.imageNodeLocked(childID)
 	if child == nil {
 		p.debugChildfLocked("unlink-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
@@ -2166,13 +2472,12 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 		p.debugChildfLocked("unlink-dir", parent, name, "node=%d errno=%d", childID, -linuxEISDIR)
 		return -linuxEISDIR
 	}
+	parentNode = p.mutableImageNodeLocked(parent)
+	child = p.mutableImageNodeLocked(childID)
 	p.debugChildfLocked("unlink", parent, name, "node=%d", childID)
-	delete(parentNode.entries, name)
+	p.deletePersistentDirentLocked(parentNode, name)
 	if parentNode.abstractDir != nil {
-		if parentNode.whiteouts == nil {
-			parentNode.whiteouts = map[string]bool{}
-		}
-		parentNode.whiteouts[name] = true
+		p.setPersistentWhiteoutLocked(parentNode, name)
 		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	child.ctime = time.Now()
@@ -2184,7 +2489,7 @@ func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid ui
 		p.refreshImageNodeLinksLocked(child)
 	}
 	p.compactImageNodeMapsLocked(parentNode)
-	return 0
+	return p.commitPersistentMutationLocked()
 }
 
 func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
@@ -2194,8 +2499,8 @@ func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName s
 func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, newName string, flags uint32, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	parentNode := p.nodes[parent]
-	newParentNode := p.nodes[newParent]
+	parentNode := p.imageNodeLocked(parent)
+	newParentNode := p.imageNodeLocked(newParent)
 	if parentNode == nil || newParentNode == nil {
 		return -linuxENOENT
 	}
@@ -2215,7 +2520,7 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		p.debugChildfLocked("rename-miss", parent, name, "new_parent=%q new_name=%q errno=%d", p.pathForNode(newParent), newName, -linuxENOENT)
 		return -linuxENOENT
 	}
-	child := p.nodes[childID]
+	child := p.imageNodeLocked(childID)
 	if child == nil {
 		p.debugChildfLocked("rename-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
@@ -2231,15 +2536,25 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		if !targetExists {
 			return -linuxENOENT
 		}
-		other := p.nodes[existingID]
+		other := p.imageNodeLocked(existingID)
 		if other == nil {
 			return -linuxENOENT
 		}
 		if existingID == childID {
 			return 0
 		}
-		parentNode.entries[name] = existingID
-		newParentNode.entries[newName] = childID
+		if errno := p.materializePersistentRenameNodeLocked(child); errno != 0 {
+			return errno
+		}
+		if errno := p.materializePersistentRenameNodeLocked(other); errno != 0 {
+			return errno
+		}
+		parentNode = p.mutableImageNodeLocked(parent)
+		newParentNode = p.mutableImageNodeLocked(newParent)
+		child = p.mutableImageNodeLocked(childID)
+		other = p.mutableImageNodeLocked(existingID)
+		p.setPersistentDirentLocked(parentNode, name, existingID)
+		p.setPersistentDirentLocked(newParentNode, newName, childID)
 		child.parent, child.name = newParent, newName
 		other.parent, other.name = parent, name
 		p.refreshImageNodeMetadataLocked(child)
@@ -2248,7 +2563,7 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		child.ctime, other.ctime = now, now
 		parentNode.modTime, parentNode.ctime = now, now
 		newParentNode.modTime, newParentNode.ctime = now, now
-		return 0
+		return p.commitPersistentMutationLocked()
 	}
 	// POSIX requires renaming one hard link over another link to the same
 	// inode to succeed without removing either directory entry.
@@ -2257,7 +2572,7 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	}
 	var replaced *imageNode
 	if existingID, exists := newParentNode.entries[newName]; exists {
-		replaced = p.nodes[existingID]
+		replaced = p.imageNodeLocked(existingID)
 		if replaced != nil && replaced.isDir() && !child.isDir() {
 			p.debugChildfLocked("rename-target-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return -linuxEISDIR
@@ -2268,18 +2583,24 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 		}
 		p.debugChildfLocked("rename-replace-target", newParent, newName, "existing=%d", existingID)
 	}
-	delete(parentNode.entries, name)
+	if errno := p.materializePersistentRenameNodeLocked(child); errno != 0 {
+		return errno
+	}
+	parentNode = p.mutableImageNodeLocked(parent)
+	newParentNode = p.mutableImageNodeLocked(newParent)
+	child = p.mutableImageNodeLocked(childID)
+	if replaced != nil {
+		replaced = p.mutableImageNodeLocked(replaced.id)
+	}
+	p.deletePersistentDirentLocked(parentNode, name)
 	if parentNode.abstractDir != nil {
-		if parentNode.whiteouts == nil {
-			parentNode.whiteouts = map[string]bool{}
-		}
-		parentNode.whiteouts[name] = true
+		p.setPersistentWhiteoutLocked(parentNode, name)
 		p.noteImageWhiteoutAddedLocked(parentNode)
 	}
 	if newParentNode.whiteouts != nil {
-		delete(newParentNode.whiteouts, newName)
+		p.deletePersistentWhiteoutLocked(newParentNode, newName)
 	}
-	newParentNode.entries[newName] = childID
+	p.setPersistentDirentLocked(newParentNode, newName, childID)
 	p.noteImageEntryAddedLocked(newParentNode)
 	child.parent = newParent
 	child.name = newName
@@ -2301,6 +2622,76 @@ func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, 
 	if newParentNode != parentNode {
 		p.compactImageNodeMapsLocked(newParentNode)
 	}
+	return p.commitPersistentMutationLocked()
+}
+
+func (p *imageFS) materializePersistentRenameNodeLocked(node *imageNode) int32 {
+	if p == nil || p.persistent == nil || node == nil {
+		return 0
+	}
+	node = p.mutableImageNodeLocked(node.id)
+	if node == nil {
+		return -linuxENOENT
+	}
+	if node.abstractFile != nil {
+		if errno := p.copyUpFileLocked(node); errno != 0 {
+			return errno
+		}
+	}
+	if node.lowerFile != nil {
+		return p.materializePersistentLowerFileLocked(node)
+	}
+	if node.abstractLink != nil {
+		p.rememberPersistentLowerPathLocked(node)
+		node.abstractLink = nil
+		node.persistentIndependent = true
+		p.markPersistentNodeLocked(node)
+		return 0
+	}
+	if node.abstractDir == nil {
+		return 0
+	}
+	p.rememberPersistentLowerPathLocked(node)
+	if !node.entriesDone {
+		entries, err := imagefs.ReadDirContext(p.materializationCtx, node.abstractDir)
+		if err != nil {
+			return errnoFromError(err)
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		for _, dirent := range entries {
+			if dirent.Name == "." || dirent.Name == ".." || node.whiteouts[dirent.Name] {
+				continue
+			}
+			if _, exists := node.entries[dirent.Name]; exists {
+				continue
+			}
+			entry, err := imagefs.LookupContext(p.materializationCtx, node.abstractDir, dirent.Name)
+			if err != nil {
+				return errnoFromError(err)
+			}
+			if _, errno := p.createAbstractNode(node, dirent.Name, entry); errno != 0 {
+				return errno
+			}
+		}
+		node.entriesDone = true
+	}
+	childIDs := make([]uint64, 0, len(node.entries))
+	for _, childID := range node.entries {
+		childIDs = append(childIDs, childID)
+	}
+	sort.Slice(childIDs, func(i, j int) bool { return childIDs[i] < childIDs[j] })
+	for _, childID := range childIDs {
+		child := p.imageNodeLocked(childID)
+		if child == nil {
+			return -linuxEIO
+		}
+		if errno := p.materializePersistentRenameNodeLocked(child); errno != 0 {
+			return errno
+		}
+	}
+	node.abstractDir = nil
+	node.persistentIndependent = true
+	p.markPersistentNodeLocked(node)
 	return 0
 }
 
@@ -2314,7 +2705,7 @@ func (p *imageFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64, uint
 func (p *imageFS) GetXattr(nodeID uint64, name string) ([]byte, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return nil, -linuxENOENT
 	}
@@ -2328,7 +2719,7 @@ func (p *imageFS) GetXattr(nodeID uint64, name string) ([]byte, int32) {
 func (p *imageFS) ListXattr(nodeID uint64) ([]byte, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return nil, -linuxENOENT
 	}
@@ -2351,7 +2742,7 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return -linuxENOENT
 	}
@@ -2362,6 +2753,7 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	if flags&2 != 0 && !exists {
 		return -linuxENODATA
 	}
+	node = p.mutableImageNodeLocked(nodeID)
 	oldBytes := 0
 	if exists {
 		oldBytes = len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead
@@ -2378,24 +2770,25 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	p.xattrBytes = uint64(int64(p.xattrBytes) - int64(oldBytes) + int64(newBytes))
 	p.refreshImageNodeMetadataLocked(node)
 	node.ctime = time.Now()
-	return 0
+	return p.commitPersistentMutationLocked()
 }
 
 func (p *imageFS) RemoveXattr(nodeID uint64, name string) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return -linuxENOENT
 	}
 	if _, exists := node.xattrs[name]; !exists {
 		return -linuxENODATA
 	}
+	node = p.mutableImageNodeLocked(nodeID)
 	p.xattrBytes -= uint64(len(name) + len(node.xattrs[name]) + imageXattrEntryOverhead)
 	delete(node.xattrs, name)
 	p.refreshImageNodeMetadataLocked(node)
 	node.ctime = time.Now()
-	return 0
+	return p.commitPersistentMutationLocked()
 }
 
 func (p *imageFS) attr(node *imageNode) FuseAttr {
@@ -2416,8 +2809,7 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 		}
 	case node.abstractLink != nil:
 		nodeMode = fs.ModeSymlink | node.abstractLink.Stat().Perm()
-		node.symlinkTarget = node.abstractLink.Target()
-		size = uint64(len(node.symlinkTarget))
+		size = uint64(len(node.abstractLink.Target()))
 		if mt := node.abstractLink.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
@@ -2436,10 +2828,14 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	}
 	nlink := uint32(1)
 	if isDir {
-		nlink = 2
-		for _, childID := range node.entries {
-			if child := p.nodes[childID]; child != nil && child.isDir() {
-				nlink++
+		if node.baseDirEntries != nil {
+			nlink = node.nlink
+		} else {
+			nlink = 2
+			for _, childID := range node.entries {
+				if child := p.imageNodeLocked(childID); child != nil && child.isDir() {
+					nlink++
+				}
 			}
 		}
 	} else {
@@ -2456,7 +2852,7 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	if ctime.IsZero() {
 		ctime = modTime
 	}
-	allocatedBytes := node.data.allocatedBytes(size)
+	allocatedBytes := p.imageDataAllocatedBytesLocked(node, size)
 	if node.abstractFile != nil || node.lowerFile != nil {
 		allocatedBytes = size
 	}
@@ -2502,36 +2898,45 @@ func (p *imageFS) refreshImageNodeLinksLocked(node *imageNode) {
 	if node == nil || node.isDir() {
 		return
 	}
-	inode := p.imageNodeInodeLocked(node)
-	nlink := uint32(0)
-	for id, candidate := range p.nodes {
-		if candidate != nil && !candidate.isDir() && p.imageNodeInodeLocked(candidate) == inode {
-			nlink += p.imageNodeReferenceCountLocked(id)
-		}
-	}
+	node = p.mutableImageNodeLocked(node.id)
+	nlink := p.imageNodeReferenceCountLocked(node.id)
 	if nlink == 0 {
 		nlink = 1
 	}
-	for _, candidate := range p.nodes {
-		if candidate != nil && !candidate.isDir() && p.imageNodeInodeLocked(candidate) == inode {
-			candidate.nlink = nlink
-		}
-	}
+	node.nlink = nlink
 }
 
 func (p *imageFS) imageNodeReferenceCountLocked(nodeID uint64) uint32 {
 	var count uint32
-	for _, candidate := range p.nodes {
+	p.forEachImageNodeLocked(func(_ uint64, candidate *imageNode) {
 		if candidate == nil || !candidate.isDir() {
-			continue
+			return
 		}
 		for _, childID := range candidate.entries {
 			if childID == nodeID {
 				count++
 			}
 		}
-	}
+	})
 	return count
+}
+
+func (p *imageFS) forEachImageNodeLocked(visit func(uint64, *imageNode)) {
+	for id := uint64(1); id < uint64(len(p.baseNodes)); id++ {
+		if _, removed := p.removedNodes[id]; removed {
+			continue
+		}
+		if node := p.nodes[id]; node != nil {
+			visit(id, node)
+		} else if node := p.baseNodes[id]; node != nil {
+			visit(id, node)
+		}
+	}
+	for id, node := range p.nodes {
+		if id >= uint64(len(p.baseNodes)) && node != nil {
+			visit(id, node)
+		}
+	}
 }
 
 func (p *imageFS) imageNodeHasHandleLocked(nodeID uint64) bool {
@@ -2563,7 +2968,7 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	if nodeID == 1 {
 		return
 	}
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		return
 	}
@@ -2573,23 +2978,40 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	// not hard-linkable and remain on the conservative reference scan.
 	linked := node.nlink != 0
 	if node.isDir() {
-		linked = p.imageNodeReferenceCountLocked(nodeID) != 0
+		parent := p.imageNodeLocked(node.parent)
+		linked = parent != nil && parent.entries[node.name] == nodeID
+	}
+	if !linked && p.persistent != nil {
+		// Once the namespace no longer reaches an inode, a crash cannot retain
+		// its open handles. Record that fact before reclaiming its data.
+		p.persistent.markDeleted(nodeID)
 	}
 	if !linked && !p.imageNodeHasHandleLocked(nodeID) {
 		if node := p.nodes[nodeID]; node != nil {
 			p.xattrBytes -= uint64(imageNodeXattrBytes(node))
 			p.retainedEntries -= node.retainedEntries
 			p.retainedWhiteouts -= node.retainedWhiteouts
-			node.data.release(p.dataStore)
+			_ = p.retireImageDataLocked(node)
 			p.dynamicMetadata -= node.accountedMetadata
 		}
 		delete(p.nodes, nodeID)
+		delete(p.persistentNodes, nodeID)
+		if nodeID < uint64(len(p.baseNodes)) {
+			p.removedNodes[nodeID] = struct{}{}
+		}
 		p.compactImageNodesLocked()
 	}
 }
 
 func (p *imageFS) Close() error {
-	return p.closeWithin(2 * time.Second)
+	timeout := 2 * time.Second
+	if p != nil && p.persistent != nil {
+		// Durable detach may need to sync a large amount of user data. Keep the
+		// bounded ownership/recovery behavior, but do not turn an ordinary slow
+		// disk or race-enabled build into a false incomplete close.
+		timeout = 30 * time.Second
+	}
+	return p.closeWithin(timeout)
 }
 
 func (p *imageFS) BeginClose() {
@@ -2622,7 +3044,19 @@ func (p *imageFS) closeWithin(timeout time.Duration) error {
 		// actually returns, but do not make VM teardown wait without a bound.
 		go func() {
 			p.materializationWG.Wait()
-			p.closeErr = p.dataStore.close()
+			p.mu.Lock()
+			persistErr := p.syncAllPersistentDataLocked()
+			if persistErr == nil {
+				persistErr = p.checkpointPersistentLocked(true)
+			}
+			if persistErr == nil && p.persistent != nil {
+				persistErr = p.persistent.markClean()
+			}
+			p.mu.Unlock()
+			p.closeErr = errors.Join(persistErr, p.dataStore.close())
+			if p.persistent != nil {
+				p.closeErr = errors.Join(p.closeErr, p.persistent.close())
+			}
 			close(done)
 		}()
 	})
@@ -2643,12 +3077,22 @@ func (p *imageFS) BackingUsage() (uint64, uint64, uint64, error) {
 	if p == nil {
 		return 0, 0, 0, nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.persistent != nil {
+		return p.persistent.currentUsage, p.persistent.highWaterUsage, p.persistent.physicalUsage, p.persistent.usageErr
+	}
 	return p.dataStore.usage()
 }
 
 func (p *imageFS) BackingCurrent() uint64 {
 	if p == nil {
 		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.persistent != nil {
+		return p.persistent.currentUsage
 	}
 	p.dataStore.mu.Lock()
 	defer p.dataStore.mu.Unlock()
@@ -2666,6 +3110,7 @@ func (p *imageFS) BackingMetadataUsage() (uint64, uint64) {
 	// that pressure visible to the same host recovery telemetry as file data.
 	metadata := uint64(p.retainedNodes)*256 + uint64(p.retainedHandles)*64 + uint64(p.retainedDirHandles)*64 + p.xattrBytes
 	metadata += uint64(p.retainedEntries+p.retainedWhiteouts) * 64
+	metadata += uint64(len(p.removedNodes)) * 16
 	metadata += uint64(len(p.materializations)) * 128
 	metadata += p.dynamicMetadata
 	metadata += p.dataStore.metadataUsage()
@@ -2819,7 +3264,13 @@ func (p *imageFS) imageNodeInodeLocked(node *imageNode) uint64 {
 }
 
 func (p *imageFS) dirType(node *imageNode) uint32 {
+	return imageNodeDirType(node)
+}
+
+func imageNodeDirType(node *imageNode) uint32 {
 	switch {
+	case node == nil:
+		return dirTypeUnknown
 	case node.isDir():
 		return dirTypeDir
 	case node.isSymlink():
@@ -2886,7 +3337,7 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 
 func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 	p.mu.Lock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		p.mu.Unlock()
 		return -linuxENOENT
@@ -2926,7 +3377,7 @@ func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node = p.nodes[nodeID]
+	node = p.imageNodeLocked(nodeID)
 	if node == nil {
 		return -linuxENOENT
 	}
@@ -2993,7 +3444,7 @@ func (p *imageFS) materializeDirEntriesContext(ctx context.Context, nodeID uint6
 		return err
 	}
 	p.mu.Lock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if node == nil {
 		p.mu.Unlock()
 		return os.ErrNotExist
@@ -3037,7 +3488,7 @@ func (p *imageFS) finishDirMaterialization(ctx context.Context, nodeID uint64, l
 	entries, err := readImageLowerEntries(ctx, lowerDir)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node := p.nodes[nodeID]
+	node := p.imageNodeLocked(nodeID)
 	if err == nil && node == materialization.node && !node.entriesDone {
 		for _, ent := range entries {
 			if node.whiteouts[ent.name] {
@@ -3089,13 +3540,16 @@ func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
 	return 0
 }
 
-// prepareImageOverlayWriteLocked materializes only partially overwritten lower
-// pages. Complete pages can be created directly from the write payload. This is
-// the page-level COW boundary that prevents a one-byte change from copying an
-// entire lower file (and from expanding sparse lower files).
+// prepareImageOverlayWriteLocked keeps the cheap page overlay used by ephemeral
+// imageFS instances. A persistent filesystem instead copies the lower file
+// once: after a successful fsync it must remain independent of image updates or
+// removal. Zero pages stay sparse in the inode-addressed upper file.
 func (p *imageFS) prepareImageOverlayWriteLocked(node *imageNode, off, length uint64) int32 {
 	if node == nil || node.lowerFile == nil || length == 0 {
 		return 0
+	}
+	if p.persistent != nil {
+		return p.materializePersistentLowerFileLocked(node)
 	}
 	defer p.refreshImageNodeMetadataLocked(node)
 	end := off + length
@@ -3118,15 +3572,38 @@ func (p *imageFS) prepareImageOverlayWriteLocked(node *imageNode, off, length ui
 				if uint64(len(data)) != visible {
 					return -linuxEIO
 				}
-				location, err := p.dataStore.allocatePage(data)
-				if err != nil {
-					return errnoFromError(err)
+				if p.persistent != nil {
+					if err := p.persistent.writePage(node.id, &node.data, page, data); err != nil {
+						return errnoFromError(err)
+					}
+				} else {
+					location, err := p.dataStore.allocatePage(data)
+					if err != nil {
+						return errnoFromError(err)
+					}
+					node.data.insert(page, location)
 				}
-				node.data.insert(page, location)
 			}
 		}
 		cursor = writeEnd
 	}
+	return 0
+}
+
+func (p *imageFS) materializePersistentLowerFileLocked(node *imageNode) int32 {
+	if p == nil || p.persistent == nil || node == nil || node.lowerFile == nil {
+		return 0
+	}
+	p.rememberPersistentLowerPathLocked(node)
+	if err := p.persistent.materializeLowerFile(node.id, &node.data, node.lowerFile, node.lowerSize); err != nil {
+		return errnoFromError(err)
+	}
+	node.lowerFile = nil
+	node.lowerSize = 0
+	node.persistentIndependent = true
+	p.markPersistentNodeLocked(node)
+	p.refreshImageNodeMetadataLocked(node)
+	p.refreshPersistentUsageLocked(node)
 	return 0
 }
 

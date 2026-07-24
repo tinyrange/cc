@@ -2,6 +2,7 @@ package vm
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -25,6 +26,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
 )
 
 const (
@@ -33,12 +35,14 @@ const (
 )
 
 type runtimeBootEnv struct {
-	backend      Backend
-	images       *oci.Store
-	imageName    string
-	altImageName string
-	memoryMB     uint64
-	caps         client.CapabilitiesResponse
+	backend        Backend
+	images         *oci.Store
+	kernelRoot     string
+	guestInitCache string
+	imageName      string
+	altImageName   string
+	memoryMB       uint64
+	caps           client.CapabilitiesResponse
 }
 
 type runtimeImageAdder interface {
@@ -62,6 +66,205 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	})
 	requireRunResponse(t, resp, err, 0)
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
+}
+
+func TestRuntimeLinuxSerialConsoleCanBeOpened(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	command := []string{
+		"sh",
+		"-lc",
+		"set -eu; exec 3<>/dev/ttyS0; test -t 3; printf 'serial-console-open\\n'",
+	}
+
+	t.Run("one-shot", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+		defer cancel()
+		resp, err := env.backend.Run(ctx, client.RunRequest{
+			Image:    env.imageName,
+			MemoryMB: env.memoryMB,
+			CPUs:     1,
+			User:     "root",
+			Command:  command,
+		})
+		requireRunResponse(t, resp, err, 0)
+		requireGuestOutput(t, resp.Output, "serial-console-open")
+	})
+
+	t.Run("persistent", func(t *testing.T) {
+		inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+		defer inst.Close()
+		resp := execInRuntimeRequest(t, inst, client.ExecRequest{
+			Command: command,
+			User:    "root",
+		})
+		requireGuestOutput(t, resp.Output, "serial-console-open")
+	})
+}
+
+func TestRuntimePersistentImageHomeSurvivesRestart(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	req := client.CreateInstanceRequest{
+		PersistentMounts: []client.PersistentMount{{
+			Name:  "runtime-home",
+			Mount: "/root",
+		}},
+	}
+	inst := startRuntimeInstance(t, env, req)
+	resp := execInRuntimeRequest(t, inst, client.ExecRequest{
+		User: "root",
+		Command: []string{"sh", "-lc", `
+set -eu
+printf 'persistent-home\n' > /root/state
+ln /root/state /root/state-link
+truncate -s 8388608 /root/sparse
+printf tail | dd of=/root/sparse bs=1 seek=8388604 conv=notrunc 2>/dev/null
+mkdir /root/directory
+printf nested > '/root/directory/name '
+sync
+`},
+	})
+	if resp.ExitCode != 0 {
+		t.Fatalf("prepare persistent home: %s", resp.Output)
+	}
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close first persistent guest: %v", err)
+	}
+
+	inst = startRuntimeInstance(t, env, req)
+	resp = execInRuntimeRequest(t, inst, client.ExecRequest{
+		User: "root",
+		Command: []string{"sh", "-lc", `
+set -eu
+test "$(cat /root/state)" = persistent-home
+test "$(stat -c %i /root/state)" = "$(stat -c %i /root/state-link)"
+test "$(stat -c %h /root/state)" = 2
+test "$(stat -c %s /root/sparse)" = 8388608
+test "$(dd if=/root/sparse bs=1 skip=8388604 count=4 2>/dev/null)" = tail
+test "$(cat '/root/directory/name ')" = nested
+mv /root/state /root/renamed
+rm /root/state-link
+sync
+`},
+	})
+	if resp.ExitCode != 0 {
+		t.Fatalf("verify persistent home after first restart: %s", resp.Output)
+	}
+	statusProvider, ok := inst.(interface {
+		PersistentFSStatus() []virtio.PersistentFSStatus
+	})
+	if !ok {
+		t.Fatalf("persistent runtime instance %T does not expose home status", inst)
+	}
+	statuses := statusProvider.PersistentFSStatus()
+	if len(statuses) != 1 || statuses[0].Name != "runtime-home" || statuses[0].Mount != "/root" || statuses[0].DurableSequence == 0 {
+		t.Fatalf("persistent runtime status = %+v", statuses)
+	}
+	if err := inst.Close(); err != nil {
+		t.Fatalf("close second persistent guest: %v", err)
+	}
+
+	inst = startRuntimeInstance(t, env, req)
+	defer inst.Close()
+	resp = execInRuntimeRequest(t, inst, client.ExecRequest{
+		User:    "root",
+		Command: []string{"sh", "-lc", "set -eu; test ! -e /root/state; test ! -e /root/state-link; test \"$(cat /root/renamed)\" = persistent-home"},
+	})
+	if resp.ExitCode != 0 {
+		t.Fatalf("verify persistent home after rename restart: %s", resp.Output)
+	}
+}
+
+func TestRuntimePersistentImageHomeSurvivesHostProcessKill(t *testing.T) {
+	if os.Getenv("CC_PERSISTENT_HOME_CRASH_HELPER") == "1" {
+		runPersistentHomeCrashHelper(t)
+		return
+	}
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*runtimeBootTimeout())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRuntimePersistentImageHomeSurvivesHostProcessKill$")
+	cmd.Env = append(os.Environ(),
+		"CC_PERSISTENT_HOME_CRASH_HELPER=1",
+		"CC_PERSISTENT_HOME_CRASH_IMAGES="+env.images.Root(),
+		"CC_PERSISTENT_HOME_CRASH_KERNEL="+env.kernelRoot,
+		"CC_PERSISTENT_HOME_CRASH_GUEST_INIT="+env.guestInitCache,
+		"CCX3_OCI_SHARED_CACHE_DIR="+os.Getenv("CCX3_OCI_SHARED_CACHE_DIR"),
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := false
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if scanner.Text() == "CC_PERSISTENT_HOME_CRASH_READY" {
+			ready = true
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !ready {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("crash helper exited before ready:\n%s", stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("crash helper exited cleanly after hard kill")
+	}
+
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		PersistentMounts: []client.PersistentMount{{Name: "crash-home", Mount: "/root"}},
+	})
+	defer inst.Close()
+	resp := execInRuntimeRequest(t, inst, client.ExecRequest{
+		User:    "root",
+		Command: []string{"sh", "-lc", "set -eu; test \"$(cat /root/committed)\" = survived-hard-kill"},
+	})
+	if resp.ExitCode != 0 {
+		t.Fatalf("verify home after host process kill: %s", resp.Output)
+	}
+}
+
+func runPersistentHomeCrashHelper(t *testing.T) {
+	store := oci.NewStore(os.Getenv("CC_PERSISTENT_HOME_CRASH_IMAGES"))
+	backend := NewRuntimeBackend(
+		alpine.NewManager(os.Getenv("CC_PERSISTENT_HOME_CRASH_KERNEL")),
+		store,
+		os.Getenv("CC_PERSISTENT_HOME_CRASH_GUEST_INIT"),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	inst, err := backend.Start(ctx, client.CreateInstanceRequest{
+		Image:    runtimeBootImage,
+		MemoryMB: 768,
+		CPUs:     1,
+		PersistentMounts: []client.PersistentMount{{
+			Name:  "crash-home",
+			Mount: "/root",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		User:    "root",
+		Command: []string{"sh", "-lc", "set -eu; printf survived-hard-kill | dd of=/root/committed conv=fsync 2>/dev/null"},
+	})
+	if err != nil || resp.ExitCode != 0 {
+		t.Fatalf("write committed home state: response=%+v error=%v", resp, err)
+	}
+	fmt.Println("CC_PERSISTENT_HOME_CRASH_READY")
+	select {}
 }
 
 func TestRuntimeLinuxExposesMatchingModuleSymbolVersions(t *testing.T) {
@@ -1945,7 +2148,8 @@ func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 		t.Setenv(name, "")
 	}
 
-	kernelManager := alpine.NewManager(filepath.Join(cacheRoot, "kernel"))
+	kernelRoot := filepath.Join(cacheRoot, "kernel")
+	kernelManager := alpine.NewManager(kernelRoot)
 	if err := kernelManager.EnsureWithProgress(ctx, nil); err != nil {
 		t.Fatalf("prepare Alpine Linux kernel: %v", err)
 	}
@@ -1968,12 +2172,14 @@ func newRuntimeBootEnv(t *testing.T) *runtimeBootEnv {
 		guestInitCache = override
 	}
 	return &runtimeBootEnv{
-		backend:      NewRuntimeBackend(kernelManager, store, guestInitCache),
-		images:       store,
-		imageName:    runtimeBootImage,
-		altImageName: runtimeBootAltImage,
-		memoryMB:     768,
-		caps:         HostCapabilities(),
+		backend:        NewRuntimeBackend(kernelManager, store, guestInitCache),
+		images:         store,
+		kernelRoot:     kernelRoot,
+		guestInitCache: guestInitCache,
+		imageName:      runtimeBootImage,
+		altImageName:   runtimeBootAltImage,
+		memoryMB:       768,
+		caps:           HostCapabilities(),
 	}
 }
 
