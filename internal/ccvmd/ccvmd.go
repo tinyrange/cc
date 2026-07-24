@@ -97,6 +97,7 @@ type ServerOptions struct {
 	TokenPath              string
 	Authentication         *ServerAuthentication
 	Persistent             bool
+	StartupWriter          io.Writer
 	OnStartup              func(client.ServerHello) error
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
@@ -473,7 +474,11 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		Kind:      opts.Kind,
 		TokenPath: opts.TokenPath,
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
+	startupWriter := opts.StartupWriter
+	if startupWriter == nil {
+		startupWriter = os.Stdout
+	}
+	if err := json.NewEncoder(startupWriter).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}

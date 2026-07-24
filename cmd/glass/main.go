@@ -4,20 +4,28 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"j5.nz/cc/ccvmd"
+	ccclient "j5.nz/cc/client"
 	"j5.nz/cc/internal/rfb"
 )
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintln(os.Stderr, "glass:", err)
 		os.Exit(1)
 	}
@@ -30,6 +38,9 @@ func run(args []string) error {
 		return err
 	}
 	args = global.Args()
+	if len(args) > 0 && args[0] == "run" {
+		return runVM(args[1:])
+	}
 	if len(args) < 2 {
 		return usageError()
 	}
@@ -156,7 +167,188 @@ func run(args []string) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: glass [-timeout DURATION] <probe|capture|resize|clipboard-set|clipboard-get|type|key|move|click|wait-pixel> ADDRESS ...")
+	return fmt.Errorf("usage: glass run [OPTIONS] IMAGE\n       glass [-timeout DURATION] <probe|capture|resize|clipboard-set|clipboard-get|type|key|move|click|wait-pixel> ADDRESS ...")
+}
+
+func runVM(args []string) (retErr error) {
+	fs := flag.NewFlagSet("glass run", flag.ContinueOnError)
+	name := fs.String("name", "glass", "VM name")
+	cacheDir := fs.String("cache-dir", "", "Image and runtime cache directory")
+	vncListen := fs.String("vnc-listen", "127.0.0.1:0", "VNC listen address")
+	display := fs.String("display", "1440x900", "Initial display size WIDTHxHEIGHT")
+	initSystem := fs.String("init", "systemd", "Guest init system")
+	memoryMB := fs.Uint64("memory-mb", 8192, "Guest memory in MiB")
+	cpus := fs.Int("cpus", 4, "Guest CPU count")
+	network := fs.Bool("network", true, "Enable isolated networking with outbound internet access")
+	bootTimeout := fs.Duration("boot-timeout", 10*time.Minute, "VM preparation and boot timeout")
+	dmesg := fs.Bool("dmesg", false, "Forward the guest kernel log")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: glass run [OPTIONS] IMAGE")
+	}
+	if *name == "" {
+		return fmt.Errorf("VM name cannot be empty")
+	}
+	if *memoryMB == 0 {
+		return fmt.Errorf("memory must be greater than zero")
+	}
+	if *cpus <= 0 {
+		return fmt.Errorf("CPU count must be greater than zero")
+	}
+	width, height, err := parseDisplaySize(*display)
+	if err != nil {
+		return err
+	}
+
+	ready := make(chan ccclient.ServerHello, 1)
+	serverDone := make(chan error, 1)
+	serverArgs := []string{"-addr", "127.0.0.1:0"}
+	if strings.TrimSpace(*cacheDir) != "" {
+		serverArgs = append(serverArgs, "-cache-dir", *cacheDir)
+	}
+	go func() {
+		_, err := ccvmd.RunServer(serverArgs, ccvmd.ServerOptions{
+			Kind:          "glass",
+			StartupWriter: io.Discard,
+			OnStartup: func(hello ccclient.ServerHello) error {
+				ready <- hello
+				return nil
+			},
+		})
+		serverDone <- err
+	}()
+
+	var hello ccclient.ServerHello
+	select {
+	case hello = <-ready:
+	case err := <-serverDone:
+		return fmt.Errorf("start embedded VM backend: %w", err)
+	}
+	if hello.Addr == "" {
+		return fmt.Errorf("embedded VM backend did not publish an address")
+	}
+	scheme := hello.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	api := ccclient.NewClient(scheme+"://"+hello.Addr, nil)
+	lifetimeContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	serverFinished := false
+	defer func() {
+		if serverFinished {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutdownErr := api.ShutdownContext(ctx)
+		cancel()
+		if shutdownErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("stop embedded VM backend: %w", shutdownErr))
+			return
+		}
+		select {
+		case err := <-serverDone:
+			serverFinished = true
+			if err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("embedded VM backend shutdown: %w", err))
+			}
+		case <-time.After(15 * time.Second):
+			retErr = errors.Join(retErr, fmt.Errorf("embedded VM backend did not stop"))
+		}
+	}()
+
+	var networkConfig *ccclient.NetworkConfig
+	if *network {
+		networkConfig = &ccclient.NetworkConfig{
+			Enabled:       true,
+			AllowInternet: true,
+		}
+	}
+	var lastBootMessage string
+	state, err := api.CreateInstanceStreamWithIDContext(lifetimeContext, *name, ccclient.CreateInstanceRequest{
+		Image:      fs.Arg(0),
+		InitSystem: *initSystem,
+		Network:    networkConfig,
+		Display: &ccclient.DisplayConfig{
+			Width:     uint32(width),
+			Height:    uint32(height),
+			VNCListen: *vncListen,
+		},
+		MemoryMB:       *memoryMB,
+		CPUs:           *cpus,
+		Dmesg:          *dmesg,
+		TimeoutSeconds: bootTimeout.Seconds(),
+	}, func(event ccclient.BootEvent) error {
+		message := strings.TrimSpace(event.Message)
+		if message != "" && message != lastBootMessage {
+			fmt.Fprintln(os.Stderr, message)
+			lastBootMessage = message
+		}
+		return nil
+	})
+	if err != nil {
+		if lifetimeContext.Err() != nil {
+			fmt.Fprintln(os.Stderr, "Stopping Glass VM...")
+			return nil
+		}
+		return fmt.Errorf("boot %q: %w", fs.Arg(0), err)
+	}
+	if state.Display == nil || state.Display.VNCAddress == "" {
+		return fmt.Errorf("VM started without a VNC endpoint")
+	}
+
+	fmt.Printf("VNC listening on %s\n", state.Display.VNCAddress)
+	fmt.Printf("VM %q is running with %d CPUs and %d MiB RAM", state.ID, state.CPUs, state.MemoryMB)
+	if state.NetworkIPv4 != "" {
+		fmt.Printf(" at %s", state.NetworkIPv4)
+	}
+	fmt.Println()
+	fmt.Println("Press Ctrl-C to stop the VM.")
+
+	statusTicker := time.NewTicker(time.Second)
+	defer statusTicker.Stop()
+	for {
+		select {
+		case <-lifetimeContext.Done():
+			fmt.Fprintln(os.Stderr, "Stopping Glass VM...")
+			return nil
+		case err := <-serverDone:
+			serverFinished = true
+			if err == nil {
+				return fmt.Errorf("embedded VM backend stopped unexpectedly")
+			}
+			return fmt.Errorf("embedded VM backend stopped: %w", err)
+		case <-statusTicker.C:
+			current, err := api.InstanceStatusOfContext(lifetimeContext, *name)
+			if err != nil {
+				if lifetimeContext.Err() != nil {
+					fmt.Fprintln(os.Stderr, "Stopping Glass VM...")
+					return nil
+				}
+				return fmt.Errorf("check VM status: %w", err)
+			}
+			if current.Status != "running" {
+				detail := current.Error
+				if detail == "" {
+					detail = current.ExitReason
+				}
+				if detail == "" {
+					detail = "no failure detail was reported"
+				}
+				return fmt.Errorf("VM entered %q state: %s", current.Status, detail)
+			}
+		}
+	}
+}
+
+func parseDisplaySize(value string) (int, int, error) {
+	widthText, heightText, ok := strings.Cut(strings.ToLower(strings.TrimSpace(value)), "x")
+	if !ok {
+		return 0, 0, fmt.Errorf("display size %q must be WIDTHxHEIGHT", value)
+	}
+	return parseDimensions(widthText, heightText)
 }
 
 func parseDimensions(widthText, heightText string) (int, int, error) {
