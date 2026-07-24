@@ -75,8 +75,9 @@ func decodeFSIndex(data []byte) ([]indexedNode, error) {
 }
 
 func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory, error) {
-	root := newIndexedDir("/", fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
+	root := newIndexedDir(fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
 	byPath := map[string]*indexedDir{"/": root}
+	tarPaths := make(map[string]string)
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Path < nodes[j].Path })
 	for _, node := range nodes {
 		if node.Path == "/" {
@@ -95,15 +96,15 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 		if !ok {
 			return nil, fmt.Errorf("missing parent %q for %q", parentPath, node.Path)
 		}
-		name := path.Base(node.Path)
+		name := strings.Clone(path.Base(node.Path))
 		modTime := time.Unix(0, node.ModTimeNS)
 		switch node.Kind {
 		case indexedKindDir:
-			dir := newIndexedDir(node.Path, imagefsMode(node.Mode, fs.ModeDir|0o755), node.UID, node.GID, node.RDev, modTime)
+			dir := newIndexedDir(imagefsMode(node.Mode, fs.ModeDir|0o755), node.UID, node.GID, node.RDev, modTime)
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile(baseDir, "", node, modTime, nil)
+			file, err := buildIndexedFile(baseDir, "", node, modTime, nil, tarPaths)
 			if err != nil {
 				return nil, err
 			}
@@ -121,11 +122,16 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 			return nil, fmt.Errorf("unknown node kind %q", node.Kind)
 		}
 	}
+	namespace, err := imagefs.BuildNamespace(root)
+	if err != nil {
+		return nil, fmt.Errorf("build image namespace: %w", err)
+	}
+	attachIndexedNamespace(namespace)
 	return root, nil
 }
 
 func buildCVMFSIndexedRootFS(client *intcvmfs.Client, packedPath string, nodes []indexedNode) (imagefs.Directory, error) {
-	root := newIndexedDir("/", fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
+	root := newIndexedDir(fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
 	byPath := map[string]*indexedDir{"/": root}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Path < nodes[j].Path })
 	for _, node := range nodes {
@@ -145,15 +151,15 @@ func buildCVMFSIndexedRootFS(client *intcvmfs.Client, packedPath string, nodes [
 		if !ok {
 			return nil, fmt.Errorf("missing parent %q for %q", parentPath, node.Path)
 		}
-		name := path.Base(node.Path)
+		name := strings.Clone(path.Base(node.Path))
 		modTime := time.Unix(0, node.ModTimeNS)
 		switch node.Kind {
 		case indexedKindDir:
-			dir := newIndexedDir(node.Path, imagefsMode(node.Mode, fs.ModeDir|0o755), node.UID, node.GID, node.RDev, modTime)
+			dir := newIndexedDir(imagefsMode(node.Mode, fs.ModeDir|0o755), node.UID, node.GID, node.RDev, modTime)
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile("", packedPath, node, modTime, client)
+			file, err := buildIndexedFile("", packedPath, node, modTime, client, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -171,10 +177,29 @@ func buildCVMFSIndexedRootFS(client *intcvmfs.Client, packedPath string, nodes [
 			return nil, fmt.Errorf("unknown node kind %q", node.Kind)
 		}
 	}
+	namespace, err := imagefs.BuildNamespace(root)
+	if err != nil {
+		return nil, fmt.Errorf("build image namespace: %w", err)
+	}
+	attachIndexedNamespace(namespace)
 	return root, nil
 }
 
-func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client) (imagefs.File, error) {
+func attachIndexedNamespace(namespace *imagefs.Namespace) {
+	for id := 1; id < len(namespace.Nodes); id++ {
+		node := namespace.Nodes[id]
+		if node == nil || node.Entry.Dir == nil {
+			continue
+		}
+		if directory, ok := node.Entry.Dir.(*indexedDir); ok {
+			directory.namespace = namespace
+			directory.nodeID = uint64(id)
+			directory.entries = nil
+		}
+	}
+}
+
+func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client, tarPaths map[string]string) (imagefs.File, error) {
 	if node.Packed {
 		if packedPath == "" {
 			return nil, fmt.Errorf("packed path is required for %q", node.Path)
@@ -205,6 +230,14 @@ func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTi
 			client:  cvmfsClient,
 		}, nil
 	}
+	tarPath := filepath.Join(baseDir, node.TarPath)
+	if tarPaths != nil {
+		if existing := tarPaths[node.TarPath]; existing != "" {
+			tarPath = existing
+		} else {
+			tarPaths[node.TarPath] = tarPath
+		}
+	}
 	return &indexedFile{
 		mode:      imagefsMode(node.Mode, 0o644),
 		uid:       node.UID,
@@ -212,27 +245,27 @@ func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTi
 		rdev:      node.RDev,
 		size:      node.Size,
 		modTime:   modTime,
-		tarPath:   filepath.Join(baseDir, node.TarPath),
+		tarPath:   tarPath,
 		tarOffset: node.TarOffset,
 	}, nil
 }
 
 type indexedDir struct {
-	path    string
-	mode    fs.FileMode
-	uid     uint32
-	gid     uint32
-	rdev    uint32
-	modTime time.Time
-	entries map[string]imagefs.Entry
+	mode      fs.FileMode
+	uid       uint32
+	gid       uint32
+	rdev      uint32
+	modTime   time.Time
+	entries   map[string]imagefs.Entry
+	namespace *imagefs.Namespace
+	nodeID    uint64
 }
 
-func newIndexedDir(path string, mode fs.FileMode, uid, gid, rdev uint32, modTime time.Time) *indexedDir {
+func newIndexedDir(mode fs.FileMode, uid, gid, rdev uint32, modTime time.Time) *indexedDir {
 	if modTime.IsZero() {
 		modTime = time.Unix(0, 0)
 	}
 	return &indexedDir{
-		path:    path,
 		mode:    mode,
 		uid:     uid,
 		gid:     gid,
@@ -246,24 +279,50 @@ func (d *indexedDir) Stat() fs.FileMode       { return d.mode & fs.ModePerm }
 func (d *indexedDir) ModTime() time.Time      { return d.modTime }
 func (d *indexedDir) Owner() (uint32, uint32) { return d.uid, d.gid }
 func (d *indexedDir) RDev() uint32            { return d.rdev }
+func (d *indexedDir) Namespace() *imagefs.Namespace {
+	return d.namespace
+}
 func (d *indexedDir) ReadDir() ([]imagefs.DirEnt, error) {
+	if d.namespace != nil && d.nodeID < uint64(len(d.namespace.Nodes)) {
+		node := d.namespace.Nodes[d.nodeID]
+		out := make([]imagefs.DirEnt, 0, len(node.Children))
+		for name, id := range node.Children {
+			out = append(out, indexedDirEnt(name, d.namespace.Nodes[id].Entry))
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return out, nil
+	}
 	out := make([]imagefs.DirEnt, 0, len(d.entries))
 	for name, entry := range d.entries {
-		switch {
-		case entry.Dir != nil:
-			out = append(out, imagefs.DirEnt{Name: name, Mode: fs.ModeDir | entry.Dir.Stat()})
-		case entry.Symlink != nil:
-			out = append(out, imagefs.DirEnt{Name: name, Mode: fs.ModeSymlink | entry.Symlink.Stat()})
-		case entry.File != nil:
-			_, mode := entry.File.Stat()
-			out = append(out, imagefs.DirEnt{Name: name, Mode: mode})
-		}
+		out = append(out, indexedDirEnt(name, entry))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
+func indexedDirEnt(name string, entry imagefs.Entry) imagefs.DirEnt {
+	switch {
+	case entry.Dir != nil:
+		return imagefs.DirEnt{Name: name, Mode: fs.ModeDir | entry.Dir.Stat()}
+	case entry.Symlink != nil:
+		return imagefs.DirEnt{Name: name, Mode: fs.ModeSymlink | entry.Symlink.Stat()}
+	case entry.File != nil:
+		_, mode := entry.File.Stat()
+		return imagefs.DirEnt{Name: name, Mode: mode}
+	default:
+		return imagefs.DirEnt{Name: name}
+	}
+}
+
 func (d *indexedDir) Lookup(name string) (imagefs.Entry, error) {
+	if d.namespace != nil && d.nodeID < uint64(len(d.namespace.Nodes)) {
+		node := d.namespace.Nodes[d.nodeID]
+		id, ok := node.Children[name]
+		if !ok {
+			return imagefs.Entry{}, os.ErrNotExist
+		}
+		return d.namespace.Nodes[id].Entry, nil
+	}
 	entry, ok := d.entries[name]
 	if !ok {
 		return imagefs.Entry{}, os.ErrNotExist

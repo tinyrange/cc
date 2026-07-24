@@ -325,7 +325,7 @@ func (s *Store) Open(name string) (*Image, error) {
 	image, err := s.openUncached(name)
 	s.mu.Lock()
 	call.image, call.err = image, err
-	if err == nil && image.SourceKind == SourceKindSIMG {
+	if err == nil {
 		s.opened[name] = image
 	}
 	delete(s.opening, name)

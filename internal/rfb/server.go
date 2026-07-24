@@ -22,6 +22,7 @@ const (
 	securityNone                = 1
 	encodingRaw                 = 0
 	encodingHextile             = 5
+	encodingZRLE                = 16
 	encodingRichCursor          = -239
 	encodingDesktopSize         = -223
 	encodingExtendedDesktopSize = -308
@@ -437,6 +438,12 @@ func supportedDesktopSize(width, height int) (int, int) {
 }
 
 func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-chan framebufferRequest) error {
+	zrle, err := newZRLEEncoder()
+	if err != nil {
+		return err
+	}
+	defer zrle.Close()
+
 	generation := uint64(0)
 	cursorSent := false
 	cursorFormat := PixelFormat{}
@@ -464,7 +471,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 				return nil
 			}
 			if request.resize != nil && request.rect.Empty() {
-				if err := writeFramebufferUpdate(conn, virtio.FramebufferUpdate{}, request.format, request.encoding, false, request.resize); err != nil {
+				if err := writeFramebufferUpdate(conn, virtio.FramebufferUpdate{}, request.format, request.encoding, false, request.resize, zrle); err != nil {
 					return err
 				}
 				continue
@@ -474,7 +481,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 					update := s.Desktop.Framebuffer.Snapshot(request.rect, generation, true)
 					sendCursor := request.richCursor && (!cursorSent || cursorFormat != request.format)
 					if !update.Rect.Empty() || sendCursor || request.resize != nil {
-						if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize); err != nil {
+						if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
 							return err
 						}
 						generation = update.Generation
@@ -493,7 +500,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 						}
 						request = next
 						if request.resize != nil && request.rect.Empty() {
-							if err := writeFramebufferUpdate(conn, virtio.FramebufferUpdate{}, request.format, request.encoding, false, request.resize); err != nil {
+							if err := writeFramebufferUpdate(conn, virtio.FramebufferUpdate{}, request.format, request.encoding, false, request.resize, zrle); err != nil {
 								return err
 							}
 							goto nextRequest
@@ -501,7 +508,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 						if !request.incremental {
 							update = s.Desktop.Framebuffer.Snapshot(request.rect, generation, false)
 							sendCursor = request.richCursor && (!cursorSent || cursorFormat != request.format)
-							if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize); err != nil {
+							if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
 								return err
 							}
 							generation = update.Generation
@@ -523,7 +530,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 			} else {
 				update := s.Desktop.Framebuffer.Snapshot(request.rect, generation, false)
 				sendCursor := request.richCursor && (!cursorSent || cursorFormat != request.format)
-				if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize); err != nil {
+				if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
 					return err
 				}
 				generation = update.Generation
@@ -537,7 +544,7 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 	}
 }
 
-func writeFramebufferUpdate(w io.Writer, update virtio.FramebufferUpdate, format PixelFormat, encoding int32, sendCursor bool, resize *desktopResize) error {
+func writeFramebufferUpdate(w io.Writer, update virtio.FramebufferUpdate, format PixelFormat, encoding int32, sendCursor bool, resize *desktopResize, zrle *zrleEncoder) error {
 	header := []byte{0, 0, 0, 0}
 	count := uint16(0)
 	if !update.Rect.Empty() {
@@ -554,7 +561,7 @@ func writeFramebufferUpdate(w io.Writer, update virtio.FramebufferUpdate, format
 		return err
 	}
 	if !update.Rect.Empty() {
-		if err := writeFramebufferRectangle(w, update, format, encoding); err != nil {
+		if err := writeFramebufferRectangle(w, update, format, encoding, zrle); err != nil {
 			return err
 		}
 	}
@@ -599,7 +606,7 @@ func writeServerCutText(w io.Writer, text string) error {
 	return err
 }
 
-func writeFramebufferRectangle(w io.Writer, update virtio.FramebufferUpdate, format PixelFormat, encoding int32) error {
+func writeFramebufferRectangle(w io.Writer, update virtio.FramebufferUpdate, format PixelFormat, encoding int32, zrle *zrleEncoder) error {
 	rect := make([]byte, 12)
 	binary.BigEndian.PutUint16(rect[0:2], uint16(update.Rect.Min.X))
 	binary.BigEndian.PutUint16(rect[2:4], uint16(update.Rect.Min.Y))
@@ -610,6 +617,11 @@ func writeFramebufferRectangle(w io.Writer, update virtio.FramebufferUpdate, for
 		return err
 	}
 	switch encoding {
+	case encodingZRLE:
+		if zrle == nil {
+			return fmt.Errorf("ZRLE encoder is unavailable")
+		}
+		return zrle.WriteRectangle(w, update.Pixels, update.Rect.Dx(), update.Rect.Dy(), format)
 	case encodingHextile:
 		return writeHextile(w, update.Pixels, update.Rect.Dx(), update.Rect.Dy(), format)
 	default:
@@ -623,8 +635,11 @@ func writeFramebufferRectangle(w io.Writer, update virtio.FramebufferUpdate, for
 }
 
 func chooseFramebufferEncoding(encodings []int32) int32 {
-	if hasEncoding(encodings, encodingHextile) {
-		return encodingHextile
+	for _, encoding := range encodings {
+		switch encoding {
+		case encodingZRLE, encodingHextile, encodingRaw:
+			return encoding
+		}
 	}
 	return encodingRaw
 }

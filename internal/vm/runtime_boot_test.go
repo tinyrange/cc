@@ -64,6 +64,39 @@ func TestRuntimeBootsLinuxAndRunsOneShotCommand(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-one-shot", "Linux", "machine=")
 }
 
+func TestRuntimeLinuxSerialConsoleCanBeOpened(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	command := []string{
+		"sh",
+		"-lc",
+		"set -eu; exec 3<>/dev/ttyS0; test -t 3; printf 'serial-console-open\\n'",
+	}
+
+	t.Run("one-shot", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+		defer cancel()
+		resp, err := env.backend.Run(ctx, client.RunRequest{
+			Image:    env.imageName,
+			MemoryMB: env.memoryMB,
+			CPUs:     1,
+			User:     "root",
+			Command:  command,
+		})
+		requireRunResponse(t, resp, err, 0)
+		requireGuestOutput(t, resp.Output, "serial-console-open")
+	})
+
+	t.Run("persistent", func(t *testing.T) {
+		inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+		defer inst.Close()
+		resp := execInRuntimeRequest(t, inst, client.ExecRequest{
+			Command: command,
+			User:    "root",
+		})
+		requireGuestOutput(t, resp.Output, "serial-console-open")
+	})
+}
+
 func TestRuntimeLinuxExposesMatchingModuleSymbolVersions(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})

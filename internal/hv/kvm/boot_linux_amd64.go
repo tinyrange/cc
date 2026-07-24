@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"strings"
 	"time"
@@ -100,7 +101,7 @@ func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []b
 	}
 
 	var serialOut bytes.Buffer
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, &serialOut)
+	uart := newAMD64UART(vm, &serialOut)
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			fsdev.Attach(vm, vm)
@@ -200,6 +201,12 @@ func bootToConditionWithNVMeBlock(ctx context.Context, kernel []byte, initrd []b
 			return serialOut.String(), nil
 		}
 	}
+}
+
+func newAMD64UART(irq virtio.IRQController, out io.Writer) *serial.UART8250 {
+	uart := serial.NewUART8250(amd64vm.COM1Base, 0, out)
+	uart.AttachIRQ(irq, amd64vm.COM1IRQ)
+	return uart
 }
 
 func BootKernelToSerialWithTimeout(kernel []byte, memoryMB uint64, dmesg bool, timeout time.Duration) (string, error) {

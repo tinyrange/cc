@@ -14,7 +14,6 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
 	managedagent "j5.nz/cc/internal/managed/agent"
-	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -154,7 +153,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 	snapshot := newSnapshotTrigger(opts.SnapshotDir, mem)
 	serialWriter = snapshot.wrapSerialWriter(serialWriter)
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
+	uart := newAMD64UART(vm, serialWriter)
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			fsdev.Attach(vm, vm)
