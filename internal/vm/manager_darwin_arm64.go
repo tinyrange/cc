@@ -19,7 +19,7 @@ func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache
 		return NewManagerWithBackend(backend)
 	}
 	mgr := NewManagerWithHosts(
-		vmhost.NewInProcess(backend, darwinInProcessCapabilities),
+		vmhost.NewInProcess(backend, HostCapabilities),
 		NewLocalSidecarVMHost(rootCache, kernel, images, guestInitCache),
 	)
 	mgr.capabilities = func() client.CapabilitiesResponse {
@@ -31,10 +31,4 @@ func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache
 		return caps
 	}
 	return mgr
-}
-
-func darwinInProcessCapabilities() client.CapabilitiesResponse {
-	caps := HostCapabilities()
-	caps.NetworkModes = nil
-	return caps
 }

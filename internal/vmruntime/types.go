@@ -93,6 +93,8 @@ type RunRequest struct {
 	Persistent        bool
 	Network           *GuestNetworkConfig
 	NetDevice         *virtio.Net
+	DisplayWidth      uint32
+	DisplayHeight     uint32
 	SnapshotDir       string
 	RestoreSnapshot   string
 	UnixTime          int64

@@ -112,6 +112,9 @@ func alpineRuntimeKernelRequirements(network bool, extra []string) ([]string, ma
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
+		"CONFIG_DRM_VIRTIO_GPU":   "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.gz",
+		"CONFIG_VIRTIO_INPUT":     "kernel/drivers/virtio/virtio_input.ko.gz",
+		"CONFIG_INPUT_EVDEV":      "kernel/drivers/input/evdev.ko.gz",
 		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
 	}
 	return configVars, moduleMap
@@ -142,6 +145,9 @@ func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]strin
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.zst",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.zst",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.zst",
+		"CONFIG_DRM_VIRTIO_GPU":   "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.zst",
+		"CONFIG_VIRTIO_INPUT":     "kernel/drivers/virtio/virtio_input.ko.zst",
+		"CONFIG_INPUT_EVDEV":      "kernel/drivers/input/evdev.ko.zst",
 		"CONFIG_OVERLAY_FS":       "kernel/fs/overlayfs/overlay.ko.zst",
 		"CONFIG_NF_TABLES":        "kernel/net/netfilter/nf_tables.ko.zst",
 		"CONFIG_IP_NF_IPTABLES":   "kernel/net/ipv4/netfilter/ip_tables.ko.zst",
@@ -563,7 +569,8 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	kernelModules := displayKernelModules(req.Display, req.KernelModules)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, kernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -582,6 +589,8 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 		return vmruntime.RunRequest{}, err
 	}
 	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
+	runReq.DisplayWidth = displayWidthDarwin(req.Display)
+	runReq.DisplayHeight = displayHeightDarwin(req.Display)
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)
@@ -625,6 +634,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Persistent:        true,
 			Network:           network.guestInitConfig(),
 			NetDevice:         networkDeviceDarwin(network),
+			DisplayWidth:      displayWidthDarwin(req.Display),
+			DisplayHeight:     displayHeightDarwin(req.Display),
 			SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 			UnixTime:          time.Now().Unix(),
@@ -648,7 +659,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, req.KernelModules)
+	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, displayKernelModules(req.Display, req.KernelModules))
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 	}
@@ -712,6 +723,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Persistent:        true,
 		Network:           network.guestInitConfig(),
 		NetDevice:         networkDeviceDarwin(network),
+		DisplayWidth:      displayWidthDarwin(req.Display),
+		DisplayHeight:     displayHeightDarwin(req.Display),
 		SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:          time.Now().Unix(),
@@ -770,6 +783,8 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 		Persistent:      true,
 		Network:         network.guestInitConfig(),
 		NetDevice:       networkDeviceDarwin(network),
+		DisplayWidth:    displayWidthDarwin(req.Display),
+		DisplayHeight:   displayHeightDarwin(req.Display),
 		SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:        time.Now().Unix(),
@@ -779,6 +794,28 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 func applyStartupSnapshotOptions(req *vmruntime.RunRequest, snapshotDir, restoreSnapshot string) {
 	req.SnapshotDir = strings.TrimSpace(snapshotDir)
 	req.RestoreSnapshot = strings.TrimSpace(restoreSnapshot)
+}
+
+func displayKernelModules(display *client.DisplayConfig, modules []string) []string {
+	out := append([]string(nil), modules...)
+	if display != nil {
+		out = append(out, "CONFIG_DRM_VIRTIO_GPU", "CONFIG_VIRTIO_INPUT", "CONFIG_INPUT_EVDEV")
+	}
+	return out
+}
+
+func displayWidthDarwin(display *client.DisplayConfig) uint32 {
+	if display == nil {
+		return 0
+	}
+	return display.Width
+}
+
+func displayHeightDarwin(display *client.DisplayConfig) uint32 {
+	if display == nil {
+		return 0
+	}
+	return display.Height
 }
 
 func workerRemoteRootFS() (virtio.FSBackend, error) {

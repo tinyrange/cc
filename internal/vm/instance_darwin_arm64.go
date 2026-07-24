@@ -166,6 +166,13 @@ func (i *darwinInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
 	return i.session.PersistentFSStatus()
 }
 
+func (i *darwinInstance) Desktop() *virtio.Desktop {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	return i.session.Desktop()
+}
+
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.managedCore().Exec(ctx, req)
 }

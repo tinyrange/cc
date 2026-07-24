@@ -36,6 +36,10 @@ func HasFatalBootText(text string) bool               { return vmruntime.HasFata
 func ParseInitDurationMarker(text string) (int, bool) { return vmruntime.ParseInitDurationMarker(text) }
 
 func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) ([]byte, error) {
+	var snapshotMMIOBase uint64
+	if strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "" {
+		snapshotMMIOBase = SnapshotBase
+	}
 	return BuildInitramfs(req.Init, req.Modules, GuestInitConfig{
 		Env:               append([]string(nil), baseEnv...),
 		WorkDir:           workDir,
@@ -54,7 +58,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		ExitMarkerPrefix:  CommandExitMarkerPref,
 		PrecopyAMD64Root:  strings.TrimSpace(os.Getenv("CCX3_BENCH_PRECOPY_AMD64_ROOT")) != "",
 		Network:           req.Network,
-		SnapshotMMIOBase:  SnapshotBase,
+		SnapshotMMIOBase:  snapshotMMIOBase,
 		UnixTime:          req.UnixTime,
 		KernelRelease:     req.KernelRelease,
 		ModuleSymvers:     req.ModuleSymvers,
