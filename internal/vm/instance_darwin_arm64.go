@@ -37,22 +37,24 @@ func (i *darwinInstance) BalloonState() (targetMB, actualMB uint64, driverReady,
 
 type darwinInstance struct {
 	*managedInstanceCore
-	session   *hvf.ContainerSession
-	network   *darwinNetworkRuntime
-	imageName string
+	session     *hvf.ContainerSession
+	network     *darwinNetworkRuntime
+	imageName   string
+	defaultUser string
 }
 
-func newDarwinInstance(session *hvf.ContainerSession, network *darwinNetworkRuntime, imageName string) *darwinInstance {
+func newDarwinInstance(session *hvf.ContainerSession, network *darwinNetworkRuntime, imageName, defaultUser string) *darwinInstance {
 	inst := &darwinInstance{
-		session:   session,
-		network:   network,
-		imageName: imageName,
+		session:     session,
+		network:     network,
+		imageName:   imageName,
+		defaultUser: defaultUser,
 	}
-	inst.managedInstanceCore = newDarwinManagedCore(session)
+	inst.managedInstanceCore = newDarwinManagedCore(session, defaultUser)
 	return inst
 }
 
-func newDarwinManagedCore(session *hvf.ContainerSession) *managedInstanceCore {
+func newDarwinManagedCore(session *hvf.ContainerSession, defaultUser string) *managedInstanceCore {
 	if session == nil {
 		return nil
 	}
@@ -62,6 +64,7 @@ func newDarwinManagedCore(session *hvf.ContainerSession) *managedInstanceCore {
 		Session:        session,
 		Root:           metadata.Root,
 		BaseEnv:        metadata.BaseEnv,
+		DefaultUser:    defaultUser,
 		WorkDir:        metadata.WorkDir,
 		Capabilities:   managedguest.LinuxProfile.Caps,
 		Env:            mergeDarwinManagedEnv,
@@ -81,7 +84,7 @@ func (i *darwinInstance) managedCore() *managedInstanceCore {
 	if i.managedInstanceCore != nil {
 		return i.managedInstanceCore
 	}
-	return newDarwinManagedCore(i.session)
+	return newDarwinManagedCore(i.session, i.defaultUser)
 }
 
 func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -154,6 +157,13 @@ func (i *darwinInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 		return virtio.FSBackingUsageSnapshot{}
 	}
 	return i.session.BackingSnapshot()
+}
+
+func (i *darwinInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	return i.session.PersistentFSStatus()
 }
 
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {

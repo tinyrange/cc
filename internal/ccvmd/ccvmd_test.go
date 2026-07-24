@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -783,7 +784,7 @@ func TestSanitizeExecEventForJSONUsesTextOrBinary(t *testing.T) {
 func TestWaitForWorkerStateReturnsTerminalState(t *testing.T) {
 	want := client.InstanceState{ID: "vm", Status: "stopped"}
 	got, completed := waitForWorkerState(t.Context(), func() client.InstanceState { return want })
-	if !completed || got != want {
+	if !completed || !reflect.DeepEqual(got, want) {
 		t.Fatalf("wait result = %+v, %t", got, completed)
 	}
 }

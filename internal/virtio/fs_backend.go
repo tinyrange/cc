@@ -2,6 +2,28 @@ package virtio
 
 import "time"
 
+type PersistentFSStatus struct {
+	Name               string
+	Mount              string
+	FormatVersion      uint32
+	LowerID            string
+	PreviousLowerID    string
+	Sequence           uint64
+	DurableSequence    uint64
+	UpperLogicalBytes  uint64
+	UpperDataBytes     uint64
+	UpperPhysicalBytes uint64
+	WALBytes           uint64
+	StagingBytes       uint64
+	TrashBytes         uint64
+	RecoveryStatus     string
+	QuarantinePath     string
+	DiscardedBytes     uint64
+	LastCheckpoint     time.Time
+	LastError          string
+	HostFreeBytes      uint64
+}
+
 // FSBackend owns the filesystem namespace, inode identities, and open handles.
 // The FUSE dispatcher owns protocol decoding; the virtqueue driver never calls
 // a backend directly.

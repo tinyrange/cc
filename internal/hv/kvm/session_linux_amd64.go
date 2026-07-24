@@ -4,6 +4,7 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -29,6 +30,7 @@ type ManagedSession struct {
 	balloon           *virtio.Balloon
 	desktop           *virtio.Desktop
 	fsdevs            []*virtio.FS
+	fsCloseErr        *error
 	bootWriter        *vmruntime.BootEventWriter
 	transcript        *vmruntime.SerialTranscript
 	serialOut         *vmruntime.SerialTranscript
@@ -222,9 +224,10 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		go serveDisplayConnections(runCtx, displayListener, desktop)
 	}
 	done := newSessionDone()
+	var fsCloseErr error
 	go func() {
 		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, displayDevices, serialOut, snapshot)
-		closeVMWithFS(vm, fsdevs)
+		fsCloseErr = closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
 
@@ -303,6 +306,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		balloon:           balloon,
 		desktop:           desktop,
 		fsdevs:            fsdevs,
+		fsCloseErr:        &fsCloseErr,
 		bootWriter:        bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()
@@ -415,7 +419,11 @@ func (s *ManagedSession) Wait() error {
 	if s == nil || s.done == nil {
 		return nil
 	}
-	return s.done.wait()
+	err := s.done.wait()
+	if s.fsCloseErr != nil {
+		err = errors.Join(err, *s.fsCloseErr)
+	}
+	return err
 }
 
 func (s *ManagedSession) Close() error {
@@ -446,16 +454,23 @@ func (s *ManagedSession) Close() error {
 	if s.cleanup != nil {
 		s.cleanup()
 	}
+	var closeErr error
 	if s.done != nil {
-		_ = s.done.wait()
+		closeErr = s.done.wait()
+		if errors.Is(closeErr, context.Canceled) {
+			closeErr = nil
+		}
+	}
+	if s.fsCloseErr != nil {
+		closeErr = errors.Join(closeErr, *s.fsCloseErr)
 	}
 	if s.transcript != nil {
-		_ = s.transcript.Close()
+		closeErr = errors.Join(closeErr, s.transcript.Close())
 	}
 	if s.serialOut != nil && s.serialOut != s.transcript {
-		_ = s.serialOut.Close()
+		closeErr = errors.Join(closeErr, s.serialOut.Close())
 	}
-	return nil
+	return closeErr
 }
 
 func transcriptError(err error, serialText, controlText string) error {

@@ -80,6 +80,7 @@ type RunRequest struct {
 	InitSystem        string
 	RootFS            virtio.FSBackend
 	Shares            []DirectoryShare
+	Mounts            []virtio.ShareMount
 	Command           []string
 	Env               []string
 	WorkDir           string

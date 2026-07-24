@@ -60,6 +60,18 @@ const (
 	BalloonSize = 0x1000
 	BalloonIRQ  = 47
 
+	GPUBase = 0x0a109000
+	GPUSize = 0x1000
+	GPUIRQ  = 48
+
+	KeyboardBase = 0x0a10a000
+	KeyboardSize = 0x1000
+	KeyboardIRQ  = 49
+
+	PointerBase = 0x0a10b000
+	PointerSize = 0x1000
+	PointerIRQ  = 50
+
 	PCIConfigBase = 0x20000000
 	PCIConfigSize = 0x01000000
 	PCIMMIOBase   = 0x21000000

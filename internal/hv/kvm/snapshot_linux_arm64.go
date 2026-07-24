@@ -553,7 +553,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	done := newSessionDone()
 	go func() {
 		resumeTrigger := &snapshotTrigger{base: arm64vm.SnapshotBase, size: arm64vm.SnapshotSize}
-		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, serialOut, resumeTrigger)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, nil, serialOut, resumeTrigger)
 		closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()

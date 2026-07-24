@@ -393,6 +393,10 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		combinedHighWater: 11 << 20,
 		physical:          5 << 20,
 		reclaimErr:        errors.New("backing filesystem refused reclamation"),
+		persistent: []virtio.PersistentFSStatus{{
+			Name: "research", Mount: "/home/cc", FormatVersion: 1,
+			Sequence: 9, DurableSequence: 8, UpperDataBytes: 3 << 20,
+		}},
 	}
 	host.queueInstance(inst)
 	manager := testManager(host)
@@ -407,6 +411,9 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	}
 	if inst.snapshotCalls != 1 || inst.usageCalls != 0 || inst.metadataCalls != 0 || inst.combinedCalls != 0 {
 		t.Fatalf("backing provider calls snapshot=%d data=%d metadata=%d combined=%d", inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls)
+	}
+	if len(state.PersistentMounts) != 1 || state.PersistentMounts[0].Name != "research" || state.PersistentMounts[0].Mount != "/home/cc" || state.PersistentMounts[0].Sequence != 9 || state.PersistentMounts[0].DurableSequence != 8 {
+		t.Fatalf("persistent mount state = %+v", state.PersistentMounts)
 	}
 }
 
@@ -1539,6 +1546,7 @@ type backingUsageTestInstance struct {
 	usageCalls                   int
 	metadataCalls                int
 	combinedCalls                int
+	persistent                   []virtio.PersistentFSStatus
 }
 
 type blockingBalloonInstance struct {
@@ -1626,6 +1634,10 @@ func (i *backingUsageTestInstance) BackingSnapshot() virtio.FSBackingUsageSnapsh
 		CombinedBytes: i.combined, CombinedHighWaterBytes: i.combinedHighWater,
 		PhysicalBytes: i.physical, ReclaimError: i.reclaimErr,
 	}
+}
+
+func (i *backingUsageTestInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
+	return append([]virtio.PersistentFSStatus(nil), i.persistent...)
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

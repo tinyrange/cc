@@ -160,6 +160,9 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -195,7 +198,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
 	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
-	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image), req.DefaultUser), nil
 }
 
 func (b *runtimeBackend) StartBlankStream(
@@ -203,6 +206,9 @@ func (b *runtimeBackend) StartBlankStream(
 	req client.StartInstanceRequest,
 	onEvent func(client.BootEvent) error,
 ) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -238,7 +244,7 @@ func (b *runtimeBackend) StartBlankStream(
 		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
 	}
 	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
-	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image), req.DefaultUser), nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -571,6 +577,11 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if runReq.RootFS == nil {
 		runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	}
+	persistentMounts, err := mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), runReq.Image, req.PersistentMounts)
+	if err != nil {
+		return vmruntime.RunRequest{}, err
+	}
+	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)
@@ -671,6 +682,16 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	} else if rootFS != nil {
 		shares = nil
 	}
+	var persistentMounts []virtio.ShareMount
+	if len(req.PersistentMounts) != 0 {
+		if b.images == nil {
+			return vmruntime.RunRequest{}, fmt.Errorf("persistent mounts require an image store")
+		}
+		persistentMounts, err = mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), image, req.PersistentMounts)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+	}
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
 		KernelRelease:     kernelMetadata.Release,
@@ -682,6 +703,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		InitSystem:        req.InitSystem,
 		RootFS:            rootFS,
 		Shares:            shares,
+		Mounts:            persistentMounts,
 		MemoryMB:          req.MemoryMB,
 		BalloonMB:         req.BalloonMB,
 		CPUs:              req.CPUs,
@@ -724,11 +746,22 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 	} else {
 		shares = nil
 	}
+	var persistentMounts []virtio.ShareMount
+	if len(req.PersistentMounts) != 0 {
+		if b.images == nil {
+			return vmruntime.RunRequest{}, fmt.Errorf("persistent mounts require an image store")
+		}
+		persistentMounts, err = mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), image, req.PersistentMounts)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+	}
 	return vmruntime.RunRequest{
 		Image:           image,
 		InitSystem:      req.InitSystem,
 		RootFS:          rootFS,
 		Shares:          shares,
+		Mounts:          persistentMounts,
 		MemoryMB:        req.MemoryMB,
 		BalloonMB:       req.BalloonMB,
 		CPUs:            req.CPUs,

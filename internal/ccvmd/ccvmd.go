@@ -1559,6 +1559,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			w.WriteHeader(http.StatusOK)
 			enc := json.NewEncoder(w)
 			flusher, _ := w.(http.Flusher)
+			if flusher != nil {
+				flusher.Flush()
+			}
 			events := make(chan client.ProgressEvent, 128)
 			go func() {
 				defer close(events)

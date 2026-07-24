@@ -94,7 +94,7 @@ func BuildFSDevices(req RunRequest, trace io.Writer) ([]*virtio.FS, virtio.Share
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
 		rootFSOwned = true
 	}
-	shares := make([]virtio.ShareMount, 0, len(req.Shares))
+	shares := append([]virtio.ShareMount(nil), req.Mounts...)
 	for i, share := range req.Shares {
 		mount, err := BuildShareMount(i, share)
 		if err != nil {

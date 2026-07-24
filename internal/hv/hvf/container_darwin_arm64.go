@@ -174,6 +174,7 @@ type ContainerSession struct {
 	balloon     *virtio.Balloon
 	rootFS      virtio.ShareMounter
 	fsdevs      []*virtio.FS
+	fsCloseErr  *error
 	sendMu      sync.Mutex
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
@@ -331,6 +332,9 @@ func (s *ContainerSession) Wait() error {
 	res := <-s.doneCh
 	if s.closeDone != nil {
 		<-s.closeDone
+	}
+	if s.fsCloseErr != nil {
+		res.err = errors.Join(res.err, *s.fsCloseErr)
 	}
 	return res.err
 }
@@ -492,6 +496,19 @@ func (s *ContainerSession) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
 		PhysicalBytes: physical, ReclaimError: err,
 	}
+}
+
+func (s *ContainerSession) PersistentFSStatus() []virtio.PersistentFSStatus {
+	if s == nil {
+		return nil
+	}
+	var statuses []virtio.PersistentFSStatus
+	for _, device := range s.fsdevs {
+		if device != nil {
+			statuses = append(statuses, device.PersistentFSStatus()...)
+		}
+	}
+	return statuses
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -1010,14 +1027,18 @@ func (s *ContainerSession) Close() error {
 	case <-time.After(15 * time.Second):
 		return fmt.Errorf("container session did not stop within 15s")
 	}
+	var closeErr error
+	if s.fsCloseErr != nil {
+		closeErr = *s.fsCloseErr
+	}
 	if s.transcript != nil {
-		_ = s.transcript.Close()
+		closeErr = errors.Join(closeErr, s.transcript.Close())
 	}
 	if s.serialOut != nil && s.serialOut != s.transcript {
-		_ = s.serialOut.Close()
+		closeErr = errors.Join(closeErr, s.serialOut.Close())
 	}
 	exitTiming.Dump()
-	return nil
+	return closeErr
 }
 
 func (s *ContainerSession) SetBalloonMB(target uint64) error {
@@ -1092,6 +1113,12 @@ func (s *ContainerSession) markExecDone() {
 }
 
 func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEvent func(client.BootEvent) error) (*ContainerSession, error) {
+	mountsOwned := true
+	defer func() {
+		if mountsOwned {
+			_ = vmruntime.CloseShareMounts(req.Mounts)
+		}
+	}()
 	start := time.Now()
 	if req.Image == nil && req.RootFS == nil {
 		return nil, fmt.Errorf("image or rootfs backend is required")
@@ -1203,6 +1230,17 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, err
 	}
+	mountsOwned = false
+	fsDevicesOwned := true
+	defer func() {
+		if fsDevicesOwned {
+			for _, device := range fsdevs {
+				if device != nil {
+					_ = device.Close()
+				}
+			}
+		}
+	}()
 	attachFSDeviceTiming(ctx, fsdevs)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		for _, fsdev := range fsdevs {
@@ -1329,8 +1367,19 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		}
 	}()
 
+	var fsCloseErr error
+	fsDevicesOwned = false
 	go func() {
 		defer close(closeDone)
+		defer func() {
+			var errs []error
+			for _, device := range fsdevs {
+				if device != nil {
+					errs = append(errs, device.Close())
+				}
+			}
+			fsCloseErr = errors.Join(errs...)
+		}()
 		defer func() {
 			_ = vm.Close()
 			exitTiming.Dump()
@@ -1486,6 +1535,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			balloon:     balloon,
 			rootFS:      rootFS,
 			fsdevs:      fsdevs,
+			fsCloseErr:  &fsCloseErr,
 			shares:      shareState,
 			activeExecs: activeExecs,
 		}, nil
@@ -1553,6 +1603,12 @@ func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunRes
 }
 
 func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- error) (ret ContainerRunResult, retErr error) {
+	mountsOwned := true
+	defer func() {
+		if mountsOwned {
+			retErr = errors.Join(retErr, vmruntime.CloseShareMounts(req.Mounts))
+		}
+	}()
 	if req.Image == nil && req.RootFS == nil {
 		return ContainerRunResult{}, fmt.Errorf("image or rootfs backend is required")
 	}
@@ -1659,6 +1715,16 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
+	mountsOwned = false
+	defer func() {
+		var errs []error
+		for _, device := range fsdevs {
+			if device != nil {
+				errs = append(errs, device.Close())
+			}
+		}
+		retErr = errors.Join(retErr, errors.Join(errs...))
+	}()
 	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
