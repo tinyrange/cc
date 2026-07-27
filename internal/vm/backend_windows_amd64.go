@@ -139,7 +139,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := windowsGuestInitConfig(modules, true)
+	initCfg := windowsGuestInitConfig(modules, true, req.InitSystem)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
@@ -283,7 +283,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := windowsGuestInitConfig(modules, true)
+	initCfg := windowsGuestInitConfig(modules, true, req.InitSystem)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
@@ -394,7 +394,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if network != nil {
 		defer network.Close()
 	}
-	initCfg := windowsGuestInitConfig(modules, len(req.Command) != 0)
+	initCfg := windowsGuestInitConfig(modules, len(req.Command) != 0, req.InitSystem)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
 	}
@@ -776,18 +776,18 @@ func (i *windowsInstance) Desktop() *virtio.Desktop {
 	return provider.Desktop()
 }
 
-func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
+func windowsGuestInitConfig(modules []alpine.Module, managedExec bool, initSystem string) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
-		Modules:            vmruntime.ModulePaths(modules),
-		ReadyMarker:        windowsInitReadyMarker,
-		BeginMarker:        vmruntime.CommandBeginMarker,
-		OutputMarkerPref:   vmruntime.CommandOutputMarker,
-		ErrorMarkerPref:    vmruntime.CommandErrorMarker,
-		ControlMarkerPref:  vmruntime.CommandControlMarker,
-		UsageMarkerPref:    vmruntime.CommandUsageMarker,
-		ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
-		DisableCgroupMount: true,
-		UnixTime:           time.Now().Unix(),
+		Modules:           vmruntime.ModulePaths(modules),
+		InitSystem:        strings.TrimSpace(initSystem),
+		ReadyMarker:       windowsInitReadyMarker,
+		BeginMarker:       vmruntime.CommandBeginMarker,
+		OutputMarkerPref:  vmruntime.CommandOutputMarker,
+		ErrorMarkerPref:   vmruntime.CommandErrorMarker,
+		ControlMarkerPref: vmruntime.CommandControlMarker,
+		UsageMarkerPref:   vmruntime.CommandUsageMarker,
+		ExitMarkerPrefix:  vmruntime.CommandExitMarkerPref,
+		UnixTime:          time.Now().Unix(),
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort
