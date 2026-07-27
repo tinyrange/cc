@@ -125,6 +125,12 @@ func (g *GPU) Attach(mem GuestMemory, irq IRQController) {
 	g.irq = irq
 }
 
+func (g *GPU) IRQAsserted() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.irqHigh
+}
+
 func (g *GPU) Contains(addr uint64, size int) bool {
 	if size <= 0 || addr < g.Base {
 		return false

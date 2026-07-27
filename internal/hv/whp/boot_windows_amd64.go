@@ -886,6 +886,22 @@ func (p *bootPlatform) resampleDeviceIRQs() {
 			p.injectIOAPIC(route, true)
 		}
 	}
+	for _, device := range p.displayDevices {
+		var irq uint32
+		var asserted bool
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			irq, asserted = typed.IRQ, typed.IRQAsserted()
+		case *virtio.Input:
+			irq, asserted = typed.IRQ, typed.IRQAsserted()
+		}
+		if asserted {
+			line := uint8(irq)
+			if route, pending := p.ioapic.assert(line, true); pending {
+				p.injectIOAPIC(route, true)
+			}
+		}
+	}
 }
 
 func (p *bootPlatform) deliverPICOutput() bool {
@@ -1163,6 +1179,18 @@ func (p *bootPlatform) usePendingInterruptionFallback(line uint8) bool {
 			return true
 		}
 	}
+	for _, device := range p.displayDevices {
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			if typed.IRQ == uint32(line) {
+				return true
+			}
+		case *virtio.Input:
+			if typed.IRQ == uint32(line) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -1231,6 +1259,10 @@ func canSetPendingInterruption(ctx *runVPExitContext, vector uint8) bool {
 		return true
 	}
 	if ctx.VpContext.ExecutionState.interruptionPending() || ctx.VpContext.ExecutionState.interruptShadow() {
+		return false
+	}
+	const rflagsInterruptEnable = uint64(1 << 9)
+	if ctx.VpContext.Rflags&rflagsInterruptEnable == 0 {
 		return false
 	}
 	priority := vector >> 4
