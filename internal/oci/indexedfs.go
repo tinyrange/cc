@@ -516,6 +516,10 @@ func (l *indexedSymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
 func (l *indexedSymlink) RDev() uint32            { return l.rdev }
 
 func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
+	return writeLayerTarFromReaderWithProgress(dstPath, mediaType, body, nil)
+}
+
+func writeLayerTarFromReaderWithProgress(dstPath, mediaType string, body io.Reader, progress func(int64)) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
@@ -528,7 +532,13 @@ func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 		_ = dst.Close()
 		_ = os.Remove(tmpPath)
 	}()
-	buffered := bufio.NewReader(body)
+	tracked := &countingReader{r: body}
+	if progress != nil {
+		tracked.report = func(current, _ int64) {
+			progress(current)
+		}
+	}
+	buffered := bufio.NewReader(tracked)
 	var src io.Reader = buffered
 	gzipLayer := strings.Contains(mediaType, "gzip")
 	if !gzipLayer {
@@ -558,28 +568,55 @@ func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 }
 
 type countingReader struct {
-	r io.Reader
-	n uint64
+	r          io.Reader
+	n          uint64
+	total      int64
+	lastReport time.Time
+	report     func(current, total int64)
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += uint64(n)
+	if c.report != nil {
+		now := time.Now()
+		if err == io.EOF || c.lastReport.IsZero() || now.Sub(c.lastReport) >= 200*time.Millisecond {
+			c.lastReport = now
+			c.report(int64(c.n), c.total)
+		}
+	}
 	return n, err
 }
 
 func applyIndexedLayer(tarPath string, tarRef string, merged map[string]*indexedNode, entries map[string]fsmeta.Entry) error {
+	return applyIndexedLayerWithProgress(tarPath, tarRef, merged, entries, nil)
+}
+
+func applyIndexedLayerWithProgress(
+	tarPath string,
+	tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	progress func(current, total int64),
+) error {
 	file, err := os.Open(tarPath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	cr := &countingReader{r: file}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	cr := &countingReader{r: file, total: info.Size(), report: progress}
 	tr := tar.NewReader(cr)
 	layerEntries := map[string]*indexedNode{}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
+			if progress != nil {
+				progress(info.Size(), info.Size())
+			}
 			return nil
 		}
 		if err != nil {

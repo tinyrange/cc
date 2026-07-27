@@ -47,6 +47,7 @@ const (
 
 const internalScratchSource = "scratch"
 const maxRegistryMetadataBytes int64 = 16 << 20
+const defaultOCIBlobDownloadWorkers = 4
 
 type Store struct {
 	root          string
@@ -125,6 +126,13 @@ func reportPullProgress(report func(client.ProgressEvent), event client.Progress
 		return
 	}
 	report(event)
+}
+
+func ratio(current, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return min(1, max(0, float64(current)/float64(total)))
 }
 
 func normalizedMirrors(mirrors []string) []string {
@@ -221,6 +229,7 @@ func (s *stringSlice) UnmarshalJSON(data []byte) error {
 type registryContext struct {
 	client   *http.Client
 	registry string
+	tokenMu  sync.RWMutex
 	token    string
 }
 
@@ -988,6 +997,13 @@ func (s *Store) fetchRootFSTar(ctx context.Context, name, source, destPath strin
 }
 
 func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
+	var reportMu sync.Mutex
+	report := func(event client.ProgressEvent) {
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		reportPullProgress(options.Report, event)
+	}
+	report(client.ProgressEvent{Status: "resolving", Artifact: name, Blob: "manifest"})
 	registry, imageName, tag, err := ParseImageRef(spec.Raw)
 	if err != nil {
 		return err
@@ -1020,17 +1036,73 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		return fmt.Errorf("decode image config: %w", err)
 	}
 
+	downloads, err := s.startLayerBlobPull(ctx, reg, imageName, name, mani.Layers, report)
+	if err != nil {
+		return err
+	}
+	defer downloads.cancel()
+
 	build := newIndexedBuildState()
+	var totalLayerBytes int64
 	for _, layer := range mani.Layers {
-		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
-		layerTarPath := filepath.Join(tmpDir, layerTarRel)
-		if err := s.fetchLayerTar(ctx, reg, imageName, layer, layerTarPath); err != nil {
+		totalLayerBytes += layer.Size
+	}
+	var preparedLayerBytes int64
+	prepareStarted := time.Now()
+	for layerIndex, layer := range mani.Layers {
+		if err := downloads.waitLayer(ctx, layer.Digest); err != nil {
 			return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
 		}
-		if err := applyIndexedLayer(layerTarPath, layerTarRel, build.merged, build.fsEntries); err != nil {
+		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
+		layerTarPath := filepath.Join(tmpDir, layerTarRel)
+		reportPrepare := func(layerWork int64) {
+			if !downloads.finished() {
+				return
+			}
+			workTotal := totalLayerBytes * 2
+			workDone := preparedLayerBytes*2 + min(layer.Size*2, max(0, layerWork))
+			progress := ratio(workDone, workTotal)
+			elapsed := time.Since(prepareStarted).Seconds()
+			var eta float64
+			if progress > 0 && progress < 1 && elapsed > 0 {
+				eta = elapsed * (1 - progress) / progress
+			}
+			report(client.ProgressEvent{
+				Status:          "indexing",
+				Artifact:        name,
+				Blob:            layer.Digest,
+				Progress:        progress,
+				FilesDownloaded: int64(layerIndex),
+				FilesTotal:      int64(len(mani.Layers)),
+				ETASeconds:      eta,
+			})
+		}
+		reportPrepare(0)
+		if err := s.writeCachedLayerTar(layer, layerTarPath, func(compressedBytes int64) {
+			reportPrepare(min(layer.Size, compressedBytes))
+		}); err != nil {
+			return fmt.Errorf("expand layer %s: %w", layer.Digest, err)
+		}
+		if err := applyIndexedLayerWithProgress(layerTarPath, layerTarRel, build.merged, build.fsEntries, func(indexedBytes, expandedBytes int64) {
+			indexFraction := ratio(indexedBytes, expandedBytes)
+			reportPrepare(layer.Size + int64(float64(layer.Size)*indexFraction))
+		}); err != nil {
 			return fmt.Errorf("index layer %s: %w", layer.Digest, err)
 		}
+		preparedLayerBytes += layer.Size
+		reportPrepare(0)
 	}
+	if err := downloads.wait(ctx); err != nil {
+		return err
+	}
+	report(client.ProgressEvent{
+		Status:          "indexing",
+		Artifact:        name,
+		Blob:            "filesystem",
+		Progress:        1,
+		FilesDownloaded: int64(len(mani.Layers)),
+		FilesTotal:      int64(len(mani.Layers)),
+	})
 	metaSpec := spec
 	if manifestDigest != "" {
 		metaSpec.Raw = resolvedOCISource(registry, imageName, manifestDigest)
@@ -1318,21 +1390,194 @@ func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName s
 	return data, nil
 }
 
-func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageName string, layer descriptor, dstPath string) error {
-	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
-	if file, err := os.Open(blobPath); err == nil {
-		defer file.Close()
-		return writeLayerTarFromReader(dstPath, layer.MediaType, file)
+func (s *Store) cacheLayerBlobs(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	artifact string,
+	layers []descriptor,
+	report func(client.ProgressEvent),
+) error {
+	pull, err := s.startLayerBlobPull(ctx, reg, imageName, artifact, layers, report)
+	if err != nil {
+		return err
+	}
+	defer pull.cancel()
+	return pull.wait(ctx)
+}
+
+type layerBlobPull struct {
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	ready     map[string]chan struct{}
+	completed map[string]bool
+	results   map[string]error
+	done      chan struct{}
+	err       error
+}
+
+func (p *layerBlobPull) complete(digest string, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.completed[digest] {
+		return
+	}
+	p.completed[digest] = true
+	p.results[digest] = err
+	close(p.ready[digest])
+	if err != nil && p.err == nil {
+		p.err = err
+		p.cancel()
+	}
+}
+
+func (p *layerBlobPull) waitLayer(ctx context.Context, digest string) error {
+	p.mu.Lock()
+	ready := p.ready[digest]
+	p.mu.Unlock()
+	if ready == nil {
+		return fmt.Errorf("layer %s is not in the download plan", digest)
+	}
+	select {
+	case <-ready:
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.results[digest]
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *layerBlobPull) wait(ctx context.Context) error {
+	select {
+	case <-p.done:
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *layerBlobPull) finished() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) startLayerBlobPull(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	artifact string,
+	layers []descriptor,
+	report func(client.ProgressEvent),
+) (*layerBlobPull, error) {
+	unique := make([]descriptor, 0, len(layers))
+	seen := make(map[string]bool, len(layers))
+	var totalBytes int64
+	for _, layer := range layers {
+		if layer.Size <= 0 {
+			return nil, fmt.Errorf("layer %s has invalid size %d", layer.Digest, layer.Size)
+		}
+		if seen[layer.Digest] {
+			continue
+		}
+		seen[layer.Digest] = true
+		unique = append(unique, layer)
+		totalBytes += layer.Size
+	}
+	if len(unique) == 0 {
+		pull := &layerBlobPull{
+			cancel:    func() {},
+			ready:     map[string]chan struct{}{},
+			completed: map[string]bool{},
+			results:   map[string]error{},
+			done:      make(chan struct{}),
+		}
+		close(pull.done)
+		return pull, nil
 	}
 
+	progress := newParallelBlobProgress(artifact, totalBytes, report)
+	pullCtx, cancel := context.WithCancel(ctx)
+	pull := &layerBlobPull{
+		cancel:    cancel,
+		ready:     make(map[string]chan struct{}, len(unique)),
+		completed: make(map[string]bool, len(unique)),
+		results:   make(map[string]error, len(unique)),
+		done:      make(chan struct{}),
+	}
+	for _, layer := range unique {
+		pull.ready[layer.Digest] = make(chan struct{})
+	}
+
+	go func() {
+		jobs := make(chan descriptor)
+		workerCount := min(defaultOCIBlobDownloadWorkers, len(unique))
+		var workers sync.WaitGroup
+		for range workerCount {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for layer := range jobs {
+					err := s.cacheLayerBlob(pullCtx, reg, imageName, layer, progress)
+					if err != nil {
+						err = fmt.Errorf("cache layer %s: %w", layer.Digest, err)
+					}
+					pull.complete(layer.Digest, err)
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	sendLayers:
+		for _, layer := range unique {
+			select {
+			case jobs <- layer:
+			case <-pullCtx.Done():
+				break sendLayers
+			}
+		}
+		close(jobs)
+		workers.Wait()
+
+		pull.mu.Lock()
+		failure := pull.err
+		if failure == nil && ctx.Err() != nil {
+			failure = ctx.Err()
+			pull.err = failure
+		}
+		pull.mu.Unlock()
+		for _, layer := range unique {
+			pull.complete(layer.Digest, failure)
+		}
+		close(pull.done)
+	}()
+	return pull, nil
+}
+
+func (s *Store) cacheLayerBlob(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	layer descriptor,
+	progress *parallelBlobProgress,
+) error {
+	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
+	if info, err := os.Stat(blobPath); err == nil && info.Mode().IsRegular() {
+		progress.complete(layer.Digest, layer.Size)
+		return nil
+	}
 	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if layer.Size <= 0 {
-		return fmt.Errorf("layer %s has invalid size %d", layer.Digest, layer.Size)
-	}
 	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
 		return err
 	}
@@ -1341,6 +1586,11 @@ func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageNa
 	if err != nil {
 		return err
 	}
+	tracked := progress.reader(resp.Body, layer.Digest)
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: tracked, Closer: resp.Body}
 	_, copyErr := download.Copy(ctx, out, resp, download.Budget{MaxBytes: layer.Size, ExpectedBytes: layer.Size, ExpectedSHA256: layer.Digest})
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
@@ -1351,12 +1601,18 @@ func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageNa
 		_ = os.Remove(tmp)
 		return err
 	}
+	progress.complete(layer.Digest, layer.Size)
+	return nil
+}
+
+func (s *Store) writeCachedLayerTar(layer descriptor, dstPath string, progress func(int64)) error {
+	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
 	file, err := os.Open(blobPath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	return writeLayerTarFromReader(dstPath, layer.MediaType, file)
+	return writeLayerTarFromReaderWithProgress(dstPath, layer.MediaType, file, progress)
 }
 
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
@@ -1407,8 +1663,8 @@ func (reg *registryContext) do(ctx context.Context, path string, accept []string
 		if err != nil {
 			return nil, err
 		}
-		if reg.token != "" {
-			req.Header.Set("Authorization", "Bearer "+reg.token)
+		if token := reg.bearerToken(); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		for _, value := range accept {
 			req.Header.Add("Accept", value)
@@ -1438,6 +1694,12 @@ func (reg *registryContext) do(ctx context.Context, path string, accept []string
 		return resp, nil
 	}
 	return nil, fmt.Errorf("registry authorization failed")
+}
+
+func (reg *registryContext) bearerToken() string {
+	reg.tokenMu.RLock()
+	defer reg.tokenMu.RUnlock()
+	return reg.token
 }
 
 func (reg *registryContext) authorize(ctx context.Context, header string) error {
@@ -1479,9 +1741,13 @@ func (reg *registryContext) authorize(ctx context.Context, header string) error 
 	}
 	switch {
 	case token.Token != "":
+		reg.tokenMu.Lock()
 		reg.token = token.Token
+		reg.tokenMu.Unlock()
 	case token.AccessToken != "":
+		reg.tokenMu.Lock()
 		reg.token = token.AccessToken
+		reg.tokenMu.Unlock()
 	default:
 		return fmt.Errorf("token response missing token")
 	}
@@ -1722,18 +1988,120 @@ type downloadProgressReader struct {
 	artifact   string
 	blob       string
 	total      int64
+	base       int64
 	downloaded int64
 	started    time.Time
 	lastReport time.Time
 	report     func(client.ProgressEvent)
 }
 
+type parallelBlobProgress struct {
+	mu           sync.Mutex
+	artifact     string
+	total        int64
+	downloaded   int64
+	networkBytes int64
+	blobs        map[string]int64
+	started      time.Time
+	lastReport   time.Time
+	report       func(client.ProgressEvent)
+}
+
+type parallelBlobProgressReader struct {
+	r        io.Reader
+	progress *parallelBlobProgress
+	blob     string
+}
+
+func newParallelBlobProgress(artifact string, total int64, report func(client.ProgressEvent)) *parallelBlobProgress {
+	return &parallelBlobProgress{
+		artifact: artifact,
+		total:    total,
+		blobs:    make(map[string]int64),
+		started:  time.Now(),
+		report:   report,
+	}
+}
+
+func (p *parallelBlobProgress) reader(r io.Reader, blob string) io.Reader {
+	return &parallelBlobProgressReader{r: r, progress: p, blob: blob}
+}
+
+func (r *parallelBlobProgressReader) Read(buf []byte) (int, error) {
+	n, err := r.r.Read(buf)
+	if n > 0 {
+		r.progress.add(r.blob, int64(n))
+	}
+	return n, err
+}
+
+func (p *parallelBlobProgress) add(blob string, count int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.blobs[blob] += count
+	p.downloaded += count
+	p.networkBytes += count
+	p.emitLocked(blob, false)
+}
+
+func (p *parallelBlobProgress) complete(blob string, size int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if remaining := size - p.blobs[blob]; remaining > 0 {
+		p.blobs[blob] += remaining
+		p.downloaded += remaining
+	}
+	p.emitLocked(blob, true)
+}
+
+func (p *parallelBlobProgress) emitLocked(blob string, force bool) {
+	if p.report == nil {
+		return
+	}
+	now := time.Now()
+	if !force && !p.lastReport.IsZero() && now.Sub(p.lastReport) < 200*time.Millisecond {
+		return
+	}
+	p.lastReport = now
+	elapsed := now.Sub(p.started)
+	if elapsed <= 0 {
+		elapsed = time.Second
+	}
+	rate := float64(p.networkBytes) / elapsed.Seconds()
+	var etaSeconds float64
+	if p.total > p.downloaded && rate > 0 {
+		etaSeconds = float64(p.total-p.downloaded) / rate
+	}
+	reportPullProgress(p.report, client.ProgressEvent{
+		Status:             "downloading",
+		Artifact:           p.artifact,
+		Blob:               blob,
+		Progress:           ratio(p.downloaded, p.total),
+		BytesDownloaded:    p.downloaded,
+		BytesTotal:         p.total,
+		RateBytesPerSecond: rate,
+		ETASeconds:         etaSeconds,
+	})
+}
+
 func newDownloadProgressReader(r io.Reader, artifact, blob string, total int64, report func(client.ProgressEvent)) *downloadProgressReader {
+	return newAggregateDownloadProgressReader(r, artifact, blob, 0, total, report)
+}
+
+func newAggregateDownloadProgressReader(
+	r io.Reader,
+	artifact string,
+	blob string,
+	base int64,
+	total int64,
+	report func(client.ProgressEvent),
+) *downloadProgressReader {
 	p := &downloadProgressReader{
 		r:          r,
 		artifact:   artifact,
 		blob:       blob,
 		total:      total,
+		base:       base,
 		started:    time.Now(),
 		lastReport: time.Time{},
 		report:     report,
@@ -1769,20 +2137,21 @@ func (p *downloadProgressReader) emit(force bool) {
 		elapsed = time.Second
 	}
 	rate := float64(p.downloaded) / elapsed.Seconds()
+	current := p.base + p.downloaded
 	etaSeconds := 0.0
-	if p.total > p.downloaded && rate > 0 {
-		etaSeconds = float64(p.total-p.downloaded) / rate
+	if p.total > current && rate > 0 {
+		etaSeconds = float64(p.total-current) / rate
 	}
 	progress := 0.0
 	if p.total > 0 {
-		progress = float64(p.downloaded) / float64(p.total)
+		progress = float64(current) / float64(p.total)
 	}
 	reportPullProgress(p.report, client.ProgressEvent{
 		Status:             "downloading",
 		Artifact:           p.artifact,
 		Blob:               p.blob,
 		Progress:           progress,
-		BytesDownloaded:    p.downloaded,
+		BytesDownloaded:    current,
 		BytesTotal:         p.total,
 		RateBytesPerSecond: rate,
 		ETASeconds:         etaSeconds,

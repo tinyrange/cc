@@ -114,19 +114,22 @@ func TestManagerDisplayListenerLifecycle(t *testing.T) {
 		MaxVMs:          1,
 		SupportsDisplay: true,
 	})
-	framebuffer, err := virtio.NewFramebuffer(64, 48)
-	if err != nil {
-		t.Fatal(err)
+	newDisplayInstance := func() (*virtio.Framebuffer, *displayFakeInstance) {
+		framebuffer, err := virtio.NewFramebuffer(64, 48)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return framebuffer, &displayFakeInstance{
+			fakeInstance: newFakeInstance(),
+			desktop: &virtio.Desktop{
+				Framebuffer: framebuffer,
+				GPU:         virtio.NewGPU(0, 0x1000, 1, framebuffer),
+				Keyboard:    virtio.NewKeyboardInput(0, 0x1000, 2),
+				Pointer:     virtio.NewAbsolutePointerInput(0, 0x1000, 3, 64, 48),
+			},
+		}
 	}
-	inst := &displayFakeInstance{
-		fakeInstance: newFakeInstance(),
-		desktop: &virtio.Desktop{
-			Framebuffer: framebuffer,
-			GPU:         virtio.NewGPU(0, 0x1000, 1, framebuffer),
-			Keyboard:    virtio.NewKeyboardInput(0, 0x1000, 2),
-			Pointer:     virtio.NewAbsolutePointerInput(0, 0x1000, 3, 64, 48),
-		},
-	}
+	_, inst := newDisplayInstance()
 	host.queueInstance(inst)
 	manager := testManager(host)
 
@@ -149,9 +152,36 @@ func TestManagerDisplayListenerLifecycle(t *testing.T) {
 	}
 
 	state, err := manager.Start(ctx, client.CreateInstanceRequest{
-		ID:      "desktop",
+		ID:      "native-desktop",
 		Image:   "alpine",
 		Display: &client.DisplayConfig{Width: 64, Height: 48},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Display == nil || state.Display.VNCAddress != "" {
+		t.Fatalf("native display state = %+v", state.Display)
+	}
+	session, ok := manager.Display("native-desktop")
+	if !ok {
+		t.Fatal("native display session is unavailable")
+	}
+	if err := session.Resize(83, 60); err != nil {
+		t.Fatal(err)
+	}
+	if width, height := session.Size(); width != 80 || height != 60 {
+		t.Fatalf("native display size = %dx%d, want 80x60", width, height)
+	}
+	if err := manager.ShutdownInstance(ctx, "native-desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, inst = newDisplayInstance()
+	host.queueInstance(inst)
+	state, err = manager.Start(ctx, client.CreateInstanceRequest{
+		ID:      "desktop",
+		Image:   "alpine",
+		Display: &client.DisplayConfig{Width: 64, Height: 48, VNCListen: "127.0.0.1:0"},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"net"
 	"runtime"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/display"
 	"j5.nz/cc/internal/hv"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/rfb"
@@ -304,7 +306,12 @@ func normalizeDisplayConfig(config *client.DisplayConfig) (*client.DisplayConfig
 	}
 	address := strings.TrimSpace(normalized.VNCListen)
 	if address == "" {
-		address = "127.0.0.1:0"
+		normalized.VNCListen = ""
+		normalized.VNCPassword = ""
+		return &normalized, nil
+	}
+	if len(normalized.VNCPassword) > 8 {
+		return nil, fmt.Errorf("VNC passwords are limited to 8 bytes")
 	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -330,19 +337,93 @@ func startVNCServer(instance Instance, id string, config *client.DisplayConfig) 
 	if !ok || provider.Desktop() == nil {
 		return nil, nil, nil, fmt.Errorf("VM backend does not support graphical displays")
 	}
+	state := &client.DisplayState{
+		Width:  config.Width,
+		Height: config.Height,
+	}
+	if config.VNCListen == "" {
+		return state, nil, nil, nil
+	}
 	listener, err := net.Listen("tcp", config.VNCListen)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("listen for VNC on %s: %w", config.VNCListen, err)
 	}
 	server := &rfb.Server{Desktop: provider.Desktop(), Name: "cc " + id}
+	if config.VNCPassword != "" {
+		server.Security = rfb.PasswordSecurity(config.VNCPassword)
+	}
 	go func() {
 		_ = server.Serve(listener)
 	}()
-	return &client.DisplayState{
-		Width:      config.Width,
-		Height:     config.Height,
-		VNCAddress: listener.Addr().String(),
-	}, listener, server, nil
+	state.VNCAddress = listener.Addr().String()
+	return state, listener, server, nil
+}
+
+// Display returns a direct frontend session for a running graphical VM.
+func (m *Manager) Display(id string) (display.Session, bool) {
+	id = instanceID(id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	machine := m.running[id]
+	if machine == nil || machine.stopping {
+		return nil, false
+	}
+	provider, ok := machine.instance.(instanceDesktopProvider)
+	if !ok || provider.Desktop() == nil {
+		return nil, false
+	}
+	return desktopSession{desktop: provider.Desktop()}, true
+}
+
+type desktopSession struct {
+	desktop *virtio.Desktop
+}
+
+func (s desktopSession) Size() (int, int) {
+	return s.desktop.Framebuffer.Size()
+}
+
+func (s desktopSession) Snapshot(request image.Rectangle, since uint64, incremental bool) display.FramebufferUpdate {
+	update := s.desktop.Framebuffer.Snapshot(request, since, incremental)
+	return display.FramebufferUpdate{
+		Width: update.Width, Height: update.Height, Generation: update.Generation,
+		Rect: update.Rect, Pixels: update.Pixels,
+	}
+}
+
+func (s desktopSession) Changed() <-chan struct{} {
+	return s.desktop.Framebuffer.Changed()
+}
+
+func (s desktopSession) Resize(width, height int) error {
+	return s.desktop.Resize(width, height)
+}
+
+func (s desktopSession) Key(code uint16, down bool) error {
+	if s.desktop.Keyboard == nil {
+		return nil
+	}
+	return s.desktop.Keyboard.Key(code, down)
+}
+
+func (s desktopSession) Pointer(x, y uint32, buttons, previousButtons uint8) error {
+	if s.desktop.Pointer == nil {
+		return nil
+	}
+	return s.desktop.Pointer.PointerEvent(x, y, buttons, previousButtons)
+}
+
+func (s desktopSession) SetClipboard(text string) {
+	if s.desktop.Clipboard != nil {
+		s.desktop.Clipboard.SetFromFrontend(text)
+	}
+}
+
+func (s desktopSession) GuestClipboard() (string, uint64) {
+	if s.desktop.Clipboard == nil {
+		return "", 0
+	}
+	return s.desktop.Clipboard.GuestSnapshot()
 }
 
 func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {

@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/display"
 	"j5.nz/cc/internal/cachepath"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/hv/hvf"
@@ -99,6 +100,7 @@ type ServerOptions struct {
 	Persistent             bool
 	StartupWriter          io.Writer
 	OnStartup              func(client.ServerHello) error
+	OnDisplay              func(string, display.Session)
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
@@ -113,6 +115,7 @@ type RuntimeView interface {
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
 	SetInstanceBalloon(string, uint64) error
+	Display(string) (display.Session, bool)
 }
 
 func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
@@ -120,6 +123,22 @@ func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
 		return fmt.Errorf("runtime is not available")
 	}
 	return s.vms.SetInstanceBalloon(id, targetMB)
+}
+
+func (s *server) Display(id string) (display.Session, bool) {
+	if s == nil || s.vms == nil {
+		return nil, false
+	}
+	return s.vms.Display(id)
+}
+
+func notifyDisplay(opts ServerOptions, runtime RuntimeView, state client.InstanceState) {
+	if opts.OnDisplay == nil || state.Display == nil {
+		return
+	}
+	if session, ok := runtime.Display(state.ID); ok {
+		opts.OnDisplay(state.ID, session)
+	}
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -1885,6 +1904,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
+			notifyDisplay(opts, srvState, state)
 			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm/start total=%s", time.Since(start))
 			return
@@ -1903,6 +1923,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		timingLog("POST /vm/start vms.StartBlank took=%s", time.Since(start))
+		notifyDisplay(opts, srvState, state)
 		writeJSON(w, http.StatusOK, state)
 		timingLog("POST /vm/start total=%s", time.Since(start))
 	})
@@ -1991,6 +2012,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 			timingLog("POST /vm vms.StartStream took=%s", time.Since(start))
+			notifyDisplay(opts, srvState, state)
 			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm total=%s", time.Since(start))
 			return
@@ -2009,6 +2031,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		timingLog("POST /vm vms.Start took=%s", time.Since(start))
+		notifyDisplay(opts, srvState, state)
 		writeJSON(w, http.StatusOK, state)
 		timingLog("POST /vm total=%s", time.Since(start))
 	})

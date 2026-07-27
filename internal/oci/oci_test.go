@@ -2,14 +2,21 @@ package oci
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +24,87 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 )
+
+func TestAggregateLayerProgressReportsWholeImageBytes(t *testing.T) {
+	var events []client.ProgressEvent
+	reader := newAggregateDownloadProgressReader(
+		bytes.NewReader(make([]byte, 50)),
+		"neurodesktop",
+		"sha256:layer",
+		100,
+		200,
+		func(event client.ProgressEvent) {
+			events = append(events, event)
+		},
+	)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatal(err)
+	}
+	reader.finish()
+	if len(events) == 0 {
+		t.Fatal("download did not report progress")
+	}
+	final := events[len(events)-1]
+	if final.BytesDownloaded != 150 || final.BytesTotal != 200 || final.Progress != 0.75 {
+		t.Fatalf("final aggregate progress = %+v", final)
+	}
+}
+
+func TestCacheLayerBlobsDownloadsConcurrently(t *testing.T) {
+	const layerCount = 4
+	layers := make([]descriptor, 0, layerCount)
+	contents := make(map[string][]byte, layerCount)
+	for index := range layerCount {
+		data := bytes.Repeat([]byte{byte(index + 1)}, 64<<10)
+		sum := sha256.Sum256(data)
+		digest := "sha256:" + hex.EncodeToString(sum[:])
+		layers = append(layers, descriptor{Digest: digest, Size: int64(len(data))})
+		contents[digest] = data
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		if current >= 2 {
+			releaseOnce.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		digest := path.Base(r.URL.Path)
+		data, ok := contents[digest]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := store.cacheLayerBlobs(ctx, reg, "test/image", "parallel", layers, nil); err != nil {
+		t.Fatalf("cache layer blobs: %v", err)
+	}
+	if maximum.Load() < 2 {
+		t.Fatalf("maximum concurrent blob requests = %d, want at least 2", maximum.Load())
+	}
+}
 
 func TestStorePullSIMGFixtureAndOpenPreservesMetadata(t *testing.T) {
 	t.Setenv(sharedCacheEnv, filepath.Join(t.TempDir(), "shared"))

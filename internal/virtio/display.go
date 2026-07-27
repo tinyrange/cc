@@ -204,6 +204,12 @@ func (d *Desktop) Resize(width, height int) error {
 	if d == nil || d.GPU == nil || d.Framebuffer == nil {
 		return fmt.Errorf("desktop resize is unavailable")
 	}
+	// Linux's virtio-gpu DRM driver constructs hotplug modes using CVT's
+	// eight-pixel horizontal character cells. Normalize at the shared desktop
+	// boundary so every frontend requests a mode the guest can actually apply.
+	if aligned := width &^ 7; aligned > 0 {
+		width = aligned
+	}
 	if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
 		return fmt.Errorf("invalid desktop dimensions %dx%d", width, height)
 	}
