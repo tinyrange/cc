@@ -100,6 +100,12 @@ func (i *Input) Attach(mem GuestMemory, irq IRQController) {
 	i.irq = irq
 }
 
+func (i *Input) IRQAsserted() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.irqHigh
+}
+
 func (i *Input) Contains(addr uint64, size int) bool {
 	if size <= 0 || addr < i.Base {
 		return false

@@ -126,3 +126,19 @@ func TestBootIOAPICActiveLowLevelLineUsesAssertedState(t *testing.T) {
 		t.Fatalf("deviceHighRoute after deassert = true, want false")
 	}
 }
+
+func TestPendingInterruptionWaitsUntilGuestEnablesInterrupts(t *testing.T) {
+	ctx := &runVPExitContext{
+		VpContext: vpExitContext{
+			Rflags: 0x2,
+		},
+	}
+	if canSetPendingInterruption(ctx, 0x3b) {
+		t.Fatal("pending interruption accepted while guest interrupts are disabled")
+	}
+
+	ctx.VpContext.Rflags |= 1 << 9
+	if !canSetPendingInterruption(ctx, 0x3b) {
+		t.Fatal("pending interruption rejected after guest enabled interrupts")
+	}
+}

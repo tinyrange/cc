@@ -5,6 +5,8 @@ package whp
 import (
 	"encoding/binary"
 	"fmt"
+
+	"j5.nz/cc/internal/amd64vm"
 )
 
 const (
@@ -89,7 +91,7 @@ func buildBootMADT() []byte {
 	body = binary.LittleEndian.AppendUint32(body, 0)
 
 	body = appendMADTInterruptOverride(body, 0, 2, 0)
-	for _, irq := range []byte{5, 6, 7, 8, 9, 10} {
+	for irq := byte(5); irq <= amd64vm.PointerIRQ; irq++ {
 		body = appendMADTInterruptOverride(body, irq, uint32(irq), 0x000d)
 	}
 	return body

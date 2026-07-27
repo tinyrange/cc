@@ -324,34 +324,35 @@ func BootInitramfsToMarkerWithTimeout(kernel []byte, initrd []byte, memoryMB uin
 }
 
 type bootPlatform struct {
-	vm            *VM
-	uart          *serial.UART8250
-	pic           bootPIC
-	pit           *bootPIT
-	ioapic        bootIOAPIC
-	hpet          bootHPET
-	fsdevs        []*virtio.FS
-	vsock         *virtio.Vsock
-	rng           *virtio.RNG
-	netdev        *virtio.Net
-	pci           *PCIBus
-	i8042         *I8042
-	rtc           *CMOSRTC
-	acpiPM        *ACPIPM
-	snapshot      *snapshotTrigger
-	start         time.Time
-	irqAttempts   uint64
-	irqDelivered  uint64
-	irqFailed     uint64
-	irqSuppressed uint64
-	irqLine       [16]uint64
-	deviceIRQLine [ioapicRedirEntries]bool
-	deferredIRQ   [ioapicRedirEntries]bool
-	pendingMu     sync.Mutex
-	pendingIRQ    [256]bool
-	pendingIRQs   []pendingIRQ
-	lastExitMu    sync.Mutex
-	lastExit      bootPlatformExitSnapshot
+	vm             *VM
+	uart           *serial.UART8250
+	pic            bootPIC
+	pit            *bootPIT
+	ioapic         bootIOAPIC
+	hpet           bootHPET
+	fsdevs         []*virtio.FS
+	vsock          *virtio.Vsock
+	rng            *virtio.RNG
+	netdev         *virtio.Net
+	displayDevices []virtio.MMIODevice
+	pci            *PCIBus
+	i8042          *I8042
+	rtc            *CMOSRTC
+	acpiPM         *ACPIPM
+	snapshot       *snapshotTrigger
+	start          time.Time
+	irqAttempts    uint64
+	irqDelivered   uint64
+	irqFailed      uint64
+	irqSuppressed  uint64
+	irqLine        [16]uint64
+	deviceIRQLine  [ioapicRedirEntries]bool
+	deferredIRQ    [ioapicRedirEntries]bool
+	pendingMu      sync.Mutex
+	pendingIRQ     [256]bool
+	pendingIRQs    []pendingIRQ
+	lastExitMu     sync.Mutex
+	lastExit       bootPlatformExitSnapshot
 }
 
 type pendingIRQ struct {
@@ -503,6 +504,23 @@ func (p *bootPlatform) AttachNet(netdev *virtio.Net) {
 	netdev.Attach(p.vm, p)
 }
 
+func (p *bootPlatform) AttachDisplayDevices(devices []virtio.MMIODevice) {
+	for _, device := range devices {
+		if device == nil {
+			continue
+		}
+		p.displayDevices = append(p.displayDevices, device)
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			p.markDeviceIRQ(typed.IRQ)
+			typed.Attach(p.vm, p)
+		case *virtio.Input:
+			p.markDeviceIRQ(typed.IRQ)
+			typed.Attach(p.vm, p)
+		}
+	}
+}
+
 func (p *bootPlatform) AttachPCI(pci *PCIBus) {
 	p.pci = pci
 	if pci == nil {
@@ -643,6 +661,16 @@ func (p *bootPlatform) ReadMMIO(addr uint64, data []byte) error {
 		putUint64(data, value)
 		return nil
 	}
+	for _, device := range p.displayDevices {
+		if device != nil && device.Contains(addr, len(data)) {
+			value, err := device.Read(addr, len(data))
+			if err != nil {
+				return err
+			}
+			putUint64(data, value)
+			return nil
+		}
+	}
 	if handled, err := p.pci.ReadMMIO(addr, data); handled || err != nil {
 		return err
 	}
@@ -673,6 +701,11 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	}
 	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
 		return p.netdev.Write(addr, len(data), readUint64(data))
+	}
+	for _, device := range p.displayDevices {
+		if device != nil && device.Contains(addr, len(data)) {
+			return device.Write(addr, len(data), readUint64(data))
+		}
 	}
 	if handled, err := p.pci.WriteMMIO(addr, data); handled || err != nil {
 		return err
@@ -851,6 +884,22 @@ func (p *bootPlatform) resampleDeviceIRQs() {
 		line := uint8(p.netdev.IRQ)
 		if route, pending := p.ioapic.assert(line, true); pending {
 			p.injectIOAPIC(route, true)
+		}
+	}
+	for _, device := range p.displayDevices {
+		var irq uint32
+		var asserted bool
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			irq, asserted = typed.IRQ, typed.IRQAsserted()
+		case *virtio.Input:
+			irq, asserted = typed.IRQ, typed.IRQAsserted()
+		}
+		if asserted {
+			line := uint8(irq)
+			if route, pending := p.ioapic.assert(line, true); pending {
+				p.injectIOAPIC(route, true)
+			}
 		}
 	}
 }
@@ -1130,6 +1179,18 @@ func (p *bootPlatform) usePendingInterruptionFallback(line uint8) bool {
 			return true
 		}
 	}
+	for _, device := range p.displayDevices {
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			if typed.IRQ == uint32(line) {
+				return true
+			}
+		case *virtio.Input:
+			if typed.IRQ == uint32(line) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -1198,6 +1259,10 @@ func canSetPendingInterruption(ctx *runVPExitContext, vector uint8) bool {
 		return true
 	}
 	if ctx.VpContext.ExecutionState.interruptionPending() || ctx.VpContext.ExecutionState.interruptShadow() {
+		return false
+	}
+	const rflagsInterruptEnable = uint64(1 << 9)
+	if ctx.VpContext.Rflags&rflagsInterruptEnable == 0 {
 		return false
 	}
 	priority := vector >> 4

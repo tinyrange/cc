@@ -9,6 +9,7 @@ import (
 	managedhost "j5.nz/cc/internal/managed/host"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/managed/rootartifact"
+	"j5.nz/cc/internal/virtio"
 )
 
 func TestNormalizeLinuxManagedMachineDefaultsSpec(t *testing.T) {
@@ -44,5 +45,22 @@ func TestWHPHostRejectsUnexpectedLinuxAttachments(t *testing.T) {
 	}, nil)
 	if err == nil {
 		t.Fatalf("Start unexpected attachments error = %v", err)
+	}
+}
+
+func TestManagedDesktopProvidesFramebufferAndInput(t *testing.T) {
+	desktop, devices, clipboardListener, displayListener, err := newManagedDesktop(virtio.NewSimpleVsockBackend(), 1440, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeManagedDisplayListeners(clipboardListener, displayListener)
+	if desktop == nil || desktop.GPU == nil || desktop.Keyboard == nil || desktop.Pointer == nil || desktop.Clipboard == nil {
+		t.Fatalf("desktop is incomplete: %+v", desktop)
+	}
+	if width, height := desktop.Framebuffer.Size(); width != 1440 || height != 900 {
+		t.Fatalf("framebuffer size = %dx%d, want 1440x900", width, height)
+	}
+	if len(devices) != 3 {
+		t.Fatalf("display device count = %d, want 3", len(devices))
 	}
 }

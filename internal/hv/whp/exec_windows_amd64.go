@@ -50,7 +50,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, "", nil)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, nil, "", nil)
 	if err != nil {
 		return client.ExecResponse{}, "", err
 	}
@@ -151,7 +151,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, serialOut.String(), nil
 }
 
-func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshotDir string, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
+func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, displayDevices []virtio.MMIODevice, snapshotDir string, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return nil, nil, nil, err
@@ -169,6 +169,13 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	}
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
+	if len(displayDevices) != 0 {
+		extraCmdline = append(extraCmdline,
+			amd64vm.VirtioMMIODeviceArg(amd64vm.GPUBase, amd64vm.GPUIRQ),
+			amd64vm.VirtioMMIODeviceArg(amd64vm.KeyboardBase, amd64vm.KeyboardIRQ),
+			amd64vm.VirtioMMIODeviceArg(amd64vm.PointerBase, amd64vm.PointerIRQ),
+		)
 	}
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
@@ -211,6 +218,7 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	if netdev != nil {
 		platform.AttachNet(netdev)
 	}
+	platform.AttachDisplayDevices(displayDevices)
 	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {
 		platform.Close()

@@ -22,25 +22,30 @@ import (
 )
 
 type ManagedSession struct {
-	cancel     context.CancelFunc
-	doneCh     chan error
-	control    io.ReadWriteCloser
-	listener   io.Closer
-	vsock      *virtio.Vsock
-	bootWriter *vmruntime.BootEventWriter
-	transcript *vmruntime.SerialTranscript
-	serialOut  *vmruntime.SerialTranscript
-	platform   *bootPlatform
-	waitOnce   sync.Once
-	waitErr    error
-	sendMu     sync.Mutex
-	nextID     atomic.Uint64
-	dmesg      bool
+	cancel            context.CancelFunc
+	doneCh            chan error
+	control           io.ReadWriteCloser
+	listener          io.Closer
+	clipboardListener io.Closer
+	displayListener   io.Closer
+	vsock             *virtio.Vsock
+	desktop           *virtio.Desktop
+	bootWriter        *vmruntime.BootEventWriter
+	transcript        *vmruntime.SerialTranscript
+	serialOut         *vmruntime.SerialTranscript
+	platform          *bootPlatform
+	waitOnce          sync.Once
+	waitErr           error
+	sendMu            sync.Mutex
+	nextID            atomic.Uint64
+	dmesg             bool
 }
 
 type ManagedSessionOptions struct {
 	SnapshotDir     string
 	RestoreSnapshot string
+	DisplayWidth    uint32
+	DisplayHeight   uint32
 }
 
 const (
@@ -57,6 +62,10 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 }
 
 func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if (strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "") &&
+		(opts.DisplayWidth != 0 || opts.DisplayHeight != 0) {
+		return nil, fmt.Errorf("display-enabled VMs do not support startup snapshots")
+	}
 	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
 		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, netdev, onEvent)
 	}
@@ -70,6 +79,12 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
+	desktop, displayDevices, clipboardListener, displayListener, err := newManagedDesktop(backend, opts.DisplayWidth, opts.DisplayHeight)
+	if err != nil {
+		_ = listener.Close()
+		vsock.Close()
+		return nil, err
+	}
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -89,8 +104,9 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = bootWriter
 	}
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, strings.TrimSpace(opts.SnapshotDir), serialWriter)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, displayDevices, strings.TrimSpace(opts.SnapshotDir), serialWriter)
 	if err != nil {
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -100,6 +116,12 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
+	if clipboardListener != nil {
+		go serveClipboardConnections(runCtx, clipboardListener, desktop.Clipboard)
+	}
+	if displayListener != nil {
+		go serveDisplayConnections(runCtx, displayListener, desktop)
+	}
 	doneCh := make(chan error, 1)
 	go func() {
 		err := runManagedExecVM(runCtx, vm, platform, serialOut)
@@ -112,6 +134,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	select {
 	case err := <-acceptErrCh:
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -122,6 +145,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		control = conn
 	case err := <-doneCh:
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -130,6 +154,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	case <-ctx.Done():
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = listener.Close()
 		vsock.Close()
 		if bootWriter != nil {
@@ -142,6 +167,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
 	}); err != nil {
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = control.Close()
 		_ = listener.Close()
 		vsock.Close()
@@ -155,6 +181,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = control.Close()
 		_ = listener.Close()
 		vsock.Close()
@@ -165,6 +192,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = control.Close()
 		_ = listener.Close()
 		vsock.Close()
@@ -175,17 +203,67 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	}
 
 	return &ManagedSession{
-		cancel:     cancel,
-		doneCh:     doneCh,
-		control:    control,
-		listener:   listener,
-		vsock:      vsock,
-		bootWriter: bootWriter,
-		transcript: controlTranscript,
-		serialOut:  serialOut,
-		platform:   platform,
-		dmesg:      dmesg,
+		cancel:            cancel,
+		doneCh:            doneCh,
+		control:           control,
+		listener:          listener,
+		clipboardListener: clipboardListener,
+		displayListener:   displayListener,
+		vsock:             vsock,
+		desktop:           desktop,
+		bootWriter:        bootWriter,
+		transcript:        controlTranscript,
+		serialOut:         serialOut,
+		platform:          platform,
+		dmesg:             dmesg,
 	}, nil
+}
+
+func newManagedDesktop(backend *virtio.SimpleVsockBackend, width, height uint32) (*virtio.Desktop, []virtio.MMIODevice, virtio.VsockListener, virtio.VsockListener, error) {
+	if width == 0 && height == 0 {
+		return nil, nil, nil, nil, nil
+	}
+	framebuffer, err := virtio.NewFramebuffer(int(width), int(height))
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("create display: %w", err)
+	}
+	gpu := virtio.NewGPU(amd64vm.GPUBase, amd64vm.GPUSize, amd64vm.GPUIRQ, framebuffer)
+	keyboard := virtio.NewKeyboardInput(amd64vm.KeyboardBase, amd64vm.KeyboardSize, amd64vm.KeyboardIRQ)
+	pointer := virtio.NewAbsolutePointerInput(amd64vm.PointerBase, amd64vm.PointerSize, amd64vm.PointerIRQ, width, height)
+	clipboard := virtio.NewClipboard()
+	clipboardListener, err := backend.Listen(vmruntime.ClipboardPort)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("listen for guest clipboard bridge: %w", err)
+	}
+	displayListener, err := backend.Listen(vmruntime.DisplayPort)
+	if err != nil {
+		_ = clipboardListener.Close()
+		return nil, nil, nil, nil, fmt.Errorf("listen for guest display bridge: %w", err)
+	}
+	desktop := &virtio.Desktop{
+		Framebuffer: framebuffer,
+		GPU:         gpu,
+		Keyboard:    keyboard,
+		Pointer:     pointer,
+		Clipboard:   clipboard,
+	}
+	return desktop, []virtio.MMIODevice{gpu, keyboard, pointer}, clipboardListener, displayListener, nil
+}
+
+func closeManagedDisplayListeners(clipboardListener, displayListener io.Closer) {
+	if clipboardListener != nil {
+		_ = clipboardListener.Close()
+	}
+	if displayListener != nil {
+		_ = displayListener.Close()
+	}
+}
+
+func (s *ManagedSession) Desktop() *virtio.Desktop {
+	if s == nil {
+		return nil
+	}
+	return s.desktop
 }
 
 func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -433,6 +511,7 @@ func (s *ManagedSession) Close() error {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
+	closeManagedDisplayListeners(s.clipboardListener, s.displayListener)
 	if s.vsock != nil {
 		_ = s.vsock.Close()
 	}
