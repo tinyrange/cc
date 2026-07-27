@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"j5.nz/cc/client"
-	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/managed/machine"
 	"j5.nz/cc/internal/netstack"
 	"j5.nz/cc/internal/nvme"
@@ -97,8 +96,7 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 	}
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
-	uart.AttachIRQ(kvmVM, amd64vm.COM1IRQ)
+	uart := newAMD64UART(kvmVM, serialWriter)
 
 	pci := attachBSDPCDevices(kvmVM, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ)
 

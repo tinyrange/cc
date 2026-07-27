@@ -258,7 +258,7 @@ func bootLinuxArm64WithHVFNVMe(ctx context.Context, kernel, initrd []byte, ctrl 
 		}
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, nil, nil, nil, nil, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, nil, rng, nil, nil, nil, nil, nil, nil, nil, exitInfo); err != nil {
 				addr := uint64(exitInfo.Exception.PhysicalAddress)
 				if pci.Contains(addr, 1) {
 					if err := handleBSDPCIDataAbort(vm, vcpuIndex, pci, exitInfo); err != nil {

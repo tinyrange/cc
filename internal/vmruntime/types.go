@@ -80,6 +80,7 @@ type RunRequest struct {
 	InitSystem        string
 	RootFS            virtio.FSBackend
 	Shares            []DirectoryShare
+	Mounts            []virtio.ShareMount
 	Command           []string
 	Env               []string
 	WorkDir           string
@@ -92,6 +93,8 @@ type RunRequest struct {
 	Persistent        bool
 	Network           *GuestNetworkConfig
 	NetDevice         *virtio.Net
+	DisplayWidth      uint32
+	DisplayHeight     uint32
 	SnapshotDir       string
 	RestoreSnapshot   string
 	UnixTime          int64

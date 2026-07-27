@@ -189,7 +189,26 @@ func BuildImageFS(path string) (imagefs.Directory, map[string]fsmeta.Entry, stri
 	if root.modTime.IsZero() {
 		root.modTime = time.Unix(0, 0)
 	}
+	namespace, err := imagefs.BuildNamespace(root)
+	if err != nil {
+		return nil, nil, img.SIFArch(), fmt.Errorf("build image namespace: %w", err)
+	}
+	attachSIMGNamespace(namespace)
 	return root, entries, img.SIFArch(), nil
+}
+
+func attachSIMGNamespace(namespace *imagefs.Namespace) {
+	for id := 1; id < len(namespace.Nodes); id++ {
+		node := namespace.Nodes[id]
+		if node == nil || node.Entry.Dir == nil {
+			continue
+		}
+		if directory, ok := node.Entry.Dir.(*simgDir); ok {
+			directory.namespace = namespace
+			directory.nodeID = uint64(id)
+			directory.entries = nil
+		}
+	}
 }
 
 func (f *File) SIFArch() string {
@@ -484,12 +503,14 @@ func (sq *Reader) ReadDirectoryEntries(d *DirInode) ([]DirEntry, error) {
 }
 
 type simgDir struct {
-	mode    fs.FileMode
-	uid     uint32
-	gid     uint32
-	rdev    uint32
-	modTime time.Time
-	entries map[string]imagefs.Entry
+	mode      fs.FileMode
+	uid       uint32
+	gid       uint32
+	rdev      uint32
+	modTime   time.Time
+	entries   map[string]imagefs.Entry
+	namespace *imagefs.Namespace
+	nodeID    uint64
 }
 
 func newSIMGDir(mode fs.FileMode, uid, gid, rdev uint32, modTime time.Time) *simgDir {
@@ -500,23 +521,50 @@ func (d *simgDir) Stat() fs.FileMode       { return d.mode & fs.ModePerm }
 func (d *simgDir) ModTime() time.Time      { return d.modTime }
 func (d *simgDir) Owner() (uint32, uint32) { return d.uid, d.gid }
 func (d *simgDir) RDev() uint32            { return d.rdev }
+func (d *simgDir) Namespace() *imagefs.Namespace {
+	return d.namespace
+}
 func (d *simgDir) ReadDir() ([]imagefs.DirEnt, error) {
+	if d.namespace != nil && d.nodeID < uint64(len(d.namespace.Nodes)) {
+		node := d.namespace.Nodes[d.nodeID]
+		out := make([]imagefs.DirEnt, 0, len(node.Children))
+		for name, id := range node.Children {
+			out = append(out, simgDirEnt(name, d.namespace.Nodes[id].Entry))
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return out, nil
+	}
 	out := make([]imagefs.DirEnt, 0, len(d.entries))
 	for name, entry := range d.entries {
-		switch {
-		case entry.Dir != nil:
-			out = append(out, imagefs.DirEnt{Name: name, Mode: fs.ModeDir | entry.Dir.Stat()})
-		case entry.Symlink != nil:
-			out = append(out, imagefs.DirEnt{Name: name, Mode: fs.ModeSymlink | entry.Symlink.Stat()})
-		case entry.File != nil:
-			_, mode := entry.File.Stat()
-			out = append(out, imagefs.DirEnt{Name: name, Mode: mode})
-		}
+		out = append(out, simgDirEnt(name, entry))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
+
+func simgDirEnt(name string, entry imagefs.Entry) imagefs.DirEnt {
+	switch {
+	case entry.Dir != nil:
+		return imagefs.DirEnt{Name: name, Mode: fs.ModeDir | entry.Dir.Stat()}
+	case entry.Symlink != nil:
+		return imagefs.DirEnt{Name: name, Mode: fs.ModeSymlink | entry.Symlink.Stat()}
+	case entry.File != nil:
+		_, mode := entry.File.Stat()
+		return imagefs.DirEnt{Name: name, Mode: mode}
+	default:
+		return imagefs.DirEnt{Name: name}
+	}
+}
+
 func (d *simgDir) Lookup(name string) (imagefs.Entry, error) {
+	if d.namespace != nil && d.nodeID < uint64(len(d.namespace.Nodes)) {
+		node := d.namespace.Nodes[d.nodeID]
+		id, ok := node.Children[name]
+		if !ok {
+			return imagefs.Entry{}, os.ErrNotExist
+		}
+		return d.namespace.Nodes[id].Entry, nil
+	}
 	entry, ok := d.entries[name]
 	if !ok {
 		return imagefs.Entry{}, os.ErrNotExist

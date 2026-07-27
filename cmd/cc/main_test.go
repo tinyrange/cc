@@ -41,7 +41,34 @@ func TestHandleVMForwardDispatchesToAPI(t *testing.T) {
 	}
 }
 
+func TestHandleVMStartCanEnableNetwork(t *testing.T) {
+	api := &fakeCCAPI{}
+	if err := handleVMCommand(api, []string{
+		"start", "--network", "--memory-mb", "8192", "--cpus", "4",
+		"desktop", "desktop-image",
+	}); err != nil {
+		t.Fatalf("handle vm start: %v", err)
+	}
+	if len(api.creates) != 1 {
+		t.Fatalf("create calls = %+v", api.creates)
+	}
+	got := api.creates[0]
+	if got.id != "desktop" || got.req.Image != "desktop-image" {
+		t.Fatalf("create call = %+v", got)
+	}
+	if got.req.Network == nil || !got.req.Network.Enabled || !got.req.Network.AllowInternet {
+		t.Fatalf("network = %+v", got.req.Network)
+	}
+	if got.req.MemoryMB != 8192 || got.req.CPUs != 4 {
+		t.Fatalf("resources = memory %d MiB, %d CPUs", got.req.MemoryMB, got.req.CPUs)
+	}
+}
+
 type fakeCCAPI struct {
+	creates []struct {
+		id  string
+		req client.CreateInstanceRequest
+	}
 	forwards []struct {
 		id      string
 		forward client.PortForward
@@ -76,7 +103,11 @@ func (f *fakeCCAPI) CreateInstanceStream(client.CreateInstanceRequest, func(clie
 	return client.InstanceState{}, nil
 }
 
-func (f *fakeCCAPI) CreateInstanceStreamWithID(string, client.CreateInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error) {
+func (f *fakeCCAPI) CreateInstanceStreamWithID(id string, req client.CreateInstanceRequest, _ func(client.BootEvent) error) (client.InstanceState, error) {
+	f.creates = append(f.creates, struct {
+		id  string
+		req client.CreateInstanceRequest
+	}{id: id, req: req})
 	return client.InstanceState{}, nil
 }
 

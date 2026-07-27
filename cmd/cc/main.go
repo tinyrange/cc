@@ -291,12 +291,15 @@ func handleVMCommand(api ccAPI, args []string) error {
 		vncListen := fs.String("vnc-listen", "127.0.0.1:0", "Loopback VNC listen address")
 		displaySize := fs.String("display", "1280x720", "Display size WIDTHxHEIGHT")
 		initSystem := fs.String("init", "", "Guest init system")
+		network := fs.Bool("network", false, "Enable isolated guest networking with outbound internet access")
+		memoryMB := fs.Uint64("memory-mb", 0, "VM memory in MiB")
+		cpus := fs.Int("cpus", 0, "VM CPUs")
 		timeout := fs.Duration("timeout", 0, "VM boot timeout")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 2 {
-			return fmt.Errorf("usage: cc vm start [--vnc] [--vnc-listen ADDRESS] [--display WIDTHxHEIGHT] [--init SYSTEM] <name> <image>")
+			return fmt.Errorf("usage: cc vm start [--vnc] [--network] [--vnc-listen ADDRESS] [--display WIDTHxHEIGHT] [--init SYSTEM] [--memory-mb MIB] [--cpus COUNT] <name> <image>")
 		}
 		var display *client.DisplayConfig
 		if *vnc {
@@ -306,10 +309,17 @@ func handleVMCommand(api ccAPI, args []string) error {
 			}
 			display = &client.DisplayConfig{Width: width, Height: height, VNCListen: *vncListen}
 		}
+		var networkConfig *client.NetworkConfig
+		if *network {
+			networkConfig = &client.NetworkConfig{Enabled: true, AllowInternet: true}
+		}
 		state, err := api.CreateInstanceStreamWithID(fs.Arg(0), client.CreateInstanceRequest{
 			Image:          fs.Arg(1),
 			InitSystem:     *initSystem,
+			Network:        networkConfig,
 			Display:        display,
+			MemoryMB:       *memoryMB,
+			CPUs:           *cpus,
 			TimeoutSeconds: timeout.Seconds(),
 		}, bootEventReporter(os.Stderr))
 		if err != nil {

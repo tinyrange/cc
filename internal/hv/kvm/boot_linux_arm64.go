@@ -324,6 +324,10 @@ func handleUARTExit(vm *VM, uart *serial.UART8250, mmio MMIOExit) error {
 }
 
 func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
+	return handleBootMMIOWithExtra(vm, uart, fsdevs, vsock, rng, nil, mmio)
+}
+
+func handleBootMMIOWithExtra(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, extra []virtio.MMIODevice, mmio MMIOExit) error {
 	if uart.Contains(mmio.Addr, int(mmio.Len)) {
 		return handleUARTExit(vm, uart, mmio)
 	}
@@ -357,6 +361,20 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := rng.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteMMIORead(value, mmio.Len)
+		return nil
+	}
+	for _, device := range extra {
+		if device == nil || !device.Contains(mmio.Addr, int(mmio.Len)) {
+			continue
+		}
+		if mmio.Write {
+			return device.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := device.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

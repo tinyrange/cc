@@ -33,7 +33,7 @@ func (p *imageFS) RootSnapshotContext(ctx context.Context) (imagefs.Directory, e
 	}
 	for {
 		p.mu.Lock()
-		root := p.nodes[1]
+		root := p.imageNodeLocked(1)
 		if root == nil || !root.isDir() {
 			p.mu.Unlock()
 			return nil, fmt.Errorf("image filesystem root is missing")
@@ -68,13 +68,13 @@ func (p *imageFS) materializeSnapshotTreeContext(ctx context.Context, rootID uin
 			return fmt.Errorf("materialize snapshot directory: %w", err)
 		}
 		p.mu.Lock()
-		node := p.nodes[nodeID]
+		node := p.imageNodeLocked(nodeID)
 		if node == nil {
 			p.mu.Unlock()
 			continue
 		}
 		for _, childID := range node.entries {
-			if child := p.nodes[childID]; child != nil && child.isDir() {
+			if child := p.imageNodeLocked(childID); child != nil && child.isDir() {
 				queue = append(queue, childID)
 			}
 		}
@@ -93,7 +93,7 @@ func (p *imageFS) firstUnmaterializedSnapshotDirLocked(rootID uint64) uint64 {
 			continue
 		}
 		seen[nodeID] = struct{}{}
-		node := p.nodes[nodeID]
+		node := p.imageNodeLocked(nodeID)
 		if node == nil || !node.isDir() {
 			continue
 		}
@@ -126,7 +126,7 @@ func (p *imageFS) snapshotDirLocked(ctx context.Context, node *imageNode, store 
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		child := p.nodes[node.entries[name]]
+		child := p.imageNodeLocked(node.entries[name])
 		if child == nil {
 			continue
 		}

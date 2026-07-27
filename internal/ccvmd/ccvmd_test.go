@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -50,6 +51,39 @@ func TestWorkerControlTransportRequiresTLSForTCP(t *testing.T) {
 	defer cleanup()
 	if network != "unix" || address == "" || secure {
 		t.Fatalf("Unix endpoint = network:%q address:%q secure:%t", network, address, secure)
+	}
+}
+
+func TestRunServerUsesConfiguredStartupWriter(t *testing.T) {
+	var startup bytes.Buffer
+	shutdownErr := make(chan error, 1)
+	started, err := RunServer([]string{
+		"-addr", "127.0.0.1:0",
+		"-cache-dir", t.TempDir(),
+	}, ServerOptions{
+		StartupWriter: &startup,
+		OnStartup: func(hello client.ServerHello) error {
+			go func() {
+				shutdownErr <- client.NewClient("http://"+hello.Addr, nil).Shutdown()
+			}()
+			return nil
+		},
+	})
+	if !started {
+		t.Fatal("server did not reach its startup callback")
+	}
+	if err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+	if err := <-shutdownErr; err != nil {
+		t.Fatalf("request shutdown: %v", err)
+	}
+	var hello client.ServerHello
+	if err := json.NewDecoder(&startup).Decode(&hello); err != nil {
+		t.Fatalf("decode startup banner: %v", err)
+	}
+	if hello.Addr == "" || hello.Scheme != "http" {
+		t.Fatalf("startup banner = %+v", hello)
 	}
 }
 
@@ -750,7 +784,7 @@ func TestSanitizeExecEventForJSONUsesTextOrBinary(t *testing.T) {
 func TestWaitForWorkerStateReturnsTerminalState(t *testing.T) {
 	want := client.InstanceState{ID: "vm", Status: "stopped"}
 	got, completed := waitForWorkerState(t.Context(), func() client.InstanceState { return want })
-	if !completed || got != want {
+	if !completed || !reflect.DeepEqual(got, want) {
 		t.Fatalf("wait result = %+v, %t", got, completed)
 	}
 }

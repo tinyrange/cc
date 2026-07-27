@@ -114,19 +114,22 @@ func TestManagerDisplayListenerLifecycle(t *testing.T) {
 		MaxVMs:          1,
 		SupportsDisplay: true,
 	})
-	framebuffer, err := virtio.NewFramebuffer(64, 48)
-	if err != nil {
-		t.Fatal(err)
+	newDisplayInstance := func() (*virtio.Framebuffer, *displayFakeInstance) {
+		framebuffer, err := virtio.NewFramebuffer(64, 48)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return framebuffer, &displayFakeInstance{
+			fakeInstance: newFakeInstance(),
+			desktop: &virtio.Desktop{
+				Framebuffer: framebuffer,
+				GPU:         virtio.NewGPU(0, 0x1000, 1, framebuffer),
+				Keyboard:    virtio.NewKeyboardInput(0, 0x1000, 2),
+				Pointer:     virtio.NewAbsolutePointerInput(0, 0x1000, 3, 64, 48),
+			},
+		}
 	}
-	inst := &displayFakeInstance{
-		fakeInstance: newFakeInstance(),
-		desktop: &virtio.Desktop{
-			Framebuffer: framebuffer,
-			GPU:         virtio.NewGPU(0, 0x1000, 1, framebuffer),
-			Keyboard:    virtio.NewKeyboardInput(0, 0x1000, 2),
-			Pointer:     virtio.NewAbsolutePointerInput(0, 0x1000, 3, 64, 48),
-		},
-	}
+	_, inst := newDisplayInstance()
 	host.queueInstance(inst)
 	manager := testManager(host)
 
@@ -149,9 +152,36 @@ func TestManagerDisplayListenerLifecycle(t *testing.T) {
 	}
 
 	state, err := manager.Start(ctx, client.CreateInstanceRequest{
-		ID:      "desktop",
+		ID:      "native-desktop",
 		Image:   "alpine",
 		Display: &client.DisplayConfig{Width: 64, Height: 48},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Display == nil || state.Display.VNCAddress != "" {
+		t.Fatalf("native display state = %+v", state.Display)
+	}
+	session, ok := manager.Display("native-desktop")
+	if !ok {
+		t.Fatal("native display session is unavailable")
+	}
+	if err := session.Resize(83, 60); err != nil {
+		t.Fatal(err)
+	}
+	if width, height := session.Size(); width != 80 || height != 60 {
+		t.Fatalf("native display size = %dx%d, want 80x60", width, height)
+	}
+	if err := manager.ShutdownInstance(ctx, "native-desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, inst = newDisplayInstance()
+	host.queueInstance(inst)
+	state, err = manager.Start(ctx, client.CreateInstanceRequest{
+		ID:      "desktop",
+		Image:   "alpine",
+		Display: &client.DisplayConfig{Width: 64, Height: 48, VNCListen: "127.0.0.1:0"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -393,6 +423,10 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 		combinedHighWater: 11 << 20,
 		physical:          5 << 20,
 		reclaimErr:        errors.New("backing filesystem refused reclamation"),
+		persistent: []virtio.PersistentFSStatus{{
+			Name: "research", Mount: "/home/cc", FormatVersion: 1,
+			Sequence: 9, DurableSequence: 8, UpperDataBytes: 3 << 20,
+		}},
 	}
 	host.queueInstance(inst)
 	manager := testManager(host)
@@ -407,6 +441,9 @@ func TestManagerReportsBackingUsageWithoutConflatingGuestMemory(t *testing.T) {
 	}
 	if inst.snapshotCalls != 1 || inst.usageCalls != 0 || inst.metadataCalls != 0 || inst.combinedCalls != 0 {
 		t.Fatalf("backing provider calls snapshot=%d data=%d metadata=%d combined=%d", inst.snapshotCalls, inst.usageCalls, inst.metadataCalls, inst.combinedCalls)
+	}
+	if len(state.PersistentMounts) != 1 || state.PersistentMounts[0].Name != "research" || state.PersistentMounts[0].Mount != "/home/cc" || state.PersistentMounts[0].Sequence != 9 || state.PersistentMounts[0].DurableSequence != 8 {
+		t.Fatalf("persistent mount state = %+v", state.PersistentMounts)
 	}
 }
 
@@ -1539,6 +1576,7 @@ type backingUsageTestInstance struct {
 	usageCalls                   int
 	metadataCalls                int
 	combinedCalls                int
+	persistent                   []virtio.PersistentFSStatus
 }
 
 type blockingBalloonInstance struct {
@@ -1626,6 +1664,10 @@ func (i *backingUsageTestInstance) BackingSnapshot() virtio.FSBackingUsageSnapsh
 		CombinedBytes: i.combined, CombinedHighWaterBytes: i.combinedHighWater,
 		PhysicalBytes: i.physical, ReclaimError: i.reclaimErr,
 	}
+}
+
+func (i *backingUsageTestInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
+	return append([]virtio.PersistentFSStatus(nil), i.persistent...)
 }
 
 func (i *fakeInstance) SetBalloonMB(target uint64) error {

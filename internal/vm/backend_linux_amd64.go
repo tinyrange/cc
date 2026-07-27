@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -47,6 +48,9 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	mountState, err := mounts.NewState(req.Shares)
 	if err != nil {
 		return nil, err
@@ -68,7 +72,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err := ensureLinuxAMD64Image(image); err != nil {
 		return nil, err
 	}
-	image = withLinuxRuntimeMountDirs(image)
+	image = withLinuxRuntimeMountDirsForUser(image, req.DefaultUser)
 	configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
 	if req.Display != nil {
 		configVars = append(configVars, linuxDisplayConfigVars...)
@@ -88,13 +92,24 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			}
 		}()
 	}
+	persistentMounts, err := mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), image, req.PersistentMounts)
+	if err != nil {
+		return nil, err
+	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: kvmhost.RuntimeImageFS(image),
 		Shares: mounts.ConvertShareMounts(req.Shares),
+		Mounts: persistentMounts,
 	}, nil)
 	if err != nil {
 		return nil, err
 	}
+	fsDevicesOwned := true
+	defer func() {
+		if fsDevicesOwned {
+			closeVirtioFSDevices(fsdevs)
+		}
+	}()
 	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
@@ -136,12 +151,14 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	fsDevicesOwned = false
 	return &linuxInstance{
 		managedInstance: &managedInstance{
 			osName:         "Linux",
 			session:        started.Session,
 			root:           image.RootFS,
 			baseEnv:        vmruntime.WithDefaultEnv(image.Config.Env),
+			defaultUser:    req.DefaultUser,
 			workDir:        workDir,
 			network:        network,
 			caps:           managedguest.LinuxProfile.Caps,
@@ -163,28 +180,36 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
-			ID:              req.ID,
-			Image:           req.Image,
-			InitSystem:      req.InitSystem,
-			Kernel:          req.Kernel,
-			Shares:          append([]client.ShareMount(nil), req.Shares...),
-			Network:         req.Network,
-			Display:         req.Display,
-			KernelModules:   append([]string(nil), req.KernelModules...),
-			MemoryMB:        req.MemoryMB,
-			BalloonMB:       req.BalloonMB,
-			CPUs:            req.CPUs,
-			NestedVirt:      req.NestedVirt,
-			Dmesg:           req.Dmesg,
-			TimeoutSeconds:  req.TimeoutSeconds,
-			SnapshotDir:     req.SnapshotDir,
-			RestoreSnapshot: req.RestoreSnapshot,
+			ID:               req.ID,
+			Image:            req.Image,
+			DefaultUser:      req.DefaultUser,
+			InitSystem:       req.InitSystem,
+			Kernel:           req.Kernel,
+			Shares:           append([]client.ShareMount(nil), req.Shares...),
+			PersistentMounts: append([]client.PersistentMount(nil), req.PersistentMounts...),
+			Network:          req.Network,
+			Display:          req.Display,
+			KernelModules:    append([]string(nil), req.KernelModules...),
+			MemoryMB:         req.MemoryMB,
+			BalloonMB:        req.BalloonMB,
+			CPUs:             req.CPUs,
+			NestedVirt:       req.NestedVirt,
+			Dmesg:            req.Dmesg,
+			TimeoutSeconds:   req.TimeoutSeconds,
+			SnapshotDir:      req.SnapshotDir,
+			RestoreSnapshot:  req.RestoreSnapshot,
 		}, onEvent)
+	}
+	if len(req.PersistentMounts) != 0 {
+		return nil, fmt.Errorf("persistent image mounts require an image")
 	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
@@ -716,6 +741,13 @@ func (i *linuxInstance) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 	return virtioFSBackingSnapshot(i.fsdevs)
 }
 
+func (i *linuxInstance) PersistentFSStatus() []virtio.PersistentFSStatus {
+	if i == nil {
+		return nil
+	}
+	return virtioFSPersistentStatus(i.fsdevs)
+}
+
 func (i *linuxInstance) Desktop() *virtio.Desktop {
 	if i == nil || i.session == nil {
 		return nil
@@ -945,6 +977,10 @@ func linuxRuntimeModuleMap() map[string]string {
 }
 
 func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
+	return withLinuxRuntimeMountDirsForUser(image, "")
+}
+
+func withLinuxRuntimeMountDirsForUser(image *oci.Image, defaultUser string) *oci.Image {
 	if image == nil || image.RootFS == nil {
 		return image
 	}
@@ -953,7 +989,9 @@ func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
 	_ = overlay.AddDir("/tmp", fs.ModeDir|0o1777)
-	kvmhost.AddRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	if strings.TrimSpace(defaultUser) == "" {
+		kvmhost.AddRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	}
 	kvmhost.AddRuntimeHostnameFiles(overlay)
 	cloned := *image
 	cloned.RootFS = overlay.Root()

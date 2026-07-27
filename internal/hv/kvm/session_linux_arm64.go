@@ -4,6 +4,7 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -23,24 +24,31 @@ import (
 )
 
 type ManagedSession struct {
-	cancel     context.CancelFunc
-	done       *sessionDone
-	control    io.ReadWriteCloser
-	listener   io.Closer
-	vsock      *virtio.Vsock
-	fsdevs     []*virtio.FS
-	bootWriter *vmruntime.BootEventWriter
-	transcript *vmruntime.SerialTranscript
-	serialOut  *vmruntime.SerialTranscript
-	cleanup    func()
-	sendMu     sync.Mutex
-	nextID     atomic.Uint64
-	dmesg      bool
+	cancel            context.CancelFunc
+	done              *sessionDone
+	control           io.ReadWriteCloser
+	listener          io.Closer
+	clipboardListener io.Closer
+	displayListener   io.Closer
+	vsock             *virtio.Vsock
+	desktop           *virtio.Desktop
+	fsdevs            []*virtio.FS
+	fsCloseErr        *error
+	bootWriter        *vmruntime.BootEventWriter
+	transcript        *vmruntime.SerialTranscript
+	serialOut         *vmruntime.SerialTranscript
+	cleanup           func()
+	sendMu            sync.Mutex
+	nextID            atomic.Uint64
+	dmesg             bool
 }
 
 type ManagedSessionOptions struct {
 	SnapshotDir     string
 	RestoreSnapshot string
+	DisplayWidth    uint32
+	DisplayHeight   uint32
+	NetDevice       *virtio.Net
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -48,6 +56,10 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 }
 
 func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if (strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "") &&
+		(opts.DisplayWidth != 0 || opts.DisplayHeight != 0) {
+		return nil, fmt.Errorf("display-enabled VMs do not support startup snapshots")
+	}
 	if snapshotPath := strings.TrimSpace(opts.RestoreSnapshot); snapshotPath != "" {
 		return StartManagedSessionFromSnapshot(ctx, snapshotPath, memoryMB, dmesg, fsdevs, onEvent)
 	}
@@ -63,6 +75,49 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 
 	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	var desktop *virtio.Desktop
+	var displayDevices []virtio.MMIODevice
+	var clipboardListener virtio.VsockListener
+	var displayListener virtio.VsockListener
+	if opts.DisplayWidth != 0 || opts.DisplayHeight != 0 {
+		framebuffer, err := virtio.NewFramebuffer(int(opts.DisplayWidth), int(opts.DisplayHeight))
+		if err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("create display: %w", err)
+		}
+		gpu := virtio.NewGPU(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer)
+		keyboard := virtio.NewKeyboardInput(arm64vm.KeyboardBase, arm64vm.KeyboardSize, arm64vm.KeyboardIRQ)
+		pointer := virtio.NewAbsolutePointerInput(arm64vm.PointerBase, arm64vm.PointerSize, arm64vm.PointerIRQ, opts.DisplayWidth, opts.DisplayHeight)
+		clipboard := virtio.NewClipboard()
+		clipboardListener, err = backend.Listen(vmruntime.ClipboardPort)
+		if err != nil {
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("listen for guest clipboard bridge: %w", err)
+		}
+		displayListener, err = backend.Listen(vmruntime.DisplayPort)
+		if err != nil {
+			_ = clipboardListener.Close()
+			_ = listener.Close()
+			vsock.Close()
+			return nil, fmt.Errorf("listen for guest display bridge: %w", err)
+		}
+		desktop = &virtio.Desktop{Framebuffer: framebuffer, GPU: gpu, Keyboard: keyboard, Pointer: pointer, Clipboard: clipboard}
+		displayDevices = []virtio.MMIODevice{gpu, keyboard, pointer}
+	}
+	displayListenersOwned := true
+	defer func() {
+		if !displayListenersOwned {
+			return
+		}
+		if clipboardListener != nil {
+			_ = clipboardListener.Close()
+		}
+		if displayListener != nil {
+			_ = displayListener.Close()
+		}
+	}()
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -77,6 +132,12 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 	}()
 
 	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
+	if opts.NetDevice != nil {
+		nodes = append(nodes, opts.NetDevice.DeviceTreeNode())
+	}
+	if desktop != nil {
+		nodes = append(nodes, desktop.GPU.DeviceTreeNode(), desktop.Keyboard.DeviceTreeNode(), desktop.Pointer.DeviceTreeNode())
+	}
 	snapshot := newSnapshotTrigger(opts.SnapshotDir, nil)
 	if snapshot != nil {
 		nodes = append(nodes, arm64vm.SnapshotDeviceNode())
@@ -127,6 +188,21 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 	}
 	vsock.Attach(vm, vm)
 	rng.Attach(vm, vm)
+	if opts.NetDevice != nil {
+		opts.NetDevice.Attach(vm, vm)
+	}
+	runtimeDevices := append([]virtio.MMIODevice(nil), displayDevices...)
+	if opts.NetDevice != nil {
+		runtimeDevices = append(runtimeDevices, opts.NetDevice)
+	}
+	for _, device := range displayDevices {
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			typed.Attach(vm, vm)
+		case *virtio.Input:
+			typed.Attach(vm, vm)
+		}
+	}
 	timing.Since(ctx, "startup.kvm.device_attach", stageStart)
 
 	stageStart = time.Now()
@@ -161,10 +237,17 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 
 	stageStart = time.Now()
 	runCtx, cancel := context.WithCancel(context.Background())
+	if clipboardListener != nil {
+		go serveClipboardConnections(runCtx, clipboardListener, desktop.Clipboard)
+	}
+	if displayListener != nil {
+		go serveDisplayConnections(runCtx, displayListener, desktop)
+	}
 	done := newSessionDone()
+	var fsCloseErr error
 	go func() {
-		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, serialOut, snapshot)
-		closeVMWithFS(vm, fsdevs)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, runtimeDevices, serialOut, snapshot)
+		fsCloseErr = closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()
 
@@ -235,14 +318,19 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}
 
+	displayListenersOwned = false
 	return &ManagedSession{
-		cancel:     cancel,
-		done:       done,
-		control:    control,
-		listener:   listener,
-		vsock:      vsock,
-		fsdevs:     fsdevs,
-		bootWriter: bootWriter,
+		cancel:            cancel,
+		done:              done,
+		control:           control,
+		listener:          listener,
+		clipboardListener: clipboardListener,
+		displayListener:   displayListener,
+		vsock:             vsock,
+		desktop:           desktop,
+		fsdevs:            fsdevs,
+		fsCloseErr:        &fsCloseErr,
+		bootWriter:        bootWriter,
 		cleanup: func() {
 			_ = vm.CancelRun()
 		},
@@ -327,7 +415,18 @@ func (s *ManagedSession) Wait() error {
 	if s == nil || s.done == nil {
 		return nil
 	}
-	return s.done.wait()
+	err := s.done.wait()
+	if s.fsCloseErr != nil {
+		err = errors.Join(err, *s.fsCloseErr)
+	}
+	return err
+}
+
+func (s *ManagedSession) Desktop() *virtio.Desktop {
+	if s == nil {
+		return nil
+	}
+	return s.desktop
 }
 
 func (s *ManagedSession) Close() error {
@@ -339,6 +438,12 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+	if s.clipboardListener != nil {
+		_ = s.clipboardListener.Close()
+	}
+	if s.displayListener != nil {
+		_ = s.displayListener.Close()
 	}
 	if s.vsock != nil {
 		_ = s.vsock.Close()
@@ -352,16 +457,23 @@ func (s *ManagedSession) Close() error {
 	if s.cleanup != nil {
 		s.cleanup()
 	}
+	var closeErr error
 	if s.done != nil {
-		_ = s.done.wait()
+		closeErr = s.done.wait()
+		if errors.Is(closeErr, context.Canceled) {
+			closeErr = nil
+		}
+	}
+	if s.fsCloseErr != nil {
+		closeErr = errors.Join(closeErr, *s.fsCloseErr)
 	}
 	if s.transcript != nil {
-		_ = s.transcript.Close()
+		closeErr = errors.Join(closeErr, s.transcript.Close())
 	}
 	if s.serialOut != nil && s.serialOut != s.transcript {
-		_ = s.serialOut.Close()
+		closeErr = errors.Join(closeErr, s.serialOut.Close())
 	}
-	return nil
+	return closeErr
 }
 
 func transcriptError(err error, serialText, controlText string) error {

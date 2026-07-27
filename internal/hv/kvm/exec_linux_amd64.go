@@ -79,7 +79,7 @@ func RunManagedExecWithFSNetAndBalloon(ctx context.Context, kernel []byte, initr
 	}
 
 	serialOut := vmruntime.NewSerialTranscript()
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialOut)
+	uart := newAMD64UART(vm, serialOut)
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			fsdev.Attach(vm, vm)

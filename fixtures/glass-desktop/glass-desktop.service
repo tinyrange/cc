@@ -9,6 +9,8 @@ Type=simple
 ExecStart=/usr/local/sbin/glass-session
 Restart=on-failure
 RestartSec=1s
+StandardOutput=append:/run/glass-desktop.log
+StandardError=inherit
 
 [Install]
 WantedBy=glass.target

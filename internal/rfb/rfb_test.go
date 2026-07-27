@@ -2,6 +2,7 @@ package rfb
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/binary"
 	"image"
@@ -153,6 +154,15 @@ func TestHextileCompressesSolidFramebuffer(t *testing.T) {
 	}
 }
 
+func TestFramebufferEncodingUsesClientPreference(t *testing.T) {
+	if got := chooseFramebufferEncoding([]int32{7, encodingZRLE, encodingHextile, encodingRaw}); got != encodingZRLE {
+		t.Fatalf("encoding = %d, want ZRLE", got)
+	}
+	if got := chooseFramebufferEncoding([]int32{7, encodingHextile, encodingRaw}); got != encodingHextile {
+		t.Fatalf("encoding = %d, want Hextile fallback", got)
+	}
+}
+
 func TestHextileCompressesSparseTile(t *testing.T) {
 	const width = 16
 	source := make([]byte, width*width*4)
@@ -193,6 +203,109 @@ func TestHextileCompressesSparseTile(t *testing.T) {
 	if client.pixels[background] != 0x30 || client.pixels[foreground] != 0xff {
 		t.Fatalf("decoded sparse tile background=%#x foreground=%#x", client.pixels[background], client.pixels[foreground])
 	}
+}
+
+func TestZRLECompressesDesktopAndKeepsOneStream(t *testing.T) {
+	const (
+		width  = 128
+		height = 96
+	)
+	source := make([]byte, width*height*4)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			offset := (y*width + x) * 4
+			source[offset] = byte(x / 8)
+			source[offset+1] = byte(y / 8)
+			source[offset+2] = 0x40
+		}
+	}
+
+	encoder, err := newZRLEEncoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encoder.Close()
+	var first bytes.Buffer
+	if err := encoder.WriteRectangle(&first, source, width, height, defaultPixelFormat); err != nil {
+		t.Fatal(err)
+	}
+	if first.Len() >= len(source)/8 {
+		t.Fatalf("ZRLE payload is %d bytes, raw framebuffer is %d", first.Len(), len(source))
+	}
+
+	firstPayload := first.Bytes()
+	compressedLength := int(binary.BigEndian.Uint32(firstPayload[:4]))
+	if compressedLength != len(firstPayload)-4 {
+		t.Fatalf("ZRLE length = %d, payload is %d", compressedLength, len(firstPayload)-4)
+	}
+	tileCount := ((width + 63) / 64) * ((height + 63) / 64)
+	var second bytes.Buffer
+	if err := encoder.WriteRectangle(&second, source, width, height, defaultPixelFormat); err != nil {
+		t.Fatal(err)
+	}
+	secondPayload := second.Bytes()
+	secondLength := int(binary.BigEndian.Uint32(secondPayload[:4]))
+	if secondLength != len(secondPayload)-4 {
+		t.Fatalf("second ZRLE length = %d, payload is %d", secondLength, len(secondPayload)-4)
+	}
+
+	var stream bytes.Buffer
+	stream.Write(firstPayload[4:])
+	stream.Write(secondPayload[4:])
+	reader, err := zlib.NewReader(&stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncompressedLength := width*height*3 + tileCount
+	uncompressed := make([]byte, uncompressedLength*2)
+	if _, err := io.ReadFull(reader, uncompressed); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{0, uncompressedLength} {
+		if uncompressed[offset] != 0 {
+			t.Fatalf("ZRLE first tile subencoding = %d, want raw", uncompressed[offset])
+		}
+		if got := uncompressed[offset+1 : offset+4]; !bytes.Equal(got, []byte{0, 0, 0x40}) {
+			t.Fatalf("ZRLE first compressed pixel = %v", got)
+		}
+	}
+}
+
+func BenchmarkZRLEDesktopFrame(b *testing.B) {
+	const (
+		width  = 1920
+		height = 1080
+	)
+	source := make([]byte, width*height*4)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			offset := (y*width + x) * 4
+			source[offset] = byte(x / 16)
+			source[offset+1] = byte(y / 16)
+			source[offset+2] = byte((x + y) / 32)
+		}
+	}
+	b.SetBytes(int64(len(source)))
+	b.ResetTimer()
+	wireBytes := 0
+	for range b.N {
+		encoder, err := newZRLEEncoder()
+		if err != nil {
+			b.Fatal(err)
+		}
+		var payload bytes.Buffer
+		if err := encoder.WriteRectangle(&payload, source, width, height, defaultPixelFormat); err != nil {
+			b.Fatal(err)
+		}
+		if err := encoder.Close(); err != nil {
+			b.Fatal(err)
+		}
+		wireBytes = payload.Len()
+	}
+	b.ReportMetric(float64(wireBytes), "wire-B/frame")
 }
 
 func TestRichCursorHasVisiblePixels(t *testing.T) {

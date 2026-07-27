@@ -191,10 +191,10 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
-	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, serialOut, nil)
+	return runManagedExecVMWithSnapshot(ctx, vm, uart, fsdevs, vsock, rng, nil, serialOut, nil)
 }
 
-func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
+func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, extra []virtio.MMIODevice, serialOut *vmruntime.SerialTranscript, snapshot *snapshotTrigger) error {
 	runtime.LockOSThread()
 	// This loop always runs in a dedicated goroutine. Leave it locked so the
 	// OS thread terminates with the goroutine instead of remaining parked.
@@ -231,7 +231,7 @@ func runManagedExecVMWithSnapshot(ctx context.Context, vm *VM, uart *serial.UART
 				return err
 			}
 			if !handled {
-				err = handleBootMMIO(vm, uart, fsdevs, vsock, rng, exit.MMIO)
+				err = handleBootMMIOWithExtra(vm, uart, fsdevs, vsock, rng, extra, exit.MMIO)
 			}
 			if err != nil {
 				return err

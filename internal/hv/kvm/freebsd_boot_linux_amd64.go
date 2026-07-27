@@ -14,7 +14,6 @@ import (
 	"j5.nz/cc/internal/amd64vm"
 	freebsdamd64 "j5.nz/cc/internal/freebsd/boot/amd64"
 	"j5.nz/cc/internal/nvme"
-	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -55,8 +54,7 @@ func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 	}
 
 	var serialOut bytes.Buffer
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, &serialOut)
-	uart.AttachIRQ(vm, amd64vm.COM1IRQ)
+	uart := newAMD64UART(vm, &serialOut)
 	var pci *PCIBus
 	var pciDevices []*PCIDevice
 	for i, block := range blocks {

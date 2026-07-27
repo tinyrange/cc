@@ -609,7 +609,7 @@ func restoreManagedVMFromSnapshot(manifest kvmSnapshotManifest, memPath string, 
 		closeVMWithFS(vm, fsdevs)
 		return nil, nil, nil, serialOut, err
 	}
-	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
+	uart := newAMD64UART(vm, serialWriter)
 	return vm, uart, rng, serialOut, nil
 }
 

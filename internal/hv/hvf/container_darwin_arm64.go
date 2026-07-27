@@ -158,29 +158,33 @@ type DirectoryShare = vmruntime.DirectoryShare
 type ContainerRunResult = vmruntime.RunResult
 
 type ContainerSession struct {
-	cancel      context.CancelFunc
-	doneCh      chan sessionRunResult
-	closeDone   <-chan struct{}
-	image       *oci.Image
-	baseEnv     []string
-	workDir     string
-	dmesg       bool
-	uart        *serial.UART8250
-	control     virtio.VsockConn
-	transcript  *arm64vm.SerialTranscript
-	serialOut   *arm64vm.SerialTranscript
-	listener    virtio.VsockListener
-	vsock       *virtio.Vsock
-	balloon     *virtio.Balloon
-	rootFS      virtio.ShareMounter
-	fsdevs      []*virtio.FS
-	sendMu      sync.Mutex
-	shareMu     sync.Mutex
-	shares      map[string]client.ShareMount
-	imageMounts map[string]string
-	nextID      atomic.Uint64
-	activeExecs *atomic.Int32
-	inlineExec  bool
+	cancel            context.CancelFunc
+	doneCh            chan sessionRunResult
+	closeDone         <-chan struct{}
+	image             *oci.Image
+	baseEnv           []string
+	workDir           string
+	dmesg             bool
+	uart              *serial.UART8250
+	control           virtio.VsockConn
+	transcript        *arm64vm.SerialTranscript
+	serialOut         *arm64vm.SerialTranscript
+	listener          virtio.VsockListener
+	clipboardListener virtio.VsockListener
+	displayListener   virtio.VsockListener
+	vsock             *virtio.Vsock
+	balloon           *virtio.Balloon
+	desktop           *virtio.Desktop
+	rootFS            virtio.ShareMounter
+	fsdevs            []*virtio.FS
+	fsCloseErr        *error
+	sendMu            sync.Mutex
+	shareMu           sync.Mutex
+	shares            map[string]client.ShareMount
+	imageMounts       map[string]string
+	nextID            atomic.Uint64
+	activeExecs       *atomic.Int32
+	inlineExec        bool
 }
 
 type ManagedMetadata struct {
@@ -332,6 +336,9 @@ func (s *ContainerSession) Wait() error {
 	if s.closeDone != nil {
 		<-s.closeDone
 	}
+	if s.fsCloseErr != nil {
+		res.err = errors.Join(res.err, *s.fsCloseErr)
+	}
 	return res.err
 }
 
@@ -340,6 +347,13 @@ func (s *ContainerSession) ConsoleHistory(context.Context) (string, error) {
 		return "", nil
 	}
 	return s.serialOut.String(), nil
+}
+
+func (s *ContainerSession) Desktop() *virtio.Desktop {
+	if s == nil {
+		return nil
+	}
+	return s.desktop
 }
 
 func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -492,6 +506,19 @@ func (s *ContainerSession) BackingSnapshot() virtio.FSBackingUsageSnapshot {
 		CombinedBytes: combined, CombinedHighWaterBytes: max(combined, dataHigh, metadataHigh),
 		PhysicalBytes: physical, ReclaimError: err,
 	}
+}
+
+func (s *ContainerSession) PersistentFSStatus() []virtio.PersistentFSStatus {
+	if s == nil {
+		return nil
+	}
+	var statuses []virtio.PersistentFSStatus
+	for _, device := range s.fsdevs {
+		if device != nil {
+			statuses = append(statuses, device.PersistentFSStatus()...)
+		}
+	}
+	return statuses
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -1001,6 +1028,12 @@ func (s *ContainerSession) Close() error {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
+	if s.clipboardListener != nil {
+		_ = s.clipboardListener.Close()
+	}
+	if s.displayListener != nil {
+		_ = s.displayListener.Close()
+	}
 	if s.vsock != nil {
 		_ = s.vsock.Close()
 	}
@@ -1010,14 +1043,18 @@ func (s *ContainerSession) Close() error {
 	case <-time.After(15 * time.Second):
 		return fmt.Errorf("container session did not stop within 15s")
 	}
+	var closeErr error
+	if s.fsCloseErr != nil {
+		closeErr = *s.fsCloseErr
+	}
 	if s.transcript != nil {
-		_ = s.transcript.Close()
+		closeErr = errors.Join(closeErr, s.transcript.Close())
 	}
 	if s.serialOut != nil && s.serialOut != s.transcript {
-		_ = s.serialOut.Close()
+		closeErr = errors.Join(closeErr, s.serialOut.Close())
 	}
 	exitTiming.Dump()
-	return nil
+	return closeErr
 }
 
 func (s *ContainerSession) SetBalloonMB(target uint64) error {
@@ -1092,6 +1129,12 @@ func (s *ContainerSession) markExecDone() {
 }
 
 func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEvent func(client.BootEvent) error) (*ContainerSession, error) {
+	mountsOwned := true
+	defer func() {
+		if mountsOwned {
+			_ = vmruntime.CloseShareMounts(req.Mounts)
+		}
+	}()
 	start := time.Now()
 	if req.Image == nil && req.RootFS == nil {
 		return nil, fmt.Errorf("image or rootfs backend is required")
@@ -1101,6 +1144,10 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}
 	if req.CPUs <= 0 {
 		req.CPUs = 1
+	}
+	if (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") &&
+		(req.DisplayWidth != 0 || req.DisplayHeight != 0) {
+		return nil, fmt.Errorf("display-enabled VMs do not support startup snapshots")
 	}
 
 	user := strings.TrimSpace(req.User)
@@ -1190,6 +1237,52 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		netdev.Attach(vm, vm)
 	}
 	vsockBackend := virtio.NewSimpleVsockBackend()
+	var desktop *virtio.Desktop
+	var displayDevices []virtio.MMIODevice
+	var clipboardListener virtio.VsockListener
+	var displayListener virtio.VsockListener
+	if req.DisplayWidth != 0 || req.DisplayHeight != 0 {
+		framebuffer, err := virtio.NewFramebuffer(int(req.DisplayWidth), int(req.DisplayHeight))
+		if err != nil {
+			vm.Close()
+			return nil, fmt.Errorf("create display: %w", err)
+		}
+		gpu := virtio.NewGPU(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer)
+		keyboard := virtio.NewKeyboardInput(arm64vm.KeyboardBase, arm64vm.KeyboardSize, arm64vm.KeyboardIRQ)
+		pointer := virtio.NewAbsolutePointerInput(arm64vm.PointerBase, arm64vm.PointerSize, arm64vm.PointerIRQ, req.DisplayWidth, req.DisplayHeight)
+		clipboard := virtio.NewClipboard()
+		clipboardListener, err = vsockBackend.Listen(vmruntime.ClipboardPort)
+		if err != nil {
+			vm.Close()
+			return nil, fmt.Errorf("listen for guest clipboard bridge: %w", err)
+		}
+		displayListener, err = vsockBackend.Listen(vmruntime.DisplayPort)
+		if err != nil {
+			_ = clipboardListener.Close()
+			vm.Close()
+			return nil, fmt.Errorf("listen for guest display bridge: %w", err)
+		}
+		desktop = &virtio.Desktop{
+			Framebuffer: framebuffer,
+			GPU:         gpu,
+			Keyboard:    keyboard,
+			Pointer:     pointer,
+			Clipboard:   clipboard,
+		}
+		displayDevices = []virtio.MMIODevice{gpu, keyboard, pointer}
+	}
+	displayListenersOwned := true
+	defer func() {
+		if !displayListenersOwned {
+			return
+		}
+		if clipboardListener != nil {
+			_ = clipboardListener.Close()
+		}
+		if displayListener != nil {
+			_ = displayListener.Close()
+		}
+	}()
 	listener, err := vsockBackend.Listen(vmruntime.ControlPort)
 	if err != nil {
 		vm.Close()
@@ -1197,12 +1290,31 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}
 	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, vsockBackend)
 	vsock.Attach(vm, vm)
+	for _, device := range displayDevices {
+		switch typed := device.(type) {
+		case *virtio.GPU:
+			typed.Attach(vm, vm)
+		case *virtio.Input:
+			typed.Attach(vm, vm)
+		}
+	}
 	fsdevs, rootFS, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
 		_ = listener.Close()
 		vm.Close()
 		return nil, err
 	}
+	mountsOwned = false
+	fsDevicesOwned := true
+	defer func() {
+		if fsDevicesOwned {
+			for _, device := range fsdevs {
+				if device != nil {
+					_ = device.Close()
+				}
+			}
+		}
+	}()
 	attachFSDeviceTiming(ctx, fsdevs)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		for _, fsdev := range fsdevs {
@@ -1224,12 +1336,21 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 	start = time.Now()
 
+	deviceNodes := appendContainerDeviceNodes(console, rng, balloon, vsock, netdev)
+	if desktop != nil {
+		deviceNodes = append(deviceNodes,
+			desktop.GPU.DeviceTreeNode(),
+			desktop.Keyboard.DeviceTreeNode(),
+			desktop.Pointer.DeviceTreeNode(),
+		)
+	}
+	deviceNodes = append(deviceNodes, arm64vm.SnapshotDeviceNode())
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:    req.MemoryMB,
 		NumCPUs:     req.CPUs,
 		Dmesg:       req.Dmesg,
 		DisableUART: !req.Dmesg,
-		ExtraNodes:  arm64vm.AppendFSNodes(append(appendContainerDeviceNodes(console, rng, balloon, vsock, netdev), arm64vm.SnapshotDeviceNode()), fsdevs),
+		ExtraNodes:  arm64vm.AppendFSNodes(deviceNodes, fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -1251,6 +1372,12 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	start = time.Now()
 
 	runCtx, cancel := context.WithCancel(context.Background())
+	if clipboardListener != nil {
+		go serveClipboardConnections(runCtx, clipboardListener, desktop.Clipboard)
+	}
+	if displayListener != nil {
+		go serveDisplayConnections(runCtx, displayListener, desktop)
+	}
 	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
 	closeDone := make(chan struct{})
@@ -1329,8 +1456,19 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		}
 	}()
 
+	var fsCloseErr error
+	fsDevicesOwned = false
 	go func() {
 		defer close(closeDone)
+		defer func() {
+			var errs []error
+			for _, device := range fsdevs {
+				if device != nil {
+					errs = append(errs, device.Close())
+				}
+			}
+			fsCloseErr = errors.Join(errs...)
+		}()
 		defer func() {
 			_ = vm.Close()
 			exitTiming.Dump()
@@ -1387,7 +1525,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, snapshot, mmioRecorder, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, displayDevices, snapshot, mmioRecorder, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1471,23 +1609,28 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 				Cache:    share.Cache,
 			}
 		}
+		displayListenersOwned = false
 		return &ContainerSession{
-			cancel:      cancel,
-			doneCh:      doneCh,
-			closeDone:   closeDone,
-			image:       req.Image,
-			baseEnv:     baseEnv,
-			workDir:     workDir,
-			dmesg:       req.Dmesg,
-			control:     res.conn,
-			transcript:  controlTranscript,
-			serialOut:   serialOut,
-			vsock:       vsock,
-			balloon:     balloon,
-			rootFS:      rootFS,
-			fsdevs:      fsdevs,
-			shares:      shareState,
-			activeExecs: activeExecs,
+			cancel:            cancel,
+			doneCh:            doneCh,
+			closeDone:         closeDone,
+			image:             req.Image,
+			baseEnv:           baseEnv,
+			workDir:           workDir,
+			dmesg:             req.Dmesg,
+			control:           res.conn,
+			transcript:        controlTranscript,
+			serialOut:         serialOut,
+			clipboardListener: clipboardListener,
+			displayListener:   displayListener,
+			vsock:             vsock,
+			balloon:           balloon,
+			desktop:           desktop,
+			rootFS:            rootFS,
+			fsdevs:            fsdevs,
+			fsCloseErr:        &fsCloseErr,
+			shares:            shareState,
+			activeExecs:       activeExecs,
 		}, nil
 	case res := <-doneCh:
 		cancel()
@@ -1553,6 +1696,12 @@ func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunRes
 }
 
 func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- error) (ret ContainerRunResult, retErr error) {
+	mountsOwned := true
+	defer func() {
+		if mountsOwned {
+			retErr = errors.Join(retErr, vmruntime.CloseShareMounts(req.Mounts))
+		}
+	}()
 	if req.Image == nil && req.RootFS == nil {
 		return ContainerRunResult{}, fmt.Errorf("image or rootfs backend is required")
 	}
@@ -1659,6 +1808,16 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
+	mountsOwned = false
+	defer func() {
+		var errs []error
+		for _, device := range fsdevs {
+			if device != nil {
+				errs = append(errs, device.Close())
+			}
+		}
+		retErr = errors.Join(retErr, errors.Join(errs...))
+	}()
 	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
@@ -1761,7 +1920,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, nil, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1865,7 +2024,7 @@ type runResultVM struct {
 	err   error
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, snapshot *snapshotTrigger, mmioRecorder *snapshotMMIORecorder, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, balloon *virtio.Balloon, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, extra []virtio.MMIODevice, snapshot *snapshotTrigger, mmioRecorder *snapshotMMIORecorder, exitInfo *VcpuExit) error {
 	recorder := timing.FromContext(ctx)
 	if recorder != nil {
 		totalStart := time.Now()
@@ -1879,6 +2038,7 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 	}
 	addr := uint64(exitInfo.Exception.PhysicalAddress)
 	fsdev := findFSDevice(fsdevs, addr, info.SizeBytes)
+	extraDevice := findMMIODevice(extra, addr, info.SizeBytes)
 	exitTimingEnabled := exitTiming.Enabled()
 	writeValue := uint64(0)
 	if info.Write {
@@ -2044,6 +2204,20 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *
 				return err
 			}
 		}
+	case extraDevice != nil:
+		if info.Write {
+			if err := extraDevice.Write(addr, info.SizeBytes, writeValue); err != nil {
+				return err
+			}
+		} else {
+			value, err := extraDevice.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
+				return err
+			}
+		}
 	case mmioInRange(addr, arm64vm.GICDistributorMin, arm64vm.GICDistributorMax) || mmioInRange(addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax):
 		if exitTimingEnabled {
 			start := time.Now()
@@ -2091,6 +2265,15 @@ func findFSDevice(fsdevs []*virtio.FS, addr uint64, size int) *virtio.FS {
 	for _, fsdev := range fsdevs {
 		if fsdev != nil && fsdev.Contains(addr, size) {
 			return fsdev
+		}
+	}
+	return nil
+}
+
+func findMMIODevice(devices []virtio.MMIODevice, addr uint64, size int) virtio.MMIODevice {
+	for _, device := range devices {
+		if device != nil && device.Contains(addr, size) {
+			return device
 		}
 	}
 	return nil

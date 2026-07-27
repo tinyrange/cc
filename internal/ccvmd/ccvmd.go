@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	"j5.nz/cc/display"
 	"j5.nz/cc/internal/cachepath"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/hv/hvf"
@@ -97,7 +98,9 @@ type ServerOptions struct {
 	TokenPath              string
 	Authentication         *ServerAuthentication
 	Persistent             bool
+	StartupWriter          io.Writer
 	OnStartup              func(client.ServerHello) error
+	OnDisplay              func(string, display.Session)
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
@@ -112,6 +115,7 @@ type RuntimeView interface {
 	ShutdownInstance(context.Context, string) error
 	AllowServiceProxyPort(context.Context, string, int) error
 	SetInstanceBalloon(string, uint64) error
+	Display(string) (display.Session, bool)
 }
 
 func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
@@ -119,6 +123,22 @@ func (s *server) SetInstanceBalloon(id string, targetMB uint64) error {
 		return fmt.Errorf("runtime is not available")
 	}
 	return s.vms.SetInstanceBalloon(id, targetMB)
+}
+
+func (s *server) Display(id string) (display.Session, bool) {
+	if s == nil || s.vms == nil {
+		return nil, false
+	}
+	return s.vms.Display(id)
+}
+
+func notifyDisplay(opts ServerOptions, runtime RuntimeView, state client.InstanceState) {
+	if opts.OnDisplay == nil || state.Display == nil {
+		return
+	}
+	if session, ok := runtime.Display(state.ID); ok {
+		opts.OnDisplay(state.ID, session)
+	}
 }
 
 func (s *server) InstanceStatuses() []client.InstanceState {
@@ -473,7 +493,11 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		Kind:      opts.Kind,
 		TokenPath: opts.TokenPath,
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(hello); err != nil {
+	startupWriter := opts.StartupWriter
+	if startupWriter == nil {
+		startupWriter = os.Stdout
+	}
+	if err := json.NewEncoder(startupWriter).Encode(hello); err != nil {
 		_ = l.Close()
 		return false, fmt.Errorf("write startup banner: %w", err)
 	}
@@ -1554,6 +1578,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			w.WriteHeader(http.StatusOK)
 			enc := json.NewEncoder(w)
 			flusher, _ := w.(http.Flusher)
+			if flusher != nil {
+				flusher.Flush()
+			}
 			events := make(chan client.ProgressEvent, 128)
 			go func() {
 				defer close(events)
@@ -1832,7 +1859,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			}
 		}
 		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
-		if vm.NeedsAMD64Emulation(startImage) {
+		if vm.WantsAMD64Emulation(startImage, req.AMD64Emulation) {
 			if wantsBootEventStream(r) {
 				bootEvents.Write(client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
 				_, err := srvState.kernel.ExtractPackageFileWithProgress(
@@ -1852,7 +1879,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
-			} else if _, err := vm.PrepareAMD64Emulator(bootCtx, startImage, srvState.kernel.ExtractPackageFile); err != nil {
+			} else if _, err := vm.PrepareAMD64EmulatorForGuest(bootCtx, startImage, req.AMD64Emulation, srvState.kernel.ExtractPackageFile); err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
 					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 					return
@@ -1877,6 +1904,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
+			notifyDisplay(opts, srvState, state)
 			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm/start total=%s", time.Since(start))
 			return
@@ -1895,6 +1923,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		timingLog("POST /vm/start vms.StartBlank took=%s", time.Since(start))
+		notifyDisplay(opts, srvState, state)
 		writeJSON(w, http.StatusOK, state)
 		timingLog("POST /vm/start total=%s", time.Since(start))
 	})
@@ -1983,6 +2012,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 				return
 			}
 			timingLog("POST /vm vms.StartStream took=%s", time.Since(start))
+			notifyDisplay(opts, srvState, state)
 			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm total=%s", time.Since(start))
 			return
@@ -2001,6 +2031,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		timingLog("POST /vm vms.Start took=%s", time.Since(start))
+		notifyDisplay(opts, srvState, state)
 		writeJSON(w, http.StatusOK, state)
 		timingLog("POST /vm total=%s", time.Since(start))
 	})

@@ -486,6 +486,7 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == stage2Mode {
 		if err := runStage2(); err != nil {
+			writeKernel("ccx3-init: stage2: " + err.Error())
 			fmt.Fprintf(os.Stderr, "ccx3-init: stage2: %v\n", err)
 			os.Exit(126)
 		}
@@ -530,9 +531,7 @@ func run() error {
 			_ = syscall.Dup3(fd, target, 0)
 		}
 	}
-	if fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
-		kmsgFD = fd
-	}
+	openKernelLog()
 
 	var cfg config
 	buf, err := os.ReadFile(configPath)
@@ -706,6 +705,7 @@ func run() error {
 }
 
 func runStage2() error {
+	openKernelLog()
 	writeKernel("ccx3-init: stage2 starting")
 	snapshotRestore := os.Getenv("CCX3_STAGE2_CONFIG") == snapshotStage2ConfigPath
 	var cfg config
@@ -941,8 +941,8 @@ ExecStart=/etc/ccx3/stage2 --ccx3-stage2
 Restart=on-failure
 RestartSec=250ms
 StandardInput=null
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=null
+StandardError=null
 
 [Install]
 WantedBy=sysinit.target
@@ -1291,6 +1291,7 @@ func finishRootFS(newRoot, emulatorTag string, disableCgroup bool) error {
 	}
 	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "gid=5,mode=620,ptmxmode=666")
 	_ = syscall.Mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777")
+	configureDevicePermissions("/dev")
 	if emulatorTag != "" {
 		if err := os.MkdirAll("/run/ccx3", 0o755); err != nil {
 			return fmt.Errorf("mkdir /run/ccx3: %w", err)
@@ -1515,6 +1516,20 @@ func configureDeviceLinks() {
 	} {
 		if err := ensureSymlink(target, link); err != nil {
 			writeKernel("ccx3-init: link " + link + ": " + err.Error())
+		}
+	}
+}
+
+// configureDevicePermissions applies the standard permissions normally set
+// by udev. Minimal guest targets may deliberately start without udev, but
+// should still expose devices intended for unprivileged use.
+func configureDevicePermissions(devRoot string) {
+	for name, mode := range map[string]os.FileMode{
+		"fuse": 0o666,
+	} {
+		path := filepath.Join(devRoot, name)
+		if err := os.Chmod(path, mode); err != nil && !errors.Is(err, os.ErrNotExist) {
+			writeKernel("ccx3-init: chmod " + path + ": " + err.Error())
 		}
 	}
 }
@@ -2107,6 +2122,15 @@ func writeKernel(value string) {
 		return
 	}
 	writeConsole(value + "\n")
+}
+
+func openKernelLog() {
+	if kmsgFD >= 0 {
+		return
+	}
+	if fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+		kmsgFD = fd
+	}
 }
 
 func itoa(v int) string {

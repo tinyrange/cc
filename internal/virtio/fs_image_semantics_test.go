@@ -33,6 +33,15 @@ type legacyBlockingSnapshotDirectory struct {
 	once    sync.Once
 }
 
+type namespaceTestDirectory struct {
+	imagefs.Directory
+	namespace *imagefs.Namespace
+}
+
+func (d *namespaceTestDirectory) Namespace() *imagefs.Namespace {
+	return d.namespace
+}
+
 func (d *legacyBlockingSnapshotDirectory) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
 func (d *legacyBlockingSnapshotDirectory) ModTime() time.Time      { return time.Unix(0, 0) }
 func (d *legacyBlockingSnapshotDirectory) Owner() (uint32, uint32) { return 0, 0 }
@@ -845,5 +854,127 @@ func TestImageFSHandleMapsReleaseBurstCapacity(t *testing.T) {
 	backend.mu.Unlock()
 	if active != 0 || retained != 0 {
 		t.Fatalf("released handles active=%d retained=%d", active, retained)
+	}
+}
+
+func TestImageFSNamespaceIsSharedWhileGuestChangesRemainPrivate(t *testing.T) {
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddDir("/etc", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := overlay.AddFile("/etc/config", 0o644, []byte("shared")); err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := imagefs.BuildNamespace(overlay.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &namespaceTestDirectory{Directory: overlay.Root(), namespace: namespace}
+	first := NewImageFS(root, "").(*imageFS)
+	second := NewImageFS(root, "").(*imageFS)
+	if len(first.baseNodes) != len(namespace.Nodes) || first.baseNodes[1] != second.baseNodes[1] {
+		t.Fatalf("namespace nodes were not shared: first=%d second=%d", len(first.baseNodes), len(second.baseNodes))
+	}
+	etcFirst, _, errno := first.Lookup(1, "etc")
+	if errno != 0 {
+		t.Fatalf("first lookup etc: errno %d", errno)
+	}
+	configFirst, _, errno := first.Lookup(etcFirst, "config")
+	if errno != 0 {
+		t.Fatalf("first lookup config: errno %d", errno)
+	}
+	if _, errno := first.SetAttr(configFirst, fattrMode, 0, 0, 0o600, 0, 0, time.Time{}, time.Time{}); errno != 0 {
+		t.Fatalf("chmod first config: errno %d", errno)
+	}
+	if errno := first.Unlink(etcFirst, "config"); errno != 0 {
+		t.Fatalf("unlink first config: errno %d", errno)
+	}
+	if _, _, errno := first.Lookup(etcFirst, "config"); errno != -linuxENOENT {
+		t.Fatalf("first config after unlink: errno %d", errno)
+	}
+
+	etcSecond, _, errno := second.Lookup(1, "etc")
+	if errno != 0 {
+		t.Fatalf("second lookup etc: errno %d", errno)
+	}
+	configSecond, attr, errno := second.Lookup(etcSecond, "config")
+	if errno != 0 {
+		t.Fatalf("second lookup config: errno %d", errno)
+	}
+	if configSecond != configFirst || attr.Mode&linuxPermMask != 0o644 {
+		t.Fatalf("second config node=%d mode=%#o, want node=%d mode=0644", configSecond, attr.Mode, configFirst)
+	}
+}
+
+func TestImageFSLargeImmutableNamespaceDoesNotMaterializePerVMNodes(t *testing.T) {
+	const files = 10000
+	overlay := imagefs.NewOverlay(nil)
+	for i := range files {
+		if err := overlay.AddFile(fmt.Sprintf("/entry-%05d", i), 0o644, nil); err != nil {
+			t.Fatalf("add entry %d: %v", i, err)
+		}
+	}
+	namespace, err := imagefs.BuildNamespace(overlay.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := NewImageFS(&namespaceTestDirectory{Directory: overlay.Root(), namespace: namespace}, "").(*imageFS)
+	if len(backend.nodes) != 0 {
+		t.Fatalf("new backend has %d private nodes", len(backend.nodes))
+	}
+	nodeID, _, errno := backend.Lookup(1, "entry-09999")
+	if errno != 0 {
+		t.Fatalf("lookup indexed entry: errno %d", errno)
+	}
+	fh, errno := backend.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("open indexed root: errno %d", errno)
+	}
+	defer backend.ReleaseDir(1, fh)
+	if page, errno := backend.ReadDir(1, fh, 0, 4096); errno != 0 || len(page) == 0 {
+		t.Fatalf("read indexed root: bytes=%d errno=%d", len(page), errno)
+	}
+	if len(backend.nodes) != 0 {
+		t.Fatalf("lookup and readdir created %d private nodes", len(backend.nodes))
+	}
+	if nodeID == 0 {
+		t.Fatal("indexed lookup returned the root node")
+	}
+}
+
+func BenchmarkImageFSLargeImmutableDirectoryOpen(b *testing.B) {
+	const files = 30000
+	overlay := imagefs.NewOverlay(nil)
+	for i := range files {
+		if err := overlay.AddFile(fmt.Sprintf("/entry-%05d", i), 0o644, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+	namespace, err := imagefs.BuildNamespace(overlay.Root())
+	if err != nil {
+		b.Fatal(err)
+	}
+	indexed := &namespaceTestDirectory{Directory: overlay.Root(), namespace: namespace}
+	for _, benchmark := range []struct {
+		name string
+		root imagefs.Directory
+	}{
+		{name: "indexed", root: indexed},
+		{name: "lazy", root: overlay.Root()},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				backend := NewImageFS(benchmark.root, "").(*imageFS)
+				fh, errno := backend.OpenDir(1, 0)
+				if errno != 0 {
+					b.Fatalf("opendir: errno %d", errno)
+				}
+				backend.ReleaseDir(1, fh)
+				if err := backend.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

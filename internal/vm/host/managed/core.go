@@ -17,6 +17,7 @@ type Core struct {
 	session        managedsession.Session
 	root           imagefs.Directory
 	baseEnv        []string
+	defaultUser    string
 	defaultRootDir string
 	workDir        string
 	caps           managedguest.Capabilities
@@ -31,6 +32,7 @@ type Config struct {
 	Session        managedsession.Session
 	Root           imagefs.Directory
 	BaseEnv        []string
+	DefaultUser    string
 	DefaultRootDir string
 	WorkDir        string
 	Capabilities   managedguest.Capabilities
@@ -46,6 +48,7 @@ func NewCore(cfg Config) *Core {
 		session:        cfg.Session,
 		root:           cfg.Root,
 		baseEnv:        append([]string(nil), cfg.BaseEnv...),
+		defaultUser:    strings.TrimSpace(cfg.DefaultUser),
 		defaultRootDir: cfg.DefaultRootDir,
 		workDir:        cfg.WorkDir,
 		caps:           cfg.Capabilities,
@@ -107,6 +110,9 @@ func (i *Core) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-
 func (i *Core) ExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil {
 		return client.ExecRequest{}, fmt.Errorf("instance is not running")
+	}
+	if strings.TrimSpace(req.User) == "" {
+		req.User = i.defaultUser
 	}
 	return execplan.ResolveExecRequest(req, execplan.Resolver{
 		Root:           i.root,

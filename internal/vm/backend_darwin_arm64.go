@@ -112,6 +112,9 @@ func alpineRuntimeKernelRequirements(network bool, extra []string) ([]string, ma
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
+		"CONFIG_DRM_VIRTIO_GPU":   "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.gz",
+		"CONFIG_VIRTIO_INPUT":     "kernel/drivers/virtio/virtio_input.ko.gz",
+		"CONFIG_INPUT_EVDEV":      "kernel/drivers/input/evdev.ko.gz",
 		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
 	}
 	return configVars, moduleMap
@@ -142,6 +145,9 @@ func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]strin
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.zst",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.zst",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.zst",
+		"CONFIG_DRM_VIRTIO_GPU":   "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.zst",
+		"CONFIG_VIRTIO_INPUT":     "kernel/drivers/virtio/virtio_input.ko.zst",
+		"CONFIG_INPUT_EVDEV":      "kernel/drivers/input/evdev.ko.zst",
 		"CONFIG_OVERLAY_FS":       "kernel/fs/overlayfs/overlay.ko.zst",
 		"CONFIG_NF_TABLES":        "kernel/net/netfilter/nf_tables.ko.zst",
 		"CONFIG_IP_NF_IPTABLES":   "kernel/net/ipv4/netfilter/ip_tables.ko.zst",
@@ -160,6 +166,9 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -195,7 +204,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
 	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
-	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image), req.DefaultUser), nil
 }
 
 func (b *runtimeBackend) StartBlankStream(
@@ -203,6 +212,9 @@ func (b *runtimeBackend) StartBlankStream(
 	req client.StartInstanceRequest,
 	onEvent func(client.BootEvent) error,
 ) (Instance, error) {
+	if len(req.PersistentMounts) != 0 && isBuiltinGuestImage(req.Image) {
+		return nil, fmt.Errorf("persistent image mounts are not supported for managed guest image %q", req.Image)
+	}
 	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
 		return inst, err
 	}
@@ -238,7 +250,7 @@ func (b *runtimeBackend) StartBlankStream(
 		return nil, fmt.Errorf("hvf host returned %T, want *hvf.ContainerSession", started.Session)
 	}
 	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
-	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image)), nil
+	return newDarwinInstance(containerSession, network, strings.TrimSpace(req.Image), req.DefaultUser), nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -421,7 +433,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, balloonMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, balloonMB uint64, cpus int, nestedVirt bool, amd64Emulation bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
@@ -465,7 +477,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
 	configVars, moduleMap := runtimeKernelRequirements(kernelFlavor, image, network != nil, kernelModules)
-	if NeedsAMD64Emulation(image) {
+	if WantsAMD64Emulation(image, amd64Emulation) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 	}
 	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
@@ -479,7 +491,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timing.Since(ctx, "backend.plan_module_load", start)
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
 	start = time.Now()
-	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64EmulatorForGuest(ctx, image, amd64Emulation, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -557,7 +569,8 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	kernelModules := displayKernelModules(req.Display, req.KernelModules)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, kernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.AMD64Emulation, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -571,6 +584,13 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if runReq.RootFS == nil {
 		runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	}
+	persistentMounts, err := mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), runReq.Image, req.PersistentMounts)
+	if err != nil {
+		return vmruntime.RunRequest{}, err
+	}
+	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
+	runReq.DisplayWidth = displayWidthDarwin(req.Display)
+	runReq.DisplayHeight = displayHeightDarwin(req.Display)
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)
@@ -614,6 +634,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Persistent:        true,
 			Network:           network.guestInitConfig(),
 			NetDevice:         networkDeviceDarwin(network),
+			DisplayWidth:      displayWidthDarwin(req.Display),
+			DisplayHeight:     displayHeightDarwin(req.Display),
 			SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 			UnixTime:          time.Now().Unix(),
@@ -637,8 +659,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, req.KernelModules)
-	if NeedsAMD64Emulation(image) {
+	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, displayKernelModules(req.Display, req.KernelModules))
+	if WantsAMD64Emulation(image, req.AMD64Emulation) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 	}
 	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
@@ -649,7 +671,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("read kernel metadata: %w", err)
 	}
-	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64EmulatorForGuest(ctx, image, req.AMD64Emulation, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -671,6 +693,16 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	} else if rootFS != nil {
 		shares = nil
 	}
+	var persistentMounts []virtio.ShareMount
+	if len(req.PersistentMounts) != 0 {
+		if b.images == nil {
+			return vmruntime.RunRequest{}, fmt.Errorf("persistent mounts require an image store")
+		}
+		persistentMounts, err = mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), image, req.PersistentMounts)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+	}
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
 		KernelRelease:     kernelMetadata.Release,
@@ -682,6 +714,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		InitSystem:        req.InitSystem,
 		RootFS:            rootFS,
 		Shares:            shares,
+		Mounts:            persistentMounts,
 		MemoryMB:          req.MemoryMB,
 		BalloonMB:         req.BalloonMB,
 		CPUs:              req.CPUs,
@@ -690,6 +723,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Persistent:        true,
 		Network:           network.guestInitConfig(),
 		NetDevice:         networkDeviceDarwin(network),
+		DisplayWidth:      displayWidthDarwin(req.Display),
+		DisplayHeight:     displayHeightDarwin(req.Display),
 		SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:          time.Now().Unix(),
@@ -724,11 +759,22 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 	} else {
 		shares = nil
 	}
+	var persistentMounts []virtio.ShareMount
+	if len(req.PersistentMounts) != 0 {
+		if b.images == nil {
+			return vmruntime.RunRequest{}, fmt.Errorf("persistent mounts require an image store")
+		}
+		persistentMounts, err = mounts.BuildPersistentImageMounts(filepath.Join(b.images.Root(), "_homes"), image, req.PersistentMounts)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+	}
 	return vmruntime.RunRequest{
 		Image:           image,
 		InitSystem:      req.InitSystem,
 		RootFS:          rootFS,
 		Shares:          shares,
+		Mounts:          persistentMounts,
 		MemoryMB:        req.MemoryMB,
 		BalloonMB:       req.BalloonMB,
 		CPUs:            req.CPUs,
@@ -737,6 +783,8 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 		Persistent:      true,
 		Network:         network.guestInitConfig(),
 		NetDevice:       networkDeviceDarwin(network),
+		DisplayWidth:    displayWidthDarwin(req.Display),
+		DisplayHeight:   displayHeightDarwin(req.Display),
 		SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:        time.Now().Unix(),
@@ -746,6 +794,28 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 func applyStartupSnapshotOptions(req *vmruntime.RunRequest, snapshotDir, restoreSnapshot string) {
 	req.SnapshotDir = strings.TrimSpace(snapshotDir)
 	req.RestoreSnapshot = strings.TrimSpace(restoreSnapshot)
+}
+
+func displayKernelModules(display *client.DisplayConfig, modules []string) []string {
+	out := append([]string(nil), modules...)
+	if display != nil {
+		out = append(out, "CONFIG_DRM_VIRTIO_GPU", "CONFIG_VIRTIO_INPUT", "CONFIG_INPUT_EVDEV")
+	}
+	return out
+}
+
+func displayWidthDarwin(display *client.DisplayConfig) uint32 {
+	if display == nil {
+		return 0
+	}
+	return display.Width
+}
+
+func displayHeightDarwin(display *client.DisplayConfig) uint32 {
+	if display == nil {
+		return 0
+	}
+	return display.Height
 }
 
 func workerRemoteRootFS() (virtio.FSBackend, error) {
@@ -857,7 +927,7 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, false, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

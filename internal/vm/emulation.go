@@ -20,9 +20,17 @@ func NeedsAMD64Emulation(image *oci.Image) bool {
 	return strings.TrimSpace(image.Architecture) == "amd64"
 }
 
+func WantsAMD64Emulation(image *oci.Image, requested bool) bool {
+	return runtime.GOARCH == "arm64" && (requested || NeedsAMD64Emulation(image))
+}
+
 func PrepareAMD64Emulator(ctx context.Context, image *oci.Image, extractPackageFile packageFileExtractor) (string, error) {
+	return PrepareAMD64EmulatorForGuest(ctx, image, false, extractPackageFile)
+}
+
+func PrepareAMD64EmulatorForGuest(ctx context.Context, image *oci.Image, requested bool, extractPackageFile packageFileExtractor) (string, error) {
 	start := time.Now()
-	if !NeedsAMD64Emulation(image) {
+	if !WantsAMD64Emulation(image, requested) {
 		timing.Since(ctx, "backend.prepare_amd64_emulator.needs_check", start)
 		return "", nil
 	}

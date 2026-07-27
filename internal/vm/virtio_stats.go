@@ -126,3 +126,13 @@ func virtioFSBackingSnapshot(fsdevs []*virtio.FS) virtio.FSBackingUsageSnapshot 
 		PhysicalBytes: physical, ReclaimError: err,
 	}
 }
+
+func virtioFSPersistentStatus(fsdevs []*virtio.FS) []virtio.PersistentFSStatus {
+	var statuses []virtio.PersistentFSStatus
+	for _, device := range fsdevs {
+		if device != nil {
+			statuses = append(statuses, device.PersistentFSStatus()...)
+		}
+	}
+	return statuses
+}

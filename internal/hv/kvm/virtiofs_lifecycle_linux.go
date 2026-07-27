@@ -2,19 +2,26 @@
 
 package kvm
 
-import "j5.nz/cc/internal/virtio"
+import (
+	"errors"
 
-func closeFSDevices(fsdevs []*virtio.FS) {
+	"j5.nz/cc/internal/virtio"
+)
+
+func closeFSDevices(fsdevs []*virtio.FS) error {
+	var errs []error
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
-			_ = fsdev.Close()
+			errs = append(errs, fsdev.Close())
 		}
 	}
+	return errors.Join(errs...)
 }
 
-func closeVMWithFS(vm *VM, fsdevs []*virtio.FS) {
-	closeFSDevices(fsdevs)
+func closeVMWithFS(vm *VM, fsdevs []*virtio.FS) error {
+	fsErr := closeFSDevices(fsdevs)
 	if vm != nil {
-		_ = vm.Close()
+		return errors.Join(fsErr, vm.Close())
 	}
+	return fsErr
 }

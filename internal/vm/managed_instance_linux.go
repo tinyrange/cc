@@ -19,6 +19,7 @@ type managedInstance struct {
 	closeRuntime   func() error
 	root           imagefs.Directory
 	baseEnv        []string
+	defaultUser    string
 	defaultRootDir string
 	workDir        string
 	network        *linuxNetworkRuntime
@@ -39,6 +40,7 @@ func (i *managedInstance) core() *managedInstanceCore {
 		Session:        i.session,
 		Root:           i.root,
 		BaseEnv:        i.baseEnv,
+		DefaultUser:    i.defaultUser,
 		DefaultRootDir: i.defaultRootDir,
 		WorkDir:        i.workDir,
 		Capabilities:   i.caps,

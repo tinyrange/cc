@@ -319,7 +319,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, balloon, fsdevs, vsock, netdev, nil, nil, nil, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
