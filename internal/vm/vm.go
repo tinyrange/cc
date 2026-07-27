@@ -224,7 +224,8 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
 	}
 	if (runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")) ||
-		(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") {
+		(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") ||
+		(runtime.GOOS == "windows" && runtime.GOARCH == "amd64") {
 		caps.SupportsDisplay = true
 	}
 	if runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {

@@ -102,6 +102,8 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			Attachments: whp.LinuxManagedAttachments{
 				FSDevices:       fsdevs,
 				NetDevice:       windowsNetworkDevice(network),
+				DisplayWidth:    displayWidthWindows(req.Display),
+				DisplayHeight:   displayHeightWindows(req.Display),
 				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 				RestoreSnapshot: restoreSnapshot,
 			},
@@ -129,7 +131,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(req.Display), windowsRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +165,8 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		Attachments: whp.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       windowsNetworkDevice(network),
+			DisplayWidth:    displayWidthWindows(req.Display),
+			DisplayHeight:   displayHeightWindows(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -244,6 +248,8 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Attachments: whp.LinuxManagedAttachments{
 				FSDevices:       fsdevs,
 				NetDevice:       windowsNetworkDevice(network),
+				DisplayWidth:    displayWidthWindows(req.Display),
+				DisplayHeight:   displayHeightWindows(req.Display),
 				SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 				RestoreSnapshot: restoreSnapshot,
 			},
@@ -269,7 +275,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(), windowsRuntimeModuleMap())
+	modules, err := b.kernel.PlanModuleLoad(windowsRuntimeConfigVars(req.Display), windowsRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -303,6 +309,8 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		Attachments: whp.LinuxManagedAttachments{
 			FSDevices:       fsdevs,
 			NetDevice:       windowsNetworkDevice(network),
+			DisplayWidth:    displayWidthWindows(req.Display),
+			DisplayHeight:   displayHeightWindows(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		},
@@ -757,6 +765,17 @@ func (i *windowsInstance) NetworkIPv4() string {
 	return netstate.IPv4(i.network.networkRuntime, "")
 }
 
+func (i *windowsInstance) Desktop() *virtio.Desktop {
+	if i == nil || i.core() == nil {
+		return nil
+	}
+	provider, _ := i.core().Session().(interface{ Desktop() *virtio.Desktop })
+	if provider == nil {
+		return nil
+	}
+	return provider.Desktop()
+}
+
 func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
 		Modules:            vmruntime.ModulePaths(modules),
@@ -776,8 +795,12 @@ func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime
 	return cfg
 }
 
-func windowsRuntimeConfigVars() []string {
-	return []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
+func windowsRuntimeConfigVars(display ...*client.DisplayConfig) []string {
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
+	if len(display) != 0 && display[0] != nil {
+		vars = append(vars, "CONFIG_DRM_VIRTIO_GPU", "CONFIG_VIRTIO_INPUT", "CONFIG_INPUT_EVDEV")
+	}
+	return vars
 }
 
 func windowsRuntimeModuleMap() map[string]string {
@@ -791,7 +814,24 @@ func windowsRuntimeModuleMap() map[string]string {
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 		"CONFIG_OVERLAY_FS":       "kernel/fs/overlayfs/overlay.ko.gz",
+		"CONFIG_DRM_VIRTIO_GPU":   "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.gz",
+		"CONFIG_VIRTIO_INPUT":     "kernel/drivers/virtio/virtio_input.ko.gz",
+		"CONFIG_INPUT_EVDEV":      "kernel/drivers/input/evdev.ko.gz",
 	}
+}
+
+func displayWidthWindows(config *client.DisplayConfig) uint32 {
+	if config == nil {
+		return 0
+	}
+	return config.Width
+}
+
+func displayHeightWindows(config *client.DisplayConfig) uint32 {
+	if config == nil {
+		return 0
+	}
+	return config.Height
 }
 
 func withWindowsRuntimeMountDirs(image *oci.Image) *oci.Image {
