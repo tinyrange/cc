@@ -8,19 +8,27 @@ import (
 	"fmt"
 	"sync/atomic"
 	"unsafe"
+
+	"j5.nz/cc/internal/amd64vm"
 )
 
 type VM struct {
 	part         partitionHandle
 	mem          *allocation
-	memGPA       uint64
 	memSize      uint64
+	memRegions   []guestMemoryRegion
 	vcpuCreated  bool
 	emulator     emulatorHandle
 	emuCallbacks emulatorCallbacks
 	emuContext   *emulatorContext
 	emuErr       error
 	running      atomic.Bool
+}
+
+type guestMemoryRegion struct {
+	guestPhysAddr uint64
+	memoryOffset  uint64
+	size          uint64
 }
 
 type Exit struct {
@@ -60,14 +68,14 @@ func NewVM(memorySize uint64) (*VM, error) {
 }
 
 func newBootVM(memorySize uint64) (*VM, error) {
-	return newVM(memorySize, true)
+	return newVMWithAllocation(memorySize, true, true, nil)
 }
 
 func newVM(memorySize uint64, localAPIC bool) (*VM, error) {
-	return newVMWithAllocation(memorySize, localAPIC, nil)
+	return newVMWithAllocation(memorySize, localAPIC, false, nil)
 }
 
-func newVMWithAllocation(memorySize uint64, localAPIC bool, mem *allocation) (*VM, error) {
+func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory bool, mem *allocation) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
@@ -119,9 +127,17 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, mem *allocation) (*V
 	}
 	vm.mem = mem
 	vm.memSize = memorySize
-	if err := mapGPARange(part, unsafe.Pointer(mem.addr), 0, memorySize, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("map guest memory: %w", err)
+	regions := []guestMemoryRegion{{size: memorySize}}
+	if splitAMD64Memory {
+		regions = amd64GuestMemoryRegions(memorySize)
+	}
+	for _, region := range regions {
+		hostAddr := unsafe.Pointer(mem.addr + uintptr(region.memoryOffset))
+		if err := mapGPARange(part, hostAddr, region.guestPhysAddr, region.size, mapGPARangeFlagRead|mapGPARangeFlagWrite|mapGPARangeFlagExecute); err != nil {
+			_ = vm.Close()
+			return nil, fmt.Errorf("map guest memory at gpa %#x: %w", region.guestPhysAddr, err)
+		}
+		vm.memRegions = append(vm.memRegions, region)
 	}
 	if err := createVirtualProcessor(part, 0); err != nil {
 		_ = vm.Close()
@@ -129,6 +145,22 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, mem *allocation) (*V
 	}
 	vm.vcpuCreated = true
 	return vm, nil
+}
+
+func amd64GuestMemoryRegions(memorySize uint64) []guestMemoryRegion {
+	lowSize := min(memorySize, uint64(amd64vm.LowMemorySize))
+	regions := []guestMemoryRegion{{
+		guestPhysAddr: amd64vm.MemoryBase,
+		size:          lowSize,
+	}}
+	if highSize := memorySize - lowSize; highSize > 0 {
+		regions = append(regions, guestMemoryRegion{
+			guestPhysAddr: amd64vm.HighMemoryBase,
+			memoryOffset:  lowSize,
+			size:          highSize,
+		})
+	}
+	return regions
 }
 
 func (v *VM) Close() error {
@@ -149,10 +181,13 @@ func (v *VM) Close() error {
 		}
 		v.vcpuCreated = false
 	}
-	if v.part != 0 && v.mem != nil {
-		if err := unmapGPARange(v.part, v.memGPA, v.memSize); err != nil && first == nil {
-			first = err
+	if v.part != 0 {
+		for _, region := range v.memRegions {
+			if err := unmapGPARange(v.part, region.guestPhysAddr, region.size); err != nil && first == nil {
+				first = err
+			}
 		}
+		v.memRegions = nil
 	}
 	if v.mem != nil {
 		if err := v.mem.free(); err != nil && first == nil {
@@ -188,13 +223,11 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 }
 
 func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
-	if v == nil || v.mem == nil {
-		return fmt.Errorf("guest memory is not mapped")
+	mem, err := v.SliceIPA(addr, len(dst))
+	if err != nil {
+		return fmt.Errorf("read ipa %#x size %d: %w", addr, len(dst), err)
 	}
-	if addr > v.memSize || uint64(len(dst)) > v.memSize-addr {
-		return fmt.Errorf("read ipa %#x size %d out of range %#x", addr, len(dst), v.memSize)
-	}
-	copy(dst, v.mem.bytes()[addr:addr+uint64(len(dst))])
+	copy(dst, mem)
 	return nil
 }
 
@@ -205,20 +238,26 @@ func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
 	if v == nil || v.mem == nil {
 		return nil, fmt.Errorf("guest memory is not mapped")
 	}
-	if addr > v.memSize || uint64(size) > v.memSize-addr {
-		return nil, fmt.Errorf("slice ipa %#x size %d out of range %#x", addr, size, v.memSize)
+	for _, region := range v.memRegions {
+		if addr < region.guestPhysAddr {
+			continue
+		}
+		regionOffset := addr - region.guestPhysAddr
+		if regionOffset > region.size || uint64(size) > region.size-regionOffset {
+			continue
+		}
+		memoryOffset := region.memoryOffset + regionOffset
+		return v.mem.bytes()[memoryOffset : memoryOffset+uint64(size)], nil
 	}
-	return v.mem.bytes()[addr : addr+uint64(size)], nil
+	return nil, fmt.Errorf("guest physical range is not mapped")
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
-	if v == nil || v.mem == nil {
-		return fmt.Errorf("guest memory is not mapped")
+	mem, err := v.SliceIPA(addr, len(data))
+	if err != nil {
+		return fmt.Errorf("write ipa %#x size %d: %w", addr, len(data), err)
 	}
-	if addr > v.memSize || uint64(len(data)) > v.memSize-addr {
-		return fmt.Errorf("write ipa %#x size %d out of range %#x", addr, len(data), v.memSize)
-	}
-	copy(v.mem.bytes()[addr:addr+uint64(len(data))], data)
+	copy(mem, data)
 	return nil
 }
 

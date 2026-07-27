@@ -184,12 +184,11 @@ func emulatorMemoryCallback(ctx, access uintptr) uintptr {
 		emu.vm.emuErr = fmt.Errorf("unsupported MMIO size %d", size)
 		return emulatorCallbackFailure
 	}
-	if info.GPA < emu.vm.memSize && info.GPA+uint64(size) <= emu.vm.memSize {
-		mem := emu.vm.Memory()
+	if mem, err := emu.vm.SliceIPA(info.GPA, size); err == nil {
 		if info.Direction == emulatorMemoryRead {
-			copy(info.Data[:size], mem[info.GPA:info.GPA+uint64(size)])
+			copy(info.Data[:size], mem)
 		} else {
-			copy(mem[info.GPA:info.GPA+uint64(size)], info.Data[:size])
+			copy(mem, info.Data[:size])
 		}
 		return 0
 	}
