@@ -5,9 +5,25 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestFilesystemBudgetAcceptsFilePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "layer.tar")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	budget, err := FilesystemBudget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget <= 0 {
+		t.Fatalf("budget = %d, want a positive number of available bytes", budget)
+	}
+}
 
 func TestCopyRejectsOversizeBeforePublication(t *testing.T) {
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader("oversized")), ContentLength: 9}
