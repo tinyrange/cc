@@ -263,7 +263,10 @@ func (w *bytesWriter) Bytes() []byte { return w.data }
 func FilesystemBudget(path string) (int64, error) {
 	probe := path
 	for {
-		if _, err := os.Stat(probe); err == nil {
+		if info, err := os.Stat(probe); err == nil {
+			if !info.IsDir() {
+				probe = filepath.Dir(probe)
+			}
 			break
 		}
 		parent := filepath.Dir(probe)
