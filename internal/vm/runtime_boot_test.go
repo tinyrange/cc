@@ -180,7 +180,8 @@ func TestRuntimePersistentImageHomeSurvivesHostProcessKill(t *testing.T) {
 		return
 	}
 	env := newRuntimeBootEnv(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*runtimeBootTimeout())
+	helperTimeout := min(runtimeBootTimeout(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRuntimePersistentImageHomeSurvivesHostProcessKill$")
 	cmd.Env = append(os.Environ(),

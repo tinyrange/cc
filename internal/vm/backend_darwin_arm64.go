@@ -433,7 +433,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, balloonMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, balloonMB uint64, cpus int, nestedVirt bool, amd64Emulation bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
@@ -477,7 +477,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
 	configVars, moduleMap := runtimeKernelRequirements(kernelFlavor, image, network != nil, kernelModules)
-	if NeedsAMD64Emulation(image) {
+	if WantsAMD64Emulation(image, amd64Emulation) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 	}
 	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
@@ -491,7 +491,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timing.Since(ctx, "backend.plan_module_load", start)
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
 	start = time.Now()
-	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64EmulatorForGuest(ctx, image, amd64Emulation, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -570,7 +570,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 		network = networks[0]
 	}
 	kernelModules := displayKernelModules(req.Display, req.KernelModules)
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, kernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, kernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.AMD64Emulation, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -660,7 +660,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		return vmruntime.RunRequest{}, err
 	}
 	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, displayKernelModules(req.Display, req.KernelModules))
-	if NeedsAMD64Emulation(image) {
+	if WantsAMD64Emulation(image, req.AMD64Emulation) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 	}
 	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
@@ -671,7 +671,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("read kernel metadata: %w", err)
 	}
-	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64EmulatorForGuest(ctx, image, req.AMD64Emulation, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -927,7 +927,7 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.BalloonMB, req.CPUs, req.NestedVirt, false, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

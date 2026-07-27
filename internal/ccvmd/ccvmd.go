@@ -1840,7 +1840,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			}
 		}
 		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
-		if vm.NeedsAMD64Emulation(startImage) {
+		if vm.WantsAMD64Emulation(startImage, req.AMD64Emulation) {
 			if wantsBootEventStream(r) {
 				bootEvents.Write(client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
 				_, err := srvState.kernel.ExtractPackageFileWithProgress(
@@ -1860,7 +1860,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 					bootEvents.Write(client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
-			} else if _, err := vm.PrepareAMD64Emulator(bootCtx, startImage, srvState.kernel.ExtractPackageFile); err != nil {
+			} else if _, err := vm.PrepareAMD64EmulatorForGuest(bootCtx, startImage, req.AMD64Emulation, srvState.kernel.ExtractPackageFile); err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
 					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 					return

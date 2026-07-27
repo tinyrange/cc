@@ -410,6 +410,7 @@ type CreateInstanceRequest struct {
 	BalloonMB        uint64            `json:"balloon_mb,omitempty"`
 	CPUs             int               `json:"cpus,omitempty"`
 	NestedVirt       bool              `json:"nested_virtualization,omitempty"`
+	AMD64Emulation   bool              `json:"amd64_emulation,omitempty"`
 	Dmesg            bool              `json:"dmesg,omitempty"`
 	SnapshotDir      string            `json:"snapshot_dir,omitempty"`
 	RestoreSnapshot  string            `json:"restore_snapshot,omitempty"`
@@ -432,6 +433,7 @@ type StartInstanceRequest struct {
 	BalloonMB        uint64            `json:"balloon_mb,omitempty"`
 	CPUs             int               `json:"cpus,omitempty"`
 	NestedVirt       bool              `json:"nested_virtualization,omitempty"`
+	AMD64Emulation   bool              `json:"amd64_emulation,omitempty"`
 	Dmesg            bool              `json:"dmesg,omitempty"`
 	SnapshotDir      string            `json:"snapshot_dir,omitempty"`
 	RestoreSnapshot  string            `json:"restore_snapshot,omitempty"`

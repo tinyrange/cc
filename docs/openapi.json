@@ -1185,6 +1185,7 @@
           "balloon_mb": { "type": "integer", "format": "uint64" },
           "cpus": { "type": "integer" },
           "nested_virtualization": { "type": "boolean" },
+          "amd64_emulation": { "type": "boolean", "description": "Install the amd64 binfmt emulator even when the guest image is arm64." },
           "dmesg": { "type": "boolean" },
           "snapshot_dir": { "type": "string", "description": "Directory where the runtime may write a startup snapshot during this boot." },
           "restore_snapshot": { "type": "string", "description": "Path to a startup snapshot directory to restore instead of cold booting." },
