@@ -464,7 +464,7 @@ func cachedImageNamespace(namespace *imagefs.Namespace) []*imageNode {
 			sort.Strings(names)
 			for _, name := range names {
 				child := nodes[node.entries[name]]
-				entries = append(entries, dirEntry{name: name, typ: imageNodeDirType(child), ino: child.id})
+				entries = append(entries, dirEntry{name: name, typ: imageNodeDirType(child), ino: node.entries[name]})
 				if child != nil && child.isDir() {
 					node.nlink++
 				}
