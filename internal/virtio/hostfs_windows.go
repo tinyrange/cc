@@ -71,6 +71,8 @@ func mapHostError(err error) (int32, bool) {
 		return linuxabi.EPIPE, true
 	case windows.ERROR_NOT_SUPPORTED:
 		return linuxabi.ENOSYS, true
+	case syscall.ENOSPC, windows.ERROR_DISK_FULL, windows.ERROR_HANDLE_DISK_FULL:
+		return linuxabi.ENOSPC, true
 	default:
 		return linuxabi.EIO, true
 	}
