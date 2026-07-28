@@ -17,12 +17,11 @@ type VM struct {
 	mem          *allocation
 	memSize      uint64
 	memRegions   []guestMemoryRegion
-	vcpuCreated  bool
-	emulator     emulatorHandle
+	vcpuCount    uint32
+	emulators    []emulatorHandle
 	emuCallbacks emulatorCallbacks
-	emuContext   *emulatorContext
-	emuErr       error
-	running      atomic.Bool
+	emuContexts  []*emulatorContext
+	running      []atomic.Bool
 }
 
 type guestMemoryRegion struct {
@@ -67,17 +66,27 @@ func NewVM(memorySize uint64) (*VM, error) {
 	return newVM(memorySize, false)
 }
 
-func newBootVM(memorySize uint64) (*VM, error) {
-	return newVMWithAllocation(memorySize, true, true, nil)
+func NewVMWithCPUs(memorySize uint64, cpus int) (*VM, error) {
+	return newVMWithAllocation(memorySize, false, false, cpus, nil)
+}
+
+func newBootVM(memorySize uint64, cpus int) (*VM, error) {
+	return newVMWithAllocation(memorySize, true, true, cpus, nil)
 }
 
 func newVM(memorySize uint64, localAPIC bool) (*VM, error) {
-	return newVMWithAllocation(memorySize, localAPIC, false, nil)
+	return newVMWithAllocation(memorySize, localAPIC, false, 1, nil)
 }
 
-func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory bool, mem *allocation) (*VM, error) {
+func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory bool, cpus int, mem *allocation) (*VM, error) {
 	if memorySize == 0 {
 		return nil, fmt.Errorf("memory size must be non-zero")
+	}
+	if cpus <= 0 {
+		cpus = 1
+	}
+	if cpus > 255 {
+		return nil, fmt.Errorf("processor count %d exceeds the amd64 guest limit of 255", cpus)
 	}
 	cleanupMem := func() {
 		if mem != nil {
@@ -90,8 +99,8 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory boo
 		cleanupMem()
 		return nil, fmt.Errorf("create partition: %w", err)
 	}
-	vm := &VM{part: part}
-	if err := setPartitionProperty(part, partitionPropertyCodeProcessorCount, uint32(1)); err != nil {
+	vm := &VM{part: part, running: make([]atomic.Bool, cpus)}
+	if err := setPartitionProperty(part, partitionPropertyCodeProcessorCount, uint32(cpus)); err != nil {
 		cleanupMem()
 		_ = vm.Close()
 		return nil, fmt.Errorf("set processor count: %w", err)
@@ -139,11 +148,24 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory boo
 		}
 		vm.memRegions = append(vm.memRegions, region)
 	}
-	if err := createVirtualProcessor(part, 0); err != nil {
-		_ = vm.Close()
-		return nil, fmt.Errorf("create virtual processor: %w", err)
+	for index := 0; index < cpus; index++ {
+		if err := createVirtualProcessor(part, uint32(index)); err != nil {
+			_ = vm.Close()
+			return nil, fmt.Errorf("create virtual processor %d: %w", index, err)
+		}
+		vm.vcpuCount++
 	}
-	vm.vcpuCreated = true
+	if localAPIC {
+		const startupSuspend = uint64(1)
+		for index := uint32(1); index < vm.vcpuCount; index++ {
+			if err := vm.SetVCPURegisters(index, map[registerName]uint64{
+				registerInternalActivityState: startupSuspend,
+			}); err != nil {
+				_ = vm.Close()
+				return nil, fmt.Errorf("put virtual processor %d in startup suspend: %w", index, err)
+			}
+		}
+	}
 	return vm, nil
 }
 
@@ -168,18 +190,26 @@ func (v *VM) Close() error {
 		return nil
 	}
 	var first error
-	if v.emulator != 0 {
-		if err := destroyEmulator(v.emulator); err != nil && first == nil {
-			first = err
+	for _, emulator := range v.emulators {
+		if emulator != 0 {
+			if err := destroyEmulator(emulator); err != nil && first == nil {
+				first = err
+			}
 		}
-		v.emulator = 0
 	}
-	if v.part != 0 && v.vcpuCreated {
-		_ = cancelRunVirtualProcessor(v.part, 0)
-		if err := deleteVirtualProcessor(v.part, 0); err != nil && first == nil {
-			first = err
+	v.emulators = nil
+	v.emuContexts = nil
+	if v.part != 0 {
+		for index := uint32(0); index < v.vcpuCount; index++ {
+			_ = cancelRunVirtualProcessor(v.part, index)
 		}
-		v.vcpuCreated = false
+		for index := v.vcpuCount; index > 0; index-- {
+			if err := deleteVirtualProcessor(v.part, index-1); err != nil && first == nil {
+				first = err
+			}
+		}
+		v.vcpuCount = 0
+		v.running = nil
 	}
 	if v.part != 0 {
 		for _, region := range v.memRegions {
@@ -525,12 +555,22 @@ func (v *VM) setupFreeBSDPageTables(pagingBase uint64, giB int) error {
 
 func (v *VM) Run() (Exit, error) {
 	var ctx runVPExitContext
-	return v.runWithContext(&ctx)
+	return v.runVCPUWithContext(0, &ctx)
 }
 
 func (v *VM) runWithContext(ctx *runVPExitContext) (Exit, error) {
-	if err := runVirtualProcessor(v.part, 0, ctx); err != nil {
-		return Exit{}, fmt.Errorf("run virtual processor: %w", err)
+	return v.runVCPUWithContext(0, ctx)
+}
+
+func (v *VM) runVCPUWithContext(index uint32, ctx *runVPExitContext) (Exit, error) {
+	if v == nil || index >= v.vcpuCount {
+		return Exit{}, fmt.Errorf("virtual processor %d out of range", index)
+	}
+	v.running[index].Store(true)
+	err := runVirtualProcessor(v.part, index, ctx)
+	v.running[index].Store(false)
+	if err != nil {
+		return Exit{}, fmt.Errorf("run virtual processor %d: %w", index, err)
 	}
 	return Exit{Reason: ctx.ExitReason, RIP: ctx.VpContext.Rip, RFLAGS: ctx.VpContext.Rflags}, nil
 }
@@ -544,9 +584,7 @@ func (v *VM) runWithCancel(ctx context.Context, raw *runVPExitContext) (Exit, er
 		case <-done:
 		}
 	}()
-	v.running.Store(true)
 	exit, err := v.runWithContext(raw)
-	v.running.Store(false)
 	close(done)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -570,19 +608,27 @@ func (v *VM) GetRIP() (uint64, error) {
 }
 
 func (v *VM) SetRIP(rip uint64) error {
+	return v.SetVCPURIP(0, rip)
+}
+
+func (v *VM) SetVCPURIP(index uint32, rip uint64) error {
 	names := []registerName{registerRip}
 	values := []registerValue{uint64RegisterValue(rip)}
-	return setVirtualProcessorRegisters(v.part, 0, names, values)
+	return setVirtualProcessorRegisters(v.part, index, names, values)
 }
 
 func (v *VM) SetRegisters(values map[registerName]uint64) error {
+	return v.SetVCPURegisters(0, values)
+}
+
+func (v *VM) SetVCPURegisters(index uint32, values map[registerName]uint64) error {
 	names := make([]registerName, 0, len(values))
 	regs := make([]registerValue, 0, len(values))
 	for name, value := range values {
 		names = append(names, name)
 		regs = append(regs, uint64RegisterValue(value))
 	}
-	return setVirtualProcessorRegisters(v.part, 0, names, regs)
+	return setVirtualProcessorRegisters(v.part, index, names, regs)
 }
 
 func (v *VM) RequestInterrupt(vector uint32) error {
@@ -590,20 +636,32 @@ func (v *VM) RequestInterrupt(vector uint32) error {
 }
 
 func (v *VM) RequestInterruptWithTrigger(vector uint32, trigger interruptTriggerMode) error {
-	return requestInterrupt(v.part, vector, trigger)
+	return requestInterrupt(v.part, vector, trigger, interruptTypeFixed, interruptDestinationPhysical, 0)
+}
+
+func (v *VM) RequestInterruptRoute(vector uint32, trigger interruptTriggerMode, typ interruptType, destinationMode interruptDestinationMode, destination uint32) error {
+	return requestInterrupt(v.part, vector, trigger, typ, destinationMode, destination)
 }
 
 func (v *VM) NotifyInterruptWindow() error {
+	return v.NotifyVCPUInterruptWindow(0)
+}
+
+func (v *VM) NotifyVCPUInterruptWindow(index uint32) error {
 	if v == nil || v.part == 0 {
 		return nil
 	}
 	const value = uint64(1 << 1)
 	names := []registerName{registerDeliverabilityNotifications}
 	values := []registerValue{uint64RegisterValue(value)}
-	return setVirtualProcessorRegisters(v.part, 0, names, values)
+	return setVirtualProcessorRegisters(v.part, index, names, values)
 }
 
 func (v *VM) SetPendingInterruption(vector uint8) error {
+	return v.SetVCPUPendingInterruption(0, vector)
+}
+
+func (v *VM) SetVCPUPendingInterruption(index uint32, vector uint8) error {
 	if v == nil || v.part == 0 {
 		return nil
 	}
@@ -611,10 +669,14 @@ func (v *VM) SetPendingInterruption(vector uint8) error {
 	value := interruptionPending | uint64(vector)<<16
 	names := []registerName{registerPendingInterruption}
 	values := []registerValue{uint64RegisterValue(value)}
-	return setVirtualProcessorRegisters(v.part, 0, names, values)
+	return setVirtualProcessorRegisters(v.part, index, names, values)
 }
 
 func (v *VM) canSetPendingInterruption(vector uint8) (bool, error) {
+	return v.vcpuCanSetPendingInterruption(0, vector)
+}
+
+func (v *VM) vcpuCanSetPendingInterruption(index uint32, vector uint8) (bool, error) {
 	if v == nil || v.part == 0 {
 		return false, nil
 	}
@@ -623,7 +685,7 @@ func (v *VM) canSetPendingInterruption(vector uint8) (bool, error) {
 		registerCr8,
 	}
 	values := make([]registerValue, len(names))
-	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+	if err := getVirtualProcessorRegisters(v.part, index, names, values); err != nil {
 		return false, err
 	}
 	if values[0].uint64() != 0 {
@@ -634,6 +696,10 @@ func (v *VM) canSetPendingInterruption(vector uint8) (bool, error) {
 }
 
 func (v *VM) haltedAndInterruptible(vector uint8) (bool, error) {
+	return v.vcpuHaltedAndInterruptible(0, vector)
+}
+
+func (v *VM) vcpuHaltedAndInterruptible(index uint32, vector uint8) (bool, error) {
 	if v == nil || v.part == 0 {
 		return false, nil
 	}
@@ -643,7 +709,7 @@ func (v *VM) haltedAndInterruptible(vector uint8) (bool, error) {
 		registerInternalActivityState,
 	}
 	values := make([]registerValue, len(names))
-	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+	if err := getVirtualProcessorRegisters(v.part, index, names, values); err != nil {
 		return false, err
 	}
 	const (
@@ -664,12 +730,16 @@ func (v *VM) haltedAndInterruptible(vector uint8) (bool, error) {
 }
 
 func (v *VM) kickOutOfHLT() error {
+	return v.kickVCPUOutOfHLT(0)
+}
+
+func (v *VM) kickVCPUOutOfHLT(index uint32) error {
 	if v == nil || v.part == 0 {
 		return nil
 	}
 	names := []registerName{registerInternalActivityState}
 	values := make([]registerValue, 1)
-	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+	if err := getVirtualProcessorRegisters(v.part, index, names, values); err != nil {
 		return err
 	}
 	const haltSuspend = uint64(1 << 1)
@@ -678,14 +748,31 @@ func (v *VM) kickOutOfHLT() error {
 		return nil
 	}
 	values[0] = uint64RegisterValue(raw &^ haltSuspend)
-	return setVirtualProcessorRegisters(v.part, 0, names, values)
+	return setVirtualProcessorRegisters(v.part, index, names, values)
 }
 
 func (v *VM) kickIfRunning() {
-	if v == nil || !v.running.Load() {
+	v.kickVCPUIfRunning(0)
+}
+
+func (v *VM) kickVCPUIfRunning(index uint32) {
+	if v == nil || index >= uint32(len(v.running)) || !v.running[index].Load() {
 		return
 	}
-	_ = cancelRunVirtualProcessor(v.part, 0)
+	_ = cancelRunVirtualProcessor(v.part, index)
+}
+
+func (v *VM) CancelRun() error {
+	if v == nil || v.part == 0 {
+		return nil
+	}
+	var first error
+	for index := uint32(0); index < v.vcpuCount; index++ {
+		if err := cancelRunVirtualProcessor(v.part, index); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func segmentAttributes(typ, s, dpl, present, avl, long, db, gran uint16) uint16 {

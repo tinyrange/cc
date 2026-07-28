@@ -136,7 +136,7 @@ func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, 
 		DisplayWidth:    machine.DisplayWidth,
 		DisplayHeight:   machine.DisplayHeight,
 	}
-	return StartManagedSessionWithNetOptions(ctx, machine.Kernel, machine.Initrd, machine.Spec.MemoryMB, machine.Spec.Dmesg, machine.FSDevices, machine.NetDevice, opts, onEvent)
+	return StartManagedSessionWithNetOptions(ctx, machine.Kernel, machine.Initrd, machine.Spec.MemoryMB, machine.Spec.CPUs, machine.Spec.Dmesg, machine.FSDevices, machine.NetDevice, opts, onEvent)
 }
 
 func normalizeLinuxManagedMachine(machine LinuxManagedMachine) LinuxManagedMachine {

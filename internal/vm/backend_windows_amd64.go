@@ -60,9 +60,6 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if b == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
-	}
 	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
 	image, err := b.images.Open(req.Image)
 	if err != nil {
@@ -199,9 +196,6 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if b == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
-	}
 	if strings.TrimSpace(req.Image) != "" {
 		return b.StartStream(ctx, client.CreateInstanceRequest{
 			ID:              req.ID,
@@ -210,6 +204,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Kernel:          req.Kernel,
 			Shares:          append([]client.ShareMount(nil), req.Shares...),
 			Network:         req.Network,
+			Display:         req.Display,
 			KernelModules:   append([]string(nil), req.KernelModules...),
 			MemoryMB:        req.MemoryMB,
 			BalloonMB:       req.BalloonMB,
@@ -334,9 +329,6 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
 	}
-	if req.CPUs > 1 {
-		return client.ExecResponse{}, fmt.Errorf("windows amd64 runtime currently supports only 1 CPU")
-	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -429,7 +421,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:      req.Cols,
 			Rows:      req.Rows,
 		}
-		resp, serial, err := whp.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), execReq)
+		resp, serial, err := whp.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, windowsNetworkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}
@@ -438,9 +430,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 
 	var output string
 	if len(fsdevs) != 0 || network != nil {
-		output, err = whp.BootInitramfsToMarkerWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, true, windowsInitReadyMarker, fsdevs, windowsNetworkDevice(network))
+		output, err = whp.BootInitramfsToMarkerWithFSAndNetAndCPUs(ctx, kernel, initrd, req.MemoryMB, req.CPUs, true, windowsInitReadyMarker, fsdevs, windowsNetworkDevice(network))
 	} else {
-		output, err = whp.BootInitramfsToMarker(ctx, kernel, initrd, req.MemoryMB, true, windowsInitReadyMarker)
+		output, err = whp.BootInitramfsToMarkerWithFSAndNetAndCPUs(ctx, kernel, initrd, req.MemoryMB, req.CPUs, true, windowsInitReadyMarker, nil, nil)
 	}
 	if err != nil {
 		return client.ExecResponse{Output: output}, err

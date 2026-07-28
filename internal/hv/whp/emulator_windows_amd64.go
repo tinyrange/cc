@@ -78,6 +78,8 @@ type emulatorCallbacks struct {
 type emulatorContext struct {
 	vm       *VM
 	platform platformDevice
+	vpIndex  uint32
+	err      error
 }
 
 type platformDevice interface {
@@ -91,10 +93,17 @@ func (v *VM) EnableEmulation(platform platformDevice) error {
 	if platform == nil {
 		return fmt.Errorf("platform device is required")
 	}
-	if v.emulator != 0 {
+	if len(v.emulators) != 0 {
 		return nil
 	}
-	v.emuContext = &emulatorContext{vm: v, platform: platform}
+	v.emuContexts = make([]*emulatorContext, v.vcpuCount)
+	for index := range v.emuContexts {
+		v.emuContexts[index] = &emulatorContext{
+			vm:       v,
+			platform: platform,
+			vpIndex:  uint32(index),
+		}
+	}
 	v.emuCallbacks = emulatorCallbacks{
 		IOPortCallback:               syscall.NewCallback(emulatorIOCallback),
 		MemoryCallback:               syscall.NewCallback(emulatorMemoryCallback),
@@ -103,27 +112,44 @@ func (v *VM) EnableEmulation(platform platformDevice) error {
 		TranslateGVAPage:             syscall.NewCallback(emulatorTranslateGVACallback),
 	}
 	v.emuCallbacks.Size = uint32(unsafe.Sizeof(v.emuCallbacks))
-	handle, err := createEmulator(&v.emuCallbacks)
-	if err != nil {
-		return err
+	v.emulators = make([]emulatorHandle, v.vcpuCount)
+	for index := range v.emulators {
+		handle, err := createEmulator(&v.emuCallbacks)
+		if err != nil {
+			for _, created := range v.emulators[:index] {
+				_ = destroyEmulator(created)
+			}
+			v.emulators = nil
+			v.emuContexts = nil
+			return err
+		}
+		v.emulators[index] = handle
 	}
-	v.emulator = handle
 	return nil
 }
 
 func (v *VM) emulateIO(exit *runVPExitContext) error {
-	if v.emulator == 0 {
+	return v.emulateVCPUIO(0, exit)
+}
+
+func (v *VM) emulateVCPUIO(vpIndex uint32, exit *runVPExitContext) error {
+	if vpIndex >= uint32(len(v.emulators)) || v.emulators[vpIndex] == 0 {
 		return fmt.Errorf("emulator is not enabled")
 	}
+	if vpIndex >= uint32(len(v.emuContexts)) || v.emuContexts[vpIndex] == nil {
+		return fmt.Errorf("emulator context for virtual processor %d is unavailable", vpIndex)
+	}
+	emu := v.emuContexts[vpIndex]
+	emu.err = nil
 	status := new(emulatorStatus)
 	fmt.Fprintf(io.Discard, "%p", status)
-	if err := tryIOEmulation(v.emulator, unsafe.Pointer(v.emuContext), &exit.VpContext, exit.ioPortAccess(), status); err != nil {
+	err := tryIOEmulation(v.emulators[vpIndex], unsafe.Pointer(emu), &exit.VpContext, exit.ioPortAccess(), status)
+	runtime.KeepAlive(emu)
+	if err != nil {
 		return err
 	}
-	if v.emuErr != nil {
-		err := v.emuErr
-		v.emuErr = nil
-		return err
+	if emu.err != nil {
+		return emu.err
 	}
 	if !status.ok() {
 		return fmt.Errorf("WHvEmulatorTryIoEmulation status=%#x", uint32(*status))
@@ -132,18 +158,27 @@ func (v *VM) emulateIO(exit *runVPExitContext) error {
 }
 
 func (v *VM) emulateMMIO(exit *runVPExitContext) error {
-	if v.emulator == 0 {
+	return v.emulateVCPUMMIO(0, exit)
+}
+
+func (v *VM) emulateVCPUMMIO(vpIndex uint32, exit *runVPExitContext) error {
+	if vpIndex >= uint32(len(v.emulators)) || v.emulators[vpIndex] == 0 {
 		return fmt.Errorf("emulator is not enabled")
 	}
+	if vpIndex >= uint32(len(v.emuContexts)) || v.emuContexts[vpIndex] == nil {
+		return fmt.Errorf("emulator context for virtual processor %d is unavailable", vpIndex)
+	}
+	emu := v.emuContexts[vpIndex]
+	emu.err = nil
 	status := new(emulatorStatus)
 	fmt.Fprintf(io.Discard, "%p", status)
-	if err := tryMMIOEmulation(v.emulator, unsafe.Pointer(v.emuContext), &exit.VpContext, exit.memoryAccess(), status); err != nil {
+	err := tryMMIOEmulation(v.emulators[vpIndex], unsafe.Pointer(emu), &exit.VpContext, exit.memoryAccess(), status)
+	runtime.KeepAlive(emu)
+	if err != nil {
 		return err
 	}
-	if v.emuErr != nil {
-		err := v.emuErr
-		v.emuErr = nil
-		return err
+	if emu.err != nil {
+		return emu.err
 	}
 	if !status.ok() {
 		return fmt.Errorf("WHvEmulatorTryMmioEmulation status=%#x", uint32(*status))
@@ -156,20 +191,20 @@ func emulatorIOCallback(ctx, access uintptr) uintptr {
 	info := (*emulatorIOAccessInfo)(unsafe.Pointer(access))
 	size := int(info.AccessSize)
 	if size <= 0 || size > 4 {
-		emu.vm.emuErr = fmt.Errorf("unsupported IO size %d", size)
+		emu.err = fmt.Errorf("unsupported IO size %d", size)
 		return emulatorCallbackFailure
 	}
 	var data [4]byte
 	if info.Direction == emulatorIOOut {
 		binary.LittleEndian.PutUint32(data[:], info.Data)
 		if err := emu.platform.WriteIO(info.Port, data[:size]); err != nil {
-			emu.vm.emuErr = err
+			emu.err = err
 			return emulatorCallbackFailure
 		}
 		return 0
 	}
 	if err := emu.platform.ReadIO(info.Port, data[:size]); err != nil {
-		emu.vm.emuErr = err
+		emu.err = err
 		return emulatorCallbackFailure
 	}
 	info.Data = binary.LittleEndian.Uint32(data[:])
@@ -181,7 +216,7 @@ func emulatorMemoryCallback(ctx, access uintptr) uintptr {
 	info := (*emulatorMemoryAccessInfo)(unsafe.Pointer(access))
 	size := int(info.AccessSize)
 	if size <= 0 || size > len(info.Data) {
-		emu.vm.emuErr = fmt.Errorf("unsupported MMIO size %d", size)
+		emu.err = fmt.Errorf("unsupported MMIO size %d", size)
 		return emulatorCallbackFailure
 	}
 	if mem, err := emu.vm.SliceIPA(info.GPA, size); err == nil {
@@ -194,13 +229,13 @@ func emulatorMemoryCallback(ctx, access uintptr) uintptr {
 	}
 	if info.Direction == emulatorMemoryRead {
 		if err := emu.platform.ReadMMIO(info.GPA, info.Data[:size]); err != nil {
-			emu.vm.emuErr = err
+			emu.err = err
 			return emulatorCallbackFailure
 		}
 		return 0
 	}
 	if err := emu.platform.WriteMMIO(info.GPA, info.Data[:size]); err != nil {
-		emu.vm.emuErr = err
+		emu.err = err
 		return emulatorCallbackFailure
 	}
 	return 0
@@ -210,8 +245,8 @@ func emulatorGetRegistersCallback(ctx, namesPtr, count, valuesPtr uintptr) uintp
 	emu := (*emulatorContext)(unsafe.Pointer(ctx))
 	names := unsafe.Slice((*registerName)(unsafe.Pointer(namesPtr)), int(count))
 	values := unsafe.Slice((*registerValue)(unsafe.Pointer(valuesPtr)), int(count))
-	if err := getVirtualProcessorRegisters(emu.vm.part, 0, names, values); err != nil {
-		emu.vm.emuErr = err
+	if err := getVirtualProcessorRegisters(emu.vm.part, emu.vpIndex, names, values); err != nil {
+		emu.err = err
 		return emulatorCallbackFailure
 	}
 	return 0
@@ -221,8 +256,8 @@ func emulatorSetRegistersCallback(ctx, namesPtr, count, valuesPtr uintptr) uintp
 	emu := (*emulatorContext)(unsafe.Pointer(ctx))
 	names := unsafe.Slice((*registerName)(unsafe.Pointer(namesPtr)), int(count))
 	values := unsafe.Slice((*registerValue)(unsafe.Pointer(valuesPtr)), int(count))
-	if err := setVirtualProcessorRegisters(emu.vm.part, 0, names, values); err != nil {
-		emu.vm.emuErr = err
+	if err := setVirtualProcessorRegisters(emu.vm.part, emu.vpIndex, names, values); err != nil {
+		emu.err = err
 		return emulatorCallbackFailure
 	}
 	return 0
@@ -233,8 +268,8 @@ func emulatorTranslateGVACallback(ctx, gva, flags, resultPtr, gpaPtr uintptr) ui
 	result := (*translateGVAResultCode)(unsafe.Pointer(resultPtr))
 	gpa := (*guestPhysicalAddress)(unsafe.Pointer(gpaPtr))
 	var full translateGVAResult
-	if err := translateGVA(emu.vm.part, 0, guestVirtualAddress(gva), translateGVAFlags(flags), &full, gpa); err != nil {
-		emu.vm.emuErr = err
+	if err := translateGVA(emu.vm.part, emu.vpIndex, guestVirtualAddress(gva), translateGVAFlags(flags), &full, gpa); err != nil {
+		emu.err = err
 		return emulatorCallbackFailure
 	}
 	*result = full.ResultCode
