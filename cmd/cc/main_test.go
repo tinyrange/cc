@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -43,8 +44,10 @@ func TestHandleVMForwardDispatchesToAPI(t *testing.T) {
 
 func TestHandleVMStartCanEnableNetwork(t *testing.T) {
 	api := &fakeCCAPI{}
+	shareDir := t.TempDir()
 	if err := handleVMCommand(api, []string{
-		"start", "--network", "--memory-mb", "8192", "--cpus", "4",
+		"start", "--network", "--default-user", "root", "--memory-mb", "8192", "--cpus", "4",
+		"--share", shareDir + ":/shared",
 		"desktop", "desktop-image",
 	}); err != nil {
 		t.Fatalf("handle vm start: %v", err)
@@ -56,11 +59,22 @@ func TestHandleVMStartCanEnableNetwork(t *testing.T) {
 	if got.id != "desktop" || got.req.Image != "desktop-image" {
 		t.Fatalf("create call = %+v", got)
 	}
+	if got.req.DefaultUser != "root" {
+		t.Fatalf("default user = %q", got.req.DefaultUser)
+	}
 	if got.req.Network == nil || !got.req.Network.Enabled || !got.req.Network.AllowInternet {
 		t.Fatalf("network = %+v", got.req.Network)
 	}
 	if got.req.MemoryMB != 8192 || got.req.CPUs != 4 {
 		t.Fatalf("resources = memory %d MiB, %d CPUs", got.req.MemoryMB, got.req.CPUs)
+	}
+	if len(got.req.Shares) != 1 {
+		t.Fatalf("shares = %+v", got.req.Shares)
+	}
+	share := got.req.Shares[0]
+	if share.Source != filepath.Clean(shareDir) || share.Mount != "/shared" || !share.Writable ||
+		share.MapOwner || share.Cache != "strict" {
+		t.Fatalf("share = %+v", share)
 	}
 }
 
