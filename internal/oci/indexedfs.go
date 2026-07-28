@@ -567,6 +567,74 @@ func writeLayerTarFromReaderWithProgress(dstPath, mediaType string, body io.Read
 	return os.Rename(tmpPath, dstPath)
 }
 
+func writeAndApplyIndexedLayer(
+	dstPath, mediaType string,
+	body io.Reader,
+	tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	progress func(int64),
+) error {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	tmpPath := dstPath + ".tmp"
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	tracked := &countingReader{r: body}
+	if progress != nil {
+		tracked.report = func(current, _ int64) {
+			progress(current)
+		}
+	}
+	buffered := bufio.NewReader(tracked)
+	var src io.Reader = buffered
+	var gzr *gzip.Reader
+	gzipLayer := strings.Contains(mediaType, "gzip")
+	if !gzipLayer {
+		if magic, peekErr := buffered.Peek(2); peekErr == nil {
+			gzipLayer = magic[0] == 0x1f && magic[1] == 0x8b
+		}
+	}
+	if gzipLayer {
+		gzr, err = gzip.NewReader(src)
+		if err != nil {
+			return fmt.Errorf("open gzip layer: %w", err)
+		}
+		defer gzr.Close()
+		src = gzr
+	}
+
+	maxBytes, err := download.FilesystemBudget(dstPath)
+	if err != nil {
+		return fmt.Errorf("determine expanded layer budget: %w", err)
+	}
+	budgetedDst, err := download.NewLimitWriter(dst, maxBytes)
+	if err != nil {
+		return err
+	}
+	expanded := &countingReader{r: io.TeeReader(src, budgetedDst)}
+	if err := applyIndexedLayerReader(tar.NewReader(expanded), expanded, tarRef, merged, entries, 0, nil); err != nil {
+		return err
+	}
+	// archive/tar stops at the end marker. Drain the decompressor so its
+	// checksum is verified and the final backing tar contains all padding.
+	if _, err := io.Copy(budgetedDst, src); err != nil {
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, dstPath)
+}
+
 type countingReader struct {
 	r          io.Reader
 	n          uint64
@@ -609,13 +677,24 @@ func applyIndexedLayerWithProgress(
 		return err
 	}
 	cr := &countingReader{r: file, total: info.Size(), report: progress}
-	tr := tar.NewReader(cr)
+	return applyIndexedLayerReader(tar.NewReader(cr), cr, tarRef, merged, entries, info.Size(), progress)
+}
+
+func applyIndexedLayerReader(
+	tr *tar.Reader,
+	cr *countingReader,
+	tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	total int64,
+	progress func(current, total int64),
+) error {
 	layerEntries := map[string]*indexedNode{}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			if progress != nil {
-				progress(info.Size(), info.Size())
+				progress(total, total)
 			}
 			return nil
 		}

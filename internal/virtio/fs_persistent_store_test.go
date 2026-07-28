@@ -555,6 +555,92 @@ func TestPersistentImageFSOpenUnlinkedFileSurvivesUntilRelease(t *testing.T) {
 	}
 }
 
+func TestPersistentImageFSCloseOmitsOpenReplacedFile(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "home")
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	replacedID, replacedFH, _, errno := backend.Create(1, "state", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create state: errno %d", errno)
+	}
+	if written, errno := backend.Write(replacedID, replacedFH, 0, []byte("old"), 0); errno != 0 || written != 3 {
+		t.Fatalf("write old state = %d, errno %d", written, errno)
+	}
+	replacementID, replacementFH, _, errno := backend.Create(1, "state.tmp", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create replacement: errno %d", errno)
+	}
+	if written, errno := backend.Write(replacementID, replacementFH, 0, []byte("new"), 0); errno != 0 || written != 3 {
+		t.Fatalf("write replacement = %d, errno %d", written, errno)
+	}
+	backend.Release(replacementID, replacementFH)
+	if errno := backend.Rename(1, "state.tmp", 1, "state", 0); errno != 0 {
+		t.Fatalf("replace state: errno %d", errno)
+	}
+	if got := readPersistentHandleTest(t, backend, replacedID, replacedFH, 0, 3); string(got) != "old" {
+		t.Fatalf("open replaced contents = %q", got)
+	}
+	// Deliberately close with the replaced inode still open. A clean checkpoint
+	// must preserve the namespace, not a handle that cannot survive restart.
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	backend = openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	defer backend.Close()
+	nodeID, _, errno := backend.Lookup(1, "state")
+	if errno != 0 {
+		t.Fatalf("lookup replacement: errno %d", errno)
+	}
+	if got := readPersistentTest(t, backend, nodeID, 0, 3); string(got) != "new" {
+		t.Fatalf("replacement contents = %q", got)
+	}
+}
+
+func TestPersistentImageFSRestoreRepairsDanglingDirectoryEntry(t *testing.T) {
+	storeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(storeDir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := newImageFS(imagefs.NewOverlay(nil).Root(), storeDir, 0, 0, false).(*imageFS)
+	backend.persistent = &persistentImageStore{
+		dir:           storeDir,
+		dataUsage:     make(map[uint64]uint64),
+		dataPhysical:  make(map[uint64]uint64),
+		pendingTrim:   make(map[uint64]uint64),
+		pendingRemove: make(map[uint64]struct{}),
+	}
+	backend.persistentNodes = make(map[uint64]struct{})
+	err := backend.restorePersistentState(&persistentImageState{
+		NextNodeID: 3,
+		Nodes: []persistentImageNode{{
+			ID:          1,
+			Parent:      1,
+			Name:        []byte("/"),
+			Kind:        "dir",
+			Mode:        uint32(fs.ModeDir | 0o755),
+			NLink:       1,
+			EntriesDone: true,
+			Entries: []persistentImageDirent{{
+				Name:  []byte("missing"),
+				Inode: 2,
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("restore dangling checkpoint: %v", err)
+	}
+	root := backend.nodes[1]
+	if _, exists := root.entries["missing"]; exists {
+		t.Fatal("dangling directory entry survived recovery")
+	}
+	if !root.whiteouts["missing"] {
+		t.Fatal("recovered name was not hidden from the lower filesystem")
+	}
+	if backend.persistent.recovery.Status != "recovered-dangling-directory-entry" {
+		t.Fatalf("recovery status = %q", backend.persistent.recovery.Status)
+	}
+}
+
 func TestPersistentImageFSTornWALTailIsPreservedAndRemovedFromReplay(t *testing.T) {
 	storeDir := filepath.Join(t.TempDir(), "home")
 	lower := imagefs.NewOverlay(nil).Root()

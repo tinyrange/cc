@@ -1516,6 +1516,29 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 		})
 	})
 
+	mux.HandleFunc("POST /image/{image}/plan", func(w http.ResponseWriter, r *http.Request) {
+		imageName := r.PathValue("image")
+		var req client.PullImageRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		source, err := req.SourceString()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		plan, err := srvState.images.PlanPull(r.Context(), imageName, source, oci.PullOptions{
+			Architecture: req.Architecture,
+			CVMFSMirrors: cvmfsSourceMirrors(req.SourceRef),
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, plan)
+	})
+
 	mux.HandleFunc("POST /image/{image}/qemu/download", func(w http.ResponseWriter, r *http.Request) {
 		imageName := r.PathValue("image")
 		if isBuiltInBSDImage(imageName) {
@@ -1589,6 +1612,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 					Prefetch:        req.Prefetch,
 					PrefetchWorkers: req.PrefetchWorkers,
 					CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
+					Refresh:         req.Refresh,
 					Report: func(event client.ProgressEvent) {
 						if event.Artifact == "" {
 							event.Artifact = imageName
@@ -1621,6 +1645,7 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			Prefetch:        req.Prefetch,
 			PrefetchWorkers: req.PrefetchWorkers,
 			CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
+			Refresh:         req.Refresh,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)

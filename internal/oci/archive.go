@@ -78,7 +78,7 @@ func (s *Store) pullDockerArchiveDirect(ctx context.Context, name string, spec S
 			return fmt.Errorf("index docker archive layer %d %q: %w", i, layerMember, err)
 		}
 	}
-	return s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build)
+	return s.finalizeIndexedImage(name, spec, "", imageDir, tmpDir, cfg, build)
 }
 
 type dockerArchiveLayerTarget struct {

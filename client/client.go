@@ -250,6 +250,16 @@ func (c *Client) GetImageContext(ctx context.Context, name string) (ImageState, 
 	return ret, err
 }
 
+func (c *Client) PlanImagePull(name string, req PullImageRequest) (ImagePullPlan, error) {
+	return c.PlanImagePullContext(context.Background(), name, req)
+}
+
+func (c *Client) PlanImagePullContext(ctx context.Context, name string, req PullImageRequest) (ImagePullPlan, error) {
+	var ret ImagePullPlan
+	err := c.postJSONExpectOKContext(ctx, "/image/"+imagePathName(name)+"/plan", req, &ret)
+	return ret, err
+}
+
 func (c *Client) PullImage(name string, req PullImageRequest) error {
 	return c.PullImageContext(context.Background(), name, req)
 }

@@ -1040,14 +1040,37 @@ func (p *imageFS) persistentStateLocked() *persistentImageState {
 	if p.persistent.lastErr != nil {
 		state.LastError = p.persistent.lastErr.Error()
 	}
-	ids := make([]uint64, 0, len(p.persistentNodes))
-	for id := range p.persistentNodes {
+	// Build the checkpoint from the namespace rooted at inode 1. Link counts
+	// and cached parent/name fields can briefly lag an atomic replacement, but
+	// the directory graph is the filesystem contract that survives restart.
+	reachable := make(map[uint64]struct{}, len(p.persistentNodes))
+	queue := []uint64{1}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, seen := reachable[id]; seen {
+			continue
+		}
+		node := p.nodes[id]
+		if node == nil {
+			continue
+		}
+		if _, persistent := p.persistentNodes[id]; id != 1 && !persistent {
+			continue
+		}
+		reachable[id] = struct{}{}
+		for _, childID := range node.entries {
+			queue = append(queue, childID)
+		}
+	}
+	ids := make([]uint64, 0, len(reachable))
+	for id := range reachable {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
 		if node := p.nodes[id]; node != nil {
-			state.Nodes = append(state.Nodes, persistentNodeFromImageNode(node, p.pathForNode(id), p.persistentNodes))
+			state.Nodes = append(state.Nodes, persistentNodeFromImageNode(node, p.pathForNode(id), reachable))
 		}
 	}
 	for id := range p.removedNodes {
@@ -1152,6 +1175,12 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 	}
 	nodeSeen := make(map[uint64]struct{}, len(state.Nodes))
 	savedByPath := make(map[string]*imageNode, len(state.Nodes)+1)
+	linkedNodes := map[uint64]struct{}{1: {}}
+	for _, saved := range state.Nodes {
+		for _, entry := range saved.Entries {
+			linkedNodes[entry.Inode] = struct{}{}
+		}
+	}
 	for _, saved := range state.Nodes {
 		if saved.ID == 0 || saved.ID == ^uint64(0) {
 			return fmt.Errorf("invalid node ID %d", saved.ID)
@@ -1163,6 +1192,14 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 		if _, removed := removedSeen[saved.ID]; removed {
 			return fmt.Errorf("node ID %d is both present and removed", saved.ID)
 		}
+		// Older writers could checkpoint an inode kept alive only by an open
+		// handle after it had been unlinked or atomically replaced. Handles
+		// cannot survive restart, so restore only nodes reached by the saved
+		// directory namespace (plus the root).
+		_, linked := linkedNodes[saved.ID]
+		if !linked && len(saved.LowerPath) == 0 {
+			continue
+		}
 		guestPath := string(saved.GuestPath)
 		if guestPath == "" && saved.ID == 1 {
 			guestPath = "/"
@@ -1171,7 +1208,18 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 			return fmt.Errorf("node %d has invalid guest path %q", saved.ID, guestPath)
 		}
 		if existing := savedByPath[guestPath]; existing != nil && existing.id != saved.ID {
-			return fmt.Errorf("nodes %d and %d both use guest path %q", existing.id, saved.ID, guestPath)
+			switch {
+			case existing.nlink == 0 && saved.NLink != 0:
+				// Older checkpoints could include an open inode after an
+				// atomic replacement. Its handle cannot survive restart, so
+				// retain the linked replacement that owns the guest path.
+				delete(p.nodes, existing.id)
+				delete(p.persistentNodes, existing.id)
+			case saved.NLink == 0 && existing.nlink != 0:
+				continue
+			default:
+				return fmt.Errorf("nodes %d and %d both use guest path %q", existing.id, saved.ID, guestPath)
+			}
 		}
 		node := &imageNode{id: saved.ID}
 		if saved.ID == 1 {
@@ -1257,7 +1305,17 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 				return fmt.Errorf("node %d has invalid directory entry %q", id, name)
 			}
 			if p.imageNodeLocked(childID) == nil {
-				return fmt.Errorf("node %d directory entry %q references missing inode %d", id, name, childID)
+				// A short-lived writer version could omit an open/replaced
+				// inode while leaving its directory entry in the checkpoint.
+				// The inode data is already absent, so retain the rest of the
+				// filesystem and hide the unrecoverable name.
+				delete(node.entries, name)
+				node.whiteouts[name] = true
+				recoveryErr := fmt.Errorf("discarded dangling directory entry %q from inode %d (missing inode %d)", name, id, childID)
+				p.persistent.lastErr = errors.Join(p.persistent.lastErr, recoveryErr)
+				if p.persistent.recovery.Status == "" {
+					p.persistent.recovery.Status = "recovered-dangling-directory-entry"
+				}
 			}
 		}
 	}

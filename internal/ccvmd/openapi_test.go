@@ -28,6 +28,7 @@ func TestOpenAPIContract(t *testing.T) {
 	}
 	for name, value := range map[string]any{
 		"ErrorResponse":           client.ErrorResponse{},
+		"ImagePullPlan":           client.ImagePullPlan{},
 		"CreateInstanceRequest":   client.CreateInstanceRequest{},
 		"StartInstanceRequest":    client.StartInstanceRequest{},
 		"RunRequest":              client.RunRequest{},
