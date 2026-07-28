@@ -366,6 +366,32 @@
         }
       }
     },
+    "/image/{image}/plan": {
+      "post": {
+        "tags": ["images"],
+        "summary": "Resolve an image and report the remaining download without pulling layers",
+        "parameters": [{ "$ref": "#/components/parameters/ImageName" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PullImageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Image pull plan",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ImagePullPlan" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/image/{image}/qemu/download": {
       "post": {
         "tags": ["images"],
@@ -930,6 +956,8 @@
           "status": { "type": "string" },
           "artifact": { "type": "string" },
           "progress": { "type": "number" },
+          "download_progress": { "type": "number" },
+          "index_progress": { "type": "number" },
           "bytes_downloaded": { "type": "integer", "format": "int64" },
           "bytes_total": { "type": "integer", "format": "int64" },
           "files_downloaded": { "type": "integer", "format": "int64" },
@@ -946,9 +974,27 @@
         "properties": {
           "name": { "type": "string" },
           "source": { "type": "string" },
+          "resolved_source": { "type": "string" },
           "source_kind": { "type": "string" },
           "status": { "type": "string" },
           "error": { "type": "string" }
+        }
+      },
+      "ImagePullPlan": {
+        "type": "object",
+        "required": ["name", "source", "installed", "available"],
+        "properties": {
+          "name": { "type": "string" },
+          "source": { "type": "string" },
+          "architecture": { "type": "string" },
+          "installed": { "type": "boolean" },
+          "available": { "type": "boolean" },
+          "bytes_total": { "type": "integer", "format": "int64" },
+          "bytes_cached": { "type": "integer", "format": "int64" },
+          "bytes_to_download": { "type": "integer", "format": "int64" },
+          "layers_total": { "type": "integer", "format": "int64" },
+          "layers_cached": { "type": "integer", "format": "int64" },
+          "resolved_source": { "type": "string" }
         }
       },
       "ImageMetadataState": {
@@ -986,7 +1032,8 @@
           "architecture": { "type": "string" },
           "cache_dir": { "type": "string" },
           "prefetch": { "type": "boolean" },
-          "prefetch_workers": { "type": "integer" }
+          "prefetch_workers": { "type": "integer" },
+          "refresh": { "type": "boolean" }
         }
       },
       "ImageSource": {

@@ -70,6 +70,7 @@ type imageOpenCall struct {
 type metadata struct {
 	Name               string      `json:"name"`
 	Source             string      `json:"source"`
+	ResolvedSource     string      `json:"resolved_source,omitempty"`
 	SourceKind         string      `json:"source_kind,omitempty"`
 	CVMFSRootHash      string      `json:"cvmfs_root_hash,omitempty"`
 	CVMFSMirrors       []string    `json:"cvmfs_mirrors,omitempty"`
@@ -113,6 +114,7 @@ type PullOptions struct {
 	PrefetchWorkers int
 	CVMFSMirrors    []string
 	Report          func(client.ProgressEvent)
+	Refresh         bool
 }
 
 type SaveOptions struct {
@@ -487,25 +489,27 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return s.Get(name)
 	}
-	if state, ok, err := s.existingState(ctx, name, spec, opts.Architecture); err != nil {
-		return client.ImageState{}, err
-	} else if ok {
-		reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
-		if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+	if !opts.Refresh {
+		if state, ok, err := s.existingState(ctx, name, spec, opts.Architecture); err != nil {
 			return client.ImageState{}, err
+		} else if ok {
+			reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
+			if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+				return client.ImageState{}, err
+			}
+			reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+			return state, nil
 		}
-		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
-		return state, nil
-	}
-	if state, ok, err := s.restoreFromSharedCache(ctx, name, spec, opts.Architecture); err != nil {
-		return client.ImageState{}, err
-	} else if ok {
-		reportPullProgress(opts.Report, client.ProgressEvent{Status: "restored", Artifact: name})
-		if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+		if state, ok, err := s.restoreFromSharedCache(ctx, name, spec, opts.Architecture); err != nil {
 			return client.ImageState{}, err
+		} else if ok {
+			reportPullProgress(opts.Report, client.ProgressEvent{Status: "restored", Artifact: name})
+			if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+				return client.ImageState{}, err
+			}
+			reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+			return state, nil
 		}
-		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
-		return state, nil
 	}
 
 	s.mu.Lock()
@@ -536,6 +540,103 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	return state, nil
 }
 
+func (s *Store) PlanPull(ctx context.Context, name, source string, options ...PullOptions) (client.ImagePullPlan, error) {
+	if name == "" {
+		return client.ImagePullPlan{}, fmt.Errorf("image name is required")
+	}
+	if source == "" {
+		return client.ImagePullPlan{}, fmt.Errorf("image source is required")
+	}
+	spec, err := ParseSource(source)
+	if err != nil {
+		return client.ImagePullPlan{}, err
+	}
+	var opts PullOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	architecture := firstNonEmpty(normalizeArchitecture(opts.Architecture), nativeArch())
+	plan := client.ImagePullPlan{
+		Name:         name,
+		Source:       source,
+		Architecture: architecture,
+	}
+	sharedName := sharedImageKey(spec, opts.Architecture)
+	shared := NewStore(s.sharedRoot())
+	shared.httpClient = s.httpClient
+	plan.Installed = pullPlanImageInstalled(s, name, spec, architecture)
+	if spec.Kind != SourceKindOCI {
+		if _, ok, err := s.existingState(ctx, name, spec, opts.Architecture); err != nil {
+			return client.ImagePullPlan{}, err
+		} else if ok {
+			plan.Available = true
+			return plan, nil
+		}
+		if _, ok, err := shared.existingState(ctx, sharedName, spec, opts.Architecture); err != nil {
+			return client.ImagePullPlan{}, err
+		} else if ok {
+			plan.Available = true
+		}
+		return plan, nil
+	}
+
+	registry, imageName, tag, err := ParseImageRef(spec.Raw)
+	if err != nil {
+		return client.ImagePullPlan{}, err
+	}
+	reg := &registryContext{client: shared.httpClient, registry: registry}
+	mani, manifestDigest, err := shared.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures(opts.Architecture)...)
+	if err != nil {
+		return client.ImagePullPlan{}, err
+	}
+	if manifestDigest != "" {
+		plan.ResolvedSource = resolvedOCISource(registry, imageName, manifestDigest)
+	}
+	if pullPlanMetadataMatches(s, name, spec, architecture, plan.ResolvedSource) ||
+		pullPlanMetadataMatches(shared, sharedName, spec, architecture, plan.ResolvedSource) {
+		plan.Available = true
+		return plan, nil
+	}
+	seen := make(map[string]struct{}, len(mani.Layers))
+	for _, layer := range mani.Layers {
+		if layer.Size <= 0 {
+			return client.ImagePullPlan{}, fmt.Errorf("layer %s has invalid size %d", layer.Digest, layer.Size)
+		}
+		if _, duplicate := seen[layer.Digest]; duplicate {
+			continue
+		}
+		seen[layer.Digest] = struct{}{}
+		plan.LayersTotal++
+		plan.BytesTotal += layer.Size
+		blobPath := filepath.Join(shared.root, "_blobs", digestToFileName(layer.Digest))
+		if info, statErr := os.Stat(blobPath); statErr == nil && info.Mode().IsRegular() && info.Size() == layer.Size {
+			plan.LayersCached++
+			plan.BytesCached += layer.Size
+		}
+	}
+	plan.BytesToDownload = max(0, plan.BytesTotal-plan.BytesCached)
+	return plan, nil
+}
+
+func pullPlanImageInstalled(store *Store, name string, spec SourceSpec, architecture string) bool {
+	meta, err := store.readMetadata(name)
+	if err != nil || meta.Source != spec.Raw || meta.SourceKind != spec.Kind || !dirExists(meta.RootFSDir) {
+		return false
+	}
+	return architecture == "" || normalizeArchitecture(meta.Architecture) == normalizeArchitecture(architecture)
+}
+
+func pullPlanMetadataMatches(store *Store, name string, spec SourceSpec, architecture, resolvedSource string) bool {
+	if resolvedSource == "" {
+		return false
+	}
+	meta, err := store.readMetadata(name)
+	if err != nil || meta.ResolvedSource != resolvedSource {
+		return false
+	}
+	return pullPlanImageInstalled(store, name, spec, architecture)
+}
+
 func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create image store: %w", err)
@@ -547,7 +648,11 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options 
 	sharedName := sharedImageKey(spec, options.Architecture)
 	shared := NewStore(s.sharedRoot())
 	shared.httpClient = s.httpClient
-	if _, ok, err := shared.existingState(ctx, sharedName, spec, options.Architecture); err != nil {
+	if options.Refresh {
+		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
+			return err
+		}
+	} else if _, ok, err := shared.existingState(ctx, sharedName, spec, options.Architecture); err != nil {
 		return err
 	} else if !ok {
 		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
@@ -603,7 +708,7 @@ func (s *Store) pullRootFSTarDirect(ctx context.Context, name string, spec Sourc
 	cfg := imageConfig{Architecture: firstNonEmpty(normalizeArchitecture(options.Architecture), nativeArch())}
 	cfg.Config.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 	cfg.Config.WorkingDir = "/"
-	if err := s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build); err != nil {
+	if err := s.finalizeIndexedImage(name, spec, "", imageDir, tmpDir, cfg, build); err != nil {
 		return err
 	}
 	return nil
@@ -1036,78 +1141,126 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		return fmt.Errorf("decode image config: %w", err)
 	}
 
-	downloads, err := s.startLayerBlobPull(ctx, reg, imageName, name, mani.Layers, report)
+	var totalLayerBytes int64
+	for _, layer := range mani.Layers {
+		totalLayerBytes += layer.Size
+	}
+	var pipelineMu sync.Mutex
+	var backgroundDownloadedBytes int64
+	var streamedDownloadedBytes int64
+	var downloadedLayerBytes int64
+	var preparedLayerWork int64
+	reportDownload := func(event client.ProgressEvent) {
+		pipelineMu.Lock()
+		if event.BytesTotal > 0 {
+			backgroundDownloadedBytes = max(backgroundDownloadedBytes, event.BytesDownloaded)
+			downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
+			event.BytesDownloaded = downloadedLayerBytes
+			event.BytesTotal = totalLayerBytes
+			event.DownloadProgress = ratio(downloadedLayerBytes, totalLayerBytes)
+			event.IndexProgress = ratio(preparedLayerWork, totalLayerBytes)
+			event.Progress = ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
+			if preparedLayerWork > 0 && event.Status == "downloading" {
+				event.Status = "processing"
+			}
+		}
+		pipelineMu.Unlock()
+		report(event)
+	}
+	streamFirstLayer := len(mani.Layers) != 0 && !s.cachedLayerBlobAvailable(mani.Layers[0])
+	downloadLayers := mani.Layers
+	if streamFirstLayer {
+		firstDigest := mani.Layers[0].Digest
+		downloadLayers = make([]descriptor, 0, len(mani.Layers)-1)
+		for _, layer := range mani.Layers[1:] {
+			if layer.Digest != firstDigest {
+				downloadLayers = append(downloadLayers, layer)
+			}
+		}
+	}
+	downloads, err := s.startLayerBlobPull(ctx, reg, imageName, name, downloadLayers, reportDownload)
 	if err != nil {
 		return err
 	}
 	defer downloads.cancel()
 
 	build := newIndexedBuildState()
-	var totalLayerBytes int64
-	for _, layer := range mani.Layers {
-		totalLayerBytes += layer.Size
-	}
 	var preparedLayerBytes int64
 	prepareStarted := time.Now()
 	for layerIndex, layer := range mani.Layers {
-		if err := downloads.waitLayer(ctx, layer.Digest); err != nil {
-			return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
-		}
 		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
 		layerTarPath := filepath.Join(tmpDir, layerTarRel)
-		reportPrepare := func(layerWork int64) {
-			if !downloads.finished() {
-				return
+		reportPrepare := func(layerWork int64, streaming bool) {
+			pipelineMu.Lock()
+			if streaming {
+				streamedDownloadedBytes = max(streamedDownloadedBytes, min(layer.Size, max(0, layerWork)))
+				downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
 			}
-			workTotal := totalLayerBytes * 2
-			workDone := preparedLayerBytes*2 + min(layer.Size*2, max(0, layerWork))
-			progress := ratio(workDone, workTotal)
+			preparedLayerWork = preparedLayerBytes + min(layer.Size, max(0, layerWork))
+			downloadProgress := ratio(downloadedLayerBytes, totalLayerBytes)
+			indexProgress := ratio(preparedLayerWork, totalLayerBytes)
+			progress := ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
+			bytesDownloaded := downloadedLayerBytes
+			pipelineMu.Unlock()
 			elapsed := time.Since(prepareStarted).Seconds()
 			var eta float64
 			if progress > 0 && progress < 1 && elapsed > 0 {
 				eta = elapsed * (1 - progress) / progress
 			}
 			report(client.ProgressEvent{
-				Status:          "indexing",
-				Artifact:        name,
-				Blob:            layer.Digest,
-				Progress:        progress,
-				FilesDownloaded: int64(layerIndex),
-				FilesTotal:      int64(len(mani.Layers)),
-				ETASeconds:      eta,
+				Status:           "processing",
+				Artifact:         name,
+				Blob:             layer.Digest,
+				Progress:         progress,
+				DownloadProgress: downloadProgress,
+				IndexProgress:    indexProgress,
+				BytesDownloaded:  bytesDownloaded,
+				BytesTotal:       totalLayerBytes,
+				FilesDownloaded:  int64(layerIndex),
+				FilesTotal:       int64(len(mani.Layers)),
+				ETASeconds:       eta,
 			})
 		}
-		reportPrepare(0)
-		if err := s.writeCachedLayerTar(layer, layerTarPath, func(compressedBytes int64) {
-			reportPrepare(min(layer.Size, compressedBytes))
-		}); err != nil {
-			return fmt.Errorf("expand layer %s: %w", layer.Digest, err)
-		}
-		if err := applyIndexedLayerWithProgress(layerTarPath, layerTarRel, build.merged, build.fsEntries, func(indexedBytes, expandedBytes int64) {
-			indexFraction := ratio(indexedBytes, expandedBytes)
-			reportPrepare(layer.Size + int64(float64(layer.Size)*indexFraction))
-		}); err != nil {
-			return fmt.Errorf("index layer %s: %w", layer.Digest, err)
+		reportPrepare(0, streamFirstLayer && layerIndex == 0)
+		if streamFirstLayer && layerIndex == 0 {
+			if err := s.downloadAndApplyLayer(ctx, reg, imageName, layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
+				reportPrepare(compressedBytes, true)
+			}); err != nil {
+				return fmt.Errorf("download and prepare layer %s: %w", layer.Digest, err)
+			}
+		} else {
+			if err := downloads.waitLayer(ctx, layer.Digest); err != nil {
+				return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
+			}
+			if err := s.writeAndApplyCachedLayer(layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
+				reportPrepare(compressedBytes, false)
+			}); err != nil {
+				return fmt.Errorf("prepare layer %s: %w", layer.Digest, err)
+			}
 		}
 		preparedLayerBytes += layer.Size
-		reportPrepare(0)
+		reportPrepare(0, false)
 	}
 	if err := downloads.wait(ctx); err != nil {
 		return err
 	}
 	report(client.ProgressEvent{
-		Status:          "indexing",
-		Artifact:        name,
-		Blob:            "filesystem",
-		Progress:        1,
-		FilesDownloaded: int64(len(mani.Layers)),
-		FilesTotal:      int64(len(mani.Layers)),
+		Status:           "processing",
+		Artifact:         name,
+		Blob:             "filesystem",
+		Progress:         1,
+		DownloadProgress: 1,
+		IndexProgress:    1,
+		BytesDownloaded:  totalLayerBytes,
+		BytesTotal:       totalLayerBytes,
+		FilesDownloaded:  int64(len(mani.Layers)),
+		FilesTotal:       int64(len(mani.Layers)),
 	})
-	metaSpec := spec
+	resolvedSource := ""
 	if manifestDigest != "" {
-		metaSpec.Raw = resolvedOCISource(registry, imageName, manifestDigest)
+		resolvedSource = resolvedOCISource(registry, imageName, manifestDigest)
 	}
-	return s.finalizeIndexedImage(name, metaSpec, imageDir, tmpDir, cfg, build)
+	return s.finalizeIndexedImage(name, spec, resolvedSource, imageDir, tmpDir, cfg, build)
 }
 
 type indexedBuildState struct {
@@ -1133,7 +1286,7 @@ func newIndexedBuildState() indexedBuildState {
 	}
 }
 
-func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, imageDir, tmpDir string, cfg imageConfig, build indexedBuildState) error {
+func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, resolvedSource, imageDir, tmpDir string, cfg imageConfig, build indexedBuildState) error {
 	ensureIndexedParents(build.merged, build.fsEntries)
 	indexPath := filepath.Join(imageDir, "rootfs.index.json")
 	indexBuf, err := encodeFSIndex(build.merged)
@@ -1153,19 +1306,20 @@ func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, imageDir, tmp
 	}
 
 	meta := metadata{
-		Name:         name,
-		Source:       spec.Raw,
-		SourceKind:   spec.Kind,
-		Architecture: cfg.Architecture,
-		RootFSDir:    imageDir,
-		MetadataPath: metadataPath,
-		IndexPath:    indexPath,
-		Env:          append([]string(nil), cfg.Config.Env...),
-		Entrypoint:   append([]string(nil), cfg.Config.Entrypoint...),
-		Cmd:          append([]string(nil), cfg.Config.Cmd...),
-		WorkingDir:   cfg.Config.WorkingDir,
-		User:         cfg.Config.User,
-		Labels:       labelPairsFromMap(cfg.Config.Labels),
+		Name:           name,
+		Source:         spec.Raw,
+		ResolvedSource: resolvedSource,
+		SourceKind:     spec.Kind,
+		Architecture:   cfg.Architecture,
+		RootFSDir:      imageDir,
+		MetadataPath:   metadataPath,
+		IndexPath:      indexPath,
+		Env:            append([]string(nil), cfg.Config.Env...),
+		Entrypoint:     append([]string(nil), cfg.Config.Entrypoint...),
+		Cmd:            append([]string(nil), cfg.Config.Cmd...),
+		WorkingDir:     cfg.Config.WorkingDir,
+		User:           cfg.Config.User,
+		Labels:         labelPairsFromMap(cfg.Config.Labels),
 	}
 
 	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1209,7 +1363,7 @@ func (s *Store) existingState(ctx context.Context, name string, spec SourceSpec,
 	if !dirExists(meta.RootFSDir) {
 		return client.ImageState{}, false, nil
 	}
-	return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, true, nil
+	return client.ImageState{Name: meta.Name, Source: meta.Source, ResolvedSource: meta.ResolvedSource, SourceKind: meta.SourceKind, Status: "downloaded"}, true, nil
 }
 
 func (s *Store) restoreFromSharedCache(ctx context.Context, name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
@@ -1246,7 +1400,7 @@ func (s *Store) restoreFromSharedCache(ctx context.Context, name string, spec So
 	if err := s.cloneFromStore(shared, sharedName, name, spec); err != nil {
 		return client.ImageState{}, false, err
 	}
-	return client.ImageState{Name: name, Source: spec.Raw, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
+	return client.ImageState{Name: name, Source: spec.Raw, ResolvedSource: meta.ResolvedSource, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
 }
 
 func (s *Store) currentCVMFSRootHash(ctx context.Context, spec SourceSpec, mirrors []string) (string, error) {
@@ -1299,6 +1453,12 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceS
 	buf, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal image metadata: %w", err)
+	}
+	// copyTree hard-links immutable cache artifacts when possible. image.json
+	// belongs to the named image, so unlink it before writing the adjusted
+	// metadata rather than truncating the shared cache's copy.
+	if err := os.Remove(filepath.Join(tmpDir, "image.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("replace cached image metadata: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "image.json"), buf, 0o644); err != nil {
 		return fmt.Errorf("write image metadata: %w", err)
@@ -1459,15 +1619,6 @@ func (p *layerBlobPull) wait(ctx context.Context) error {
 	}
 }
 
-func (p *layerBlobPull) finished() bool {
-	select {
-	case <-p.done:
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *Store) startLayerBlobPull(
 	ctx context.Context,
 	reg *registryContext,
@@ -1570,8 +1721,13 @@ func (s *Store) cacheLayerBlob(
 ) error {
 	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
 	if info, err := os.Stat(blobPath); err == nil && info.Mode().IsRegular() {
-		progress.complete(layer.Digest, layer.Size)
-		return nil
+		if info.Size() == layer.Size {
+			progress.complete(layer.Digest, layer.Size)
+			return nil
+		}
+		if err := os.Remove(blobPath); err != nil {
+			return fmt.Errorf("remove invalid cached layer: %w", err)
+		}
 	}
 	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
 	if err != nil {
@@ -1605,14 +1761,81 @@ func (s *Store) cacheLayerBlob(
 	return nil
 }
 
-func (s *Store) writeCachedLayerTar(layer descriptor, dstPath string, progress func(int64)) error {
+func (s *Store) cachedLayerBlobAvailable(layer descriptor) bool {
+	info, err := os.Stat(filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest)))
+	return err == nil && info.Mode().IsRegular() && info.Size() == layer.Size
+}
+
+func (s *Store) downloadAndApplyLayer(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	layer descriptor,
+	dstPath, tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	progress func(int64),
+) error {
+	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, layer.Size); err != nil {
+		return err
+	}
+	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		return err
+	}
+	tmpBlobPath := blobPath + ".tmp"
+	blob, err := os.OpenFile(tmpBlobPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = blob.Close()
+		_ = os.Remove(tmpBlobPath)
+	}()
+	hash := sha256.New()
+	body := io.TeeReader(resp.Body, io.MultiWriter(blob, hash))
+	if err := writeAndApplyIndexedLayer(dstPath, layer.MediaType, body, tarRef, merged, entries, progress); err != nil {
+		return err
+	}
+	if err := blob.Close(); err != nil {
+		return err
+	}
+	info, err := os.Stat(tmpBlobPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() != layer.Size {
+		return &download.LengthError{Expected: layer.Size, Actual: info.Size()}
+	}
+	actualDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(actualDigest, layer.Digest) {
+		return &download.DigestError{Expected: layer.Digest, Actual: actualDigest}
+	}
+	if err := os.Rename(tmpBlobPath, blobPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) writeAndApplyCachedLayer(
+	layer descriptor,
+	dstPath, tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	progress func(int64),
+) error {
 	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
 	file, err := os.Open(blobPath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	return writeLayerTarFromReaderWithProgress(dstPath, layer.MediaType, file, progress)
+	return writeAndApplyIndexedLayer(dstPath, layer.MediaType, file, tarRef, merged, entries, progress)
 }
 
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
@@ -1758,14 +1981,14 @@ func (s *Store) getLocked(name string) (client.ImageState, error) {
 	if s.downloading[name] {
 		meta, err := s.readMetadata(name)
 		if err == nil {
-			return client.ImageState{Name: name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloading"}, nil
+			return client.ImageState{Name: name, Source: meta.Source, ResolvedSource: meta.ResolvedSource, SourceKind: meta.SourceKind, Status: "downloading"}, nil
 		}
 		return client.ImageState{Name: name, Status: "downloading"}, nil
 	}
 
 	meta, err := s.readMetadata(name)
 	if err == nil {
-		return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, nil
+		return client.ImageState{Name: meta.Name, Source: meta.Source, ResolvedSource: meta.ResolvedSource, SourceKind: meta.SourceKind, Status: "downloaded"}, nil
 	}
 	if lastErr := s.lastErr[name]; lastErr != nil {
 		return client.ImageState{Name: name, Status: "error", Error: lastErr.Error()}, nil
@@ -2255,6 +2478,11 @@ func copyTree(srcDir, dstDir string) error {
 			}
 			return os.Symlink(link, target)
 		case mode.IsRegular():
+			if err := os.Link(current, target); err == nil {
+				return nil
+			}
+			// Custom image and shared-cache roots may live on different
+			// filesystems, where hard links are unavailable.
 			return copyFile(current, target, mode.Perm())
 		default:
 			return fmt.Errorf("unsupported file mode %v at %s", mode, current)

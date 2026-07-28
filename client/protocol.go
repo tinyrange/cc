@@ -80,6 +80,8 @@ type ProgressEvent struct {
 	Status             string  `json:"status"`
 	Artifact           string  `json:"artifact,omitempty"`
 	Progress           float64 `json:"progress,omitempty"`
+	DownloadProgress   float64 `json:"download_progress,omitempty"`
+	IndexProgress      float64 `json:"index_progress,omitempty"`
 	BytesDownloaded    int64   `json:"bytes_downloaded,omitempty"`
 	BytesTotal         int64   `json:"bytes_total,omitempty"`
 	FilesDownloaded    int64   `json:"files_downloaded,omitempty"`
@@ -91,11 +93,26 @@ type ProgressEvent struct {
 }
 
 type ImageState struct {
-	Name       string `json:"name"`
-	Source     string `json:"source,omitempty"`
-	SourceKind string `json:"source_kind,omitempty"`
-	Status     string `json:"status"`
-	Error      string `json:"error,omitempty"`
+	Name           string `json:"name"`
+	Source         string `json:"source,omitempty"`
+	ResolvedSource string `json:"resolved_source,omitempty"`
+	SourceKind     string `json:"source_kind,omitempty"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
+}
+
+type ImagePullPlan struct {
+	Name            string `json:"name"`
+	Source          string `json:"source"`
+	Architecture    string `json:"architecture,omitempty"`
+	Installed       bool   `json:"installed"`
+	Available       bool   `json:"available"`
+	BytesTotal      int64  `json:"bytes_total,omitempty"`
+	BytesCached     int64  `json:"bytes_cached,omitempty"`
+	BytesToDownload int64  `json:"bytes_to_download,omitempty"`
+	LayersTotal     int64  `json:"layers_total,omitempty"`
+	LayersCached    int64  `json:"layers_cached,omitempty"`
+	ResolvedSource  string `json:"resolved_source,omitempty"`
 }
 
 type SaveImageRequest struct {
@@ -110,6 +127,7 @@ type PullImageRequest struct {
 	CacheDir        string       `json:"cache_dir,omitempty"`
 	Prefetch        bool         `json:"prefetch,omitempty"`
 	PrefetchWorkers int          `json:"prefetch_workers,omitempty"`
+	Refresh         bool         `json:"refresh,omitempty"`
 }
 
 type ImageSource struct {
@@ -179,6 +197,9 @@ func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	if r.PrefetchWorkers > 0 {
 		payload["prefetch_workers"] = r.PrefetchWorkers
 	}
+	if r.Refresh {
+		payload["refresh"] = true
+	}
 	return json.Marshal(payload)
 }
 
@@ -189,6 +210,7 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 		CacheDir        string          `json:"cache_dir,omitempty"`
 		Prefetch        bool            `json:"prefetch,omitempty"`
 		PrefetchWorkers int             `json:"prefetch_workers,omitempty"`
+		Refresh         bool            `json:"refresh,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -199,6 +221,7 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	r.CacheDir = raw.CacheDir
 	r.Prefetch = raw.Prefetch
 	r.PrefetchWorkers = raw.PrefetchWorkers
+	r.Refresh = raw.Refresh
 	if len(raw.Source) == 0 || string(raw.Source) == "null" {
 		return nil
 	}

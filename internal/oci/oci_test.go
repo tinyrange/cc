@@ -3,9 +3,11 @@ package oci
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +26,67 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 )
+
+func TestWriteAndApplyIndexedLayerUsesOneStream(t *testing.T) {
+	var compressed bytes.Buffer
+	gzw := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gzw)
+	body := []byte("hello from one pass")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "usr/share/message",
+		Mode:     0o644,
+		Size:     int64(len(body)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	build := newIndexedBuildState()
+	layerPath := filepath.Join(t.TempDir(), "layers", "test.tar")
+	var finalProgress int64
+	if err := writeAndApplyIndexedLayer(
+		layerPath,
+		"application/vnd.oci.image.layer.v1.tar+gzip",
+		bytes.NewReader(compressed.Bytes()),
+		"layers/test.tar",
+		build.merged,
+		build.fsEntries,
+		func(current int64) { finalProgress = current },
+	); err != nil {
+		t.Fatal(err)
+	}
+	node := build.merged["/usr/share/message"]
+	if node == nil || node.TarPath != "layers/test.tar" || node.Size != uint64(len(body)) {
+		t.Fatalf("indexed node = %+v", node)
+	}
+	file, err := os.Open(layerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got := make([]byte, len(body))
+	if _, err := file.ReadAt(got, int64(node.TarOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("indexed contents = %q", got)
+	}
+	if finalProgress != int64(compressed.Len()) {
+		t.Fatalf("progress = %d, want %d", finalProgress, compressed.Len())
+	}
+	if _, err := os.Stat(layerPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temporary layer remains: %v", err)
+	}
+}
 
 func TestAggregateLayerProgressReportsWholeImageBytes(t *testing.T) {
 	var events []client.ProgressEvent
@@ -47,6 +110,100 @@ func TestAggregateLayerProgressReportsWholeImageBytes(t *testing.T) {
 	final := events[len(events)-1]
 	if final.BytesDownloaded != 150 || final.BytesTotal != 200 || final.Progress != 0.75 {
 		t.Fatalf("final aggregate progress = %+v", final)
+	}
+}
+
+func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
+	const (
+		firstDigest  = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		secondDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	)
+	manifestData, err := json.Marshal(manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		Config: descriptor{
+			MediaType: "application/vnd.oci.image.config.v1+json",
+			Digest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Size:      32,
+		},
+		Layers: []descriptor{
+			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: firstDigest, Size: 100},
+			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: secondDigest, Size: 250},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/manifests/edge") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		_, _ = w.Write(manifestData)
+	}))
+	defer server.Close()
+
+	shared := filepath.Join(t.TempDir(), "shared")
+	t.Setenv(sharedCacheEnv, shared)
+	if err := os.MkdirAll(filepath.Join(shared, "_blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "_blobs", digestToFileName(firstDigest)), make([]byte, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(filepath.Join(t.TempDir(), "store"))
+	store.httpClient = server.Client()
+	source := strings.TrimPrefix(server.URL, "https://") + "/team/squad:edge"
+	plan, err := store.PlanPull(t.Context(), "squadvm", source, PullOptions{Architecture: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Available || plan.BytesTotal != 350 || plan.BytesCached != 100 || plan.BytesToDownload != 250 {
+		t.Fatalf("pull plan = %+v", plan)
+	}
+	if plan.LayersTotal != 2 || plan.LayersCached != 1 {
+		t.Fatalf("pull plan layers = %+v", plan)
+	}
+
+	spec, err := ParseSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeMetadata("squadvm", metadata{
+		Name:           "squadvm",
+		Source:         spec.Raw,
+		SourceKind:     spec.Kind,
+		Architecture:   "amd64",
+		RootFSDir:      store.imageDir("squadvm"),
+		ResolvedSource: "oci:old",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	update, err := store.PlanPull(t.Context(), "squadvm", source, PullOptions{Architecture: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !update.Installed || update.Available || update.BytesToDownload != 250 {
+		t.Fatalf("update plan = %+v", update)
+	}
+
+	sum := sha256.Sum256(manifestData)
+	currentSource := resolvedOCISource(server.URL, "team/squad", "sha256:"+hex.EncodeToString(sum[:]))
+	meta, err := store.readMetadata("squadvm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.ResolvedSource = currentSource
+	if err := store.writeMetadata("squadvm", meta); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.PlanPull(t.Context(), "squadvm", source, PullOptions{Architecture: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Installed || !current.Available || current.BytesToDownload != 0 {
+		t.Fatalf("current plan = %+v", current)
 	}
 }
 
@@ -173,12 +330,14 @@ func TestStorePullRestoresSIMGFromSharedCache(t *testing.T) {
 	t.Setenv(sharedCacheEnv, shared)
 	source := alpineFixture(t)
 
-	first := NewStore(filepath.Join(t.TempDir(), "first"))
+	firstRoot := filepath.Join(t.TempDir(), "first")
+	first := NewStore(firstRoot)
 	if _, err := first.Pull(context.Background(), "alpine", source, PullOptions{Architecture: "amd64"}); err != nil {
 		t.Fatalf("initial pull: %v", err)
 	}
 
-	second := NewStore(filepath.Join(t.TempDir(), "second"))
+	secondRoot := filepath.Join(t.TempDir(), "second")
+	second := NewStore(secondRoot)
 	state, err := second.Pull(context.Background(), "restored", source, PullOptions{Architecture: "amd64"})
 	if err != nil {
 		t.Fatalf("restore pull: %v", err)
@@ -188,6 +347,39 @@ func TestStorePullRestoresSIMGFromSharedCache(t *testing.T) {
 	}
 	if _, err := second.Open("restored"); err != nil {
 		t.Fatalf("open restored image: %v", err)
+	}
+
+	spec, err := ParseSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedImage := filepath.Join(shared, sharedImageKey(spec, "amd64"))
+	sharedRootFS, err := os.Stat(filepath.Join(sharedImage, "rootfs.simg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(firstRoot, "alpine", "rootfs.simg"),
+		filepath.Join(secondRoot, "restored", "rootfs.simg"),
+	} {
+		localRootFS, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(sharedRootFS, localRootFS) {
+			t.Fatalf("cached image artifact %q occupies a second copy", path)
+		}
+	}
+	sharedMetadata, err := os.Stat(filepath.Join(sharedImage, "image.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	localMetadata, err := os.Stat(filepath.Join(secondRoot, "restored", "image.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(sharedMetadata, localMetadata) {
+		t.Fatal("named image metadata aliases shared-cache metadata")
 	}
 }
 

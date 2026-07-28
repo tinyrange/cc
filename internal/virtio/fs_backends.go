@@ -2953,6 +2953,20 @@ func (p *imageFS) imageNodeHasHandleLocked(nodeID uint64) bool {
 	return false
 }
 
+func (p *imageFS) imageNodeLinkedLocked(node *imageNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.id == 1 {
+		return true
+	}
+	if !node.isDir() {
+		return node.nlink != 0
+	}
+	parent := p.imageNodeLocked(node.parent)
+	return parent != nil && parent.entries[node.name] == node.id
+}
+
 func (p *imageFS) touchImageDirectoryLocked(node *imageNode, now time.Time) {
 	if node == nil || !node.isDir() {
 		return
@@ -2975,12 +2989,8 @@ func (p *imageFS) collectImageNodeLocked(nodeID uint64) {
 	// Regular-file link counts are maintained when directory entries change.
 	// Most Release calls therefore prove the node is still linked in O(1),
 	// instead of rescanning every directory after every close. Directories are
-	// not hard-linkable and remain on the conservative reference scan.
-	linked := node.nlink != 0
-	if node.isDir() {
-		parent := p.imageNodeLocked(node.parent)
-		linked = parent != nil && parent.entries[node.name] == nodeID
-	}
+	// not hard-linkable and remain on the conservative parent-entry check.
+	linked := p.imageNodeLinkedLocked(node)
 	if !linked && p.persistent != nil {
 		// Once the namespace no longer reaches an inode, a crash cannot retain
 		// its open handles. Record that fact before reclaiming its data.
