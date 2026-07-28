@@ -26,6 +26,17 @@ type daemonState struct {
 	Addr string `json:"addr"`
 }
 
+type stringListFlag []string
+
+func (values *stringListFlag) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *stringListFlag) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
 type ccAPI interface {
 	DownloadKernelStream(client.DownloadRequest, func(client.ProgressEvent) error) error
 	VMSupported() (client.VMSupportedResponse, error)
@@ -291,15 +302,18 @@ func handleVMCommand(api ccAPI, args []string) error {
 		vncListen := fs.String("vnc-listen", "127.0.0.1:0", "Loopback VNC listen address")
 		displaySize := fs.String("display", "1280x720", "Display size WIDTHxHEIGHT")
 		initSystem := fs.String("init", "", "Guest init system")
+		defaultUser := fs.String("default-user", "", "Default guest user for VM commands")
 		network := fs.Bool("network", false, "Enable isolated guest networking with outbound internet access")
 		memoryMB := fs.Uint64("memory-mb", 0, "VM memory in MiB")
 		cpus := fs.Int("cpus", 0, "VM CPUs")
 		timeout := fs.Duration("timeout", 0, "VM boot timeout")
+		var shareSpecs stringListFlag
+		fs.Var(&shareSpecs, "share", "Writable host directory share HOST_PATH:GUEST_PATH (repeatable)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 2 {
-			return fmt.Errorf("usage: cc vm start [--vnc] [--network] [--vnc-listen ADDRESS] [--display WIDTHxHEIGHT] [--init SYSTEM] [--memory-mb MIB] [--cpus COUNT] <name> <image>")
+			return fmt.Errorf("usage: cc vm start [--vnc] [--network] [--share HOST_PATH:GUEST_PATH] [--vnc-listen ADDRESS] [--display WIDTHxHEIGHT] [--init SYSTEM] [--default-user USER] [--memory-mb MIB] [--cpus COUNT] <name> <image>")
 		}
 		var display *client.DisplayConfig
 		if *vnc {
@@ -313,10 +327,20 @@ func handleVMCommand(api ccAPI, args []string) error {
 		if *network {
 			networkConfig = &client.NetworkConfig{Enabled: true, AllowInternet: true}
 		}
+		shares := make([]client.ShareMount, 0, len(shareSpecs))
+		for _, spec := range shareSpecs {
+			share, err := parseWritableShareSpec(spec)
+			if err != nil {
+				return err
+			}
+			shares = append(shares, share)
+		}
 		state, err := api.CreateInstanceStreamWithID(fs.Arg(0), client.CreateInstanceRequest{
 			Image:          fs.Arg(1),
 			InitSystem:     *initSystem,
+			DefaultUser:    *defaultUser,
 			Network:        networkConfig,
+			Shares:         shares,
 			Display:        display,
 			MemoryMB:       *memoryMB,
 			CPUs:           *cpus,
@@ -485,6 +509,47 @@ func parsePortForwardSpec(spec string) (client.PortForward, error) {
 		HostAddr:  "127.0.0.1",
 		HostPort:  hostPort,
 		GuestPort: guestPort,
+	}, nil
+}
+
+func parseWritableShareSpec(spec string) (client.ShareMount, error) {
+	spec = strings.TrimSpace(spec)
+	separator := strings.LastIndex(spec, ":")
+	if separator <= 0 || separator == len(spec)-1 {
+		return client.ShareMount{}, fmt.Errorf("invalid share %q: expected HOST_PATH:GUEST_PATH", spec)
+	}
+	source := strings.TrimSpace(spec[:separator])
+	mount := strings.TrimSpace(spec[separator+1:])
+	if mount == "" || !strings.HasPrefix(mount, "/") {
+		return client.ShareMount{}, fmt.Errorf("invalid share %q: guest path must be absolute", spec)
+	}
+	if source == "~" || strings.HasPrefix(source, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return client.ShareMount{}, fmt.Errorf("resolve share home directory: %w", err)
+		}
+		if source == "~" {
+			source = home
+		} else {
+			source = filepath.Join(home, strings.TrimPrefix(source, "~/"))
+		}
+	}
+	absoluteSource, err := filepath.Abs(source)
+	if err != nil {
+		return client.ShareMount{}, fmt.Errorf("resolve share source %q: %w", source, err)
+	}
+	info, err := os.Stat(absoluteSource)
+	if err != nil {
+		return client.ShareMount{}, fmt.Errorf("inspect share source %q: %w", absoluteSource, err)
+	}
+	if !info.IsDir() {
+		return client.ShareMount{}, fmt.Errorf("share source %q is not a directory", absoluteSource)
+	}
+	return client.ShareMount{
+		Source:   absoluteSource,
+		Mount:    filepath.ToSlash(filepath.Clean(mount)),
+		Writable: true,
+		Cache:    "strict",
 	}, nil
 }
 
