@@ -27,13 +27,16 @@ const (
 	inputEventRel = 0x02
 	inputEventAbs = 0x03
 
-	inputSynReport = 0
-	inputRelWheel  = 0x08
-	inputAbsX      = 0
-	inputAbsY      = 1
-	inputBtnLeft   = 0x110
-	inputBtnRight  = 0x111
-	inputBtnMiddle = 0x112
+	inputSynReport      = 0
+	inputRelHWheel      = 0x06
+	inputRelWheel       = 0x08
+	inputRelWheelHiRes  = 0x0b
+	inputRelHWheelHiRes = 0x0c
+	inputAbsX           = 0
+	inputAbsY           = 1
+	inputBtnLeft        = 0x110
+	inputBtnRight       = 0x111
+	inputBtnMiddle      = 0x112
 )
 
 type InputKind uint8
@@ -71,6 +74,8 @@ type Input struct {
 	width            uint32
 	height           uint32
 	pending          []InputEvent
+	scrollX120       int64
+	scrollY120       int64
 	queues           [2]queue
 }
 
@@ -336,6 +341,38 @@ func (i *Input) PointerEvent(x, y uint32, buttons uint8, previous uint8) error {
 	return i.flushEventsLocked()
 }
 
+// ScrollEvent reports high-resolution wheel movement in v120 units. Linux
+// expects the high-resolution events for every movement and a legacy wheel
+// event whenever the accumulated movement crosses a 120-unit detent.
+func (i *Input) ScrollEvent(deltaX120, deltaY120 int32) error {
+	if deltaX120 == 0 && deltaY120 == 0 {
+		return nil
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	events := make([]InputEvent, 0, 5)
+	if deltaX120 != 0 {
+		events = append(events, InputEvent{Type: inputEventRel, Code: inputRelHWheelHiRes, Value: deltaX120})
+		i.scrollX120 += int64(deltaX120)
+		if steps := i.scrollX120 / 120; steps != 0 {
+			events = append(events, InputEvent{Type: inputEventRel, Code: inputRelHWheel, Value: int32(steps)})
+			i.scrollX120 -= steps * 120
+		}
+	}
+	if deltaY120 != 0 {
+		events = append(events, InputEvent{Type: inputEventRel, Code: inputRelWheelHiRes, Value: deltaY120})
+		i.scrollY120 += int64(deltaY120)
+		if steps := i.scrollY120 / 120; steps != 0 {
+			events = append(events, InputEvent{Type: inputEventRel, Code: inputRelWheel, Value: int32(steps)})
+			i.scrollY120 -= steps * 120
+		}
+	}
+	events = append(events, InputEvent{Type: inputEventSyn, Code: inputSynReport})
+	i.pending = append(i.pending, events...)
+	return i.flushEventsLocked()
+}
+
 func scaleAbsolutePosition(position, extent uint32) uint32 {
 	if extent <= 1 {
 		return 0
@@ -493,8 +530,11 @@ func (i *Input) eventBitmapLocked(eventType byte) []byte {
 		return bitmap
 	case inputEventRel:
 		if i.Kind == InputAbsolutePointer {
-			bitmap := make([]byte, inputRelWheel/8+1)
+			bitmap := make([]byte, inputRelHWheelHiRes/8+1)
+			setInputBit(bitmap, inputRelHWheel)
 			setInputBit(bitmap, inputRelWheel)
+			setInputBit(bitmap, inputRelWheelHiRes)
+			setInputBit(bitmap, inputRelHWheelHiRes)
 			return bitmap
 		}
 	case inputEventAbs:

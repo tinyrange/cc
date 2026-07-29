@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"reflect"
 	"testing"
 )
 
@@ -265,6 +266,61 @@ func TestAbsolutePointerReportsMouseWheel(t *testing.T) {
 	}
 	if len(wheelEvents) != 2 || wheelEvents[0] != 1 || wheelEvents[1] != -1 {
 		t.Fatalf("wheel events = %v, want [1 -1]", wheelEvents)
+	}
+}
+
+func TestAbsolutePointerReportsHighResolutionScroll(t *testing.T) {
+	mem := make(testGuestMemory, 64<<10)
+	input := NewAbsolutePointerInput(0x1000, 0x1000, 11, 800, 600)
+	input.Attach(mem, &testIRQ{})
+
+	relativeEvents := input.eventBitmapLocked(inputEventRel)
+	for _, code := range []uint16{inputRelHWheel, inputRelWheel, inputRelWheelHiRes, inputRelHWheelHiRes} {
+		if relativeEvents[code/8]&(1<<(code%8)) == 0 {
+			t.Fatalf("pointer does not advertise relative event %d", code)
+		}
+	}
+
+	q := &input.queues[inputQueueEvent]
+	q.size = 16
+	q.ready = true
+	q.descAddr = 0x2000
+	q.availAddr = 0x3000
+	q.usedAddr = 0x3800
+	for index := uint16(0); index < q.size; index++ {
+		writeDesc(mem, q.descAddr+uint64(index)*16, 0x4000+uint64(index)*8, 8, descFWrite, 0)
+		binary.LittleEndian.PutUint16(mem[q.availAddr+4+uint64(index)*2:], index)
+	}
+	binary.LittleEndian.PutUint16(mem[q.availAddr+2:], q.size)
+
+	if err := input.ScrollEvent(30, 40); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.ScrollEvent(90, 80); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []InputEvent
+	for index := uint16(0); index < q.usedIdx; index++ {
+		raw := mem[0x4000+uint64(index)*8:]
+		events = append(events, InputEvent{
+			Type:  binary.LittleEndian.Uint16(raw),
+			Code:  binary.LittleEndian.Uint16(raw[2:]),
+			Value: int32(binary.LittleEndian.Uint32(raw[4:])),
+		})
+	}
+	want := []InputEvent{
+		{Type: inputEventRel, Code: inputRelHWheelHiRes, Value: 30},
+		{Type: inputEventRel, Code: inputRelWheelHiRes, Value: 40},
+		{Type: inputEventSyn, Code: inputSynReport},
+		{Type: inputEventRel, Code: inputRelHWheelHiRes, Value: 90},
+		{Type: inputEventRel, Code: inputRelHWheel, Value: 1},
+		{Type: inputEventRel, Code: inputRelWheelHiRes, Value: 80},
+		{Type: inputEventRel, Code: inputRelWheel, Value: 1},
+		{Type: inputEventSyn, Code: inputSynReport},
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %#v, want %#v", events, want)
 	}
 }
 

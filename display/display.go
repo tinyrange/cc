@@ -29,3 +29,10 @@ type Session interface {
 	SetClipboard(text string)
 	GuestClipboard() (text string, generation uint64)
 }
+
+// HighResolutionScroller is implemented by display sessions that accept
+// horizontal and vertical wheel movement in v120 units, where 120 is one
+// conventional wheel detent.
+type HighResolutionScroller interface {
+	Scroll(deltaX120, deltaY120 int32) error
+}
