@@ -54,6 +54,15 @@ func TestWorkerControlTransportRequiresTLSForTCP(t *testing.T) {
 	}
 }
 
+func TestExplicitCacheKeepsRuntimeArtifactsInsideCache(t *testing.T) {
+	root := t.TempDir()
+	got := resolveRuntimeRoot(root, root)
+	want := filepath.Join(root, "runtime")
+	if got != want {
+		t.Fatalf("runtime root = %q, want %q", got, want)
+	}
+}
+
 func TestRunServerUsesConfiguredStartupWriter(t *testing.T) {
 	var startup bytes.Buffer
 	shutdownErr := make(chan error, 1)
