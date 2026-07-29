@@ -388,6 +388,7 @@ func TestRuntimeCancelsInteractiveShellWithBlockedForegroundCommand(t *testing.T
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
 		ID: "cancel-interactive-shell", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
 	})
+	defer inst.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	inputs := make(chan client.ExecInput, 1)
 	inputs <- client.ExecInput{Kind: "stdin", Data: []byte("trap '' TERM INT\nprintf 'ready\\n'\nsleep 60\n")}
@@ -452,6 +453,7 @@ func TestRuntimeArchiveControlsInitializeUserHomeAndPreserveHardLinks(t *testing
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
 		ID: "archive-user-home", Image: env.imageName, MemoryMB: env.memoryMB, CPUs: 1,
 	})
+	defer inst.Close()
 	rootFirst := execInRuntimeRequest(t, inst, client.ExecRequest{
 		Command: []string{"/bin/true"},
 		WorkDir: "/home/cc",
@@ -1374,7 +1376,11 @@ func TestRuntimePersistentLinuxTTYStreamsControlFD(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
 	defer cancel()
 	const instanceID = "tty-control"
-	guestWorkDir := "/host" + t.TempDir()
+	hostWorkDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize TTY workdir: %v", err)
+	}
+	guestWorkDir := "/host" + hostWorkDir
 	share := client.ShareMount{
 		Source:   "/",
 		Mount:    "/host",
@@ -1424,7 +1430,7 @@ __vmsh_run() {
 }
 __vmsh_report ready 0
 while IFS= read -r __vmsh_line; do eval "$__vmsh_line"; done`
-	err := manager.RunStreamIn(ctx, instanceID, client.RunRequest{
+	err = manager.RunStreamIn(ctx, instanceID, client.RunRequest{
 		Image:   env.imageName,
 		Command: []string{"sh", "-lc", persistentCommand},
 		Env: []string{
@@ -1675,6 +1681,7 @@ func TestRuntimePersistentCancelAndCloseDuringLongRunningExec(t *testing.T) {
 func TestRuntimeGuestPoweroffTerminatesSessionAndActiveCommand(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{})
+	defer inst.Close()
 	execDone := make(chan error, 1)
 	go func() {
 		_, err := inst.Exec(context.Background(), client.ExecRequest{Command: []string{"poweroff", "-f"}, User: "root"})

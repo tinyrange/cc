@@ -971,6 +971,8 @@ func (c *simpleVsockConn) Read(b []byte) (int, error) {
 		return n, nil
 	case <-c.closed:
 		return 0, io.EOF
+	case <-c.peer.closed:
+		return 0, io.EOF
 	}
 }
 

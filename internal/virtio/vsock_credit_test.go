@@ -1,9 +1,45 @@
 package virtio
 
 import (
+	"io"
 	"testing"
 	"time"
 )
+
+func TestSimpleVsockPeerCloseUnblocksRead(t *testing.T) {
+	backend := NewSimpleVsockBackend()
+	listener, err := backend.Listen(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	clientConn, err := backend.Connect(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	if err := serverConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err != io.EOF {
+			t.Fatalf("read after peer close = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer close did not unblock read")
+	}
+}
 
 func TestVsockBackendDeliveryWaitsForPeerCredit(t *testing.T) {
 	backend := NewSimpleVsockBackend()
