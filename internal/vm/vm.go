@@ -414,6 +414,13 @@ func (s desktopSession) Pointer(x, y uint32, buttons, previousButtons uint8) err
 	return s.desktop.Pointer.PointerEvent(x, y, buttons, previousButtons)
 }
 
+func (s desktopSession) Scroll(deltaX120, deltaY120 int32) error {
+	if s.desktop.Pointer == nil {
+		return nil
+	}
+	return s.desktop.Pointer.ScrollEvent(deltaX120, deltaY120)
+}
+
 func (s desktopSession) SetClipboard(text string) {
 	if s.desktop.Clipboard != nil {
 		s.desktop.Clipboard.SetFromFrontend(text)

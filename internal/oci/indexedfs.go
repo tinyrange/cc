@@ -52,12 +52,7 @@ type indexedNode struct {
 }
 
 func encodeFSIndex(nodes map[string]*indexedNode) ([]byte, error) {
-	out := make([]indexedNode, 0, len(nodes))
-	for _, node := range nodes {
-		out = append(out, *node)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return json.MarshalIndent(out, "", "  ")
+	return encodeBinaryFSIndexMap(nodes)
 }
 
 func encodeIndexedNodes(nodes []indexedNode) ([]byte, error) {
@@ -67,6 +62,9 @@ func encodeIndexedNodes(nodes []indexedNode) ([]byte, error) {
 }
 
 func decodeFSIndex(data []byte) ([]indexedNode, error) {
+	if len(data) >= len(fsIndexMagic) && string(data[:len(fsIndexMagic)]) == fsIndexMagic {
+		return decodeBinaryFSIndex(data)
+	}
 	var out []indexedNode
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, err
@@ -789,7 +787,9 @@ func applyIndexedLayerReader(
 		if node.Kind == indexedKindSymlink {
 			meta.LinkTarget = node.LinkTarget
 		}
-		entries[node.Path] = meta
+		if entries != nil {
+			entries[node.Path] = meta
+		}
 	}
 }
 
@@ -814,10 +814,12 @@ func ensureIndexedParents(merged map[string]*indexedNode, entries map[string]fsm
 				GID:  0,
 				RDev: 0,
 			}
-			entries[parent] = fsmeta.Entry{
-				UID:  0,
-				GID:  0,
-				Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755),
+			if entries != nil {
+				entries[parent] = fsmeta.Entry{
+					UID:  0,
+					GID:  0,
+					Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755),
+				}
 			}
 			parent = path.Dir(parent)
 		}
@@ -835,7 +837,9 @@ func removeMergedPath(merged map[string]*indexedNode, entries map[string]fsmeta.
 	for key := range merged {
 		if key == target || strings.HasPrefix(key, target+"/") {
 			delete(merged, key)
-			delete(entries, key)
+			if entries != nil {
+				delete(entries, key)
+			}
 		}
 	}
 }
