@@ -624,8 +624,8 @@ func (p *bootPIT) armChannel0Locked() {
 		reload = 0xffff
 	}
 	period := time.Duration(reload) * time.Second / 1193182
-	if period <= 0 {
-		period = time.Millisecond
+	if period < 10*time.Millisecond {
+		period = 10 * time.Millisecond
 	}
 	p.ticker = time.NewTicker(period)
 	ticker := p.ticker
@@ -707,9 +707,12 @@ func (a *bootIOAPIC) RestoreState(state bootIOAPICState) {
 }
 
 type bootIOAPICRoute struct {
-	line   uint8
-	vector uint8
-	level  bool
+	line            uint8
+	vector          uint8
+	level           bool
+	interruptType   interruptType
+	destinationMode interruptDestinationMode
+	destination     uint32
 }
 
 func (a *bootIOAPIC) init() {
@@ -862,9 +865,12 @@ func (a *bootIOAPIC) routeForLineLocked(line uint8) (bootIOAPICRoute, bool) {
 	}
 	level := entry&(1<<15) != 0
 	return bootIOAPICRoute{
-		line:   line,
-		vector: vector,
-		level:  level,
+		line:            line,
+		vector:          vector,
+		level:           level,
+		interruptType:   ioapicInterruptType(entry),
+		destinationMode: ioapicDestinationMode(entry),
+		destination:     uint32(entry >> 56),
 	}, true
 }
 
@@ -957,8 +963,25 @@ func (a *bootIOAPIC) evaluateLocked(line uint8, edge bool) (bootIOAPICRoute, boo
 		return bootIOAPICRoute{}, false
 	}
 	return bootIOAPICRoute{
-		line:   line,
-		vector: vector,
-		level:  level,
+		line:            line,
+		vector:          vector,
+		level:           level,
+		interruptType:   ioapicInterruptType(entry),
+		destinationMode: ioapicDestinationMode(entry),
+		destination:     uint32(entry >> 56),
 	}, true
+}
+
+func ioapicInterruptType(entry uint64) interruptType {
+	if (entry>>8)&0x7 == 1 {
+		return interruptTypeLowestPriority
+	}
+	return interruptTypeFixed
+}
+
+func ioapicDestinationMode(entry uint64) interruptDestinationMode {
+	if entry&(1<<11) != 0 {
+		return interruptDestinationLogical
+	}
+	return interruptDestinationPhysical
 }

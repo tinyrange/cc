@@ -159,6 +159,7 @@ type ContainerRunResult = vmruntime.RunResult
 
 type ContainerSession struct {
 	cancel            context.CancelFunc
+	runCtx            context.Context
 	doneCh            chan sessionRunResult
 	closeDone         <-chan struct{}
 	image             *oci.Image
@@ -631,7 +632,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	timingLog("session.Exec writeControlPayload took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 
-	beginSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	waitCtx, cancelWait := s.operationContext(ctx)
+	defer cancelWait()
+	beginSegment, err := s.transcript.WaitFor(waitCtx, start, func(text string) bool {
 		return hasManagedExecBegin(text, id)
 	})
 	if err != nil {
@@ -641,7 +644,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, s.withControlDebug("wait for exec begin", err)
 	}
 	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
-	firstByteSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+	firstByteSegment, err := s.transcript.WaitFor(waitCtx, start, func(text string) bool {
 		return hasManagedExecFirstByte(text, id)
 	})
 	if err != nil {
@@ -651,7 +654,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, s.withControlDebug("wait for exec first byte", err)
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
-	segment, err := s.transcript.WaitForCommand(ctx, start, id, func(text string) bool {
+	segment, err := s.transcript.WaitForCommand(waitCtx, start, id, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -680,6 +683,18 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	timingLog("session.Exec total=%s argv=%q id=%s exit=%d output_bytes=%d", time.Since(startTime), req.Command, id, exitCode, len(output))
 	return client.ExecResponse{ExitCode: exitCode, Output: output}, nil
+}
+
+func (s *ContainerSession) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	opCtx, cancel := context.WithCancel(ctx)
+	if s == nil || s.runCtx == nil {
+		return opCtx, cancel
+	}
+	stop := context.AfterFunc(s.runCtx, cancel)
+	return opCtx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (s *ContainerSession) withControlDebug(op string, err error) error {
@@ -912,8 +927,14 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 			}
 		},
 		Wait: func(context.Context) error {
-			time.Sleep(5 * time.Millisecond)
-			return nil
+			select {
+			case <-s.runCtx.Done():
+				return fmt.Errorf("VM exited during exec")
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+				return nil
+			}
 		},
 	})
 }
@@ -1022,6 +1043,19 @@ func recordCount(recorder *timing.Recorder, name string, count int) {
 }
 
 func (s *ContainerSession) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.closeDone != nil {
+		select {
+		case <-s.closeDone:
+		case <-time.After(15 * time.Second):
+			return fmt.Errorf("container session did not stop within 15s")
+		}
+	}
 	if s.control != nil {
 		_ = s.control.Close()
 	}
@@ -1036,12 +1070,6 @@ func (s *ContainerSession) Close() error {
 	}
 	if s.vsock != nil {
 		_ = s.vsock.Close()
-	}
-	s.cancel()
-	select {
-	case <-s.closeDone:
-	case <-time.After(15 * time.Second):
-		return fmt.Errorf("container session did not stop within 15s")
 	}
 	var closeErr error
 	if s.fsCloseErr != nil {
@@ -1473,6 +1501,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			_ = vm.Close()
 			exitTiming.Dump()
 		}()
+		defer cancel()
 		runner := newVMRunManager(vm)
 		for {
 			active := activeExecs.Load() > 0
@@ -1553,7 +1582,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 					return
 				}
 				if halt {
-					doneCh <- sessionRunResult{err: fmt.Errorf("guest halted while instance was running\nserial:\n%s\nvirtio-fs:\n%s", serialOut.String(), fsTrace.String())}
+					doneCh <- sessionRunResult{}
 					return
 				}
 			default:
@@ -1612,6 +1641,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		displayListenersOwned = false
 		return &ContainerSession{
 			cancel:            cancel,
+			runCtx:            runCtx,
 			doneCh:            doneCh,
 			closeDone:         closeDone,
 			image:             req.Image,

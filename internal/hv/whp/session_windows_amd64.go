@@ -53,15 +53,21 @@ const (
 	execKillWait       = 2 * time.Second
 )
 
-func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
-	return StartManagedSessionWithNet(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, onEvent)
+func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNet(ctx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, nil, onEvent)
 }
 
-func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
-	return StartManagedSessionWithNetOptions(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, netdev, ManagedSessionOptions{}, onEvent)
+func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNetOptions(ctx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, netdev, ManagedSessionOptions{}, onEvent)
 }
 
-func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, opts ManagedSessionOptions, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	if cpus <= 0 {
+		cpus = 1
+	}
+	if cpus > 1 && (strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "") {
+		return nil, fmt.Errorf("WHP startup snapshots currently support only one vCPU")
+	}
 	if (strings.TrimSpace(opts.SnapshotDir) != "" || strings.TrimSpace(opts.RestoreSnapshot) != "") &&
 		(opts.DisplayWidth != 0 || opts.DisplayHeight != 0) {
 		return nil, fmt.Errorf("display-enabled VMs do not support startup snapshots")
@@ -104,7 +110,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = bootWriter
 	}
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, displayDevices, strings.TrimSpace(opts.SnapshotDir), serialWriter)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, cpus, dmesg, fsdevs, vsock, netdev, displayDevices, strings.TrimSpace(opts.SnapshotDir), serialWriter)
 	if err != nil {
 		closeManagedDisplayListeners(clipboardListener, displayListener)
 		_ = listener.Close()
@@ -189,6 +195,17 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 			_ = bootWriter.Close()
 		}
 		return nil, transcriptError(fmt.Errorf("guest reported boot failure"), serialOut.String(), controlTranscript.String())
+	}
+	if err := onlineManagedVCPUs(ctx, control, controlTranscript, cpus); err != nil {
+		cancel()
+		closeManagedDisplayListeners(clipboardListener, displayListener)
+		_ = control.Close()
+		_ = listener.Close()
+		vsock.Close()
+		if bootWriter != nil {
+			_ = bootWriter.Close()
+		}
+		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}
 	if err := emitManagedBootStatus(onEvent, "guest ready"); err != nil {
 		cancel()

@@ -33,6 +33,7 @@ func run() error {
 	var simgPath string
 	var timeout time.Duration
 	var memoryMB uint64
+	var cpus int
 	var dmesg bool
 	var runCommand string
 	var stdin string
@@ -45,6 +46,7 @@ func run() error {
 	flag.StringVar(&simgPath, "simg", "./fixtures/alpine.simg", "SIMG root filesystem")
 	flag.DurationVar(&timeout, "timeout", 30*time.Second, "boot timeout")
 	flag.Uint64Var(&memoryMB, "memory-mb", 512, "guest memory in MiB")
+	flag.IntVar(&cpus, "cpus", 1, "guest CPUs")
 	flag.BoolVar(&dmesg, "dmesg", false, "enable serial console and dmesg capture")
 	flag.StringVar(&runCommand, "exec", "", "optional command to run after boot, split on spaces")
 	flag.StringVar(&stdin, "stdin", "", "stdin for the optional command")
@@ -61,6 +63,12 @@ func run() error {
 	}
 	if warmup < 0 {
 		return fmt.Errorf("warmup must be non-negative")
+	}
+	if cpus <= 0 {
+		return fmt.Errorf("cpus must be positive")
+	}
+	if restoreSnapshot != "" && cpus > 1 {
+		return fmt.Errorf("WHP startup snapshots currently support only one vCPU")
 	}
 	if cacheDir == "" {
 		dir, err := os.MkdirTemp("", "cc-tinyboot-*")
@@ -165,7 +173,7 @@ func run() error {
 				runCancel()
 				return fmt.Errorf("build initramfs run %d: %w", i, err)
 			}
-			session, err = whp.StartManagedSessionWithNetOptions(runCtx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, whp.ManagedSessionOptions{
+			session, err = whp.StartManagedSessionWithNetOptions(runCtx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, nil, whp.ManagedSessionOptions{
 				SnapshotDir: snapshotDir,
 			}, onEvent)
 		}

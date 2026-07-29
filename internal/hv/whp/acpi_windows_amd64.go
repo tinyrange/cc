@@ -15,12 +15,12 @@ const (
 	whpZeroPageRSDPAddr = 112
 )
 
-func installBootACPI(memory []byte) error {
+func installBootACPI(memory []byte, cpus int) error {
 	if len(memory) < whpACPITableAddress+0x10000 {
 		return fmt.Errorf("guest memory too small for ACPI tables")
 	}
 	writer := acpiTableWriter{base: whpACPITableAddress}
-	madt := writer.append("APIC", 1, "CCWHPAPC", buildBootMADT())
+	madt := writer.append("APIC", 1, "CCWHPAPC", buildBootMADT(cpus))
 	hpet := writer.append("HPET", 1, "CCWHPHPT", buildBootHPET())
 	xsdt := writer.append("XSDT", 1, "CCWHPXSD", buildBootXSDT([]uint64{madt, hpet}))
 	copy(memory[whpACPITableAddress:], writer.data)
@@ -28,8 +28,8 @@ func installBootACPI(memory []byte) error {
 	return nil
 }
 
-func installBootACPIForZeroPage(memory []byte, zeroPageGPA uint64) error {
-	if err := installBootACPI(memory); err != nil {
+func installBootACPIForZeroPage(memory []byte, zeroPageGPA uint64, cpus int) error {
+	if err := installBootACPI(memory, cpus); err != nil {
 		return err
 	}
 	rsdpOff := zeroPageGPA + whpZeroPageRSDPAddr
@@ -78,13 +78,21 @@ func buildBootXSDT(entries []uint64) []byte {
 	return body
 }
 
-func buildBootMADT() []byte {
+func buildBootMADT(cpus int) []byte {
+	if cpus <= 0 {
+		cpus = 1
+	}
+	if cpus > 255 {
+		cpus = 255
+	}
 	var body []byte
 	body = binary.LittleEndian.AppendUint32(body, 0xfee00000)
 	body = binary.LittleEndian.AppendUint32(body, 1)
 
-	body = append(body, 0, 8, 0, 0)
-	body = binary.LittleEndian.AppendUint32(body, 1)
+	for cpu := 0; cpu < cpus; cpu++ {
+		body = append(body, 0, 8, byte(cpu), byte(cpu))
+		body = binary.LittleEndian.AppendUint32(body, 1)
+	}
 
 	body = append(body, 1, 12, 0, 0)
 	body = binary.LittleEndian.AppendUint32(body, ioapicBaseAddress)

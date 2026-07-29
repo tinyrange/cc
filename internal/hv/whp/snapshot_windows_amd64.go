@@ -347,7 +347,7 @@ func restoreManagedVMFromSnapshot(manifest whpSnapshotManifest, memPath string, 
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("map snapshot memory: %w", err)
 	}
-	vm, err := newVMWithAllocation(memorySize, true, true, mem)
+	vm, err := newVMWithAllocation(memorySize, true, true, 1, mem)
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestBootMADTMarksVirtioIRQsLevelTriggered(t *testing.T) {
-	body := buildBootMADT()
+	body := buildBootMADT(1)
 	overrides := make(map[byte]uint16)
 	for offset := 28; offset+2 <= len(body); {
 		length := int(body[offset+1])

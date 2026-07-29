@@ -229,7 +229,7 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	vm, err := newBootVM(amd64vm.MemorySizeBytes(cfg.MemoryMB))
+	vm, err := newBootVM(amd64vm.MemorySizeBytes(cfg.MemoryMB), 1)
 	if err != nil {
 		_ = ln.Close()
 		return nil, err
@@ -475,7 +475,7 @@ func runBSDManagedVM(ctx context.Context, guestName string, vm *VM, platform *bo
 		case runVPExitReasonX64ApicEoi:
 			platform.HandleEOI(raw.apicEoi().InterruptVector)
 		case runVPExitReasonX64MsrAccess:
-			if err := handleMSRAccess(vm, exit, &raw); err != nil {
+			if err := handleMSRAccess(vm, 0, exit, &raw); err != nil {
 				return fmt.Errorf("handle msr at rip=%#x: %w\nserial:\n%s", exit.RIP, err, serialOut.String())
 			}
 		case runVPExitReasonX64InterruptWindow:
@@ -491,17 +491,17 @@ func runBSDManagedVM(ctx context.Context, guestName string, vm *VM, platform *bo
 	}
 }
 
-func handleMSRAccess(vm *VM, exit Exit, raw *runVPExitContext) error {
+func handleMSRAccess(vm *VM, vpIndex uint32, exit Exit, raw *runVPExitContext) error {
 	msr := raw.msrAccess()
 	nextRIP := exit.RIP + uint64(raw.instructionLength())
 	if raw.instructionLength() == 0 {
 		nextRIP = exit.RIP + 2
 	}
 	if msr.AccessInfo.isWrite() {
-		return vm.SetRIP(nextRIP)
+		return vm.SetVCPURIP(vpIndex, nextRIP)
 	}
 	value := readMSR(msr.MSRNumber)
-	return vm.SetRegisters(map[registerName]uint64{
+	return vm.SetVCPURegisters(vpIndex, map[registerName]uint64{
 		registerRax: value & 0xffffffff,
 		registerRdx: value >> 32,
 		registerRip: nextRIP,

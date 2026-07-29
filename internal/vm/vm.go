@@ -228,9 +228,11 @@ func HostCapabilities() client.CapabilitiesResponse {
 		(runtime.GOOS == "windows" && runtime.GOARCH == "amd64") {
 		caps.SupportsDisplay = true
 	}
-	if runtime.GOOS == "windows" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		caps.MaxInstances = 1
 		caps.Notes = append(caps.Notes, "Windows WHP currently supports one vCPU per instance")
+	} else if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" {
+		caps.MaxInstances = 1
 	}
 	if supported, err := hv.NestedVirtualizationSupported(); err == nil && supported {
 		caps.SupportsNestedVirt = true
@@ -251,6 +253,8 @@ func resourceLimitsForHost(goos, goarch string) []string {
 	case goos == "linux" && goarch == "amd64":
 		limits = append(limits, "cpus")
 	case goos == "darwin" && goarch == "arm64":
+		limits = append(limits, "cpus")
+	case goos == "windows" && goarch == "amd64":
 		limits = append(limits, "cpus")
 	}
 	return limits

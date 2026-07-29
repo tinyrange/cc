@@ -280,6 +280,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			_ = vm.Close()
 			exitTiming.Dump()
 		}()
+		defer cancel()
 		runner := newVMRunManager(vm)
 		for {
 			active := activeExecs.Load() > 0
@@ -340,7 +341,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 					return
 				}
 				if halt {
-					doneCh <- sessionRunResult{err: fmt.Errorf("guest halted while restored instance was running\n%s\nserial:\n%s\nvirtio-fs:\n%s", vsock.Summary(), serialOut.String(), fsTrace.String())}
+					doneCh <- sessionRunResult{}
 					return
 				}
 			default:
@@ -386,7 +387,7 @@ func StartContainerFromSnapshot(ctx context.Context, req ContainerRunRequest, sn
 			}
 		}
 		session := &ContainerSession{
-			cancel: cancel, closeDone: closeDone, image: req.Image, baseEnv: baseEnv, workDir: workDir,
+			cancel: cancel, runCtx: runCtx, doneCh: doneCh, closeDone: closeDone, image: req.Image, baseEnv: baseEnv, workDir: workDir,
 			dmesg: req.Dmesg, uart: uart, control: res.conn, transcript: controlTranscript, serialOut: serialOut,
 			listener: listener, vsock: vsock, rootFS: rootFS, fsdevs: fsdevs, shares: shareState,
 			balloon:     balloon,

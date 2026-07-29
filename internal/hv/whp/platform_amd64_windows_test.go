@@ -2,7 +2,11 @@
 
 package whp
 
-import "testing"
+import (
+	"testing"
+
+	"j5.nz/cc/internal/virtio"
+)
 
 func TestBootPICLevelLineResamplesUntilDeasserted(t *testing.T) {
 	var pic bootPIC
@@ -140,5 +144,44 @@ func TestPendingInterruptionWaitsUntilGuestEnablesInterrupts(t *testing.T) {
 	ctx.VpContext.Rflags |= 1 << 9
 	if !canSetPendingInterruption(ctx, 0x3b) {
 		t.Fatal("pending interruption rejected after guest enabled interrupts")
+	}
+}
+
+func TestBootIOAPICRoutePreservesVirtualCPUDestination(t *testing.T) {
+	var ioapic bootIOAPIC
+	ioapic.init()
+	ioapic.redir[5] = 0x51 | 1<<8 | 1<<11 | uint64(0x04)<<56
+
+	route, ok := ioapic.routeForLine(5)
+	if !ok {
+		t.Fatal("routeForLine(5) did not return the configured route")
+	}
+	if route.vector != 0x51 || route.interruptType != interruptTypeLowestPriority {
+		t.Fatalf("route vector/type = %#x/%d, want 0x51/%d", route.vector, route.interruptType, interruptTypeLowestPriority)
+	}
+	if route.destinationMode != interruptDestinationLogical || route.destination != 0x04 {
+		t.Fatalf("route destination = mode %d value %#x, want logical/0x04", route.destinationMode, route.destination)
+	}
+}
+
+func TestVirtioPendingInterruptTargetsRoutedVCPU(t *testing.T) {
+	platform := &bootPlatform{
+		vm:     &VM{vcpuCount: 4},
+		fsdevs: []*virtio.FS{{IRQ: 5}},
+	}
+	route := bootIOAPICRoute{
+		line:            5,
+		vector:          0x51,
+		destinationMode: interruptDestinationPhysical,
+		destination:     3,
+	}
+	if target := platform.pendingRouteVCPU(route); target != 3 {
+		t.Fatalf("pending physical virtio IRQ target = %d, want vCPU 3", target)
+	}
+
+	route.destinationMode = interruptDestinationLogical
+	route.destination = 0x04
+	if target := platform.pendingRouteVCPU(route); target != 2 {
+		t.Fatalf("pending logical virtio IRQ target = %d, want vCPU 2", target)
 	}
 }
