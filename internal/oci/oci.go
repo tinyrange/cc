@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -48,11 +49,16 @@ const (
 const internalScratchSource = "scratch"
 const maxRegistryMetadataBytes int64 = 16 << 20
 const defaultOCIBlobDownloadWorkers = 4
+const defaultOCIBlobInactivityTimeout = 2 * time.Minute
+const maximumOCIBlobRetryDelay = 30 * time.Second
+
+var ociBlobRetryDelay = time.Second
 
 type Store struct {
-	root          string
-	httpClient    *http.Client
-	CVMFSActivity func(int)
+	root            string
+	sharedCacheRoot string
+	httpClient      *http.Client
+	CVMFSActivity   func(int)
 
 	mu          sync.Mutex
 	downloading map[string]bool
@@ -249,6 +255,19 @@ func NewStore(root string) *Store {
 		opened:      map[string]*Image{},
 		opening:     map[string]*imageOpenCall{},
 	}
+}
+
+func NewStoreWithSharedCache(root, sharedRoot string) *Store {
+	store := NewStore(root)
+	store.sharedCacheRoot = strings.TrimSpace(sharedRoot)
+	return store
+}
+
+func (s *Store) newSharedStore() *Store {
+	root := s.sharedRoot()
+	shared := NewStoreWithSharedCache(root, root)
+	shared.httpClient = s.httpClient
+	return shared
 }
 
 func (s *Store) Root() string {
@@ -562,8 +581,7 @@ func (s *Store) PlanPull(ctx context.Context, name, source string, options ...Pu
 		Architecture: architecture,
 	}
 	sharedName := sharedImageKey(spec, opts.Architecture)
-	shared := NewStore(s.sharedRoot())
-	shared.httpClient = s.httpClient
+	shared := s.newSharedStore()
 	plan.Installed = pullPlanImageInstalled(s, name, spec, architecture)
 	if spec.Kind != SourceKindOCI {
 		if _, ok, err := s.existingState(ctx, name, spec, opts.Architecture); err != nil {
@@ -646,8 +664,7 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options 
 	}
 
 	sharedName := sharedImageKey(spec, options.Architecture)
-	shared := NewStore(s.sharedRoot())
-	shared.httpClient = s.httpClient
+	shared := s.newSharedStore()
 	if options.Refresh {
 		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
 			return err
@@ -1221,12 +1238,51 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 				ETASeconds:       eta,
 			})
 		}
+		reportFirstLayerDownload := func(downloaded int64) {
+			pipelineMu.Lock()
+			streamedDownloadedBytes = max(streamedDownloadedBytes, min(layer.Size, max(0, downloaded)))
+			downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
+			downloadProgress := ratio(downloadedLayerBytes, totalLayerBytes)
+			indexProgress := ratio(preparedLayerWork, totalLayerBytes)
+			progress := ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
+			bytesDownloaded := downloadedLayerBytes
+			pipelineMu.Unlock()
+			report(client.ProgressEvent{
+				Status:           "downloading",
+				Artifact:         name,
+				Blob:             layer.Digest,
+				Progress:         progress,
+				DownloadProgress: downloadProgress,
+				IndexProgress:    indexProgress,
+				BytesDownloaded:  bytesDownloaded,
+				BytesTotal:       totalLayerBytes,
+				FilesDownloaded:  int64(layerIndex),
+				FilesTotal:       int64(len(mani.Layers)),
+			})
+		}
 		reportPrepare(0, streamFirstLayer && layerIndex == 0)
 		if streamFirstLayer && layerIndex == 0 {
 			if err := s.downloadAndApplyLayer(ctx, reg, imageName, layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
 				reportPrepare(compressedBytes, true)
 			}); err != nil {
-				return fmt.Errorf("download and prepare layer %s: %w", layer.Digest, err)
+				if !errors.Is(err, errStreamedLayerIncomplete) || ctx.Err() != nil {
+					return fmt.Errorf("download and prepare layer %s: %w", layer.Digest, err)
+				}
+				build = newIndexedBuildState()
+				pipelineMu.Lock()
+				preparedLayerWork = preparedLayerBytes
+				pipelineMu.Unlock()
+				resumeProgress := newParallelBlobProgress(name, layer.Size, func(event client.ProgressEvent) {
+					reportFirstLayerDownload(event.BytesDownloaded)
+				})
+				if err := s.cacheLayerBlob(ctx, reg, imageName, layer, resumeProgress); err != nil {
+					return fmt.Errorf("resume layer %s: %w", layer.Digest, err)
+				}
+				if err := s.writeAndApplyCachedLayer(layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
+					reportPrepare(compressedBytes, false)
+				}); err != nil {
+					return fmt.Errorf("prepare resumed layer %s: %w", layer.Digest, err)
+				}
 			}
 		} else {
 			if err := downloads.waitLayer(ctx, layer.Digest); err != nil {
@@ -1367,7 +1423,7 @@ func (s *Store) existingState(ctx context.Context, name string, spec SourceSpec,
 }
 
 func (s *Store) restoreFromSharedCache(ctx context.Context, name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
-	shared := NewStore(s.sharedRoot())
+	shared := s.newSharedStore()
 	sharedName := sharedImageKey(spec, architecture)
 	meta, err := shared.readMetadata(sharedName)
 	if err != nil {
@@ -1729,36 +1785,295 @@ func (s *Store) cacheLayerBlob(
 			return fmt.Errorf("remove invalid cached layer: %w", err)
 		}
 	}
-	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
 	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
 		return err
 	}
-	tmp := blobPath + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	partialPath := blobPath + ".partial"
+	out, err := os.OpenFile(partialPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
-	tracked := progress.reader(resp.Body, layer.Digest)
-	resp.Body = struct {
-		io.Reader
-		io.Closer
-	}{Reader: tracked, Closer: resp.Body}
-	_, copyErr := download.Copy(ctx, out, resp, download.Budget{MaxBytes: layer.Size, ExpectedBytes: layer.Size, ExpectedSHA256: layer.Digest})
-	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(tmp)
-		return errors.Join(copyErr, closeErr)
+	defer out.Close()
+
+	offset, digest, err := preparePartialBlob(out, partialPath, layer)
+	if err != nil {
+		return err
 	}
-	if err := os.Rename(tmp, blobPath); err != nil {
-		_ = os.Remove(tmp)
+	progress.set(layer.Digest, offset)
+
+	delay := ociBlobRetryDelay
+	integrityRestarts := 0
+	var actualDigest string
+
+downloadPartial:
+	for offset < layer.Size {
+		attemptCtx, attemptWatchdog, timedOut := withBlobInactivityTimeout(ctx, defaultOCIBlobInactivityTimeout)
+		resp, err := reg.doRange(attemptCtx, "/"+imageName+"/blobs/"+layer.Digest, offset)
+		if err != nil {
+			attemptWatchdog.stop()
+			attemptErr := err
+			if timedOut() && ctx.Err() == nil {
+				attemptErr = errBlobDownloadInactive
+			}
+			if !retryableBlobDownloadError(ctx, attemptErr) {
+				return attemptErr
+			}
+			if err := waitBlobRetry(ctx, delay); err != nil {
+				return err
+			}
+			delay = min(delay*2, maximumOCIBlobRetryDelay)
+			continue
+		}
+
+		if offset > 0 && resp.StatusCode == http.StatusOK {
+			if err := out.Truncate(0); err != nil {
+				resp.Body.Close()
+				attemptWatchdog.stop()
+				return fmt.Errorf("restart partial layer: %w", err)
+			}
+			if _, err := out.Seek(0, io.SeekStart); err != nil {
+				resp.Body.Close()
+				attemptWatchdog.stop()
+				return fmt.Errorf("seek restarted partial layer: %w", err)
+			}
+			offset = 0
+			digest = sha256.New()
+			progress.set(layer.Digest, 0)
+		} else if offset > 0 {
+			if err := validateBlobContentRange(resp, offset, layer.Size); err != nil {
+				resp.Body.Close()
+				attemptWatchdog.stop()
+				_ = os.Remove(partialPath)
+				return err
+			}
+		}
+
+		remaining := layer.Size - offset
+		if resp.ContentLength >= 0 && resp.ContentLength != remaining {
+			resp.Body.Close()
+			attemptWatchdog.stop()
+			return &download.LengthError{Expected: remaining, Actual: resp.ContentLength}
+		}
+		tracked := progress.reader(resp.Body, layer.Digest)
+		resp.Body = &activityBody{
+			ReadCloser: resp.Body,
+			onActivity: attemptWatchdog.activity,
+			reader:     tracked,
+		}
+		writer := &layerBlobWriter{dst: io.MultiWriter(out, digest)}
+		written, copyErr := download.Copy(attemptCtx, writer, resp, download.Budget{
+			MaxBytes:      remaining,
+			ExpectedBytes: remaining,
+		})
+		attemptWatchdog.stop()
+		closeErr := resp.Body.Close()
+		offset += written
+		if copyErr == nil && closeErr == nil {
+			continue
+		}
+		attemptErr := errors.Join(copyErr, closeErr)
+		if timedOut() && ctx.Err() == nil {
+			attemptErr = errBlobDownloadInactive
+		}
+		if !retryableBlobDownloadError(ctx, attemptErr) {
+			return attemptErr
+		}
+		if err := waitBlobRetry(ctx, delay); err != nil {
+			return err
+		}
+		delay = min(delay*2, maximumOCIBlobRetryDelay)
+	}
+
+	actualDigest = "sha256:" + hex.EncodeToString(digest.Sum(nil))
+	if !strings.EqualFold(actualDigest, layer.Digest) {
+		if integrityRestarts == 0 {
+			if err := out.Truncate(0); err != nil {
+				return fmt.Errorf("discard corrupt partial layer: %w", err)
+			}
+			if _, err := out.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("seek restarted layer: %w", err)
+			}
+			offset = 0
+			digest = sha256.New()
+			delay = ociBlobRetryDelay
+			integrityRestarts++
+			progress.set(layer.Digest, 0)
+			goto downloadPartial
+		}
+		_ = os.Remove(partialPath)
+		return &download.DigestError{Expected: layer.Digest, Actual: actualDigest}
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("sync downloaded layer: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close downloaded layer: %w", err)
+	}
+	if err := os.Rename(partialPath, blobPath); err != nil {
 		return err
 	}
 	progress.complete(layer.Digest, layer.Size)
 	return nil
+}
+
+var errBlobDownloadInactive = errors.New("OCI blob download made no progress")
+
+type layerBlobWriteError struct{ err error }
+
+func (e *layerBlobWriteError) Error() string { return e.err.Error() }
+func (e *layerBlobWriteError) Unwrap() error { return e.err }
+
+type layerBlobWriter struct{ dst io.Writer }
+
+func (w *layerBlobWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if err != nil {
+		return n, &layerBlobWriteError{err: err}
+	}
+	return n, nil
+}
+
+func preparePartialBlob(out *os.File, partialPath string, layer descriptor) (int64, hash.Hash, error) {
+	info, err := out.Stat()
+	if err != nil {
+		return 0, nil, fmt.Errorf("inspect partial layer: %w", err)
+	}
+	if info.Size() < 0 || info.Size() > layer.Size {
+		if err := out.Truncate(0); err != nil {
+			return 0, nil, fmt.Errorf("discard invalid partial layer: %w", err)
+		}
+		info, err = out.Stat()
+		if err != nil {
+			return 0, nil, fmt.Errorf("inspect reset partial layer: %w", err)
+		}
+	}
+	digest := sha256.New()
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return 0, nil, fmt.Errorf("seek partial layer: %w", err)
+	}
+	if _, err := io.Copy(digest, io.LimitReader(out, info.Size())); err != nil {
+		return 0, nil, fmt.Errorf("hash partial layer %q: %w", partialPath, err)
+	}
+	if _, err := out.Seek(info.Size(), io.SeekStart); err != nil {
+		return 0, nil, fmt.Errorf("seek partial layer end: %w", err)
+	}
+	return info.Size(), digest, nil
+}
+
+func validateBlobContentRange(resp *http.Response, offset, total int64) error {
+	var start, end, responseTotal int64
+	if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &start, &end, &responseTotal); err != nil {
+		return fmt.Errorf("invalid OCI blob Content-Range %q", resp.Header.Get("Content-Range"))
+	}
+	if start != offset || end != total-1 || responseTotal != total {
+		return fmt.Errorf(
+			"unexpected OCI blob Content-Range %q for bytes %d-%d/%d",
+			resp.Header.Get("Content-Range"),
+			offset,
+			total-1,
+			total,
+		)
+	}
+	return nil
+}
+
+func retryableBlobDownloadError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var writeErr *layerBlobWriteError
+	if errors.As(err, &writeErr) {
+		return false
+	}
+	var limitErr *download.LimitError
+	if errors.As(err, &limitErr) {
+		return false
+	}
+	var digestErr *download.DigestError
+	if errors.As(err, &digestErr) {
+		return false
+	}
+	var statusErr *registryStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.code == http.StatusRequestTimeout ||
+			statusErr.code == http.StatusTooManyRequests ||
+			statusErr.code >= http.StatusInternalServerError
+	}
+	return true
+}
+
+func waitBlobRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type blobAttemptWatchdog struct {
+	mu       sync.Mutex
+	timer    *time.Timer
+	cancel   context.CancelFunc
+	finished bool
+	timedOut bool
+	timeout  time.Duration
+}
+
+func withBlobInactivityTimeout(parent context.Context, timeout time.Duration) (context.Context, *blobAttemptWatchdog, func() bool) {
+	ctx, cancel := context.WithCancel(parent)
+	watchdog := &blobAttemptWatchdog{cancel: cancel, timeout: timeout}
+	watchdog.timer = time.AfterFunc(timeout, func() {
+		watchdog.mu.Lock()
+		defer watchdog.mu.Unlock()
+		if watchdog.finished {
+			return
+		}
+		watchdog.timedOut = true
+		watchdog.cancel()
+	})
+	return ctx, watchdog, func() bool {
+		watchdog.mu.Lock()
+		defer watchdog.mu.Unlock()
+		return watchdog.timedOut
+	}
+}
+
+func (w *blobAttemptWatchdog) activity() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return
+	}
+	w.timer.Stop()
+	w.timer.Reset(w.timeout)
+}
+
+func (w *blobAttemptWatchdog) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return
+	}
+	w.finished = true
+	w.timer.Stop()
+	w.cancel()
+}
+
+type activityBody struct {
+	io.ReadCloser
+	reader     io.Reader
+	onActivity func()
+}
+
+func (r *activityBody) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.onActivity()
+	}
+	return n, err
 }
 
 func (s *Store) cachedLayerBlobAvailable(layer descriptor) bool {
@@ -1776,51 +2091,81 @@ func (s *Store) downloadAndApplyLayer(
 	entries map[string]fsmeta.Entry,
 	progress func(int64),
 ) error {
-	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if err := download.BoundResponse(resp, layer.Size); err != nil {
-		return err
-	}
 	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
 	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
 		return err
 	}
-	tmpBlobPath := blobPath + ".tmp"
-	blob, err := os.OpenFile(tmpBlobPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	partialBlobPath := blobPath + ".partial"
+	if info, err := os.Stat(partialBlobPath); err == nil && info.Size() > 0 {
+		return errStreamedLayerIncomplete
+	}
+
+	attemptCtx, attemptWatchdog, timedOut := withBlobInactivityTimeout(ctx, defaultOCIBlobInactivityTimeout)
+	resp, err := reg.do(attemptCtx, "/"+imageName+"/blobs/"+layer.Digest, nil)
 	if err != nil {
+		attemptWatchdog.stop()
+		if timedOut() && ctx.Err() == nil {
+			return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, errBlobDownloadInactive)
+		}
+		if retryableBlobDownloadError(ctx, err) {
+			return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, err)
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if err := download.BoundResponse(resp, layer.Size); err != nil {
+		attemptWatchdog.stop()
+		return err
+	}
+	resp.Body = &activityBody{
+		ReadCloser: resp.Body,
+		onActivity: attemptWatchdog.activity,
+		reader:     resp.Body,
+	}
+	blob, err := os.OpenFile(partialBlobPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		attemptWatchdog.stop()
 		return err
 	}
 	defer func() {
 		_ = blob.Close()
-		_ = os.Remove(tmpBlobPath)
 	}()
 	hash := sha256.New()
-	body := io.TeeReader(resp.Body, io.MultiWriter(blob, hash))
+	body := io.TeeReader(resp.Body, &layerBlobWriter{dst: io.MultiWriter(blob, hash)})
 	if err := writeAndApplyIndexedLayer(dstPath, layer.MediaType, body, tarRef, merged, entries, progress); err != nil {
+		attemptWatchdog.stop()
+		if timedOut() && ctx.Err() == nil {
+			return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, errBlobDownloadInactive)
+		}
+		info, statErr := blob.Stat()
+		if statErr == nil && info.Size() < layer.Size {
+			return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, err)
+		}
 		return err
 	}
+	attemptWatchdog.stop()
 	if err := blob.Close(); err != nil {
 		return err
 	}
-	info, err := os.Stat(tmpBlobPath)
+	info, err := os.Stat(partialBlobPath)
 	if err != nil {
 		return err
 	}
 	if info.Size() != layer.Size {
-		return &download.LengthError{Expected: layer.Size, Actual: info.Size()}
+		return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, &download.LengthError{Expected: layer.Size, Actual: info.Size()})
 	}
 	actualDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
 	if !strings.EqualFold(actualDigest, layer.Digest) {
+		_ = os.Remove(partialBlobPath)
 		return &download.DigestError{Expected: layer.Digest, Actual: actualDigest}
 	}
-	if err := os.Rename(tmpBlobPath, blobPath); err != nil {
+	if err := os.Rename(partialBlobPath, blobPath); err != nil {
 		return err
 	}
 	return nil
 }
+
+var errStreamedLayerIncomplete = errors.New("streamed OCI layer download is incomplete")
 
 func (s *Store) writeAndApplyCachedLayer(
 	layer descriptor,
@@ -1880,7 +2225,28 @@ func (s *Store) getRawBlob(ctx context.Context, reg *registryContext, path strin
 	return data, nil
 }
 
+type registryStatusError struct {
+	code   int
+	status string
+	body   string
+}
+
+func (e *registryStatusError) Error() string {
+	return fmt.Sprintf("registry request failed: %s (%s)", e.status, e.body)
+}
+
 func (reg *registryContext) do(ctx context.Context, path string, accept []string) (*http.Response, error) {
+	return reg.doRequest(ctx, path, accept, 0, true)
+}
+
+func (reg *registryContext) doRange(ctx context.Context, path string, offset int64) (*http.Response, error) {
+	// The caller applies the descriptor's exact byte budget while streaming.
+	// Unlike metadata responses, OCI registries may send blobs using chunked
+	// transfer encoding, so they do not require a declared Content-Length here.
+	return reg.doRequest(ctx, path, nil, offset, false)
+}
+
+func (reg *registryContext) doRequest(ctx context.Context, path string, accept []string, rangeOffset int64, requireContentLength bool) (*http.Response, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reg.registry+path, nil)
 		if err != nil {
@@ -1891,6 +2257,9 @@ func (reg *registryContext) do(ctx context.Context, path string, accept []string
 		}
 		for _, value := range accept {
 			req.Header.Add("Accept", value)
+		}
+		if rangeOffset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeOffset))
 		}
 
 		resp, err := reg.client.Do(req)
@@ -1905,14 +2274,22 @@ func (reg *registryContext) do(ctx context.Context, path string, accept []string
 			resp.Body.Close()
 			continue
 		}
-		if resp.StatusCode != http.StatusOK {
+		statusOK := resp.StatusCode == http.StatusOK ||
+			(rangeOffset > 0 && resp.StatusCode == http.StatusPartialContent)
+		if !statusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
-			return nil, fmt.Errorf("registry request failed: %s (%s)", resp.Status, strings.TrimSpace(string(body)))
+			return nil, &registryStatusError{
+				code:   resp.StatusCode,
+				status: resp.Status,
+				body:   strings.TrimSpace(string(body)),
+			}
 		}
-		if err := download.BoundResponse(resp, 0); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("registry response: %w", err)
+		if requireContentLength {
+			if err := download.BoundResponse(resp, 0); err != nil {
+				resp.Body.Close()
+				return nil, fmt.Errorf("registry response: %w", err)
+			}
 		}
 		return resp, nil
 	}
@@ -2062,6 +2439,9 @@ func validateImageStoreName(name string) error {
 }
 
 func (s *Store) sharedRoot() string {
+	if root := strings.TrimSpace(s.sharedCacheRoot); root != "" {
+		return root
+	}
 	if root := strings.TrimSpace(os.Getenv(sharedCacheEnv)); root != "" {
 		return root
 	}
@@ -2265,6 +2645,18 @@ func (p *parallelBlobProgress) add(blob string, count int64) {
 	p.downloaded += count
 	p.networkBytes += count
 	p.emitLocked(blob, false)
+}
+
+func (p *parallelBlobProgress) set(blob string, count int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	previous := p.blobs[blob]
+	if previous == count {
+		return
+	}
+	p.blobs[blob] = count
+	p.downloaded += count - previous
+	p.emitLocked(blob, true)
 }
 
 func (p *parallelBlobProgress) complete(blob string, size int64) {

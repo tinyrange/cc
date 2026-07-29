@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -85,6 +87,18 @@ func TestWriteAndApplyIndexedLayerUsesOneStream(t *testing.T) {
 	}
 	if _, err := os.Stat(layerPath + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf("temporary layer remains: %v", err)
+	}
+}
+
+func TestStoreSharedCacheCanBeKeptInsidePortableRoot(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "oci")
+	store := NewStoreWithSharedCache(filepath.Join(root, "images"), shared)
+	if got := store.sharedRoot(); got != shared {
+		t.Fatalf("shared cache root = %q, want %q", got, shared)
+	}
+	if got := store.newSharedStore().sharedRoot(); got != shared {
+		t.Fatalf("nested shared cache root = %q, want %q", got, shared)
 	}
 }
 
@@ -260,6 +274,324 @@ func TestCacheLayerBlobsDownloadsConcurrently(t *testing.T) {
 	}
 	if maximum.Load() < 2 {
 		t.Fatalf("maximum concurrent blob requests = %d, want at least 2", maximum.Load())
+	}
+}
+
+func TestCacheLayerBlobResumesInterruptedTransfer(t *testing.T) {
+	data := bytes.Repeat([]byte("resumable-layer"), 16<<10)
+	sum := sha256.Sum256(data)
+	layer := descriptor{
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size:   int64(len(data)),
+	}
+	cut := len(data) / 3
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := requests.Add(1)
+		switch request {
+		case 1:
+			if got := r.Header.Get("Range"); got != "" {
+				t.Errorf("first request Range = %q", got)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data[:cut])
+			if hijacker, ok := w.(http.Hijacker); ok {
+				conn, _, err := hijacker.Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}
+		case 2:
+			wantRange := fmt.Sprintf("bytes=%d-", cut)
+			if got := r.Header.Get("Range"); got != wantRange {
+				t.Errorf("resumed request Range = %q, want %q", got, wantRange)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", cut, len(data)-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[cut:])
+		default:
+			t.Errorf("unexpected request %d", request)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	previousDelay := ociBlobRetryDelay
+	ociBlobRetryDelay = time.Millisecond
+	defer func() { ociBlobRetryDelay = previousDelay }()
+
+	store := NewStore(t.TempDir())
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	progress := newParallelBlobProgress("test", layer.Size, nil)
+	if err := store.cacheLayerBlob(t.Context(), reg, "test/image", layer, progress); err != nil {
+		t.Fatalf("cache layer blob: %v", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+	got, err := os.ReadFile(filepath.Join(store.root, "_blobs", digestToFileName(layer.Digest)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("cached layer does not match source")
+	}
+}
+
+func TestCacheLayerBlobRestartsWhenRegistryIgnoresRange(t *testing.T) {
+	data := bytes.Repeat([]byte("complete-layer"), 4096)
+	sum := sha256.Sum256(data)
+	layer := descriptor{
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size:   int64(len(data)),
+	}
+	cut := len(data) / 4
+	var gotRange string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	blobPath := filepath.Join(store.root, "_blobs", digestToFileName(layer.Digest))
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blobPath+".partial", data[:cut], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	progress := newParallelBlobProgress("test", layer.Size, nil)
+	if err := store.cacheLayerBlob(t.Context(), reg, "test/image", layer, progress); err != nil {
+		t.Fatalf("cache layer blob: %v", err)
+	}
+	if want := fmt.Sprintf("bytes=%d-", cut); gotRange != want {
+		t.Fatalf("Range = %q, want %q", gotRange, want)
+	}
+	got, err := os.ReadFile(blobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("cached layer does not match source")
+	}
+}
+
+func TestCacheLayerBlobKeepsPartialDataWhenCanceled(t *testing.T) {
+	data := bytes.Repeat([]byte("keep-partial"), 8192)
+	sum := sha256.Sum256(data)
+	layer := descriptor{
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size:   int64(len(data)),
+	}
+	cut := len(data) / 3
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data[:cut])
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	received := make(chan struct{})
+	var receivedOnce sync.Once
+	progress := newParallelBlobProgress("test", layer.Size, func(event client.ProgressEvent) {
+		if event.BytesDownloaded > 0 {
+			receivedOnce.Do(func() { close(received) })
+		}
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- store.cacheLayerBlob(ctx, reg, "test/image", layer, progress)
+	}()
+	select {
+	case <-received:
+		cancel()
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("download did not receive partial data")
+	}
+	err := <-result
+	if !errors.Is(err, context.DeadlineExceeded) {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cache layer error = %v, want cancellation", err)
+		}
+	}
+	partialPath := filepath.Join(store.root, "_blobs", digestToFileName(layer.Digest)) + ".partial"
+	info, err := os.Stat(partialPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= 0 || info.Size() >= layer.Size {
+		t.Fatalf("partial layer size = %d, want between 0 and %d", info.Size(), layer.Size)
+	}
+}
+
+func TestCacheLayerBlobRestartsAfterCorruptPartialData(t *testing.T) {
+	data := bytes.Repeat([]byte("verified-layer"), 4096)
+	sum := sha256.Sum256(data)
+	layer := descriptor{
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size:   int64(len(data)),
+	}
+	cut := len(data) / 3
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := requests.Add(1)
+		if request == 1 {
+			wantRange := fmt.Sprintf("bytes=%d-", cut)
+			if got := r.Header.Get("Range"); got != wantRange {
+				t.Errorf("resume Range = %q, want %q", got, wantRange)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)-cut))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", cut, len(data)-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[cut:])
+			return
+		}
+		if got := r.Header.Get("Range"); got != "" {
+			t.Errorf("clean restart Range = %q, want empty", got)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	blobPath := filepath.Join(store.root, "_blobs", digestToFileName(layer.Digest))
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := bytes.Repeat([]byte{0xff}, cut)
+	if err := os.WriteFile(blobPath+".partial", corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	progress := newParallelBlobProgress("test", layer.Size, nil)
+	if err := store.cacheLayerBlob(t.Context(), reg, "test/image", layer, progress); err != nil {
+		t.Fatalf("cache layer blob: %v", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want resumed attempt and clean restart", requests.Load())
+	}
+	got, err := os.ReadFile(blobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("cleanly restarted layer does not match source")
+	}
+}
+
+func TestStreamedFirstLayerCanResumeBeforeIndexing(t *testing.T) {
+	var compressed bytes.Buffer
+	gzw := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gzw)
+	body := bytes.Repeat([]byte("challenge-data"), 4096)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "opt/challenge",
+		Mode:     0o755,
+		Size:     int64(len(body)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := compressed.Bytes()
+	sum := sha256.Sum256(data)
+	layer := descriptor{
+		MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+		Digest:    "sha256:" + hex.EncodeToString(sum[:]),
+		Size:      int64(len(data)),
+	}
+	cut := len(data) / 2
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := requests.Add(1)
+		if request == 1 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data[:cut])
+			if hijacker, ok := w.(http.Hijacker); ok {
+				conn, _, err := hijacker.Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
+		}
+		if header := r.Header.Get("Range"); header != "" {
+			var offset int
+			if _, err := fmt.Sscanf(header, "bytes=%d-", &offset); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)-offset))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, len(data)-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[offset:])
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	reg := &registryContext{client: server.Client(), registry: server.URL}
+	firstBuild := newIndexedBuildState()
+	layerTar := filepath.Join(t.TempDir(), "layers", "first.tar")
+	err := store.downloadAndApplyLayer(
+		t.Context(),
+		reg,
+		"test/image",
+		layer,
+		layerTar,
+		"layers/first.tar",
+		firstBuild.merged,
+		firstBuild.fsEntries,
+		func(int64) {},
+	)
+	if !errors.Is(err, errStreamedLayerIncomplete) {
+		t.Fatalf("streamed layer error = %v, want incomplete transfer", err)
+	}
+
+	progress := newParallelBlobProgress("test", layer.Size, nil)
+	if err := store.cacheLayerBlob(t.Context(), reg, "test/image", layer, progress); err != nil {
+		t.Fatalf("resume streamed layer: %v", err)
+	}
+	resumedBuild := newIndexedBuildState()
+	if err := store.writeAndApplyCachedLayer(
+		layer,
+		layerTar,
+		"layers/first.tar",
+		resumedBuild.merged,
+		resumedBuild.fsEntries,
+		func(int64) {},
+	); err != nil {
+		t.Fatalf("index resumed layer: %v", err)
+	}
+	node := resumedBuild.merged["/opt/challenge"]
+	if node == nil || node.Size != uint64(len(body)) {
+		t.Fatalf("resumed indexed node = %+v", node)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want initial and resumed requests", requests.Load())
 	}
 }
 

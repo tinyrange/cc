@@ -450,16 +450,22 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("resolve cache directory %q: %w", *cacheDir, err)
 	}
+	runtimeRoot := resolveRuntimeRoot(*cacheDir, rootCache)
+	imageRoot := filepath.Join(rootCache, "images")
+	imageStore := oci.NewStore(imageRoot)
+	if strings.TrimSpace(*cacheDir) != "" {
+		imageStore = oci.NewStoreWithSharedCache(imageRoot, filepath.Join(rootCache, "oci"))
+	}
 
 	srvState := &server{
-		kernel:        alpine.NewManager(filepath.Join(sharedRuntimeRoot(), "kernel")),
-		images:        oci.NewStore(filepath.Join(rootCache, "images")),
+		kernel:        alpine.NewManager(filepath.Join(runtimeRoot, "kernel")),
+		images:        imageStore,
 		cvmfsCacheDir: filepath.Join(rootCache, "_cvmfs_cache"),
 	}
 	srvState.vms = vm.NewRuntimeManager(
 		srvState.kernel,
 		srvState.images,
-		filepath.Join(sharedRuntimeRoot(), "guestinit"),
+		filepath.Join(runtimeRoot, "guestinit"),
 		rootCache,
 		*worker,
 	)
@@ -2304,6 +2310,13 @@ func sharedRuntimeRoot() string {
 		return filepath.Join(os.TempDir(), "ccx3-runtime")
 	}
 	return filepath.Join(userCacheDir, "ccx3", "runtime")
+}
+
+func resolveRuntimeRoot(cacheArg, rootCache string) string {
+	if strings.TrimSpace(cacheArg) != "" {
+		return filepath.Join(rootCache, "runtime")
+	}
+	return sharedRuntimeRoot()
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
