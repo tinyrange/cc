@@ -112,3 +112,71 @@ DCL SVIEW[0], 2D, FLOAT
 		t.Fatal(err)
 	}
 }
+
+func TestGlmarkArithmeticTGSICompilesInDarwinHostContext(t *testing.T) {
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL IN[0], POSITION
+DCL TEMP[0..7]
+DCL CONST[0..7]
+DCL ADDR[0]
+IMM[0] FLT32 {0.25, 0.5, 1.0, 2.0}
+IMM[1] UINT32 {0, 1, 2, 3}
+  0: MOV TEMP[0], IMM[0]
+  1: RCP TEMP[1], TEMP[0]
+  2: POW TEMP[2], TEMP[0], IMM[0].wwww
+  3: FLR TEMP[3], TEMP[1]
+  4: FRC TEMP[4], TEMP[1]
+  5: FSLT TEMP[5], TEMP[0], TEMP[1]
+  6: FSGE TEMP[6], TEMP[1], TEMP[0]
+  7: FSEQ TEMP[7], TEMP[0], TEMP[0]
+  8: EX2 TEMP[7], TEMP[0]
+  9: SIN TEMP[7], TEMP[0]
+ 10: LRP TEMP[6], TEMP[0], TEMP[2], TEMP[4]
+ 11: AND TEMP[7], IMM[0], IMM[0]
+ 12: DIV_SAT TEMP[6], TEMP[2], TEMP[1]
+ 13: UCMP TEMP[7], IMM[0], TEMP[6], IN[0]
+ 14: ARL ADDR[0].x, IMM[0]
+ 15: MOV TEMP[0], CONST[ADDR[0].x+1]
+ 16: ISGE TEMP[1], IMM[1], IMM[1]
+ 17: UADD TEMP[1], IMM[1], IMM[1]
+ 18: UMUL TEMP[1], TEMP[1], IMM[1]
+ 19: SHL TEMP[1], TEMP[1], IMM[1]
+ 20: USHR TEMP[1], TEMP[1], IMM[1]
+ 21: ISHR TEMP[1], TEMP[1], IMM[1]
+ 22: OR TEMP[1], TEMP[1], IMM[1]
+ 23: XOR TEMP[1], TEMP[1], IMM[1]
+ 24: BGNLOOP :30
+ 25: UIF IMM[0] :28
+ 26: BRK
+ 27: ELSE :29
+ 28: CONT
+ 29: ENDIF
+ 30: ENDLOOP :24
+ 31: KILL_IF TEMP[0]
+ 32: ADD OUT[0], TEMP[6], TEMP[7]
+ 33: END`
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const vertexGLSL = `#version 410 core
+void main() {
+	vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+	gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}`
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

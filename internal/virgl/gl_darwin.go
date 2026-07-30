@@ -10,116 +10,123 @@ import (
 )
 
 const (
-	glArrayBuffer            = 0x8892
-	glElementArrayBuffer     = 0x8893
-	glStaticDraw             = 0x88e4
-	glTexture2D              = 0x0de1
-	glTexture0               = 0x84c0
-	glRGBA8                  = 0x8058
-	glRGBA                   = 0x1908
-	glBGRA                   = 0x80e1
-	glUnsignedByte           = 0x1401
-	glUnsignedShort          = 0x1403
-	glUnsignedInt            = 0x1405
-	glUnsignedInt248         = 0x84fa
-	glFloat                  = 0x1406
-	glFramebuffer            = 0x8d40
-	glReadFramebuffer        = 0x8ca8
-	glDrawFramebuffer        = 0x8ca9
-	glColorAttachment0       = 0x8ce0
-	glDepthAttachment        = 0x8d00
-	glDepthStencilAttachment = 0x821a
-	glFramebufferComplete    = 0x8cd5
-	glDepthComponent         = 0x1902
-	glDepthComponent24       = 0x81a6
-	glDepthStencil           = 0x84f9
-	glDepth24Stencil8        = 0x88f0
-	glVertexShader           = 0x8b31
-	glFragmentShader         = 0x8b30
-	glCompileStatus          = 0x8b81
-	glLinkStatus             = 0x8b82
-	glInfoLogLength          = 0x8b84
-	glColorBufferBit         = 0x00004000
-	glDepthBufferBit         = 0x00000100
-	glStencilBufferBit       = 0x00000400
-	glTriangles              = 0x0004
-	glTriangleStrip          = 0x0005
-	glCullFace               = 0x0b44
-	glFront                  = 0x0404
-	glBack                   = 0x0405
-	glFrontAndBack           = 0x0408
-	glCW                     = 0x0900
-	glCCW                    = 0x0901
-	glDepthTest              = 0x0b71
-	glBlend                  = 0x0be2
-	glScissorTest            = 0x0c11
-	glPrimitiveRestart       = 0x8f9d
-	glNever                  = 0x0200
-	glLess                   = 0x0201
-	glEqual                  = 0x0202
-	glLEqual                 = 0x0203
-	glGreater                = 0x0204
-	glNotEqual               = 0x0205
-	glGEqual                 = 0x0206
-	glAlways                 = 0x0207
-	glUnpackAlignment        = 0x0cf5
-	glPackAlignment          = 0x0d05
-	glTextureMinFilter       = 0x2801
-	glTextureMagFilter       = 0x2800
-	glTextureMinLOD          = 0x813a
-	glTextureMaxLOD          = 0x813b
-	glTextureLODBias         = 0x8501
-	glTextureBaseLevel       = 0x813c
-	glTextureMaxLevel        = 0x813d
-	glTextureBorderColor     = 0x1004
-	glTextureCompareMode     = 0x884c
-	glTextureCompareFunc     = 0x884d
-	glCompareRefToTexture    = 0x884e
-	glNone                   = 0
-	glLinear                 = 0x2601
-	glNearest                = 0x2600
-	glNearestMipmapNearest   = 0x2700
-	glLinearMipmapNearest    = 0x2701
-	glNearestMipmapLinear    = 0x2702
-	glLinearMipmapLinear     = 0x2703
-	glRepeat                 = 0x2901
-	glClampToEdge            = 0x812f
-	glClampToBorder          = 0x812d
-	glMirroredRepeat         = 0x8370
-	glTextureWrapS           = 0x2802
-	glTextureWrapT           = 0x2803
-	glTextureSwizzleR        = 0x8e42
-	glTextureSwizzleG        = 0x8e43
-	glTextureSwizzleB        = 0x8e44
-	glTextureSwizzleA        = 0x8e45
-	glRed                    = 0x1903
-	glGreen                  = 0x1904
-	glBlue                   = 0x1905
-	glAlpha                  = 0x1906
-	glZero                   = 0
-	glOne                    = 1
-	glSrcColor               = 0x0300
-	glOneMinusSrcColor       = 0x0301
-	glSrcAlpha               = 0x0302
-	glOneMinusSrcAlpha       = 0x0303
-	glDstAlpha               = 0x0304
-	glOneMinusDstAlpha       = 0x0305
-	glDstColor               = 0x0306
-	glOneMinusDstColor       = 0x0307
-	glSrcAlphaSaturate       = 0x0308
-	glConstantColor          = 0x8001
-	glOneMinusConstantColor  = 0x8002
-	glConstantAlpha          = 0x8003
-	glOneMinusConstantAlpha  = 0x8004
-	glSrc1Color              = 0x88f9
-	glOneMinusSrc1Color      = 0x88fa
-	glSrc1Alpha              = 0x8589
-	glOneMinusSrc1Alpha      = 0x88fb
-	glFuncAdd                = 0x8006
-	glMin                    = 0x8007
-	glMax                    = 0x8008
-	glFuncSubtract           = 0x800a
-	glFuncReverseSubtract    = 0x800b
+	glArrayBuffer             = 0x8892
+	glElementArrayBuffer      = 0x8893
+	glStaticDraw              = 0x88e4
+	glTexture2D               = 0x0de1
+	glTexture0                = 0x84c0
+	glRGBA8                   = 0x8058
+	glRGBA                    = 0x1908
+	glBGRA                    = 0x80e1
+	glUnsignedByte            = 0x1401
+	glUnsignedShort           = 0x1403
+	glUnsignedInt             = 0x1405
+	glUnsignedInt248          = 0x84fa
+	glFloat                   = 0x1406
+	glFramebuffer             = 0x8d40
+	glReadFramebuffer         = 0x8ca8
+	glDrawFramebuffer         = 0x8ca9
+	glColorAttachment0        = 0x8ce0
+	glDepthAttachment         = 0x8d00
+	glDepthStencilAttachment  = 0x821a
+	glFramebufferComplete     = 0x8cd5
+	glDepthComponent          = 0x1902
+	glDepthComponent24        = 0x81a6
+	glDepthStencil            = 0x84f9
+	glDepth24Stencil8         = 0x88f0
+	glVertexShader            = 0x8b31
+	glFragmentShader          = 0x8b30
+	glCompileStatus           = 0x8b81
+	glLinkStatus              = 0x8b82
+	glInfoLogLength           = 0x8b84
+	glColorBufferBit          = 0x00004000
+	glDepthBufferBit          = 0x00000100
+	glStencilBufferBit        = 0x00000400
+	glPoints                  = 0x0000
+	glLines                   = 0x0001
+	glLineLoop                = 0x0002
+	glLineStrip               = 0x0003
+	glTriangles               = 0x0004
+	glTriangleStrip           = 0x0005
+	glTriangleFan             = 0x0006
+	glCullFace                = 0x0b44
+	glFront                   = 0x0404
+	glBack                    = 0x0405
+	glFrontAndBack            = 0x0408
+	glCW                      = 0x0900
+	glCCW                     = 0x0901
+	glDepthTest               = 0x0b71
+	glBlend                   = 0x0be2
+	glScissorTest             = 0x0c11
+	glPrimitiveRestart        = 0x8f9d
+	glNever                   = 0x0200
+	glLess                    = 0x0201
+	glEqual                   = 0x0202
+	glLEqual                  = 0x0203
+	glGreater                 = 0x0204
+	glNotEqual                = 0x0205
+	glGEqual                  = 0x0206
+	glAlways                  = 0x0207
+	glUnpackAlignment         = 0x0cf5
+	glPackAlignment           = 0x0d05
+	glTextureMinFilter        = 0x2801
+	glTextureMagFilter        = 0x2800
+	glTextureMinLOD           = 0x813a
+	glTextureMaxLOD           = 0x813b
+	glTextureLODBias          = 0x8501
+	glTextureBaseLevel        = 0x813c
+	glTextureMaxLevel         = 0x813d
+	glTextureBorderColor      = 0x1004
+	glTextureCompareMode      = 0x884c
+	glTextureCompareFunc      = 0x884d
+	glCompareRefToTexture     = 0x884e
+	glNone                    = 0
+	glLinear                  = 0x2601
+	glNearest                 = 0x2600
+	glNearestMipmapNearest    = 0x2700
+	glLinearMipmapNearest     = 0x2701
+	glNearestMipmapLinear     = 0x2702
+	glLinearMipmapLinear      = 0x2703
+	glRepeat                  = 0x2901
+	glClampToEdge             = 0x812f
+	glClampToBorder           = 0x812d
+	glMirroredRepeat          = 0x8370
+	glTextureWrapS            = 0x2802
+	glTextureWrapT            = 0x2803
+	glTextureSwizzleR         = 0x8e42
+	glTextureSwizzleG         = 0x8e43
+	glTextureSwizzleB         = 0x8e44
+	glTextureSwizzleA         = 0x8e45
+	glRed                     = 0x1903
+	glGreen                   = 0x1904
+	glBlue                    = 0x1905
+	glAlpha                   = 0x1906
+	glZero                    = 0
+	glOne                     = 1
+	glSrcColor                = 0x0300
+	glOneMinusSrcColor        = 0x0301
+	glSrcAlpha                = 0x0302
+	glOneMinusSrcAlpha        = 0x0303
+	glDstAlpha                = 0x0304
+	glOneMinusDstAlpha        = 0x0305
+	glDstColor                = 0x0306
+	glOneMinusDstColor        = 0x0307
+	glSrcAlphaSaturate        = 0x0308
+	glConstantColor           = 0x8001
+	glOneMinusConstantColor   = 0x8002
+	glConstantAlpha           = 0x8003
+	glOneMinusConstantAlpha   = 0x8004
+	glSrc1Color               = 0x88f9
+	glOneMinusSrc1Color       = 0x88fa
+	glSrc1Alpha               = 0x8589
+	glOneMinusSrc1Alpha       = 0x88fb
+	glFuncAdd                 = 0x8006
+	glMin                     = 0x8007
+	glMax                     = 0x8008
+	glFuncSubtract            = 0x800a
+	glFuncReverseSubtract     = 0x800b
+	glSyncGPUCommandsComplete = 0x9117
+	glTimeoutIgnored          = ^uint64(0)
 )
 
 type hostGL struct {
@@ -189,6 +196,12 @@ type hostGL struct {
 	drawElementsBaseVertex func(uint32, int32, uint32, uintptr, int32)
 	primitiveRestartIndex  func(uint32)
 	readPixels             func(int32, int32, int32, int32, uint32, uint32, uintptr)
+	drawBuffer             func(uint32)
+	readBuffer             func(uint32)
+	fenceSync              func(uint32, uint32) uintptr
+	waitSync               func(uintptr, uint32, uint64)
+	deleteSync             func(uintptr)
+	flush                  func()
 	finish                 func()
 }
 
@@ -267,6 +280,12 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.drawElementsBaseVertex, "glDrawElementsBaseVertex")
 	register(&gl.primitiveRestartIndex, "glPrimitiveRestartIndex")
 	register(&gl.readPixels, "glReadPixels")
+	register(&gl.drawBuffer, "glDrawBuffer")
+	register(&gl.readBuffer, "glReadBuffer")
+	register(&gl.fenceSync, "glFenceSync")
+	register(&gl.waitSync, "glWaitSync")
+	register(&gl.deleteSync, "glDeleteSync")
+	register(&gl.flush, "glFlush")
 	register(&gl.finish, "glFinish")
 	return gl, nil
 }

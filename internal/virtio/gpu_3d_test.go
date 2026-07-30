@@ -126,6 +126,65 @@ func TestGPU3DTransportCarriesMesaCommandsToRenderer(t *testing.T) {
 	}
 }
 
+func TestGPUNativeScanoutDefersReadbackUntilCPUConsumer(t *testing.T) {
+	framebuffer, err := NewFramebuffer(2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pixels := []byte{
+		1, 2, 3, 0, 4, 5, 6, 0,
+		7, 8, 9, 0, 10, 11, 12, 0,
+	}
+	base := &recordingGPURenderer{scanout: pixels}
+	renderer := &nativeRecordingGPURenderer{recordingGPURenderer: base}
+	gpu := NewGPUWithRenderer(0x1000, 0x1000, 9, framebuffer, renderer)
+
+	createResource := gpuTestRequest(gpuCmdResourceCreate3D, 72)
+	binary.LittleEndian.PutUint32(createResource[24:28], 7)
+	binary.LittleEndian.PutUint32(createResource[28:32], 2)
+	binary.LittleEndian.PutUint32(createResource[32:36], gpuFormatB8G8R8X8)
+	binary.LittleEndian.PutUint32(createResource[40:44], 2)
+	binary.LittleEndian.PutUint32(createResource[44:48], 2)
+	binary.LittleEndian.PutUint32(createResource[48:52], 1)
+	binary.LittleEndian.PutUint32(createResource[52:56], 1)
+	requireGPUResponse(t, gpu.dispatchLocked(createResource, gpuQueueControl), gpuRespOKNoData)
+
+	setScanout := gpuTestRequest(gpuCmdSetScanout, 48)
+	putGPUTestRect(setScanout[24:40], 0, 0, 2, 2)
+	binary.LittleEndian.PutUint32(setScanout[44:48], 7)
+	requireGPUResponse(t, gpu.dispatchLocked(setScanout, gpuQueueControl), gpuRespOKNoData)
+	flush := gpuTestRequest(gpuCmdResourceFlush, 48)
+	putGPUTestRect(flush[24:40], 0, 0, 2, 2)
+	binary.LittleEndian.PutUint32(flush[40:44], 7)
+	requireGPUResponse(t, gpu.dispatchLocked(flush, gpuQueueControl), gpuRespOKNoData)
+
+	if base.readCalls != 0 {
+		t.Fatalf("native flush performed %d CPU readbacks, want 0", base.readCalls)
+	}
+	frame, available, err := gpu.AcquireNativeFrame(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available || frame.Texture != 99 || frame.ProducerFence != 77 || frame.Generation == 0 {
+		t.Fatalf("native frame = %+v, available=%t", frame, available)
+	}
+	frame.ReleaseFrame(55)
+	if got, want := renderer.releasedFence, uintptr(55); got != want {
+		t.Fatalf("released consumer fence = %d, want %d", got, want)
+	}
+
+	update, err := gpu.Snapshot(image.Rect(0, 0, 2, 2), 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.readCalls != 1 {
+		t.Fatalf("CPU snapshot readbacks = %d, want 1", base.readCalls)
+	}
+	if !bytes.Equal(update.Pixels, pixels) {
+		t.Fatalf("CPU fallback pixels = %v, want %v", update.Pixels, pixels)
+	}
+}
+
 func putGPUTestBox(dst []byte, x, y, z, width, height, depth uint32) {
 	for index, value := range []uint32{x, y, z, width, height, depth} {
 		binary.LittleEndian.PutUint32(dst[index*4:], value)
@@ -139,6 +198,7 @@ type recordingGPURenderer struct {
 	scanout     []byte
 	contexts    map[uint32]struct{}
 	resources   map[uint32]GPUResource3D
+	readCalls   int
 }
 
 func (r *recordingGPURenderer) Capsets() []GPUCapset { return r.capsets }
@@ -194,6 +254,7 @@ func (r *recordingGPURenderer) Submit(_ uint32, commands []byte) error {
 }
 
 func (r *recordingGPURenderer) ReadScanout(_ uint32, rect image.Rectangle) ([]byte, int, error) {
+	r.readCalls++
 	return append([]byte(nil), r.scanout...), rect.Dx() * 4, nil
 }
 
@@ -203,3 +264,20 @@ func (r *recordingGPURenderer) Reset() {
 }
 
 func (r *recordingGPURenderer) Close() error { return nil }
+
+type nativeRecordingGPURenderer struct {
+	*recordingGPURenderer
+	releasedFence uintptr
+}
+
+func (r *nativeRecordingGPURenderer) NativeScanout(_ uint32, rect image.Rectangle) (GPUNativeFrame, bool, error) {
+	return GPUNativeFrame{
+		Width:         rect.Dx(),
+		Height:        rect.Dy(),
+		Texture:       99,
+		ProducerFence: 77,
+		ReleaseFrame: func(consumerFence uintptr) {
+			r.releasedFence = consumerFence
+		},
+	}, true, nil
+}

@@ -14,7 +14,7 @@ import (
 	vmhost "j5.nz/cc/internal/vm/host"
 )
 
-func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool) *Manager {
+func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool, _ func() (context, pixelFormat uintptr)) *Manager {
 	backend := NewRuntimeBackend(kernel, images, guestInitCache)
 	sidecarsEnabled := strings.TrimSpace(os.Getenv(sidecarEnableEnv)) != "" || defaultSidecarsEnabled()
 	if worker || strings.TrimSpace(os.Getenv(sidecarDisableEnv)) != "" || !sidecarsEnabled {

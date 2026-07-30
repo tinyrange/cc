@@ -16,6 +16,40 @@ type FramebufferUpdate struct {
 	Pixels     []byte
 }
 
+// OpenGLFrame is a leased texture produced in the presentation context's
+// OpenGL share group. The producer fence orders guest rendering before
+// sampling. Release must be called exactly once; consumerFence may identify a
+// fence inserted after the final sampling command, or zero when the frame was
+// never sampled.
+type OpenGLFrame struct {
+	Width, Height int
+	Generation    uint64
+	Damage        image.Rectangle
+	Texture       uint32
+	ProducerFence uintptr
+	release       func(uintptr)
+}
+
+func NewOpenGLFrame(
+	width, height int,
+	generation uint64,
+	damage image.Rectangle,
+	texture uint32,
+	producerFence uintptr,
+	release func(uintptr),
+) OpenGLFrame {
+	return OpenGLFrame{
+		Width: width, Height: height, Generation: generation, Damage: damage,
+		Texture: texture, ProducerFence: producerFence, release: release,
+	}
+}
+
+func (f OpenGLFrame) Release(consumerFence uintptr) {
+	if f.release != nil {
+		f.release(consumerFence)
+	}
+}
+
 // Session provides direct access to a running VM's graphical desktop. Key
 // accepts Linux input-event key codes. Pointer uses absolute guest coordinates
 // and the conventional VNC button mask: left=1, middle=2, right=4, wheel=8/16.
@@ -28,6 +62,11 @@ type Session interface {
 	Pointer(x, y uint32, buttons, previousButtons uint8) error
 	SetClipboard(text string)
 	GuestClipboard() (text string, generation uint64)
+}
+
+// OpenGLFrameSession is an optional zero-copy presentation capability.
+type OpenGLFrameSession interface {
+	AcquireOpenGLFrame(since uint64) (OpenGLFrame, bool, error)
 }
 
 // HighResolutionScroller is implemented by display sessions that accept

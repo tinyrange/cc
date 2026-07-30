@@ -43,9 +43,10 @@ func timingLog(format string, args ...any) {
 }
 
 type runtimeBackend struct {
-	kernel         *alpine.Manager
-	images         *oci.Store
-	guestInitCache string
+	kernel           *alpine.Manager
+	images           *oci.Store
+	guestInitCache   string
+	openGLShareGroup func() (context, pixelFormat uintptr)
 }
 
 type runtimeKernelProvider interface {
@@ -591,6 +592,9 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
 	runReq.DisplayWidth = displayWidthDarwin(req.Display)
 	runReq.DisplayHeight = displayHeightDarwin(req.Display)
+	if runReq.DisplayWidth != 0 && runReq.DisplayHeight != 0 && b.openGLShareGroup != nil {
+		runReq.OpenGLShareContext, runReq.OpenGLSharePixelFormat = b.openGLShareGroup()
+	}
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)

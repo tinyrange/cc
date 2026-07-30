@@ -101,6 +101,7 @@ type ServerOptions struct {
 	StartupWriter          io.Writer
 	OnStartup              func(client.ServerHello) error
 	OnDisplay              func(string, display.Session)
+	OpenGLShareGroup       func() (context, pixelFormat uintptr)
 	RegisterHandlers       func(*http.ServeMux, RuntimeView)
 	WrapHandler            func(http.Handler) http.Handler
 	NormalizeCreateRequest func(*client.CreateInstanceRequest, RuntimeView) error
@@ -468,6 +469,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		filepath.Join(runtimeRoot, "guestinit"),
 		rootCache,
 		*worker,
+		opts.OpenGLShareGroup,
 	)
 
 	if *worker {

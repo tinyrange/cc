@@ -103,6 +103,9 @@ type GPU struct {
 	framebuffer      *Framebuffer
 	renderer         GPURenderer
 	rendererErrors   map[string]struct{}
+	nativeFrame      *GPUNativeFrame
+	nativeGeneration uint64
+	cpuGeneration    uint64
 }
 
 func NewGPU(base, size uint64, irq uint32, framebuffer *Framebuffer) *GPU {
@@ -129,6 +132,7 @@ func (g *GPU) Framebuffer() *Framebuffer {
 func (g *GPU) Close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.releaseNativeFrameLocked(0)
 	if g.renderer == nil {
 		return nil
 	}
@@ -148,6 +152,7 @@ func (g *GPU) Resize(width, height int) error {
 	if err := g.framebuffer.Resize(width, height); err != nil {
 		return err
 	}
+	g.releaseNativeFrameLocked(0)
 	g.scanoutResource = 0
 	g.scanoutRect = image.Rectangle{}
 	g.eventsRead |= 1 // VIRTIO_GPU_EVENT_DISPLAY
@@ -441,6 +446,7 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 		}
 		delete(g.resources, id)
 		if g.scanoutResource == id {
+			g.releaseNativeFrameLocked(0)
 			g.scanoutResource = 0
 			g.scanoutRect = image.Rectangle{}
 		}
@@ -705,6 +711,7 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 			return gpuResponse(request, gpuRespErrInvalidScanoutID, nil)
 		}
 		if id == 0 {
+			g.releaseNativeFrameLocked(0)
 			g.scanoutResource = 0
 			g.scanoutRect = image.Rectangle{}
 			return gpuResponse(request, gpuRespOKNoData, nil)
@@ -724,6 +731,9 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 				g.reportGPUErrorLocked(fmt.Errorf("resize scanout framebuffer to %dx%d: %w", rect.Dx(), rect.Dy(), err))
 				return gpuResponse(request, gpuRespErrInvalidParameter, nil)
 			}
+		}
+		if g.scanoutResource != id || g.scanoutRect != rect {
+			g.releaseNativeFrameLocked(0)
 		}
 		g.scanoutResource = id
 		g.scanoutRect = rect
@@ -861,6 +871,21 @@ func (b gpuResourceBacking) WriteAt(offset uint64, src []byte) error {
 }
 
 func (g *GPU) flushResource3DLocked(resource *gpuResource, rect image.Rectangle) error {
+	if renderer, ok := g.renderer.(GPUNativeScanoutRenderer); ok {
+		frame, available, err := renderer.NativeScanout(resource.id, rect)
+		if err != nil {
+			return fmt.Errorf("publish native 3D scanout resource %d: %w", resource.id, err)
+		}
+		if available {
+			g.releaseNativeFrameLocked(0)
+			g.nativeGeneration++
+			frame.Generation = g.nativeGeneration
+			frame.Damage = rect.Sub(g.scanoutRect.Min)
+			g.nativeFrame = &frame
+			g.framebuffer.MarkDirty(frame.Damage)
+			return nil
+		}
+	}
 	pixels, stride, err := g.renderer.ReadScanout(resource.id, rect)
 	if err != nil {
 		return fmt.Errorf("read 3D scanout resource %d: %w", resource.id, err)
@@ -870,6 +895,58 @@ func (g *GPU) flushResource3DLocked(resource *gpuResource, rect image.Rectangle)
 		return fmt.Errorf("update 3D scanout resource %d: %w", resource.id, err)
 	}
 	return nil
+}
+
+func (g *GPU) AcquireNativeFrame(since uint64) (GPUNativeFrame, bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.nativeFrame == nil || g.nativeFrame.Generation <= since {
+		return GPUNativeFrame{}, false, nil
+	}
+	frame := *g.nativeFrame
+	g.nativeFrame = nil
+	return frame, true, nil
+}
+
+func (g *GPU) Snapshot(request image.Rectangle, since uint64, incremental bool) (FramebufferUpdate, error) {
+	g.mu.Lock()
+	err := g.syncNativeScanoutLocked()
+	g.mu.Unlock()
+	if err != nil {
+		return FramebufferUpdate{}, err
+	}
+	return g.framebuffer.Snapshot(request, since, incremental), nil
+}
+
+func (g *GPU) syncNativeScanoutLocked() error {
+	if g.nativeGeneration == 0 || g.cpuGeneration == g.nativeGeneration ||
+		g.scanoutResource == 0 || g.scanoutRect.Empty() {
+		return nil
+	}
+	resource := g.resources[g.scanoutResource]
+	if resource == nil || resource.resource3D == nil {
+		return nil
+	}
+	pixels, stride, err := g.renderer.ReadScanout(resource.id, g.scanoutRect)
+	if err != nil {
+		return fmt.Errorf("read native 3D scanout resource %d for CPU consumer: %w", resource.id, err)
+	}
+	dstRect := image.Rect(0, 0, g.scanoutRect.Dx(), g.scanoutRect.Dy())
+	if err := g.framebuffer.Update(dstRect, pixels, stride); err != nil {
+		return fmt.Errorf("update native 3D scanout resource %d for CPU consumer: %w", resource.id, err)
+	}
+	g.cpuGeneration = g.nativeGeneration
+	return nil
+}
+
+func (g *GPU) releaseNativeFrameLocked(consumerFence uintptr) {
+	if g.nativeFrame == nil {
+		return
+	}
+	if g.nativeFrame.ReleaseFrame != nil {
+		g.nativeFrame.ReleaseFrame(consumerFence)
+	}
+	g.nativeFrame = nil
 }
 
 func (g *GPU) flushResourceLocked(resource *gpuResource, requested image.Rectangle) {
@@ -984,6 +1061,7 @@ func (g *GPU) updateIRQLocked() error {
 }
 
 func (g *GPU) resetLocked() {
+	g.releaseNativeFrameLocked(0)
 	if g.renderer != nil {
 		g.renderer.Reset()
 	}
@@ -1000,6 +1078,8 @@ func (g *GPU) resetLocked() {
 	g.contexts = make(map[uint32]*gpuContext)
 	g.scanoutResource = 0
 	g.scanoutRect = image.Rectangle{}
+	g.nativeGeneration = 0
+	g.cpuGeneration = 0
 	for index := range g.queues {
 		g.queues[index] = queue{}
 	}
