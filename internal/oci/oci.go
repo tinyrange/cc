@@ -627,7 +627,10 @@ func (s *Store) PlanPull(ctx context.Context, name, source string, options ...Pu
 		plan.LayersTotal++
 		plan.BytesTotal += layer.Size
 		blobPath := filepath.Join(shared.root, "_blobs", digestToFileName(layer.Digest))
-		if info, statErr := os.Stat(blobPath); statErr == nil && info.Mode().IsRegular() && info.Size() == layer.Size {
+		if shared.cachedLayerArchiveAvailable(layer) {
+			plan.LayersCached++
+			plan.BytesCached += layer.Size
+		} else if info, statErr := os.Stat(blobPath); statErr == nil && info.Mode().IsRegular() && info.Size() == layer.Size {
 			plan.LayersCached++
 			plan.BytesCached += layer.Size
 		}
@@ -1163,142 +1166,135 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		totalLayerBytes += layer.Size
 	}
 	var pipelineMu sync.Mutex
-	var backgroundDownloadedBytes int64
-	var streamedDownloadedBytes int64
-	var downloadedLayerBytes int64
-	var preparedLayerWork int64
-	reportDownload := func(event client.ProgressEvent) {
-		pipelineMu.Lock()
-		if event.BytesTotal > 0 {
-			backgroundDownloadedBytes = max(backgroundDownloadedBytes, event.BytesDownloaded)
-			downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
-			event.BytesDownloaded = downloadedLayerBytes
-			event.BytesTotal = totalLayerBytes
-			event.DownloadProgress = ratio(downloadedLayerBytes, totalLayerBytes)
-			event.IndexProgress = ratio(preparedLayerWork, totalLayerBytes)
-			event.Progress = ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
-			if preparedLayerWork > 0 && event.Status == "downloading" {
-				event.Status = "processing"
-			}
-		}
-		pipelineMu.Unlock()
-		report(event)
-	}
-	streamFirstLayer := len(mani.Layers) != 0 && !s.cachedLayerBlobAvailable(mani.Layers[0])
-	downloadLayers := mani.Layers
-	if streamFirstLayer {
-		firstDigest := mani.Layers[0].Digest
-		downloadLayers = make([]descriptor, 0, len(mani.Layers)-1)
-		for _, layer := range mani.Layers[1:] {
-			if layer.Digest != firstDigest {
-				downloadLayers = append(downloadLayers, layer)
-			}
-		}
-	}
-	downloads, err := s.startLayerBlobPull(ctx, reg, imageName, name, downloadLayers, reportDownload)
-	if err != nil {
-		return err
-	}
-	defer downloads.cancel()
-
 	build := newIndexedBuildState()
-	var preparedLayerBytes int64
 	prepareStarted := time.Now()
+	downloadedByLayer := make([]int64, len(mani.Layers))
+	indexedByLayer := make([]int64, len(mani.Layers))
 	for layerIndex, layer := range mani.Layers {
-		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
-		layerTarPath := filepath.Join(tmpDir, layerTarRel)
-		reportPrepare := func(layerWork int64, streaming bool) {
-			pipelineMu.Lock()
-			if streaming {
-				streamedDownloadedBytes = max(streamedDownloadedBytes, min(layer.Size, max(0, layerWork)))
-				downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
+		switch {
+		case s.cachedLayerArchiveAvailable(layer):
+			downloadedByLayer[layerIndex] = layer.Size
+			indexedByLayer[layerIndex] = layer.Size
+		case s.cachedLayerBlobAvailable(layer):
+			downloadedByLayer[layerIndex] = layer.Size
+		default:
+			partialPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest)) + ".partial"
+			if info, statErr := os.Stat(partialPath); statErr == nil {
+				downloadedByLayer[layerIndex] = min(layer.Size, max(0, info.Size()))
 			}
-			preparedLayerWork = preparedLayerBytes + min(layer.Size, max(0, layerWork))
-			downloadProgress := ratio(downloadedLayerBytes, totalLayerBytes)
-			indexProgress := ratio(preparedLayerWork, totalLayerBytes)
-			progress := ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
-			bytesDownloaded := downloadedLayerBytes
-			pipelineMu.Unlock()
-			elapsed := time.Since(prepareStarted).Seconds()
-			var eta float64
-			if progress > 0 && progress < 1 && elapsed > 0 {
-				eta = elapsed * (1 - progress) / progress
-			}
-			report(client.ProgressEvent{
-				Status:           "processing",
-				Artifact:         name,
-				Blob:             layer.Digest,
-				Progress:         progress,
-				DownloadProgress: downloadProgress,
-				IndexProgress:    indexProgress,
-				BytesDownloaded:  bytesDownloaded,
-				BytesTotal:       totalLayerBytes,
-				FilesDownloaded:  int64(layerIndex),
-				FilesTotal:       int64(len(mani.Layers)),
-				ETASeconds:       eta,
-			})
 		}
-		reportFirstLayerDownload := func(downloaded int64) {
-			pipelineMu.Lock()
-			streamedDownloadedBytes = max(streamedDownloadedBytes, min(layer.Size, max(0, downloaded)))
-			downloadedLayerBytes = min(totalLayerBytes, backgroundDownloadedBytes+streamedDownloadedBytes)
-			downloadProgress := ratio(downloadedLayerBytes, totalLayerBytes)
-			indexProgress := ratio(preparedLayerWork, totalLayerBytes)
-			progress := ratio(downloadedLayerBytes+preparedLayerWork, totalLayerBytes*2)
-			bytesDownloaded := downloadedLayerBytes
-			pipelineMu.Unlock()
-			report(client.ProgressEvent{
-				Status:           "downloading",
-				Artifact:         name,
-				Blob:             layer.Digest,
-				Progress:         progress,
-				DownloadProgress: downloadProgress,
-				IndexProgress:    indexProgress,
-				BytesDownloaded:  bytesDownloaded,
-				BytesTotal:       totalLayerBytes,
-				FilesDownloaded:  int64(layerIndex),
-				FilesTotal:       int64(len(mani.Layers)),
-			})
+	}
+	reportPipeline := func(layerIndex int, layer descriptor, downloaded, indexed *int64) {
+		pipelineMu.Lock()
+		if downloaded != nil {
+			downloadedByLayer[layerIndex] = min(layer.Size, max(0, *downloaded))
 		}
-		reportPrepare(0, streamFirstLayer && layerIndex == 0)
-		if streamFirstLayer && layerIndex == 0 {
-			if err := s.downloadAndApplyLayer(ctx, reg, imageName, layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
-				reportPrepare(compressedBytes, true)
-			}); err != nil {
-				if !errors.Is(err, errStreamedLayerIncomplete) || ctx.Err() != nil {
-					return fmt.Errorf("download and prepare layer %s: %w", layer.Digest, err)
-				}
-				build = newIndexedBuildState()
-				pipelineMu.Lock()
-				preparedLayerWork = preparedLayerBytes
-				pipelineMu.Unlock()
-				resumeProgress := newParallelBlobProgress(name, layer.Size, func(event client.ProgressEvent) {
-					reportFirstLayerDownload(event.BytesDownloaded)
-				})
-				if err := s.cacheLayerBlob(ctx, reg, imageName, layer, resumeProgress); err != nil {
-					return fmt.Errorf("resume layer %s: %w", layer.Digest, err)
-				}
-				if err := s.writeAndApplyCachedLayer(layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
-					reportPrepare(compressedBytes, false)
-				}); err != nil {
-					return fmt.Errorf("prepare resumed layer %s: %w", layer.Digest, err)
-				}
+		if indexed != nil {
+			indexedByLayer[layerIndex] = min(layer.Size, max(0, *indexed))
+		}
+		var downloadedBytes, indexedBytes, indexedLayers int64
+		for index := range mani.Layers {
+			downloadedBytes += downloadedByLayer[index]
+			indexedBytes += indexedByLayer[index]
+			if indexedByLayer[index] >= mani.Layers[index].Size {
+				indexedLayers++
 			}
-		} else {
-			if err := downloads.waitLayer(ctx, layer.Digest); err != nil {
-				return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
+		}
+		downloadProgress := ratio(downloadedBytes, totalLayerBytes)
+		indexProgress := ratio(indexedBytes, totalLayerBytes)
+		progress := ratio(downloadedBytes+indexedBytes, totalLayerBytes*2)
+		pipelineMu.Unlock()
+		elapsed := time.Since(prepareStarted).Seconds()
+		var eta float64
+		if progress > 0 && progress < 1 && elapsed > 0 {
+			eta = elapsed * (1 - progress) / progress
+		}
+		status := "processing"
+		if indexedBytes == 0 {
+			status = "downloading"
+		}
+		report(client.ProgressEvent{
+			Status:           status,
+			Artifact:         name,
+			Blob:             layer.Digest,
+			Progress:         progress,
+			DownloadProgress: downloadProgress,
+			IndexProgress:    indexProgress,
+			BytesDownloaded:  downloadedBytes,
+			BytesTotal:       totalLayerBytes,
+			FilesDownloaded:  indexedLayers,
+			FilesTotal:       int64(len(mani.Layers)),
+			ETASeconds:       eta,
+		})
+	}
+	prepareCtx, cancelPrepare := context.WithCancel(ctx)
+	defer cancelPrepare()
+	type layerPrepareResult struct {
+		done chan struct{}
+		err  error
+	}
+	prepareResults := make([]*layerPrepareResult, len(mani.Layers))
+	resultsByDigest := make(map[string]*layerPrepareResult, len(mani.Layers))
+	prepareJobs := make(chan int, len(mani.Layers))
+	missingLayers := 0
+	for layerIndex, layer := range mani.Layers {
+		if s.cachedLayerArchiveAvailable(layer) {
+			continue
+		}
+		if existing := resultsByDigest[layer.Digest]; existing != nil {
+			prepareResults[layerIndex] = existing
+			continue
+		}
+		result := &layerPrepareResult{done: make(chan struct{})}
+		resultsByDigest[layer.Digest] = result
+		prepareResults[layerIndex] = result
+		prepareJobs <- layerIndex
+		missingLayers++
+	}
+	close(prepareJobs)
+	// Downloading, decompressing, and writing layer contents all share the same
+	// stream. Bound that combined work so large images do not saturate host CPU,
+	// disk, or network.
+	for range min(2, missingLayers) {
+		go func() {
+			for layerIndex := range prepareJobs {
+				layer := mani.Layers[layerIndex]
+				err := s.ensureLayerArchive(
+					prepareCtx,
+					reg,
+					imageName,
+					name,
+					layer,
+					func(current int64) {
+						reportPipeline(layerIndex, layer, &current, nil)
+					},
+					func(current int64) {
+						reportPipeline(layerIndex, layer, nil, &current)
+					},
+				)
+				result := prepareResults[layerIndex]
+				result.err = err
+				close(result.done)
 			}
-			if err := s.writeAndApplyCachedLayer(layer, layerTarPath, layerTarRel, build.merged, build.fsEntries, func(compressedBytes int64) {
-				reportPrepare(compressedBytes, false)
-			}); err != nil {
+		}()
+	}
+
+	for layerIndex, layer := range mani.Layers {
+		layerContentsRel := filepath.Join("layers", digestToFileName(layer.Digest)+".contents")
+		layerContentsPath := filepath.Join(tmpDir, layerContentsRel)
+		if result := prepareResults[layerIndex]; result != nil {
+			<-result.done
+			if err := result.err; err != nil {
+				cancelPrepare()
 				return fmt.Errorf("prepare layer %s: %w", layer.Digest, err)
 			}
 		}
-		preparedLayerBytes += layer.Size
-		reportPrepare(0, false)
-	}
-	if err := downloads.wait(ctx); err != nil {
-		return err
+		if err := s.writeAndApplyCachedLayer(layer, layerContentsPath, layerContentsRel, build.merged, build.fsEntries, nil); err != nil {
+			cancelPrepare()
+			return fmt.Errorf("apply layer %s: %w", layer.Digest, err)
+		}
+		complete := layer.Size
+		reportPipeline(layerIndex, layer, &complete, &complete)
 	}
 	report(client.ProgressEvent{
 		Status:           "processing",
@@ -1325,16 +1321,13 @@ type indexedBuildState struct {
 }
 
 func newIndexedBuildState() indexedBuildState {
-	fsEntries := map[string]fsmeta.Entry{
-		"/": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)},
-	}
+	rootMode := fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)
 	return indexedBuildState{
-		fsEntries: fsEntries,
 		merged: map[string]*indexedNode{
 			"/": {
 				Path: "/",
 				Kind: indexedKindDir,
-				Mode: fsEntries["/"].Mode,
+				Mode: rootMode,
 				UID:  0,
 				GID:  0,
 			},
@@ -1344,21 +1337,13 @@ func newIndexedBuildState() indexedBuildState {
 
 func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, resolvedSource, imageDir, tmpDir string, cfg imageConfig, build indexedBuildState) error {
 	ensureIndexedParents(build.merged, build.fsEntries)
-	indexPath := filepath.Join(imageDir, "rootfs.index.json")
+	indexPath := filepath.Join(imageDir, "rootfs.index")
 	indexBuf, err := encodeFSIndex(build.merged)
 	if err != nil {
 		return fmt.Errorf("marshal fs index: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index.json"), indexBuf, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index"), indexBuf, 0o644); err != nil {
 		return fmt.Errorf("write fs index: %w", err)
-	}
-	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
-	fsMetaBuf, err := json.MarshalIndent(build.fsEntries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal fs metadata: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.metadata.json"), fsMetaBuf, 0o644); err != nil {
-		return fmt.Errorf("write fs metadata: %w", err)
 	}
 
 	meta := metadata{
@@ -1368,7 +1353,6 @@ func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, resolvedSourc
 		SourceKind:     spec.Kind,
 		Architecture:   cfg.Architecture,
 		RootFSDir:      imageDir,
-		MetadataPath:   metadataPath,
 		IndexPath:      indexPath,
 		Env:            append([]string(nil), cfg.Config.Env...),
 		Entrypoint:     append([]string(nil), cfg.Config.Entrypoint...),
@@ -1501,10 +1485,10 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceS
 		meta.RootFSDir = dstDir
 	}
 	if meta.MetadataPath != "" {
-		meta.MetadataPath = filepath.Join(dstDir, "rootfs.metadata.json")
+		meta.MetadataPath = filepath.Join(dstDir, filepath.Base(srcMeta.MetadataPath))
 	}
 	if meta.IndexPath != "" {
-		meta.IndexPath = filepath.Join(dstDir, "rootfs.index.json")
+		meta.IndexPath = filepath.Join(dstDir, filepath.Base(srcMeta.IndexPath))
 	}
 	buf, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -2081,14 +2065,11 @@ func (s *Store) cachedLayerBlobAvailable(layer descriptor) bool {
 	return err == nil && info.Mode().IsRegular() && info.Size() == layer.Size
 }
 
-func (s *Store) downloadAndApplyLayer(
+func (s *Store) downloadAndPrepareLayer(
 	ctx context.Context,
 	reg *registryContext,
 	imageName string,
 	layer descriptor,
-	dstPath, tarRef string,
-	merged map[string]*indexedNode,
-	entries map[string]fsmeta.Entry,
 	progress func(int64),
 ) error {
 	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
@@ -2132,7 +2113,8 @@ func (s *Store) downloadAndApplyLayer(
 	}()
 	hash := sha256.New()
 	body := io.TeeReader(resp.Body, &layerBlobWriter{dst: io.MultiWriter(blob, hash)})
-	if err := writeAndApplyIndexedLayer(dstPath, layer.MediaType, body, tarRef, merged, entries, progress); err != nil {
+	indexPath, _, err := s.writeLayerArchiveAtomic(layer, body, progress)
+	if err != nil {
 		attemptWatchdog.stop()
 		if timedOut() && ctx.Err() == nil {
 			return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, errBlobDownloadInactive)
@@ -2143,6 +2125,12 @@ func (s *Store) downloadAndApplyLayer(
 		}
 		return err
 	}
+	archiveValidated := false
+	defer func() {
+		if !archiveValidated {
+			_ = os.RemoveAll(filepath.Dir(indexPath))
+		}
+	}()
 	attemptWatchdog.stop()
 	if err := blob.Close(); err != nil {
 		return err
@@ -2152,6 +2140,7 @@ func (s *Store) downloadAndApplyLayer(
 		return err
 	}
 	if info.Size() != layer.Size {
+		_ = os.RemoveAll(filepath.Dir(indexPath))
 		return fmt.Errorf("%w: %v", errStreamedLayerIncomplete, &download.LengthError{Expected: layer.Size, Actual: info.Size()})
 	}
 	actualDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
@@ -2159,13 +2148,99 @@ func (s *Store) downloadAndApplyLayer(
 		_ = os.Remove(partialBlobPath)
 		return &download.DigestError{Expected: layer.Digest, Actual: actualDigest}
 	}
+	archiveValidated = true
 	if err := os.Rename(partialBlobPath, blobPath); err != nil {
 		return err
+	}
+	_ = os.Remove(blobPath)
+	return nil
+}
+
+func (s *Store) downloadAndApplyLayer(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	layer descriptor,
+	dstPath, tarRef string,
+	merged map[string]*indexedNode,
+	entries map[string]fsmeta.Entry,
+	progress func(int64),
+) error {
+	if err := s.downloadAndPrepareLayer(ctx, reg, imageName, layer, progress); err != nil {
+		return err
+	}
+	indexPath, contentsPath := s.layerArchivePaths(layer.Digest)
+	if err := linkOrCopyLayerContents(contentsPath, dstPath); err != nil {
+		return fmt.Errorf("link layer contents: %w", err)
+	}
+	if err := applyLayerArchive(indexPath, tarRef, merged, entries); err != nil {
+		return fmt.Errorf("apply layer archive: %w", err)
 	}
 	return nil
 }
 
 var errStreamedLayerIncomplete = errors.New("streamed OCI layer download is incomplete")
+
+func (s *Store) ensureLayerArchive(
+	ctx context.Context,
+	reg *registryContext,
+	imageName string,
+	artifact string,
+	layer descriptor,
+	reportDownload func(int64),
+	reportIndex func(int64),
+) error {
+	if s.cachedLayerArchiveAvailable(layer) {
+		reportDownload(layer.Size)
+		reportIndex(layer.Size)
+		return nil
+	}
+	if s.cachedLayerBlobAvailable(layer) {
+		reportDownload(layer.Size)
+		return s.prepareLayerArchiveFromBlob(layer, reportIndex)
+	}
+
+	partialPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest)) + ".partial"
+	partial, partialErr := os.Stat(partialPath)
+	if partialErr != nil && !errors.Is(partialErr, os.ErrNotExist) {
+		return partialErr
+	}
+	if partialErr == nil && partial.Size() == 0 {
+		_ = os.Remove(partialPath)
+		partialErr = os.ErrNotExist
+	}
+	if errors.Is(partialErr, os.ErrNotExist) {
+		err := s.downloadAndPrepareLayer(ctx, reg, imageName, layer, func(current int64) {
+			reportDownload(current)
+			reportIndex(current)
+		})
+		if err == nil {
+			reportDownload(layer.Size)
+			reportIndex(layer.Size)
+			return nil
+		}
+		if !errors.Is(err, errStreamedLayerIncomplete) || ctx.Err() != nil {
+			return err
+		}
+		// The streamed archive is atomic and was discarded. Keep the partial
+		// compressed blob for a ranged retry, then rebuild the index from the
+		// completed blob.
+		reportIndex(0)
+	}
+
+	resumeProgress := newParallelBlobProgress(artifact, layer.Size, func(event client.ProgressEvent) {
+		reportDownload(event.BytesDownloaded)
+	})
+	if err := s.cacheLayerBlob(ctx, reg, imageName, layer, resumeProgress); err != nil {
+		return err
+	}
+	reportDownload(layer.Size)
+	if err := s.prepareLayerArchiveFromBlob(layer, reportIndex); err != nil {
+		return err
+	}
+	reportIndex(layer.Size)
+	return nil
+}
 
 func (s *Store) writeAndApplyCachedLayer(
 	layer descriptor,
@@ -2174,13 +2249,31 @@ func (s *Store) writeAndApplyCachedLayer(
 	entries map[string]fsmeta.Entry,
 	progress func(int64),
 ) error {
+	indexPath, contentsPath := s.layerArchivePaths(layer.Digest)
+	if s.cachedLayerArchiveAvailable(layer) {
+		if err := linkOrCopyLayerContents(contentsPath, dstPath); err != nil {
+			return fmt.Errorf("link cached layer contents: %w", err)
+		}
+		return applyLayerArchive(indexPath, tarRef, merged, entries)
+	}
 	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
 	file, err := os.Open(blobPath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	return writeAndApplyIndexedLayer(dstPath, layer.MediaType, file, tarRef, merged, entries, progress)
+	indexPath, contentsPath, err = s.writeLayerArchiveAtomic(layer, file, progress)
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	_ = os.Remove(blobPath)
+	if err := linkOrCopyLayerContents(contentsPath, dstPath); err != nil {
+		return fmt.Errorf("link layer contents: %w", err)
+	}
+	return applyLayerArchive(indexPath, tarRef, merged, entries)
 }
 
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
