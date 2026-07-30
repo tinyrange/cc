@@ -19,6 +19,7 @@ import (
 	"j5.nz/cc/internal/kernel/alpine"
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/execplan"
@@ -164,6 +165,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		DisplayWidth:    displayWidth(req.Display),
 		DisplayHeight:   displayHeight(req.Display),
 		NetDevice:       networkDevice(network),
+		SharedMemory:    shmem.FromContext(ctx),
 	}, onEvent)
 	timing.Since(ctx, "startup.kvm_to_ready", stageStart)
 	if err != nil {
@@ -211,6 +213,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Shares:           append([]client.ShareMount(nil), req.Shares...),
 			PersistentMounts: append([]client.PersistentMount(nil), req.PersistentMounts...),
 			Network:          req.Network,
+			SharedMemory:     req.SharedMemory,
 			KernelModules:    append([]string(nil), req.KernelModules...),
 			MemoryMB:         req.MemoryMB,
 			BalloonMB:        req.BalloonMB,
@@ -302,6 +305,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		DisplayWidth:    displayWidth(req.Display),
 		DisplayHeight:   displayHeight(req.Display),
 		NetDevice:       networkDevice(network),
+		SharedMemory:    shmem.FromContext(ctx),
 	}, onEvent)
 	if err != nil {
 		return nil, err

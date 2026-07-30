@@ -18,6 +18,7 @@ import (
 	"j5.nz/cc/internal/fdt"
 	managedagent "j5.nz/cc/internal/managed/agent"
 	"j5.nz/cc/internal/serial"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -49,6 +50,7 @@ type ManagedSessionOptions struct {
 	DisplayWidth    uint32
 	DisplayHeight   uint32
 	NetDevice       *virtio.Net
+	SharedMemory    *shmem.Attachment
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -166,6 +168,17 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 		vsock.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	var sharedMemoryDevice *shmem.Device
+	if opts.SharedMemory != nil {
+		sharedMemoryDevice, err = shmem.NewDevice(opts.SharedMemory.Config().PhysAddr, opts.SharedMemory, vm)
+		if err != nil {
+			closeVMWithFS(vm, fsdevs)
+			_ = listener.Close()
+			vsock.Close()
+			return nil, err
+		}
+		opts.SharedMemory.Claim()
+	}
 	if snapshot != nil {
 		snapshot.mem = mem
 	}
@@ -192,6 +205,9 @@ func StartManagedSessionWithOptions(ctx context.Context, kernel []byte, initrd [
 		opts.NetDevice.Attach(vm, vm)
 	}
 	runtimeDevices := append([]virtio.MMIODevice(nil), displayDevices...)
+	if sharedMemoryDevice != nil {
+		runtimeDevices = append(runtimeDevices, sharedMemoryDevice)
+	}
 	if opts.NetDevice != nil {
 		runtimeDevices = append(runtimeDevices, opts.NetDevice)
 	}

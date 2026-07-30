@@ -15,6 +15,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
 	managedagent "j5.nz/cc/internal/managed/agent"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -47,6 +48,7 @@ type ManagedSessionOptions struct {
 	BalloonMB       uint64
 	DisplayWidth    uint32
 	DisplayHeight   uint32
+	SharedMemory    *shmem.Attachment
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -145,6 +147,18 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		vsock.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	runtimeDevices := append([]virtio.MMIODevice(nil), displayDevices...)
+	if opts.SharedMemory != nil {
+		device, err := shmem.NewDevice(opts.SharedMemory.Config().PhysAddr, opts.SharedMemory, vm)
+		if err != nil {
+			closeVMWithFS(vm, fsdevs)
+			_ = listener.Close()
+			vsock.Close()
+			return nil, err
+		}
+		opts.SharedMemory.Claim()
+		runtimeDevices = append(runtimeDevices, device)
+	}
 
 	serialOut := vmruntime.NewSerialTranscript()
 	var serialWriter io.Writer = serialOut
@@ -226,7 +240,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	done := newSessionDone()
 	var fsCloseErr error
 	go func() {
-		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, displayDevices, serialOut, snapshot)
+		err := runManagedExecVMWithSnapshot(runCtx, vm, uart, fsdevs, vsock, rng, balloon, netdev, runtimeDevices, serialOut, snapshot)
 		fsCloseErr = closeVMWithFS(vm, fsdevs)
 		done.finish(err)
 	}()

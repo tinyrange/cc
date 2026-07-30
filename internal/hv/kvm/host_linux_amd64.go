@@ -13,6 +13,7 @@ import (
 	"j5.nz/cc/internal/managed/machine"
 	managedsession "j5.nz/cc/internal/managed/session"
 	"j5.nz/cc/internal/netstack"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -29,6 +30,7 @@ type LinuxManagedMachine struct {
 	DisplayHeight   uint32
 	SnapshotDir     string
 	RestoreSnapshot string
+	SharedMemory    *shmem.Attachment
 }
 
 type LinuxManagedAttachments struct {
@@ -39,6 +41,7 @@ type LinuxManagedAttachments struct {
 	DisplayHeight   uint32
 	SnapshotDir     string
 	RestoreSnapshot string
+	SharedMemory    *shmem.Attachment
 }
 
 type BSDManagedAttachments struct {
@@ -87,6 +90,7 @@ func (Host) startLinux(ctx context.Context, req managedhost.StartRequest, onEven
 		DisplayHeight:   attachments.DisplayHeight,
 		SnapshotDir:     strings.TrimSpace(attachments.SnapshotDir),
 		RestoreSnapshot: strings.TrimSpace(attachments.RestoreSnapshot),
+		SharedMemory:    attachments.SharedMemory,
 	}, onEvent)
 }
 
@@ -176,6 +180,7 @@ func (Host) StartLinuxManaged(ctx context.Context, machine LinuxManagedMachine, 
 			BalloonMB:       machine.BalloonMB,
 			DisplayWidth:    machine.DisplayWidth,
 			DisplayHeight:   machine.DisplayHeight,
+			SharedMemory:    machine.SharedMemory,
 		},
 		onEvent,
 	)

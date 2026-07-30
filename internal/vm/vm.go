@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/hv"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/rfb"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/builtin"
 	vmhost "j5.nz/cc/internal/vm/host"
@@ -121,6 +122,7 @@ type Manager struct {
 	maxMemoryMB   uint64
 	maxCPUs       int
 	closing       bool
+	sharedMemory  *shmem.Registry
 }
 
 type resourceReservation struct {
@@ -151,6 +153,7 @@ type Machine struct {
 	balloonMB                uint64
 	cpus                     int
 	nestedVirt               bool
+	sharedMemoryConfig       *client.SharedMemoryConfig
 	startedAt                time.Time
 	instance                 Instance
 	lastErr                  error
@@ -160,6 +163,7 @@ type Machine struct {
 	display                  *client.DisplayState
 	vncListener              net.Listener
 	vncServer                *rfb.Server
+	sharedMemory             *shmem.Attachment
 }
 
 type machineStopOperation struct {
@@ -195,11 +199,36 @@ func newManagerBudgets(m *Manager) *Manager {
 	// configured totals are not useful host-capacity ceilings. The vmsh host
 	// observes real memory pressure and dynamically balloons guests instead.
 	// Explicit test/embedding budgets can still set these fields when desired.
+	if m.sharedMemory == nil {
+		m.sharedMemory = shmem.NewRegistry()
+	}
 	return m
 }
 
 func NewManagerWithHosts(hosts ...VMHost) *Manager {
 	return NewManagerWithHost(vmhost.NewPlacement(hosts...))
+}
+
+func validateSharedMemoryRequest(config *client.SharedMemoryConfig) error {
+	if config == nil {
+		return nil
+	}
+	return shmem.ValidateConfig(shmem.Config{Domain: config.Domain, PhysAddr: config.PhysAddr})
+}
+
+func cloneSharedMemoryConfig(config *client.SharedMemoryConfig) *client.SharedMemoryConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
+}
+
+func (m *Manager) attachSharedMemory(config *client.SharedMemoryConfig) (*shmem.Attachment, error) {
+	if config == nil {
+		return nil, nil
+	}
+	return m.sharedMemory.Attach(shmem.Config{Domain: config.Domain, PhysAddr: config.PhysAddr})
 }
 
 func Supports() error {
@@ -455,6 +484,12 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if display != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
 		return client.InstanceState{}, fmt.Errorf("display-enabled VMs do not support startup snapshots")
 	}
+	if req.SharedMemory != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
+		return client.InstanceState{}, fmt.Errorf("shared-memory VMs do not support startup snapshots")
+	}
+	if err := validateSharedMemoryRequest(req.SharedMemory); err != nil {
+		return client.InstanceState{}, err
+	}
 	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
 	if err != nil {
 		return client.InstanceState{}, err
@@ -501,32 +536,50 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	req.Network = m.ensureNetworkLeaseLocked(id, req.Image, req.Network)
 	m.mu.Unlock()
 
-	inst, err := m.host.StartStream(startCtx, req, onEvent)
+	attachment, err := m.attachSharedMemory(req.SharedMemory)
 	if err != nil {
 		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
+	if attachment != nil {
+		startCtx = shmem.WithAttachment(startCtx, attachment)
+	}
+	inst, err := m.host.StartStream(startCtx, req, onEvent)
+	if err != nil {
+		_ = attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, err
+	}
+	if attachment != nil && !attachment.Claimed() {
+		closeErr := inst.Close()
+		releaseErr := attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, errors.Join(fmt.Errorf("VM backend does not support shared memory"), closeErr, releaseErr)
+	}
 	displayState, vncListener, vncServer, err := startVNCServer(inst, id, display)
 	if err != nil {
 		closeErr := inst.Close()
+		releaseErr := attachment.Release()
 		m.finishStart(id, start)
-		return client.InstanceState{}, errors.Join(err, closeErr)
+		return client.InstanceState{}, errors.Join(err, closeErr, releaseErr)
 	}
 
 	machine := &Machine{
-		id:          id,
-		image:       req.Image,
-		initSystem:  req.InitSystem,
-		kernel:      req.Kernel,
-		memoryMB:    req.MemoryMB,
-		balloonMB:   req.BalloonMB,
-		cpus:        req.CPUs,
-		nestedVirt:  req.NestedVirt,
-		startedAt:   time.Now().UTC(),
-		instance:    inst,
-		display:     displayState,
-		vncListener: vncListener,
-		vncServer:   vncServer,
+		id:                 id,
+		image:              req.Image,
+		initSystem:         req.InitSystem,
+		kernel:             req.Kernel,
+		memoryMB:           req.MemoryMB,
+		balloonMB:          req.BalloonMB,
+		cpus:               req.CPUs,
+		nestedVirt:         req.NestedVirt,
+		sharedMemoryConfig: cloneSharedMemoryConfig(req.SharedMemory),
+		startedAt:          time.Now().UTC(),
+		instance:           inst,
+		display:            displayState,
+		vncListener:        vncListener,
+		vncServer:          vncServer,
+		sharedMemory:       attachment,
 	}
 
 	m.mu.Lock()
@@ -543,6 +596,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		}
 		_ = vncServer.Close()
 		start.cleanupErr = inst.Close()
+		start.cleanupErr = errors.Join(start.cleanupErr, attachment.Release())
 		close(start.done)
 		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
 	}
@@ -592,6 +646,12 @@ func (m *Manager) StartBlankInstanceStream(
 	req.Display = display
 	if display != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
 		return client.InstanceState{}, fmt.Errorf("display-enabled VMs do not support startup snapshots")
+	}
+	if req.SharedMemory != nil && (strings.TrimSpace(req.SnapshotDir) != "" || strings.TrimSpace(req.RestoreSnapshot) != "") {
+		return client.InstanceState{}, fmt.Errorf("shared-memory VMs do not support startup snapshots")
+	}
+	if err := validateSharedMemoryRequest(req.SharedMemory); err != nil {
+		return client.InstanceState{}, err
 	}
 	canonicalShares, err := mounts.CanonicalRuntimeShares(req.Shares)
 	if err != nil {
@@ -645,14 +705,29 @@ func (m *Manager) StartBlankInstanceStream(
 	if !startupShares {
 		req.Shares = nil
 	}
-	inst, err := m.host.StartBlankStream(startCtx, req, onEvent)
+	attachment, err := m.attachSharedMemory(req.SharedMemory)
 	if err != nil {
 		m.finishStart(id, start)
 		return client.InstanceState{}, err
 	}
+	if attachment != nil {
+		startCtx = shmem.WithAttachment(startCtx, attachment)
+	}
+	inst, err := m.host.StartBlankStream(startCtx, req, onEvent)
+	if err != nil {
+		_ = attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, err
+	}
+	if attachment != nil && !attachment.Claimed() {
+		closeErr := inst.Close()
+		releaseErr := attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, errors.Join(fmt.Errorf("VM backend does not support shared memory"), closeErr, releaseErr)
+	}
 	if !startupShares {
 		if err := addInstanceShares(startCtx, inst, shares); err != nil {
-			start.cleanupErr = inst.Close()
+			start.cleanupErr = errors.Join(inst.Close(), attachment.Release())
 			m.finishStart(id, start)
 			return client.InstanceState{}, errors.Join(err, start.cleanupErr)
 		}
@@ -660,24 +735,27 @@ func (m *Manager) StartBlankInstanceStream(
 	displayState, vncListener, vncServer, err := startVNCServer(inst, id, display)
 	if err != nil {
 		closeErr := inst.Close()
+		releaseErr := attachment.Release()
 		m.finishStart(id, start)
-		return client.InstanceState{}, errors.Join(err, closeErr)
+		return client.InstanceState{}, errors.Join(err, closeErr, releaseErr)
 	}
 
 	machine := &Machine{
-		id:          id,
-		image:       req.Image,
-		initSystem:  req.InitSystem,
-		kernel:      req.Kernel,
-		memoryMB:    req.MemoryMB,
-		balloonMB:   req.BalloonMB,
-		cpus:        req.CPUs,
-		nestedVirt:  req.NestedVirt,
-		startedAt:   time.Now().UTC(),
-		instance:    inst,
-		display:     displayState,
-		vncListener: vncListener,
-		vncServer:   vncServer,
+		id:                 id,
+		image:              req.Image,
+		initSystem:         req.InitSystem,
+		kernel:             req.Kernel,
+		memoryMB:           req.MemoryMB,
+		balloonMB:          req.BalloonMB,
+		cpus:               req.CPUs,
+		nestedVirt:         req.NestedVirt,
+		sharedMemoryConfig: cloneSharedMemoryConfig(req.SharedMemory),
+		startedAt:          time.Now().UTC(),
+		instance:           inst,
+		display:            displayState,
+		vncListener:        vncListener,
+		vncServer:          vncServer,
+		sharedMemory:       attachment,
 	}
 
 	m.mu.Lock()
@@ -694,6 +772,7 @@ func (m *Manager) StartBlankInstanceStream(
 		}
 		_ = vncServer.Close()
 		start.cleanupErr = inst.Close()
+		start.cleanupErr = errors.Join(start.cleanupErr, attachment.Release())
 		close(start.done)
 		return client.InstanceState{}, errors.Join(ErrManagerClosing, start.cleanupErr)
 	}
@@ -858,7 +937,7 @@ func (m *Manager) runMachineStop(machine *Machine, stop *machineStopOperation) {
 	if errors.Is(vncErr, net.ErrClosed) {
 		vncErr = nil
 	}
-	err := errors.Join(vncErr, machine.vncServer.Close(), machine.instance.Close())
+	err := errors.Join(vncErr, machine.vncServer.Close(), machine.instance.Close(), machine.sharedMemory.Release())
 	machine.lifecycleMu.Unlock()
 	m.mu.Lock()
 	stop.err = err
@@ -1314,17 +1393,18 @@ func (m *Manager) statusSnapshotLocked(id string) managerStatusSnapshot {
 	}
 	machine := m.running[id]
 	state := client.InstanceState{
-		ID:         id,
-		Status:     "running",
-		Image:      machine.image,
-		InitSystem: machine.initSystem,
-		Kernel:     machine.kernel,
-		MemoryMB:   machine.memoryMB,
-		BalloonMB:  machine.balloonMB,
-		CPUs:       machine.cpus,
-		NestedVirt: machine.nestedVirt,
-		StartedAt:  machine.startedAt.Format(time.RFC3339Nano),
-		Display:    machine.display,
+		ID:           id,
+		Status:       "running",
+		Image:        machine.image,
+		InitSystem:   machine.initSystem,
+		Kernel:       machine.kernel,
+		MemoryMB:     machine.memoryMB,
+		BalloonMB:    machine.balloonMB,
+		CPUs:         machine.cpus,
+		NestedVirt:   machine.nestedVirt,
+		SharedMemory: cloneSharedMemoryConfig(machine.sharedMemoryConfig),
+		StartedAt:    machine.startedAt.Format(time.RFC3339Nano),
+		Display:      machine.display,
 	}
 	snapshot := managerStatusSnapshot{id: id, machine: machine, state: state}
 	if machine.stopping {
@@ -1501,6 +1581,7 @@ func saturatingUint64Add(a, b uint64) uint64 {
 
 func (m *Manager) watch(machine *Machine) {
 	err := machine.instance.Wait()
+	err = errors.Join(err, machine.sharedMemory.Release())
 	if machine.vncListener != nil {
 		_ = machine.vncListener.Close()
 	}
@@ -1529,7 +1610,7 @@ func (m *Manager) recordExitLocked(machine *Machine, err error) {
 	if m.exited == nil {
 		m.exited = make(map[string]client.InstanceState)
 	}
-	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
+	state := client.InstanceState{ID: machine.id, Status: "stopped", Image: machine.image, InitSystem: machine.initSystem, Kernel: machine.kernel, MemoryMB: machine.memoryMB, BalloonMB: machine.balloonMB, CPUs: machine.cpus, NestedVirt: machine.nestedVirt, SharedMemory: cloneSharedMemoryConfig(machine.sharedMemoryConfig), StartedAt: machine.startedAt.Format(time.RFC3339), ExitedAt: machine.exitedAt.Format(time.RFC3339)}
 	if err != nil {
 		state.Status = "crashed"
 		state.Error = boundedLifecycleDiagnostic(err.Error())
