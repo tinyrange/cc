@@ -419,50 +419,57 @@ type DisplayState struct {
 	VNCAddress string `json:"vnc_address,omitempty"`
 }
 
+type SharedMemoryConfig struct {
+	Domain   string `json:"domain"`
+	PhysAddr uint64 `json:"phys_addr"`
+}
+
 type CreateInstanceRequest struct {
-	ID               string            `json:"id,omitempty"`
-	Image            string            `json:"image"`
-	DefaultUser      string            `json:"default_user,omitempty"`
-	InitSystem       string            `json:"init,omitempty"`
-	Kernel           string            `json:"kernel,omitempty"`
-	Shares           []ShareMount      `json:"shares,omitempty"`
-	PersistentMounts []PersistentMount `json:"persistent_mounts,omitempty"`
-	Network          *NetworkConfig    `json:"network,omitempty"`
-	Display          *DisplayConfig    `json:"display,omitempty"`
-	KernelModules    []string          `json:"kernel_modules,omitempty"`
-	MemoryMB         uint64            `json:"memory_mb,omitempty"`
-	BalloonMB        uint64            `json:"balloon_mb,omitempty"`
-	CPUs             int               `json:"cpus,omitempty"`
-	NestedVirt       bool              `json:"nested_virtualization,omitempty"`
-	AMD64Emulation   bool              `json:"amd64_emulation,omitempty"`
-	Dmesg            bool              `json:"dmesg,omitempty"`
-	SnapshotDir      string            `json:"snapshot_dir,omitempty"`
-	RestoreSnapshot  string            `json:"restore_snapshot,omitempty"`
-	TimeoutSeconds   float64           `json:"timeout_seconds,omitempty"`
-	PolicyToken      uint64            `json:"-"`
+	ID               string              `json:"id,omitempty"`
+	Image            string              `json:"image"`
+	DefaultUser      string              `json:"default_user,omitempty"`
+	InitSystem       string              `json:"init,omitempty"`
+	Kernel           string              `json:"kernel,omitempty"`
+	Shares           []ShareMount        `json:"shares,omitempty"`
+	PersistentMounts []PersistentMount   `json:"persistent_mounts,omitempty"`
+	Network          *NetworkConfig      `json:"network,omitempty"`
+	Display          *DisplayConfig      `json:"display,omitempty"`
+	SharedMemory     *SharedMemoryConfig `json:"shared_memory,omitempty"`
+	KernelModules    []string            `json:"kernel_modules,omitempty"`
+	MemoryMB         uint64              `json:"memory_mb,omitempty"`
+	BalloonMB        uint64              `json:"balloon_mb,omitempty"`
+	CPUs             int                 `json:"cpus,omitempty"`
+	NestedVirt       bool                `json:"nested_virtualization,omitempty"`
+	AMD64Emulation   bool                `json:"amd64_emulation,omitempty"`
+	Dmesg            bool                `json:"dmesg,omitempty"`
+	SnapshotDir      string              `json:"snapshot_dir,omitempty"`
+	RestoreSnapshot  string              `json:"restore_snapshot,omitempty"`
+	TimeoutSeconds   float64             `json:"timeout_seconds,omitempty"`
+	PolicyToken      uint64              `json:"-"`
 }
 
 type StartInstanceRequest struct {
-	ID               string            `json:"id,omitempty"`
-	Image            string            `json:"image,omitempty"`
-	DefaultUser      string            `json:"default_user,omitempty"`
-	InitSystem       string            `json:"init,omitempty"`
-	Kernel           string            `json:"kernel,omitempty"`
-	Shares           []ShareMount      `json:"shares,omitempty"`
-	PersistentMounts []PersistentMount `json:"persistent_mounts,omitempty"`
-	Network          *NetworkConfig    `json:"network,omitempty"`
-	Display          *DisplayConfig    `json:"display,omitempty"`
-	KernelModules    []string          `json:"kernel_modules,omitempty"`
-	MemoryMB         uint64            `json:"memory_mb,omitempty"`
-	BalloonMB        uint64            `json:"balloon_mb,omitempty"`
-	CPUs             int               `json:"cpus,omitempty"`
-	NestedVirt       bool              `json:"nested_virtualization,omitempty"`
-	AMD64Emulation   bool              `json:"amd64_emulation,omitempty"`
-	Dmesg            bool              `json:"dmesg,omitempty"`
-	SnapshotDir      string            `json:"snapshot_dir,omitempty"`
-	RestoreSnapshot  string            `json:"restore_snapshot,omitempty"`
-	TimeoutSeconds   float64           `json:"timeout_seconds,omitempty"`
-	PolicyToken      uint64            `json:"-"`
+	ID               string              `json:"id,omitempty"`
+	Image            string              `json:"image,omitempty"`
+	DefaultUser      string              `json:"default_user,omitempty"`
+	InitSystem       string              `json:"init,omitempty"`
+	Kernel           string              `json:"kernel,omitempty"`
+	Shares           []ShareMount        `json:"shares,omitempty"`
+	PersistentMounts []PersistentMount   `json:"persistent_mounts,omitempty"`
+	Network          *NetworkConfig      `json:"network,omitempty"`
+	Display          *DisplayConfig      `json:"display,omitempty"`
+	SharedMemory     *SharedMemoryConfig `json:"shared_memory,omitempty"`
+	KernelModules    []string            `json:"kernel_modules,omitempty"`
+	MemoryMB         uint64              `json:"memory_mb,omitempty"`
+	BalloonMB        uint64              `json:"balloon_mb,omitempty"`
+	CPUs             int                 `json:"cpus,omitempty"`
+	NestedVirt       bool                `json:"nested_virtualization,omitempty"`
+	AMD64Emulation   bool                `json:"amd64_emulation,omitempty"`
+	Dmesg            bool                `json:"dmesg,omitempty"`
+	SnapshotDir      string              `json:"snapshot_dir,omitempty"`
+	RestoreSnapshot  string              `json:"restore_snapshot,omitempty"`
+	TimeoutSeconds   float64             `json:"timeout_seconds,omitempty"`
+	PolicyToken      uint64              `json:"-"`
 }
 
 type InstanceState struct {
@@ -477,6 +484,7 @@ type InstanceState struct {
 	BalloonStatus                 string                 `json:"balloon_status,omitempty"`
 	CPUs                          int                    `json:"cpus,omitempty"`
 	NestedVirt                    bool                   `json:"nested_virtualization,omitempty"`
+	SharedMemory                  *SharedMemoryConfig    `json:"shared_memory,omitempty"`
 	StartedAt                     string                 `json:"started_at,omitempty"`
 	NetworkIPv4                   string                 `json:"network_ipv4,omitempty"`
 	Display                       *DisplayState          `json:"display,omitempty"`

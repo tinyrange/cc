@@ -235,6 +235,49 @@ func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint
 	return mem, nil
 }
 
+func (v *VM) MapSharedMemory(mem []byte, guestPhysAddr uint64) error {
+	if len(mem) == 0 || guestPhysAddr%4096 != 0 || uint64(len(mem))%4096 != 0 {
+		return fmt.Errorf("shared memory mapping must be non-empty and page-aligned")
+	}
+	size := uint64(len(mem))
+	if guestPhysAddr > ^uint64(0)-(size-1) {
+		return fmt.Errorf("shared memory mapping overflows guest address space")
+	}
+	// The current amd64 platform devices occupy the 0xd0000000 aperture.
+	if guestPhysAddr < 0xd1000000 && 0xd0000000 < guestPhysAddr+size {
+		return fmt.Errorf("shared memory mapping overlaps the platform device aperture")
+	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
+	if v.kvm == nil || v.memoryClosing {
+		return fmt.Errorf("VM is closing")
+	}
+	if rangesOverlapGuestMemory(guestPhysAddr, size, 0, v.lowMemLimit) {
+		return fmt.Errorf("shared memory mapping overlaps guest RAM")
+	}
+	for _, existing := range v.regions {
+		if rangesOverlapGuestMemory(guestPhysAddr, size, existing.guestPhysAddr, uint64(len(existing.mem))) {
+			return fmt.Errorf("shared memory mapping overlaps an existing guest mapping")
+		}
+	}
+	slot := uint32(1 + len(v.regions))
+	region := kvmUserspaceMemoryRegion{
+		Slot:          slot,
+		GuestPhysAddr: guestPhysAddr,
+		MemorySize:    size,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
+		return fmt.Errorf("map shared memory slot %d: %w", slot, err)
+	}
+	v.regions = append(v.regions, memoryMapping{guestPhysAddr: guestPhysAddr, mem: mem})
+	return nil
+}
+
+func rangesOverlapGuestMemory(a, aSize, b, bSize uint64) bool {
+	return a < b+bSize && b < a+aSize
+}
+
 func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 	totalSize := amd64vm.MemorySizeBytes(memoryMB)
 	mem, err := unix.Mmap(-1, 0, int(totalSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)

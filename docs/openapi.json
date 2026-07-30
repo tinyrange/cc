@@ -1197,6 +1197,14 @@
           "vnc_address": { "type": "string" }
         }
       },
+      "SharedMemoryConfig": {
+        "type": "object",
+        "required": ["domain", "phys_addr"],
+        "properties": {
+          "domain": { "type": "string" },
+          "phys_addr": { "type": "integer", "format": "uint64" }
+        }
+      },
       "PortForward": {
         "type": "object",
         "properties": {
@@ -1227,11 +1235,13 @@
           "persistent_mounts": { "type": "array", "items": { "$ref": "#/components/schemas/PersistentMount" } },
           "network": { "$ref": "#/components/schemas/NetworkConfig" },
           "display": { "$ref": "#/components/schemas/DisplayConfig" },
+          "shared_memory": { "$ref": "#/components/schemas/SharedMemoryConfig" },
           "kernel_modules": { "type": "array", "items": { "type": "string" } },
           "memory_mb": { "type": "integer", "format": "uint64" },
           "balloon_mb": { "type": "integer", "format": "uint64" },
           "cpus": { "type": "integer" },
           "nested_virtualization": { "type": "boolean" },
+          "shared_memory": { "$ref": "#/components/schemas/SharedMemoryConfig" },
           "amd64_emulation": { "type": "boolean", "description": "Install the amd64 binfmt emulator even when the guest image is arm64." },
           "dmesg": { "type": "boolean" },
           "snapshot_dir": { "type": "string", "description": "Directory where the runtime may write a startup snapshot during this boot." },

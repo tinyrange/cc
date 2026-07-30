@@ -22,6 +22,7 @@ import (
 	"j5.nz/cc/internal/managed/rootartifact"
 	managedruntime "j5.nz/cc/internal/managed/runtime"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/shmem"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm/execplan"
 	kvmhost "j5.nz/cc/internal/vm/host/kvm"
@@ -146,6 +147,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+			SharedMemory:    shmem.FromContext(ctx),
 		},
 	}, onEvent)
 	if err != nil {
@@ -197,6 +199,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			PersistentMounts: append([]client.PersistentMount(nil), req.PersistentMounts...),
 			Network:          req.Network,
 			Display:          req.Display,
+			SharedMemory:     req.SharedMemory,
 			KernelModules:    append([]string(nil), req.KernelModules...),
 			MemoryMB:         req.MemoryMB,
 			BalloonMB:        req.BalloonMB,
@@ -287,6 +290,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+			SharedMemory:    shmem.FromContext(ctx),
 		},
 	}, onEvent)
 	if err != nil {

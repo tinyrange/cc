@@ -55,10 +55,16 @@ type VM struct {
 	run           []byte
 	mem           []byte
 	extraMem      [][]byte
+	sharedMem     []arm64SharedMapping
 	memRegion     kvmUserspaceMemoryRegion
 	tid           atomic.Int32
 	memoryDetach  []func()
 	memoryClosing bool
+}
+
+type arm64SharedMapping struct {
+	guestPhysAddr uint64
+	mem           []byte
 }
 
 func NewVM() (*VM, error) {
@@ -151,6 +157,7 @@ func (v *VM) Close() error {
 		}
 	}
 	v.extraMem = nil
+	v.sharedMem = nil
 	if v.kvm != nil {
 		_ = v.kvm.CloseVCPU(v.vcpufd)
 		if v.vgicfd >= 0 {
@@ -251,6 +258,46 @@ func (v *VM) MapMemoryAlias(slot uint32, guestPhysAddr uint64, mem []byte) error
 	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
 		return fmt.Errorf("set user memory alias: %w", err)
 	}
+	return nil
+}
+
+func (v *VM) MapSharedMemory(mem []byte, guestPhysAddr uint64) error {
+	if len(mem) == 0 || guestPhysAddr%4096 != 0 || uint64(len(mem))%4096 != 0 {
+		return fmt.Errorf("shared memory mapping must be non-empty and page-aligned")
+	}
+	size := uint64(len(mem))
+	if guestPhysAddr > ^uint64(0)-(size-1) {
+		return fmt.Errorf("shared memory mapping overflows guest address space")
+	}
+	if guestPhysAddr < 0x22000000 && 0x08000000 < guestPhysAddr+size {
+		return fmt.Errorf("shared memory mapping overlaps the platform device aperture")
+	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
+	if v.kvm == nil || v.memoryClosing {
+		return fmt.Errorf("VM is closing")
+	}
+	if guestPhysAddr < v.memRegion.GuestPhysAddr+v.memRegion.MemorySize &&
+		v.memRegion.GuestPhysAddr < guestPhysAddr+size {
+		return fmt.Errorf("shared memory mapping overlaps guest RAM")
+	}
+	for _, existing := range v.sharedMem {
+		if guestPhysAddr < existing.guestPhysAddr+uint64(len(existing.mem)) &&
+			existing.guestPhysAddr < guestPhysAddr+size {
+			return fmt.Errorf("shared memory mapping overlaps an existing guest mapping")
+		}
+	}
+	slot := uint32(1 + len(v.extraMem) + len(v.sharedMem))
+	region := kvmUserspaceMemoryRegion{
+		Slot:          slot,
+		GuestPhysAddr: guestPhysAddr,
+		MemorySize:    size,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
+		return fmt.Errorf("map shared memory slot %d: %w", slot, err)
+	}
+	v.sharedMem = append(v.sharedMem, arm64SharedMapping{guestPhysAddr: guestPhysAddr, mem: mem})
 	return nil
 }
 
