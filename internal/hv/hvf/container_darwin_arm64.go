@@ -1286,7 +1286,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			vm.Close()
 			return nil, fmt.Errorf("create display: %w", err)
 		}
-		renderer, err := virgl.NewHostRenderer()
+		renderer, err := virgl.NewHostRendererWithShareGroup(req.OpenGLShareContext, req.OpenGLSharePixelFormat)
 		if err != nil {
 			vm.Close()
 			return nil, fmt.Errorf("create VirGL renderer: %w", err)

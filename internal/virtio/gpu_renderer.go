@@ -54,6 +54,24 @@ type GPUResourceBacking interface {
 	WriteAt(offset uint64, src []byte) error
 }
 
+// GPUNativeFrame is a leased host texture in the frontend's OpenGL share
+// group. ReleaseFrame receives an optional consumer fence inserted after the
+// frontend's final sample of Texture.
+type GPUNativeFrame struct {
+	Width, Height int
+	Generation    uint64
+	Damage        image.Rectangle
+	Texture       uint32
+	ProducerFence uintptr
+	ReleaseFrame  func(uintptr)
+}
+
+// GPUNativeScanoutRenderer is implemented when the renderer can publish
+// scanout frames without a CPU readback.
+type GPUNativeScanoutRenderer interface {
+	NativeScanout(resourceID uint32, rect image.Rectangle) (GPUNativeFrame, bool, error)
+}
+
 // GPURenderer owns the host implementation of an advertised virtio-gpu 3D
 // command protocol. Calls are ordered exactly as they arrive on controlq.
 // Returning from a call means the command is complete for virtio fence

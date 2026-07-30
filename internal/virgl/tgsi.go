@@ -24,6 +24,7 @@ type tgsiShader struct {
 	outputs        map[int]tgsiDeclaration
 	maxConstant    int
 	maxTemporary   int
+	maxAddress     int
 	maxSampler     int
 	maxSamplerView int
 	immediates     []string
@@ -31,11 +32,14 @@ type tgsiShader struct {
 }
 
 var (
-	tgsiDeclarationPattern = regexp.MustCompile(`^DCL (IN|OUT|CONST|TEMP|SAMP)\[(\d+)(?:\.\.(\d+))?\](?:,\s*([^,]+))?`)
+	tgsiDeclarationPattern = regexp.MustCompile(`^DCL (IN|OUT|CONST|TEMP|ADDR|SAMP)\[(\d+)(?:\.\.(\d+))?\](?:,\s*([^,]+))?`)
 	tgsiImmediatePattern   = regexp.MustCompile(`^IMM\[(\d+)\]\s+(\w+)\s+\{([^}]+)\}$`)
 	tgsiSamplerViewPattern = regexp.MustCompile(`^DCL SVIEW\[(\d+)(?:\.\.(\d+))?\],\s*([A-Z0-9_]+),\s*([A-Z0-9_]+)$`)
 	tgsiInstructionPattern = regexp.MustCompile(`^\s*\d+:\s+([A-Z0-9_]+)(?:\s+(.+))?$`)
 	tgsiRegisterPattern    = regexp.MustCompile(`^(IN|OUT|CONST|TEMP|IMM)\[(\d+)\](?:\.([xyzw]+))?$`)
+	tgsiIndirectPattern    = regexp.MustCompile(`^(CONST|TEMP)\[ADDR\[(\d+)\]\.([xyzw])([+-]\d+)?\](?:\(\d+\))?(?:\.([xyzw]+))?$`)
+	tgsiAddressPattern     = regexp.MustCompile(`^ADDR\[(\d+)\](?:\.([xyzw]+))?$`)
+	tgsiControlLabel       = regexp.MustCompile(`(?:^|\s+):\d+$`)
 	tgsiSamplerPattern     = regexp.MustCompile(`^SAMP\[(\d+)\]$`)
 )
 
@@ -45,6 +49,7 @@ func translateTGSI(source string) (uint32, string, error) {
 		outputs:        make(map[int]tgsiDeclaration),
 		maxConstant:    -1,
 		maxTemporary:   -1,
+		maxAddress:     -1,
 		maxSampler:     -1,
 		maxSamplerView: -1,
 	}
@@ -80,6 +85,8 @@ func translateTGSI(source string) (uint32, string, error) {
 				shader.maxConstant = max(shader.maxConstant, last)
 			case "TEMP":
 				shader.maxTemporary = max(shader.maxTemporary, last)
+			case "ADDR":
+				shader.maxAddress = max(shader.maxAddress, last)
 			case "SAMP":
 				shader.maxSampler = max(shader.maxSampler, last)
 			}
@@ -121,7 +128,14 @@ func translateTGSI(source string) (uint32, string, error) {
 			if match[1] == "END" {
 				continue
 			}
-			statement, err := shader.translateInstruction(match[1], splitTGSIList(match[2]))
+			operands := match[2]
+			switch match[1] {
+			case "BGNLOOP", "ENDLOOP", "ELSE":
+				operands = tgsiControlLabel.ReplaceAllString(operands, "")
+			case "IF", "UIF":
+				operands = tgsiControlLabel.ReplaceAllString(operands, "")
+			}
+			statement, err := shader.translateInstruction(match[1], splitTGSIList(operands))
 			if err != nil {
 				return 0, "", fmt.Errorf("TGSI line %d: %w", lineNumber, err)
 			}
@@ -141,6 +155,9 @@ func translateTGSI(source string) (uint32, string, error) {
 }
 
 func splitTGSIList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
 	raw := strings.Split(value, ",")
 	result := make([]string, 0, len(raw))
 	for _, item := range raw {
@@ -150,6 +167,84 @@ func splitTGSIList(value string) []string {
 }
 
 func (s *tgsiShader) translateInstruction(opcode string, operands []string) (string, error) {
+	saturate := strings.HasSuffix(opcode, "_SAT")
+	if saturate {
+		opcode = strings.TrimSuffix(opcode, "_SAT")
+	}
+	switch opcode {
+	case "BGNLOOP":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode BGNLOOP has %d operands, want 0", len(operands))
+		}
+		return "while (true) {", nil
+	case "ENDLOOP":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode ENDLOOP has %d operands, want 0", len(operands))
+		}
+		return "}", nil
+	case "BRK":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode BRK has %d operands, want 0", len(operands))
+		}
+		return "break;", nil
+	case "CONT":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode CONT has %d operands, want 0", len(operands))
+		}
+		return "continue;", nil
+	case "ELSE":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode ELSE has %d operands, want 0", len(operands))
+		}
+		return "} else {", nil
+	case "ENDIF":
+		if len(operands) != 0 {
+			return "", fmt.Errorf("opcode ENDIF has %d operands, want 0", len(operands))
+		}
+		return "}", nil
+	case "IF", "UIF":
+		if len(operands) != 1 {
+			return "", fmt.Errorf("opcode %s has %d operands, want 1", opcode, len(operands))
+		}
+		condition, _, err := s.register(operands[0], false)
+		if err != nil {
+			return "", err
+		}
+		if opcode == "UIF" {
+			return "if (floatBitsToUint((" + condition + ").x) != 0u) {", nil
+		}
+		return "if ((" + condition + ").x != 0.0) {", nil
+	case "ARL", "UARL":
+		if len(operands) != 2 {
+			return "", fmt.Errorf("opcode %s has %d operands, want 2", opcode, len(operands))
+		}
+		destination, err := s.addressRegister(operands[0])
+		if err != nil {
+			return "", err
+		}
+		source, _, err := s.register(operands[1], false)
+		if err != nil {
+			return "", err
+		}
+		expression := "ivec4(floor(" + source + "))"
+		if opcode == "UARL" {
+			expression = "floatBitsToInt(" + source + ")"
+		}
+		address := tgsiAddressPattern.FindStringSubmatch(operands[0])
+		if mask := address[2]; mask != "" {
+			expression = "(" + expression + ")." + mask
+		}
+		return destination + " = " + expression + ";", nil
+	case "KILL_IF":
+		if len(operands) != 1 {
+			return "", fmt.Errorf("opcode KILL_IF has %d operands, want 1", len(operands))
+		}
+		source, _, err := s.register(operands[0], false)
+		if err != nil {
+			return "", err
+		}
+		return "if (any(lessThan(" + source + ", vec4(0.0)))) discard;", nil
+	}
 	if opcode == "TEX" {
 		if len(operands) != 4 || operands[3] != "2D" {
 			return "", fmt.Errorf("opcode TEX operands %q are unsupported", operands)
@@ -167,15 +262,20 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 			return "", fmt.Errorf("invalid texture sampler %q", operands[2])
 		}
 		expression := fmt.Sprintf("texture(sampler%s, (%s).xy)", sampler[1], coordinate)
+		if saturate {
+			expression = "clamp(" + expression + ", 0.0, 1.0)"
+		}
 		if mask != "" {
 			expression = "(" + expression + ")." + mask
 		}
 		return destination + " = " + expression + ";", nil
 	}
 	arities := map[string]int{
-		"MOV": 2, "RSQ": 2,
+		"MOV": 2, "RSQ": 2, "RCP": 2, "FLR": 2, "FRC": 2, "EX2": 2, "SIN": 2,
 		"ADD": 3, "MUL": 3, "DIV": 3, "DP3": 3, "DP4": 3, "MAX": 3, "MIN": 3,
-		"MAD": 4,
+		"POW": 3, "FSLT": 3, "FSGE": 3, "FSEQ": 3, "ISGE": 3,
+		"AND": 3, "OR": 3, "XOR": 3, "UADD": 3, "UMUL": 3, "SHL": 3, "USHR": 3, "ISHR": 3,
+		"MAD": 4, "LRP": 4, "UCMP": 4,
 	}
 	arity, ok := arities[opcode]
 	if !ok {
@@ -202,6 +302,16 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = sources[0]
 	case "RSQ":
 		expression = "vec4(inversesqrt((" + sources[0] + ").x))"
+	case "RCP":
+		expression = "vec4(1.0 / (" + sources[0] + ").x)"
+	case "FLR":
+		expression = "floor(" + sources[0] + ")"
+	case "FRC":
+		expression = "fract(" + sources[0] + ")"
+	case "EX2":
+		expression = "vec4(exp2((" + sources[0] + ").x))"
+	case "SIN":
+		expression = "vec4(sin((" + sources[0] + ").x))"
 	case "ADD":
 		expression = "(" + sources[0] + " + " + sources[1] + ")"
 	case "MUL":
@@ -216,8 +326,43 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "vec4(dot((" + sources[0] + ").xyz, (" + sources[1] + ").xyz))"
 	case "DP4":
 		expression = "vec4(dot(" + sources[0] + ", " + sources[1] + "))"
+	case "POW":
+		expression = "vec4(pow((" + sources[0] + ").x, (" + sources[1] + ").x))"
+	case "FSLT":
+		expression = "vec4(lessThan(" + sources[0] + ", " + sources[1] + "))"
+	case "FSGE":
+		expression = "vec4(greaterThanEqual(" + sources[0] + ", " + sources[1] + "))"
+	case "FSEQ":
+		expression = "vec4(equal(" + sources[0] + ", " + sources[1] + "))"
+	case "ISGE":
+		expression = "intBitsToFloat(-ivec4(greaterThanEqual(" +
+			"floatBitsToInt(" + sources[0] + "), floatBitsToInt(" + sources[1] + "))))"
+	case "AND":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") & floatBitsToUint(" + sources[1] + "))"
+	case "OR":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") | floatBitsToUint(" + sources[1] + "))"
+	case "XOR":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") ^ floatBitsToUint(" + sources[1] + "))"
+	case "UADD":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") + floatBitsToUint(" + sources[1] + "))"
+	case "UMUL":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") * floatBitsToUint(" + sources[1] + "))"
+	case "SHL":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") << floatBitsToUint(" + sources[1] + "))"
+	case "USHR":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") >> floatBitsToUint(" + sources[1] + "))"
+	case "ISHR":
+		expression = "intBitsToFloat(floatBitsToInt(" + sources[0] + ") >> floatBitsToInt(" + sources[1] + "))"
 	case "MAD":
 		expression = "((" + sources[0] + " * " + sources[1] + ") + " + sources[2] + ")"
+	case "LRP":
+		expression = "mix(" + sources[2] + ", " + sources[1] + ", " + sources[0] + ")"
+	case "UCMP":
+		expression = "mix(" + sources[2] + ", " + sources[1] +
+			", notEqual(floatBitsToUint(" + sources[0] + "), uvec4(0)))"
+	}
+	if saturate {
+		expression = "clamp(" + expression + ", 0.0, 1.0)"
 	}
 	if mask != "" {
 		expression = "(" + expression + ")." + mask
@@ -233,6 +378,36 @@ func (s *tgsiShader) register(raw string, destination bool) (string, string, err
 		}
 		raw = strings.TrimPrefix(raw, "-")
 	}
+	if match := tgsiIndirectPattern.FindStringSubmatch(raw); match != nil {
+		if destination {
+			return "", "", fmt.Errorf("indirect destination %q is unsupported", raw)
+		}
+		addressIndex, _ := strconv.Atoi(match[2])
+		if addressIndex > s.maxAddress {
+			return "", "", fmt.Errorf("address register %d is not declared", addressIndex)
+		}
+		offset := match[4]
+		index := fmt.Sprintf("address[%d].%s", addressIndex, match[3])
+		if offset != "" {
+			index += offset
+		}
+		name := ""
+		if match[1] == "CONST" {
+			name = fmt.Sprintf("%s[%s]", s.constantName(), index)
+		} else {
+			name = fmt.Sprintf("temporary[%s]", index)
+		}
+		if swizzle := match[5]; swizzle != "" {
+			if len(swizzle) < 4 {
+				swizzle += strings.Repeat(swizzle[len(swizzle)-1:], 4-len(swizzle))
+			}
+			name += "." + swizzle
+		}
+		if negative {
+			name = "(-" + name + ")"
+		}
+		return name, "", nil
+	}
 	match := tgsiRegisterPattern.FindStringSubmatch(raw)
 	if match == nil {
 		return "", "", fmt.Errorf("invalid register %q", raw)
@@ -246,7 +421,7 @@ func (s *tgsiShader) register(raw string, destination bool) (string, string, err
 	case "OUT":
 		name = s.outputName(index)
 	case "CONST":
-		name = fmt.Sprintf("uConstants[%d]", index)
+		name = fmt.Sprintf("%s[%d]", s.constantName(), index)
 	case "TEMP":
 		name = fmt.Sprintf("temporary[%d]", index)
 	case "IMM":
@@ -267,9 +442,35 @@ func (s *tgsiShader) register(raw string, destination bool) (string, string, err
 	return name, mask, nil
 }
 
+func (s *tgsiShader) constantName() string {
+	if s.stage == tgsiFragment {
+		return "uFragmentConstants"
+	}
+	return "uVertexConstants"
+}
+
+func (s *tgsiShader) addressRegister(raw string) (string, error) {
+	match := tgsiAddressPattern.FindStringSubmatch(raw)
+	if match == nil {
+		return "", fmt.Errorf("invalid address register %q", raw)
+	}
+	index, _ := strconv.Atoi(match[1])
+	if index > s.maxAddress {
+		return "", fmt.Errorf("address register %d is not declared", index)
+	}
+	name := fmt.Sprintf("address[%d]", index)
+	if mask := match[2]; mask != "" {
+		name += "." + mask
+	}
+	return name, nil
+}
+
 func (s *tgsiShader) inputName(index int) string {
 	declaration := s.inputs[index]
 	if s.stage == tgsiFragment {
+		if declaration.semantic == "POSITION" {
+			return "gl_FragCoord"
+		}
 		if declaration.semantic == "" || isInterpolationQualifier(declaration.semantic) {
 			return fmt.Sprintf("varying%d", declarationRank(s.inputs, index, false))
 		}
@@ -330,6 +531,9 @@ func (s *tgsiShader) glsl() (string, error) {
 		if !ok {
 			continue
 		}
+		if s.stage == tgsiFragment && declaration.semantic == "POSITION" {
+			continue
+		}
 		if s.stage == tgsiVertex {
 			fmt.Fprintf(&source, "layout(location = %d) in vec4 %s;\n", index, s.inputName(index))
 		} else {
@@ -352,7 +556,7 @@ func (s *tgsiShader) glsl() (string, error) {
 		}
 	}
 	if s.maxConstant >= 0 {
-		fmt.Fprintf(&source, "uniform vec4 uConstants[%d];\n", s.maxConstant+1)
+		fmt.Fprintf(&source, "uniform vec4 %s[%d];\n", s.constantName(), s.maxConstant+1)
 	}
 	for index := 0; index <= max(s.maxSampler, s.maxSamplerView); index++ {
 		fmt.Fprintf(&source, "uniform sampler2D sampler%d;\n", index)
@@ -363,6 +567,9 @@ func (s *tgsiShader) glsl() (string, error) {
 	source.WriteString("void main() {\n")
 	if s.maxTemporary >= 0 {
 		fmt.Fprintf(&source, "    vec4 temporary[%d];\n", s.maxTemporary+1)
+	}
+	if s.maxAddress >= 0 {
+		fmt.Fprintf(&source, "    ivec4 address[%d];\n", s.maxAddress+1)
 	}
 	for _, instruction := range s.instructions {
 		fmt.Fprintf(&source, "    %s\n", instruction)

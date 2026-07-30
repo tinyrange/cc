@@ -29,6 +29,7 @@ type hostBackend interface {
 	transferFromHost(resource *resource, transfer virtio.GPUTransfer3D) error
 	execute(contextID uint32, commands []command, resources map[uint32]*resource) error
 	readScanout(resource *resource, rect image.Rectangle) ([]byte, int, error)
+	nativeScanout(resource *resource, rect image.Rectangle) (virtio.GPUNativeFrame, bool, error)
 	reset() error
 	close() error
 }
@@ -214,6 +215,16 @@ func (r *Renderer) ReadScanout(resourceID uint32, rect image.Rectangle) ([]byte,
 		return nil, 0, fmt.Errorf("unknown VirGL scanout resource %d", resourceID)
 	}
 	return r.host.readScanout(resource, rect)
+}
+
+func (r *Renderer) NativeScanout(resourceID uint32, rect image.Rectangle) (virtio.GPUNativeFrame, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	resource := r.resources[resourceID]
+	if resource == nil {
+		return virtio.GPUNativeFrame{}, false, fmt.Errorf("unknown VirGL scanout resource %d", resourceID)
+	}
+	return r.host.nativeScanout(resource, rect)
 }
 
 func (r *Renderer) Reset() {

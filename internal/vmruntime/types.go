@@ -70,34 +70,36 @@ func CloseFSBackend(backend virtio.FSBackend) error {
 
 // RunRequest is the backend-neutral request shape for the managed guest runtime.
 type RunRequest struct {
-	Kernel            []byte
-	KernelRelease     string
-	ModuleSymvers     []byte
-	Init              []byte
-	AMD64EmulatorPath string
-	Modules           []alpine.Module
-	Image             *oci.Image
-	InitSystem        string
-	RootFS            virtio.FSBackend
-	Shares            []DirectoryShare
-	Mounts            []virtio.ShareMount
-	Command           []string
-	Env               []string
-	WorkDir           string
-	User              string
-	MemoryMB          uint64
-	BalloonMB         uint64
-	CPUs              int
-	NestedVirt        bool
-	Dmesg             bool
-	Persistent        bool
-	Network           *GuestNetworkConfig
-	NetDevice         *virtio.Net
-	DisplayWidth      uint32
-	DisplayHeight     uint32
-	SnapshotDir       string
-	RestoreSnapshot   string
-	UnixTime          int64
+	Kernel                 []byte
+	KernelRelease          string
+	ModuleSymvers          []byte
+	Init                   []byte
+	AMD64EmulatorPath      string
+	Modules                []alpine.Module
+	Image                  *oci.Image
+	InitSystem             string
+	RootFS                 virtio.FSBackend
+	Shares                 []DirectoryShare
+	Mounts                 []virtio.ShareMount
+	Command                []string
+	Env                    []string
+	WorkDir                string
+	User                   string
+	MemoryMB               uint64
+	BalloonMB              uint64
+	CPUs                   int
+	NestedVirt             bool
+	Dmesg                  bool
+	Persistent             bool
+	Network                *GuestNetworkConfig
+	NetDevice              *virtio.Net
+	DisplayWidth           uint32
+	DisplayHeight          uint32
+	OpenGLShareContext     uintptr
+	OpenGLSharePixelFormat uintptr
+	SnapshotDir            string
+	RestoreSnapshot        string
+	UnixTime               int64
 }
 
 // RunResult is the backend-neutral result shape for one-shot guest execution.

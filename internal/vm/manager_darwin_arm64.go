@@ -13,8 +13,9 @@ import (
 	vmhost "j5.nz/cc/internal/vm/host"
 )
 
-func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool) *Manager {
+func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool, openGLShareGroup func() (context, pixelFormat uintptr)) *Manager {
 	backend := NewRuntimeBackend(kernel, images, guestInitCache)
+	backend.(*runtimeBackend).openGLShareGroup = openGLShareGroup
 	if worker || strings.TrimSpace(os.Getenv(sidecarDisableEnv)) != "" {
 		return NewManagerWithBackend(backend)
 	}

@@ -41,9 +41,21 @@ type darwinHost struct {
 	enabledVertexAttributes int
 	blitReadFBO             uint32
 	blitDrawFBO             uint32
+	depthOnlyFBO            uint32
 	programs                map[string]hostProgram
 	contexts                map[uint32]*hostContext
 	resources               map[uint32]*hostResource
+	sharedPresentation      bool
+	nativeFrames            [3]hostNativeFrame
+}
+
+type hostNativeFrame struct {
+	texture       uint32
+	width         int
+	height        int
+	producerFence uintptr
+	consumerFence uintptr
+	inUse         bool
 }
 
 type hostResource struct {
@@ -102,8 +114,9 @@ type hostShader struct {
 }
 
 type hostProgram struct {
-	id        uint32
-	constants int32
+	id                uint32
+	vertexConstants   int32
+	fragmentConstants int32
 }
 
 type hostScissor struct {
@@ -126,6 +139,7 @@ type hostContext struct {
 	boundDSA            uint32
 	boundRasterizer     uint32
 	colorSurface        uint32
+	depthSurface        uint32
 	blendColor          [4]float32
 	scissors            [16]hostScissor
 	vertexBuffers       [16]hostVertexBuffer
@@ -138,14 +152,18 @@ type hostContext struct {
 }
 
 func NewHostRenderer() (virtio.GPURenderer, error) {
-	host, err := newDarwinHost()
+	return NewHostRendererWithShareGroup(0, 0)
+}
+
+func NewHostRendererWithShareGroup(shareContext, sharePixelFormat uintptr) (virtio.GPURenderer, error) {
+	host, err := newDarwinHost(shareContext, sharePixelFormat)
 	if err != nil {
 		return nil, err
 	}
 	return NewRenderer(host), nil
 }
 
-func newDarwinHost() (*darwinHost, error) {
+func newDarwinHost(shareGroup ...uintptr) (*darwinHost, error) {
 	if _, err := purego.Dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", purego.RTLD_GLOBAL|purego.RTLD_LAZY); err != nil {
 		return nil, fmt.Errorf("load AppKit for VirGL: %w", err)
 	}
@@ -162,8 +180,17 @@ func newDarwinHost() (*darwinHost, error) {
 		contexts:  make(map[uint32]*hostContext),
 		resources: make(map[uint32]*hostResource),
 	}
+	var shareContext uintptr
+	var sharePixelFormat uintptr
+	if len(shareGroup) != 0 {
+		shareContext = shareGroup[0]
+	}
+	if len(shareGroup) > 1 {
+		sharePixelFormat = shareGroup[1]
+	}
+	host.sharedPresentation = shareContext != 0 && sharePixelFormat != 0
 	ready := make(chan error, 1)
-	go host.contextLoop(ready)
+	go host.contextLoop(shareContext, sharePixelFormat, ready)
 	if err := <-ready; err != nil {
 		<-host.done
 		return nil, err
@@ -171,7 +198,7 @@ func newDarwinHost() (*darwinHost, error) {
 	return host, nil
 }
 
-func (h *darwinHost) contextLoop(ready chan<- error) {
+func (h *darwinHost) contextLoop(shareContext, sharePixelFormat uintptr, ready chan<- error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer close(h.done)
@@ -200,16 +227,19 @@ func (h *darwinHost) contextLoop(ready chan<- error) {
 		nsOpenGLPFAOpenGLProfile, nsOpenGLProfileVersion41Core,
 		0,
 	}
-	format := objc.ID(objc.GetClass("NSOpenGLPixelFormat")).Send(alloc)
-	format = format.Send(initWithAttributes, unsafe.Pointer(&attributes[0]))
+	format := objc.ID(sharePixelFormat)
 	if format == 0 {
-		ready <- errors.New("create accelerated VirGL pixel format")
-		return
+		format = objc.ID(objc.GetClass("NSOpenGLPixelFormat")).Send(alloc)
+		format = format.Send(initWithAttributes, unsafe.Pointer(&attributes[0]))
+		if format == 0 {
+			ready <- errors.New("create accelerated VirGL pixel format")
+			return
+		}
+		defer format.Send(release)
 	}
-	defer format.Send(release)
 
 	context := objc.ID(objc.GetClass("NSOpenGLContext")).Send(alloc)
-	context = context.Send(initWithFormat, format, objc.ID(0))
+	context = context.Send(initWithFormat, format, objc.ID(shareContext))
 	if context == 0 {
 		ready <- errors.New("create VirGL OpenGL 4.1 context")
 		return
@@ -221,6 +251,7 @@ func (h *darwinHost) contextLoop(ready chan<- error) {
 	h.gl.bindVertexArray(h.vao)
 	h.gl.genFramebuffers(1, &h.blitReadFBO)
 	h.gl.genFramebuffers(1, &h.blitDrawFBO)
+	h.gl.genFramebuffers(1, &h.depthOnlyFBO)
 	h.gl.pixelStorei(glPackAlignment, 1)
 	h.gl.pixelStorei(glUnpackAlignment, 1)
 	ready <- nil
@@ -490,8 +521,106 @@ func (h *darwinHost) readScanout(resource *resource, rect image.Rectangle) ([]by
 	return result, rect.Dx() * 4, nil
 }
 
+func (h *darwinHost) nativeScanout(resource *resource, rect image.Rectangle) (virtio.GPUNativeFrame, bool, error) {
+	if !h.sharedPresentation {
+		return virtio.GPUNativeFrame{}, false, nil
+	}
+	var frame virtio.GPUNativeFrame
+	var slot *hostNativeFrame
+	err := h.dispatch(func() error {
+		width := int(resource.description.Width)
+		height := int(resource.description.Height)
+		rect = rect.Intersect(image.Rect(0, 0, width, height))
+		if rect.Empty() {
+			return errors.New("VirGL native scanout rectangle is empty")
+		}
+		hostResource := h.resources[resource.description.ID]
+		if hostResource == nil || hostResource.texture == 0 || hostResource.depth {
+			return fmt.Errorf("VirGL resource %d is not a color texture", resource.description.ID)
+		}
+		for index := range h.nativeFrames {
+			if !h.nativeFrames[index].inUse {
+				slot = &h.nativeFrames[index]
+				break
+			}
+		}
+		if slot == nil {
+			return nil
+		}
+		if slot.consumerFence != 0 {
+			h.gl.waitSync(slot.consumerFence, 0, glTimeoutIgnored)
+			h.gl.deleteSync(slot.consumerFence)
+			slot.consumerFence = 0
+		}
+		if slot.texture == 0 || slot.width != rect.Dx() || slot.height != rect.Dy() {
+			if slot.texture != 0 {
+				h.gl.deleteTextures(1, &slot.texture)
+			}
+			h.gl.genTextures(1, &slot.texture)
+			h.gl.bindTexture(glTexture2D, slot.texture)
+			h.gl.texParameteri(glTexture2D, glTextureMinFilter, glNearest)
+			h.gl.texParameteri(glTexture2D, glTextureMagFilter, glNearest)
+			h.gl.texParameteri(glTexture2D, glTextureBaseLevel, 0)
+			h.gl.texParameteri(glTexture2D, glTextureMaxLevel, 0)
+			h.gl.texImage2D(glTexture2D, 0, glRGBA8, int32(rect.Dx()), int32(rect.Dy()), 0, glRGBA, glUnsignedByte, 0)
+			slot.width, slot.height = rect.Dx(), rect.Dy()
+		}
+		h.gl.bindFramebuffer(glReadFramebuffer, h.blitReadFBO)
+		h.gl.framebufferTexture(glReadFramebuffer, glColorAttachment0, glTexture2D, hostResource.texture, 0)
+		if status := h.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
+			return fmt.Errorf("VirGL native source framebuffer status %#x", status)
+		}
+		h.gl.bindFramebuffer(glDrawFramebuffer, h.blitDrawFBO)
+		h.gl.framebufferTexture(glDrawFramebuffer, glColorAttachment0, glTexture2D, slot.texture, 0)
+		if status := h.gl.checkFramebuffer(glDrawFramebuffer); status != glFramebufferComplete {
+			return fmt.Errorf("VirGL native destination framebuffer status %#x", status)
+		}
+		h.gl.blitFramebuffer(
+			int32(rect.Min.X), int32(height-rect.Min.Y), int32(rect.Max.X), int32(height-rect.Max.Y),
+			0, 0, int32(rect.Dx()), int32(rect.Dy()),
+			glColorBufferBit, glNearest,
+		)
+		slot.producerFence = h.gl.fenceSync(glSyncGPUCommandsComplete, 0)
+		if slot.producerFence == 0 {
+			return errors.New("create VirGL native frame fence")
+		}
+		h.gl.flush()
+		slot.inUse = true
+		frame = virtio.GPUNativeFrame{
+			Width: rect.Dx(), Height: rect.Dy(), Damage: image.Rect(0, 0, rect.Dx(), rect.Dy()),
+			Texture: slot.texture, ProducerFence: slot.producerFence,
+		}
+		return nil
+	})
+	if err != nil {
+		return virtio.GPUNativeFrame{}, false, err
+	}
+	if slot == nil {
+		return virtio.GPUNativeFrame{}, false, nil
+	}
+	var once sync.Once
+	frame.ReleaseFrame = func(consumerFence uintptr) {
+		once.Do(func() {
+			_ = h.dispatch(func() error {
+				if slot.producerFence != 0 {
+					h.gl.deleteSync(slot.producerFence)
+					slot.producerFence = 0
+				}
+				if slot.consumerFence != 0 {
+					h.gl.deleteSync(slot.consumerFence)
+				}
+				slot.consumerFence = consumerFence
+				slot.inUse = false
+				return nil
+			})
+		})
+	}
+	return frame, true, nil
+}
+
 func (h *darwinHost) reset() error {
 	return h.dispatch(func() error {
+		h.releaseNativeFrames()
 		for _, resource := range h.resources {
 			h.deleteResource(resource)
 		}
@@ -700,7 +829,10 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 		}
 		if payload[0] == 0 {
 			context.colorSurface = 0
-			h.gl.bindFramebuffer(glFramebuffer, 0)
+			context.depthSurface = payload[1]
+			if err := h.bindContextFramebuffer(context); err != nil {
+				return err
+			}
 			break
 		}
 		if len(payload) < 3 {
@@ -712,6 +844,7 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			return fmt.Errorf("unknown color surface %d", payload[2])
 		}
 		context.colorSurface = payload[2]
+		context.depthSurface = payload[1]
 		h.gl.bindFramebuffer(glFramebuffer, resource.framebuffer)
 		h.gl.framebufferTexture(glFramebuffer, glDepthAttachment, glTexture2D, 0, 0)
 		h.gl.framebufferTexture(glFramebuffer, glDepthStencilAttachment, glTexture2D, 0, 0)
@@ -950,16 +1083,16 @@ func shaderText(payload []uint32) string {
 
 func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 	start, count, mode, indexed := payload[0], payload[1], payload[2], payload[3] != 0
-	surface := context.surfaces[context.colorSurface]
-	target := h.resources[surface.resourceID]
-	if target == nil || target.framebuffer == 0 {
-		return errors.New("draw has no color framebuffer")
+	if context.colorSurface == 0 && context.depthSurface == 0 {
+		return errors.New("draw has no framebuffer")
+	}
+	if err := h.bindContextFramebuffer(context); err != nil {
+		return err
 	}
 	elements := context.vertexElements[context.boundVertexElements]
 	if len(elements) == 0 {
 		return errors.New("draw has no vertex elements")
 	}
-	h.gl.bindFramebuffer(glFramebuffer, target.framebuffer)
 	h.gl.bindVertexArray(h.vao)
 	for index, element := range elements {
 		if element.bufferIndex >= uint32(len(context.vertexBuffers)) {
@@ -990,8 +1123,12 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 	}
 	h.gl.useProgram(program.id)
 	vertexConstants := context.constants[tgsiVertex]
-	if program.constants >= 0 && len(vertexConstants) != 0 {
-		h.gl.uniform4fv(program.constants, int32(len(vertexConstants)/4), &vertexConstants[0])
+	if program.vertexConstants >= 0 && len(vertexConstants) != 0 {
+		h.gl.uniform4fv(program.vertexConstants, int32(len(vertexConstants)/4), &vertexConstants[0])
+	}
+	fragmentConstants := context.constants[tgsiFragment]
+	if program.fragmentConstants >= 0 && len(fragmentConstants) != 0 {
+		h.gl.uniform4fv(program.fragmentConstants, int32(len(fragmentConstants)/4), &fragmentConstants[0])
 	}
 	for slot, viewHandle := range context.boundSamplerViews[tgsiFragment] {
 		if viewHandle == 0 {
@@ -1018,10 +1155,20 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 
 	var glMode uint32
 	switch mode {
+	case 0:
+		glMode = glPoints
+	case 1:
+		glMode = glLines
+	case 2:
+		glMode = glLineLoop
+	case 3:
+		glMode = glLineStrip
 	case 4:
 		glMode = glTriangles
 	case 5:
 		glMode = glTriangleStrip
+	case 6:
+		glMode = glTriangleFan
 	default:
 		return fmt.Errorf("unsupported primitive mode %d", mode)
 	}
@@ -1068,6 +1215,30 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 
 func (h *darwinHost) bindContextFramebuffer(context *hostContext) error {
 	if context.colorSurface == 0 {
+		if context.depthSurface != 0 {
+			surface, ok := context.surfaces[context.depthSurface]
+			if !ok {
+				return fmt.Errorf("unknown bound depth surface %d", context.depthSurface)
+			}
+			target := h.resources[surface.resourceID]
+			if target == nil || !target.depth || target.texture == 0 {
+				return fmt.Errorf("bound depth surface %d has no depth texture", context.depthSurface)
+			}
+			attachment := uint32(glDepthAttachment)
+			if target.stencil {
+				attachment = glDepthStencilAttachment
+			}
+			h.gl.bindFramebuffer(glFramebuffer, h.depthOnlyFBO)
+			h.gl.framebufferTexture(glFramebuffer, glDepthAttachment, glTexture2D, 0, 0)
+			h.gl.framebufferTexture(glFramebuffer, glDepthStencilAttachment, glTexture2D, 0, 0)
+			h.gl.framebufferTexture(glFramebuffer, attachment, glTexture2D, target.texture, 0)
+			h.gl.drawBuffer(glNone)
+			h.gl.readBuffer(glNone)
+			if status := h.gl.checkFramebuffer(glFramebuffer); status != glFramebufferComplete {
+				return fmt.Errorf("VirGL depth-only framebuffer status %#x", status)
+			}
+			return nil
+		}
 		h.gl.bindFramebuffer(glFramebuffer, 0)
 		return nil
 	}
@@ -1106,8 +1277,9 @@ func (h *darwinHost) programFor(context *hostContext) (hostProgram, error) {
 		return hostProgram{}, err
 	}
 	program := hostProgram{
-		id:        id,
-		constants: uniformLocation(h.gl, id, "uConstants[0]"),
+		id:                id,
+		vertexConstants:   uniformLocation(h.gl, id, "uVertexConstants[0]"),
+		fragmentConstants: uniformLocation(h.gl, id, "uFragmentConstants[0]"),
 	}
 	h.programs[key] = program
 	return program, nil
@@ -1511,6 +1683,7 @@ func (h *darwinHost) deleteResource(resource *hostResource) {
 }
 
 func (h *darwinHost) releaseGLObjects() {
+	h.releaseNativeFrames()
 	for _, resource := range h.resources {
 		h.deleteResource(resource)
 	}
@@ -1523,8 +1696,27 @@ func (h *darwinHost) releaseGLObjects() {
 	if h.blitDrawFBO != 0 {
 		h.gl.deleteFramebuffers(1, &h.blitDrawFBO)
 	}
+	if h.depthOnlyFBO != 0 {
+		h.gl.deleteFramebuffers(1, &h.depthOnlyFBO)
+	}
 	for _, program := range h.programs {
 		h.gl.deleteProgram(program.id)
+	}
+}
+
+func (h *darwinHost) releaseNativeFrames() {
+	for index := range h.nativeFrames {
+		frame := &h.nativeFrames[index]
+		if frame.producerFence != 0 {
+			h.gl.deleteSync(frame.producerFence)
+		}
+		if frame.consumerFence != 0 {
+			h.gl.deleteSync(frame.consumerFence)
+		}
+		if frame.texture != 0 {
+			h.gl.deleteTextures(1, &frame.texture)
+		}
+		*frame = hostNativeFrame{}
 	}
 }
 
