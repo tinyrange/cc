@@ -12,6 +12,7 @@ import (
 const (
 	glArrayBuffer             = 0x8892
 	glElementArrayBuffer      = 0x8893
+	glStreamDraw              = 0x88e0
 	glStaticDraw              = 0x88e4
 	glTexture2D               = 0x0de1
 	glTexture0                = 0x84c0
@@ -19,6 +20,7 @@ const (
 	glRGBA                    = 0x1908
 	glBGRA                    = 0x80e1
 	glUnsignedByte            = 0x1401
+	glShort                   = 0x1402
 	glUnsignedShort           = 0x1403
 	glUnsignedInt             = 0x1405
 	glUnsignedInt248          = 0x84fa
@@ -150,6 +152,7 @@ type hostGL struct {
 	deleteVertexArrays     func(int32, *uint32)
 	bindVertexArray        func(uint32)
 	vertexAttribPtr        func(uint32, int32, uint32, bool, int32, uintptr)
+	vertexAttrib4f         func(uint32, float32, float32, float32, float32)
 	enableVertexAttrib     func(uint32)
 	disableVertexAttrib    func(uint32)
 	genFramebuffers        func(int32, *uint32)
@@ -174,8 +177,10 @@ type hostGL struct {
 	getUniformLocation     func(uint32, *byte) int32
 	uniformMatrix4fv       func(int32, int32, bool, *float32)
 	uniform4fv             func(int32, int32, *float32)
+	uniform1f              func(int32, float32)
 	uniform1i              func(int32, int32)
 	viewport               func(int32, int32, int32, int32)
+	depthRange             func(float64, float64)
 	scissor                func(int32, int32, int32, int32)
 	clearColor             func(float32, float32, float32, float32)
 	clearDepth             func(float64)
@@ -203,6 +208,7 @@ type hostGL struct {
 	deleteSync             func(uintptr)
 	flush                  func()
 	finish                 func()
+	getError               func() uint32
 }
 
 func loadHostGL() (*hostGL, error) {
@@ -234,6 +240,7 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.deleteVertexArrays, "glDeleteVertexArrays")
 	register(&gl.bindVertexArray, "glBindVertexArray")
 	register(&gl.vertexAttribPtr, "glVertexAttribPointer")
+	register(&gl.vertexAttrib4f, "glVertexAttrib4f")
 	register(&gl.enableVertexAttrib, "glEnableVertexAttribArray")
 	register(&gl.disableVertexAttrib, "glDisableVertexAttribArray")
 	register(&gl.genFramebuffers, "glGenFramebuffers")
@@ -258,8 +265,10 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.getUniformLocation, "glGetUniformLocation")
 	register(&gl.uniformMatrix4fv, "glUniformMatrix4fv")
 	register(&gl.uniform4fv, "glUniform4fv")
+	register(&gl.uniform1f, "glUniform1f")
 	register(&gl.uniform1i, "glUniform1i")
 	register(&gl.viewport, "glViewport")
+	register(&gl.depthRange, "glDepthRange")
 	register(&gl.scissor, "glScissor")
 	register(&gl.clearColor, "glClearColor")
 	register(&gl.clearDepth, "glClearDepth")
@@ -287,6 +296,7 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.deleteSync, "glDeleteSync")
 	register(&gl.flush, "glFlush")
 	register(&gl.finish, "glFinish")
+	register(&gl.getError, "glGetError")
 	return gl, nil
 }
 
