@@ -157,9 +157,16 @@ func TestGPUNativeScanoutDefersReadbackUntilCPUConsumer(t *testing.T) {
 	putGPUTestRect(flush[24:40], 0, 0, 2, 2)
 	binary.LittleEndian.PutUint32(flush[40:44], 7)
 	requireGPUResponse(t, gpu.dispatchLocked(flush, gpuQueueControl), gpuRespOKNoData)
+	// A second guest frame can arrive before the frontend acquires the first.
+	// The pending lease must be retired before the renderer's bounded native
+	// frame pool is asked to publish its replacement.
+	requireGPUResponse(t, gpu.dispatchLocked(flush, gpuQueueControl), gpuRespOKNoData)
 
 	if base.readCalls != 0 {
 		t.Fatalf("native flush performed %d CPU readbacks, want 0", base.readCalls)
+	}
+	if renderer.nativeCalls != 2 {
+		t.Fatalf("native frame publications = %d, want 2", renderer.nativeCalls)
 	}
 	frame, available, err := gpu.AcquireNativeFrame(0)
 	if err != nil {
@@ -268,9 +275,16 @@ func (r *recordingGPURenderer) Close() error { return nil }
 type nativeRecordingGPURenderer struct {
 	*recordingGPURenderer
 	releasedFence uintptr
+	nativeCalls   int
+	outstanding   bool
 }
 
 func (r *nativeRecordingGPURenderer) NativeScanout(_ uint32, rect image.Rectangle) (GPUNativeFrame, bool, error) {
+	r.nativeCalls++
+	if r.outstanding {
+		return GPUNativeFrame{}, false, nil
+	}
+	r.outstanding = true
 	return GPUNativeFrame{
 		Width:         rect.Dx(),
 		Height:        rect.Dy(),
@@ -278,6 +292,7 @@ func (r *nativeRecordingGPURenderer) NativeScanout(_ uint32, rect image.Rectangl
 		ProducerFence: 77,
 		ReleaseFrame: func(consumerFence uintptr) {
 			r.releasedFence = consumerFence
+			r.outstanding = false
 		},
 	}, true, nil
 }

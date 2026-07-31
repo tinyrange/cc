@@ -27,12 +27,13 @@ type tgsiShader struct {
 	maxAddress     int
 	maxSampler     int
 	maxSamplerView int
+	samplerViews   map[int]string
 	immediates     []string
 	instructions   []string
 }
 
 var (
-	tgsiDeclarationPattern = regexp.MustCompile(`^DCL (IN|OUT|CONST|TEMP|ADDR|SAMP)\[(\d+)(?:\.\.(\d+))?\](?:,\s*([^,]+))?`)
+	tgsiDeclarationPattern = regexp.MustCompile(`^DCL (IN|OUT|CONST|TEMP|ADDR|SAMP)\[(\d+)(?:\.\.(\d+))?\](?:\.[xyzw]+)?(?:,\s*([^,]+))?`)
 	tgsiImmediatePattern   = regexp.MustCompile(`^IMM\[(\d+)\]\s+(\w+)\s+\{([^}]+)\}$`)
 	tgsiSamplerViewPattern = regexp.MustCompile(`^DCL SVIEW\[(\d+)(?:\.\.(\d+))?\],\s*([A-Z0-9_]+),\s*([A-Z0-9_]+)$`)
 	tgsiInstructionPattern = regexp.MustCompile(`^\s*\d+:\s+([A-Z0-9_]+)(?:\s+(.+))?$`)
@@ -47,6 +48,7 @@ func translateTGSI(source string) (uint32, string, error) {
 	shader := tgsiShader{
 		inputs:         make(map[int]tgsiDeclaration),
 		outputs:        make(map[int]tgsiDeclaration),
+		samplerViews:   make(map[int]string),
 		maxConstant:    -1,
 		maxTemporary:   -1,
 		maxAddress:     -1,
@@ -98,8 +100,11 @@ func translateTGSI(source string) (uint32, string, error) {
 			if match[2] != "" {
 				last, _ = strconv.Atoi(match[2])
 			}
-			if match[3] != "2D" || match[4] != "FLOAT" {
+			if (match[3] != "2D" && match[3] != "SHADOW2D") || match[4] != "FLOAT" {
 				return 0, "", fmt.Errorf("TGSI line %d sampler view %s/%s is unsupported", lineNumber, match[3], match[4])
+			}
+			for index := first; index <= last; index++ {
+				shader.samplerViews[index] = match[3]
 			}
 			shader.maxSamplerView = max(shader.maxSamplerView, last)
 			continue
@@ -118,7 +123,15 @@ func translateTGSI(source string) (uint32, string, error) {
 				shader.immediates = append(shader.immediates,
 					"uintBitsToFloat(uvec4("+strings.Join(values, ", ")+"))")
 			case "FLT32":
-				shader.immediates = append(shader.immediates, "vec4("+strings.Join(values, ", ")+")")
+				components := make([]string, len(values))
+				for index, value := range values {
+					if strings.HasPrefix(strings.ToLower(value), "0x") {
+						components[index] = "uintBitsToFloat(uint(" + value + "))"
+					} else {
+						components[index] = value
+					}
+				}
+				shader.immediates = append(shader.immediates, "vec4("+strings.Join(components, ", ")+")")
 			default:
 				return 0, "", fmt.Errorf("TGSI line %d immediate type %s is unsupported", lineNumber, match[2])
 			}
@@ -246,7 +259,7 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		return "if (any(lessThan(" + source + ", vec4(0.0)))) discard;", nil
 	}
 	if opcode == "TEX" {
-		if len(operands) != 4 || operands[3] != "2D" {
+		if len(operands) != 4 || (operands[3] != "2D" && operands[3] != "SHADOW2D") {
 			return "", fmt.Errorf("opcode TEX operands %q are unsupported", operands)
 		}
 		destination, mask, err := s.register(operands[0], true)
@@ -261,7 +274,13 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		if sampler == nil {
 			return "", fmt.Errorf("invalid texture sampler %q", operands[2])
 		}
-		expression := fmt.Sprintf("texture(sampler%s, (%s).xy)", sampler[1], coordinate)
+		samplerIndex, _ := strconv.Atoi(sampler[1])
+		var expression string
+		if operands[3] == "SHADOW2D" || s.samplerViews[samplerIndex] == "SHADOW2D" {
+			expression = fmt.Sprintf("vec4(texture(sampler%s, (%s).xyz))", sampler[1], coordinate)
+		} else {
+			expression = fmt.Sprintf("texture(sampler%s, (%s).xy)", sampler[1], coordinate)
+		}
 		if saturate {
 			expression = "clamp(" + expression + ", 0.0, 1.0)"
 		}
@@ -271,9 +290,10 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		return destination + " = " + expression + ";", nil
 	}
 	arities := map[string]int{
-		"MOV": 2, "RSQ": 2, "RCP": 2, "FLR": 2, "FRC": 2, "EX2": 2, "SIN": 2,
-		"ADD": 3, "MUL": 3, "DIV": 3, "DP3": 3, "DP4": 3, "MAX": 3, "MIN": 3,
-		"POW": 3, "FSLT": 3, "FSGE": 3, "FSEQ": 3, "ISGE": 3,
+		"MOV": 2, "RSQ": 2, "RCP": 2, "FLR": 2, "FRC": 2, "EX2": 2, "LG2": 2, "SIN": 2, "COS": 2, "DDX": 2, "DDY": 2, "SSG": 2, "NOT": 2,
+		"F2I": 2, "F2U": 2, "I2F": 2, "U2F": 2,
+		"ADD": 3, "MUL": 3, "DIV": 3, "DP2": 3, "DP3": 3, "DP4": 3, "MAX": 3, "MIN": 3,
+		"POW": 3, "FSLT": 3, "FSGE": 3, "SGE": 3, "FSEQ": 3, "FSNE": 3, "ISGE": 3, "USEQ": 3, "USNE": 3,
 		"AND": 3, "OR": 3, "XOR": 3, "UADD": 3, "UMUL": 3, "SHL": 3, "USHR": 3, "ISHR": 3,
 		"MAD": 4, "LRP": 4, "UCMP": 4,
 	}
@@ -310,8 +330,28 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "fract(" + sources[0] + ")"
 	case "EX2":
 		expression = "vec4(exp2((" + sources[0] + ").x))"
+	case "LG2":
+		expression = "vec4(log2((" + sources[0] + ").x))"
 	case "SIN":
 		expression = "vec4(sin((" + sources[0] + ").x))"
+	case "COS":
+		expression = "vec4(cos((" + sources[0] + ").x))"
+	case "DDX":
+		expression = "dFdx(" + sources[0] + ")"
+	case "DDY":
+		expression = "dFdy(" + sources[0] + ")"
+	case "SSG":
+		expression = "sign(" + sources[0] + ")"
+	case "NOT":
+		expression = "uintBitsToFloat(~floatBitsToUint(" + sources[0] + "))"
+	case "F2I":
+		expression = "intBitsToFloat(ivec4(" + sources[0] + "))"
+	case "F2U":
+		expression = "uintBitsToFloat(uvec4(" + sources[0] + "))"
+	case "I2F":
+		expression = "vec4(floatBitsToInt(" + sources[0] + "))"
+	case "U2F":
+		expression = "vec4(floatBitsToUint(" + sources[0] + "))"
 	case "ADD":
 		expression = "(" + sources[0] + " + " + sources[1] + ")"
 	case "MUL":
@@ -324,19 +364,31 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "min(" + sources[0] + ", " + sources[1] + ")"
 	case "DP3":
 		expression = "vec4(dot((" + sources[0] + ").xyz, (" + sources[1] + ").xyz))"
+	case "DP2":
+		expression = "vec4(dot((" + sources[0] + ").xy, (" + sources[1] + ").xy))"
 	case "DP4":
 		expression = "vec4(dot(" + sources[0] + ", " + sources[1] + "))"
 	case "POW":
 		expression = "vec4(pow((" + sources[0] + ").x, (" + sources[1] + ").x))"
 	case "FSLT":
-		expression = "vec4(lessThan(" + sources[0] + ", " + sources[1] + "))"
+		expression = "intBitsToFloat(-ivec4(lessThan(" + sources[0] + ", " + sources[1] + ")))"
 	case "FSGE":
+		expression = "intBitsToFloat(-ivec4(greaterThanEqual(" + sources[0] + ", " + sources[1] + ")))"
+	case "SGE":
 		expression = "vec4(greaterThanEqual(" + sources[0] + ", " + sources[1] + "))"
 	case "FSEQ":
-		expression = "vec4(equal(" + sources[0] + ", " + sources[1] + "))"
+		expression = "intBitsToFloat(-ivec4(equal(" + sources[0] + ", " + sources[1] + ")))"
+	case "FSNE":
+		expression = "intBitsToFloat(-ivec4(notEqual(" + sources[0] + ", " + sources[1] + ")))"
 	case "ISGE":
 		expression = "intBitsToFloat(-ivec4(greaterThanEqual(" +
 			"floatBitsToInt(" + sources[0] + "), floatBitsToInt(" + sources[1] + "))))"
+	case "USEQ":
+		expression = "intBitsToFloat(-ivec4(equal(" +
+			"floatBitsToUint(" + sources[0] + "), floatBitsToUint(" + sources[1] + "))))"
+	case "USNE":
+		expression = "intBitsToFloat(-ivec4(notEqual(" +
+			"floatBitsToUint(" + sources[0] + "), floatBitsToUint(" + sources[1] + "))))"
 	case "AND":
 		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") & floatBitsToUint(" + sources[1] + "))"
 	case "OR":
@@ -471,6 +523,9 @@ func (s *tgsiShader) inputName(index int) string {
 		if declaration.semantic == "POSITION" {
 			return "gl_FragCoord"
 		}
+		if declaration.semantic == "FACE" {
+			return "vec4(gl_FrontFacing ? 1.0 : -1.0)"
+		}
 		if declaration.semantic == "" || isInterpolationQualifier(declaration.semantic) {
 			return fmt.Sprintf("varying%d", declarationRank(s.inputs, index, false))
 		}
@@ -493,11 +548,11 @@ func (s *tgsiShader) outputName(index int) string {
 	return semanticName(declaration.semantic, index)
 }
 
-func declarationRank(declarations map[int]tgsiDeclaration, index int, skipPosition bool) int {
+func declarationRank(declarations map[int]tgsiDeclaration, index int, _ bool) int {
 	rank := 0
 	for candidate := 0; candidate < index; candidate++ {
 		declaration, ok := declarations[candidate]
-		if !ok || (skipPosition && declaration.semantic == "POSITION") {
+		if !ok || declaration.semantic == "FACE" || declaration.semantic == "POSITION" {
 			continue
 		}
 		rank++
@@ -523,15 +578,104 @@ func semanticName(semantic string, fallback int) string {
 	return "varying_" + strings.ToLower(replacer.Replace(semantic))
 }
 
+type glslVarying struct {
+	name      string
+	qualifier string
+}
+
+func linkTGSIInterfaces(vertex, fragment string) string {
+	vertexOutputs := glslVaryings(vertex, "out")
+	fragmentInputs := glslVaryings(fragment, "in")
+	matched := make(map[string]bool, len(fragmentInputs))
+
+	for _, output := range vertexOutputs {
+		for _, input := range fragmentInputs {
+			if output.name == input.name {
+				matched[input.name] = true
+				break
+			}
+		}
+	}
+	fallback := regexp.MustCompile(`^varying\d+$`)
+	for _, output := range vertexOutputs {
+		if matched[output.name] || !fallback.MatchString(output.name) {
+			continue
+		}
+		for _, input := range fragmentInputs {
+			if matched[input.name] {
+				continue
+			}
+			vertex = regexp.MustCompile(`\b`+regexp.QuoteMeta(output.name)+`\b`).
+				ReplaceAllString(vertex, input.name)
+			matched[input.name] = true
+			break
+		}
+	}
+
+	var declarations strings.Builder
+	var initializers strings.Builder
+	for _, input := range fragmentInputs {
+		if matched[input.name] {
+			continue
+		}
+		if input.qualifier != "" {
+			declarations.WriteString(input.qualifier)
+			declarations.WriteByte(' ')
+		}
+		fmt.Fprintf(&declarations, "out vec4 %s;\n", input.name)
+		fmt.Fprintf(&initializers, "    %s = vec4(0.0);\n", input.name)
+	}
+	if declarations.Len() == 0 {
+		return vertex
+	}
+	vertex = strings.Replace(vertex, "#version 410 core\n", "#version 410 core\n"+declarations.String(), 1)
+	return strings.Replace(vertex, "void main() {\n", "void main() {\n"+initializers.String(), 1)
+}
+
+func glslVaryings(source, direction string) []glslVarying {
+	var varyings []glslVarying
+	for _, line := range strings.Split(source, "\n") {
+		fields := strings.Fields(line)
+		directionIndex := -1
+		for index, field := range fields {
+			if field == direction {
+				directionIndex = index
+				break
+			}
+		}
+		if directionIndex < 0 || directionIndex+2 >= len(fields) || fields[directionIndex+1] != "vec4" {
+			continue
+		}
+		name := strings.TrimSuffix(fields[directionIndex+2], ";")
+		if !strings.HasPrefix(name, "varying") {
+			continue
+		}
+		varyings = append(varyings, glslVarying{
+			name:      name,
+			qualifier: strings.Join(fields[:directionIndex], " "),
+		})
+	}
+	return varyings
+}
+
 func (s *tgsiShader) glsl() (string, error) {
 	var source strings.Builder
 	source.WriteString("#version 410 core\n")
+	if s.stage == tgsiVertex {
+		// VirGL applications commonly render coplanar geometry in multiple
+		// passes with different vertex programs.  GLSL only guarantees identical
+		// window-space positions across those programs when gl_Position is
+		// invariant; without it, distant surfaces can fail an EQUAL/LEQUAL depth
+		// comparison as alternating triangles.
+		source.WriteString("invariant gl_Position;\n")
+		source.WriteString("uniform float uWinsysAdjustY;\n")
+	}
 	for index := 0; index <= maxDeclarationIndex(s.inputs); index++ {
 		declaration, ok := s.inputs[index]
 		if !ok {
 			continue
 		}
-		if s.stage == tgsiFragment && declaration.semantic == "POSITION" {
+		if s.stage == tgsiFragment && (declaration.semantic == "POSITION" || declaration.semantic == "FACE") {
 			continue
 		}
 		if s.stage == tgsiVertex {
@@ -559,7 +703,11 @@ func (s *tgsiShader) glsl() (string, error) {
 		fmt.Fprintf(&source, "uniform vec4 %s[%d];\n", s.constantName(), s.maxConstant+1)
 	}
 	for index := 0; index <= max(s.maxSampler, s.maxSamplerView); index++ {
-		fmt.Fprintf(&source, "uniform sampler2D sampler%d;\n", index)
+		samplerType := "sampler2D"
+		if s.samplerViews[index] == "SHADOW2D" {
+			samplerType = "sampler2DShadow"
+		}
+		fmt.Fprintf(&source, "uniform %s sampler%d;\n", samplerType, index)
 	}
 	for index, immediate := range s.immediates {
 		fmt.Fprintf(&source, "const vec4 immediate%d = %s;\n", index, immediate)
@@ -573,6 +721,9 @@ func (s *tgsiShader) glsl() (string, error) {
 	}
 	for _, instruction := range s.instructions {
 		fmt.Fprintf(&source, "    %s\n", instruction)
+	}
+	if s.stage == tgsiVertex {
+		source.WriteString("    gl_Position.y *= uWinsysAdjustY;\n")
 	}
 	source.WriteString("}\n")
 	return source.String(), nil

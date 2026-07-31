@@ -872,12 +872,16 @@ func (b gpuResourceBacking) WriteAt(offset uint64, src []byte) error {
 
 func (g *GPU) flushResource3DLocked(resource *gpuResource, rect image.Rectangle) error {
 	if renderer, ok := g.renderer.(GPUNativeScanoutRenderer); ok {
+		// A frame the frontend has not acquired yet is obsolete as soon as a
+		// newer guest flush arrives. Retire it before asking the renderer for
+		// another lease so a bounded native-frame pool cannot fill and force
+		// every subsequent flush through the CPU readback fallback.
+		g.releaseNativeFrameLocked(0)
 		frame, available, err := renderer.NativeScanout(resource.id, rect)
 		if err != nil {
 			return fmt.Errorf("publish native 3D scanout resource %d: %w", resource.id, err)
 		}
 		if available {
-			g.releaseNativeFrameLocked(0)
 			g.nativeGeneration++
 			frame.Generation = g.nativeGeneration
 			frame.Damage = rect.Sub(g.scanoutRect.Min)
