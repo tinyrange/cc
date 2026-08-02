@@ -26,6 +26,7 @@ func main() {
 func run(args []string) error {
 	global := flag.NewFlagSet("glass", flag.ContinueOnError)
 	timeout := global.Duration("timeout", 30*time.Second, "Operation timeout")
+	password := global.String("password", "", "VNC password")
 	if err := global.Parse(args); err != nil {
 		return err
 	}
@@ -35,7 +36,13 @@ func run(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	client, err := rfb.Dial(ctx, args[1])
+	var client *rfb.Client
+	var err error
+	if *password == "" {
+		client, err = rfb.Dial(ctx, args[1])
+	} else {
+		client, err = rfb.DialPassword(ctx, args[1], *password)
+	}
 	if err != nil {
 		return err
 	}
@@ -156,7 +163,7 @@ func run(args []string) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: glass [-timeout DURATION] <probe|capture|resize|clipboard-set|clipboard-get|type|key|move|click|wait-pixel> ADDRESS ...")
+	return fmt.Errorf("usage: glass [-timeout DURATION] [-password PASSWORD] <probe|capture|resize|clipboard-set|clipboard-get|type|key|move|click|wait-pixel> ADDRESS ...")
 }
 
 func parseDimensions(widthText, heightText string) (int, int, error) {

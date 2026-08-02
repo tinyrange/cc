@@ -186,6 +186,95 @@ DCL TEMP[0]
 	}
 }
 
+func TestPointSizeAndPointCoordinatesUseGLBuiltins(t *testing.T) {
+	const vertex = `VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL OUT[1], PSIZE
+IMM[0] FLT32 {5.0, 0.0, 0.0, 0.0}
+  0: MOV OUT[0], IN[0]
+  1: MOV OUT[1].x, IMM[0].x
+  2: END`
+	const fragment = `FRAG
+DCL IN[0], PCOORD, PERSPECTIVE
+DCL OUT[0], COLOR
+  0: MOV OUT[0].xy, IN[0].xy
+  1: MOV OUT[0].zw, IN[0].xx
+  2: END`
+
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(vertexGLSL, "gl_PointSize = varying_psize.x;") {
+		t.Fatalf("vertex shader does not publish point size:\n%s", vertexGLSL)
+	}
+	if !strings.Contains(fragmentGLSL, "vec4(gl_PointCoord, 0.0, 1.0)") ||
+		strings.Contains(fragmentGLSL, "in vec4 varying_pcoord") {
+		t.Fatalf("fragment shader does not consume point coordinates as a builtin:\n%s", fragmentGLSL)
+	}
+
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPointSpriteRasterizerCoordinatesReplaceGenericInput(t *testing.T) {
+	fragment := `#version 150
+in vec4 varying_generic_8;
+in vec4 varying_generic_9;
+out vec4 result;
+void main() {
+	result = varying_generic_8 + varying_generic_9;
+}`
+	fragment = pointSpriteFragmentSource(fragment, 1<<8)
+	if strings.Contains(fragment, "in vec4 varying_generic_8") {
+		t.Fatal("point-sprite generic input remains declared")
+	}
+	if !strings.Contains(fragment, "vec4(gl_PointCoord, 0.0, 1.0) + varying_generic_9") {
+		t.Fatalf("point-sprite coordinate was not substituted:\n%s", fragment)
+	}
+	if !strings.Contains(fragment, "in vec4 varying_generic_9") {
+		t.Fatal("unselected generic input was removed")
+	}
+
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	vertex := `#version 150
+out vec4 varying_generic_9;
+void main() {
+	gl_Position = vec4(0.0);
+	varying_generic_9 = vec4(1.0);
+}`
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertex, fragment)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaskedTGSIfaceBuiltinDoesNotShiftGenericVaryings(t *testing.T) {
 	const vertex = `VERT
 DCL IN[0]

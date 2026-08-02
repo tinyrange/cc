@@ -3,6 +3,7 @@ package virgl
 import (
 	"bufio"
 	"fmt"
+	"math/bits"
 	"regexp"
 	"strconv"
 	"strings"
@@ -526,6 +527,9 @@ func (s *tgsiShader) inputName(index int) string {
 		if declaration.semantic == "FACE" {
 			return "vec4(gl_FrontFacing ? 1.0 : -1.0)"
 		}
+		if declaration.semantic == "PCOORD" {
+			return "vec4(gl_PointCoord, 0.0, 1.0)"
+		}
 		if declaration.semantic == "" || isInterpolationQualifier(declaration.semantic) {
 			return fmt.Sprintf("varying%d", declarationRank(s.inputs, index, false))
 		}
@@ -581,6 +585,22 @@ func semanticName(semantic string, fallback int) string {
 type glslVarying struct {
 	name      string
 	qualifier string
+}
+
+func pointSpriteFragmentSource(fragment string, coordinates uint32) string {
+	for coordinates != 0 {
+		index := bits.TrailingZeros32(coordinates)
+		name := fmt.Sprintf("varying_generic_%d", index)
+		declaration := regexp.MustCompile(`(?m)^\s*(?:(?:flat|smooth|noperspective)\s+)?in\s+vec4\s+` +
+			regexp.QuoteMeta(name) + `\s*;\s*\n?`)
+		if declaration.MatchString(fragment) {
+			fragment = declaration.ReplaceAllString(fragment, "")
+			fragment = regexp.MustCompile(`\b`+regexp.QuoteMeta(name)+`\b`).
+				ReplaceAllString(fragment, "vec4(gl_PointCoord, 0.0, 1.0)")
+		}
+		coordinates &^= 1 << index
+	}
+	return fragment
 }
 
 func linkTGSIInterfaces(vertex, fragment string) string {
@@ -675,7 +695,8 @@ func (s *tgsiShader) glsl() (string, error) {
 		if !ok {
 			continue
 		}
-		if s.stage == tgsiFragment && (declaration.semantic == "POSITION" || declaration.semantic == "FACE") {
+		if s.stage == tgsiFragment && (declaration.semantic == "POSITION" ||
+			declaration.semantic == "FACE" || declaration.semantic == "PCOORD") {
 			continue
 		}
 		if s.stage == tgsiVertex {
@@ -723,6 +744,12 @@ func (s *tgsiShader) glsl() (string, error) {
 		fmt.Fprintf(&source, "    %s\n", instruction)
 	}
 	if s.stage == tgsiVertex {
+		for index := 0; index <= maxDeclarationIndex(s.outputs); index++ {
+			if declaration, ok := s.outputs[index]; ok && declaration.semantic == "PSIZE" {
+				fmt.Fprintf(&source, "    gl_PointSize = %s.x;\n", s.outputName(index))
+				break
+			}
+		}
 		source.WriteString("    gl_Position.y *= uWinsysAdjustY;\n")
 	}
 	source.WriteString("}\n")

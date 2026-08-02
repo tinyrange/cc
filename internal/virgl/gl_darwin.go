@@ -61,6 +61,7 @@ const (
 	glBlend                   = 0x0be2
 	glScissorTest             = 0x0c11
 	glPrimitiveRestart        = 0x8f9d
+	glProgramPointSize        = 0x8642
 	glNever                   = 0x0200
 	glLess                    = 0x0201
 	glEqual                   = 0x0202

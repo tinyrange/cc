@@ -447,7 +447,7 @@ void main() { result = vec4(%g, %g, %g, %g); }`, red, green, blue, alpha)
 	// With rasterizer scissoring enabled, only the left pixel is replaced.
 	if err := host.execute(contextID, []command{
 		{Opcode: 2, Object: 1, Payload: []uint32{0}},
-		{Opcode: 1, Object: 2, Payload: []uint32{13, 1 << 14}},
+		{Opcode: 1, Object: 2, Payload: []uint32{13, 1 << 14, 0, 0, 0, 0, 0, 0, 0}},
 		{Opcode: 15, Payload: []uint32{0, 0, 1 | (1 << 16)}},
 		{Opcode: 2, Object: 2, Payload: []uint32{13}},
 	}, nil); err != nil {
@@ -493,7 +493,7 @@ func TestRasterizerWindingAccountsForHostFramebufferOrigin(t *testing.T) {
 			math.Float32bits(0.5), math.Float32bits(0.5), math.Float32bits(0),
 		}},
 		// Cull back faces with Gallium's clockwise front face.
-		{Opcode: 1, Object: 2, Payload: []uint32{12, 2 << 8}},
+		{Opcode: 1, Object: 2, Payload: []uint32{12, 2 << 8, 0, 0, 0, 0, 0, 0, 0}},
 		{Opcode: 2, Object: 2, Payload: []uint32{12}},
 		{Opcode: 7, Payload: []uint32{0x4, 0, 0, 0, math.Float32bits(1)}},
 	}, nil); err != nil {
@@ -1006,6 +1006,58 @@ func TestZeroStridePartialTextureTransferUsesFullMipWidth(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("zero-stride partial texture pixels BGRA = %v, want %v", got, want)
+	}
+}
+
+func TestTransferFromHostReturnsTextureRowsToGuestBacking(t *testing.T) {
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer := NewRenderer(host)
+	defer renderer.Close()
+
+	description := virtio.GPUResource3D{
+		ID: 1, Target: 2, Format: 67,
+		Width: 4, Height: 2, Depth: 1, ArraySize: 1,
+	}
+	if err := renderer.CreateResource(description); err != nil {
+		t.Fatal(err)
+	}
+	pixels := []byte{
+		1, 2, 3, 255, 11, 12, 13, 255, 21, 22, 23, 255, 31, 32, 33, 255,
+		41, 42, 43, 255, 51, 52, 53, 255, 61, 62, 63, 255, 71, 72, 73, 255,
+	}
+	if err := host.dispatch(func() error {
+		host.gl.bindTexture(glTexture2D, host.resources[description.ID].texture)
+		host.gl.texSubImage2D(glTexture2D, 0, 0, 0, 4, 2, glRGBA, glUnsignedByte, glPointer(pixels))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	backing := transferBacking(make([]byte, 36))
+	for index := range backing {
+		backing[index] = 0xee
+	}
+	if err := renderer.TransferFromHost(virtio.GPUTransfer3D{
+		ResourceID: description.ID,
+		Box:        virtio.GPUBox{X: 1, Width: 2, Height: 2, Depth: 1},
+		Offset:     4,
+		Stride:     16,
+		Backing:    backing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := transferBacking(make([]byte, len(backing)))
+	for index := range want {
+		want[index] = 0xee
+	}
+	copy(want[4:12], pixels[4:12])
+	copy(want[20:28], pixels[20:28])
+	if string(backing) != string(want) {
+		t.Fatalf("guest backing after texture readback = %v, want %v", backing, want)
 	}
 }
 

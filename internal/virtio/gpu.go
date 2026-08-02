@@ -834,11 +834,9 @@ func (g *GPU) writeBackingLocked(resource *gpuResource, offset uint64, src []byt
 		if available := uint64(entry.length) - entryOffset; count > available {
 			count = available
 		}
-		raw, err := g.mem.ReadIPA(entry.addr+entryOffset, int(count))
-		if err != nil {
+		if err := g.mem.WriteIPA(entry.addr+entryOffset, remaining[:count]); err != nil {
 			return err
 		}
-		copy(raw, remaining[:count])
 		remaining = remaining[count:]
 		offset += count
 		position = end

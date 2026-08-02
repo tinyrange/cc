@@ -322,7 +322,7 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 	fmt.Fprintf(output, "  draw_payload=%v index_resource=%d index_size=%d index_offset=%d\n",
 		command.Payload, context.indexBuffer, context.indexSize, context.indexOffset)
 	fmt.Fprintf(output, "  rasterizer_state=%#x dsa_state=%#x\n",
-		context.rasterizers[context.boundRasterizer], context.depthStencilAlpha[context.boundDSA].state)
+		context.rasterizers[context.boundRasterizer].state, context.depthStencilAlpha[context.boundDSA].state)
 	fmt.Fprintf(output, "  vertex_constants=%v fragment_constants=%v\n",
 		context.constants[tgsiVertex], context.constants[tgsiFragment])
 	if _, ok := seen[stateKey]; ok {
