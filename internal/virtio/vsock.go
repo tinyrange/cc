@@ -110,9 +110,22 @@ func NewVsock(base, size uint64, irq uint32, guestCID uint64, backend VsockBacke
 
 func (v *Vsock) Attach(mem GuestMemory, irq IRQController) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.mem = mem
 	v.irq = irq
+	v.mu.Unlock()
+	if registrar, ok := mem.(guestMemoryDetachRegistrar); ok {
+		registrar.RegisterGuestMemoryDetach(v.Detach)
+	}
+}
+
+// Detach prevents asynchronous backend readers from touching guest memory
+// after the hypervisor starts unmapping it.
+func (v *Vsock) Detach() {
+	v.mu.Lock()
+	v.mem = nil
+	v.irq = nil
+	v.pendingRx = nil
+	v.mu.Unlock()
 }
 
 func (v *Vsock) Contains(addr uint64, size int) bool {
@@ -849,6 +862,11 @@ func (v *Vsock) configBytesLocked() []byte {
 }
 
 func (v *Vsock) resetLocked() {
+	for _, conn := range v.connections {
+		if conn != nil && conn.backend != nil {
+			_ = conn.backend.Close()
+		}
+	}
 	v.deviceFeatureSel = 0
 	v.driverFeatureSel = 0
 	v.driverFeatures = 0

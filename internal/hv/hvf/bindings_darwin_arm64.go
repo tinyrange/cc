@@ -288,24 +288,27 @@ func registerOptionalLibFunc(fptr any, handle uintptr, name string) bool {
 }
 
 type VM struct {
-	vcpu        VCPU
-	vcpuCreated bool
-	exitInfo    *VcpuExit
-	vcpus       []*hvfVCPU
-	mappings    []mapping
-	mappingsMu  sync.RWMutex
-	fastMem     []byte
-	fastMemBase uint64
-	fastMemEnd  uint64
-	gicMu       sync.Mutex
-	threadCh    chan func()
-	threadMu    sync.Mutex
-	closed      bool
-	dit         bool
-	mdscrEL1    uint64
-	osdlrEL1    uint64
-	nestedVirt  bool
-	osLock      bool
+	vcpu          VCPU
+	vcpuCreated   bool
+	exitInfo      *VcpuExit
+	vcpus         []*hvfVCPU
+	mappings      []mapping
+	mappingsMu    sync.RWMutex
+	lifecycleMu   sync.Mutex
+	memoryDetach  []func()
+	memoryClosing bool
+	fastMem       []byte
+	fastMemBase   uint64
+	fastMemEnd    uint64
+	gicMu         sync.Mutex
+	threadCh      chan func()
+	threadMu      sync.Mutex
+	closed        bool
+	dit           bool
+	mdscrEL1      uint64
+	osdlrEL1      uint64
+	nestedVirt    bool
+	osLock        bool
 }
 
 type hvfVCPU struct {
@@ -1328,6 +1331,16 @@ func (v *VM) Close() error {
 			v.vcpu = 0
 		}
 	}
+	v.lifecycleMu.Lock()
+	v.memoryClosing = true
+	detaches := v.memoryDetach
+	v.memoryDetach = nil
+	v.lifecycleMu.Unlock()
+	for _, detach := range detaches {
+		if detach != nil {
+			detach()
+		}
+	}
 	v.mappingsMu.Lock()
 	mappings := append([]mapping(nil), v.mappings...)
 	v.mappings = nil
@@ -1364,6 +1377,23 @@ func (v *VM) Close() error {
 	}
 	v.closeThreads()
 	return firstErr
+}
+
+// RegisterGuestMemoryDetach registers work that must finish before guest
+// memory is unmapped. Devices with asynchronous host-side workers use this to
+// stop dereferencing virtqueues during VM teardown.
+func (v *VM) RegisterGuestMemoryDetach(detach func()) {
+	if v == nil || detach == nil {
+		return
+	}
+	v.lifecycleMu.Lock()
+	if v.memoryClosing {
+		v.lifecycleMu.Unlock()
+		detach()
+		return
+	}
+	v.memoryDetach = append(v.memoryDetach, detach)
+	v.lifecycleMu.Unlock()
 }
 
 type ExceptionClass uint64
