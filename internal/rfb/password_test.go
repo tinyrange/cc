@@ -1,11 +1,16 @@
 package rfb
 
 import (
+	"context"
 	"crypto/des"
 	"encoding/binary"
+	"image"
 	"io"
 	"net"
 	"testing"
+	"time"
+
+	"j5.nz/cc/internal/virtio"
 )
 
 func TestPasswordSecurityAuthenticatesVNCResponse(t *testing.T) {
@@ -41,5 +46,51 @@ func TestPasswordSecurityAuthenticatesVNCResponse(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPasswordClientAuthenticatesAndCaptures(t *testing.T) {
+	framebuffer, err := virtio.NewFramebuffer(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := framebuffer.Update(image.Rect(0, 0, 1, 1), []byte{0x30, 0x20, 0x10, 0}, 4); err != nil {
+		t.Fatal(err)
+	}
+	serverSide, clientSide := net.Pipe()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- (&Server{
+			Desktop: &virtio.Desktop{
+				Framebuffer: framebuffer,
+				GPU:         virtio.NewGPU(0, 0x1000, 3, framebuffer),
+			},
+			Name:     "password-client-test",
+			Security: PasswordSecurity("password"),
+		}).ServeConn(context.Background(), serverSide)
+	}()
+
+	password := "password"
+	client, err := newClient(clientSide, &password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := client.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := frame.RGBAAt(0, 0); got.R != 0x10 || got.G != 0x20 || got.B != 0x30 || got.A != 0xff {
+		t.Fatalf("captured pixel = %#v", got)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("password-protected RFB server did not finish after disconnect")
 	}
 }

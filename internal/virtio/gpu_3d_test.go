@@ -77,12 +77,15 @@ func TestGPU3DTransportCarriesMesaCommandsToRenderer(t *testing.T) {
 	requireGPUResponse(t, gpu.dispatchLocked(attachResource, gpuQueueControl), gpuRespOKNoData)
 
 	backingBytes := []byte{20, 21, 22, 23}
-	copy(mem[0x4000:], backingBytes)
-	attachBacking := gpuTestRequest(gpuCmdResourceAttachBacking, 48)
+	copy(mem[0x4000:], backingBytes[:2])
+	copy(mem[0x5000:], backingBytes[2:])
+	attachBacking := gpuTestRequest(gpuCmdResourceAttachBacking, 64)
 	binary.LittleEndian.PutUint32(attachBacking[24:28], 7)
-	binary.LittleEndian.PutUint32(attachBacking[28:32], 1)
+	binary.LittleEndian.PutUint32(attachBacking[28:32], 2)
 	binary.LittleEndian.PutUint64(attachBacking[32:40], 0x4000)
-	binary.LittleEndian.PutUint32(attachBacking[40:44], uint32(len(backingBytes)))
+	binary.LittleEndian.PutUint32(attachBacking[40:44], 2)
+	binary.LittleEndian.PutUint64(attachBacking[48:56], 0x5000)
+	binary.LittleEndian.PutUint32(attachBacking[56:60], 2)
 	requireGPUResponse(t, gpu.dispatchLocked(attachBacking, gpuQueueControl), gpuRespOKNoData)
 
 	transfer := gpuTestRequest(gpuCmdTransferToHost3D, 72)
@@ -110,6 +113,16 @@ func TestGPU3DTransportCarriesMesaCommandsToRenderer(t *testing.T) {
 	}
 	if !bytes.Equal(renderer.transferred, backingBytes) {
 		t.Fatalf("transferred bytes = %v", renderer.transferred)
+	}
+
+	renderer.fromHost = []byte{31, 32, 33, 34}
+	transferFromHost := append([]byte(nil), transfer...)
+	binary.LittleEndian.PutUint32(transferFromHost[0:4], gpuCmdTransferFromHost3D)
+	requireGPUResponse(t, gpu.dispatchLocked(transferFromHost, gpuQueueControl), gpuRespOKNoData)
+	gotFromHost := append([]byte(nil), mem[0x4000:0x4002]...)
+	gotFromHost = append(gotFromHost, mem[0x5000:0x5002]...)
+	if !bytes.Equal(gotFromHost, renderer.fromHost) {
+		t.Fatalf("guest backing after host transfer = %v, want %v", gotFromHost, renderer.fromHost)
 	}
 
 	setScanout := gpuTestRequest(gpuCmdSetScanout, 48)
@@ -202,6 +215,7 @@ type recordingGPURenderer struct {
 	capsets     []GPUCapset
 	submitted   []byte
 	transferred []byte
+	fromHost    []byte
 	scanout     []byte
 	contexts    map[uint32]struct{}
 	resources   map[uint32]GPUResource3D
@@ -253,7 +267,12 @@ func (r *recordingGPURenderer) TransferToHost(transfer GPUTransfer3D) error {
 	return transfer.Backing.ReadAt(0, r.transferred)
 }
 
-func (r *recordingGPURenderer) TransferFromHost(GPUTransfer3D) error { return nil }
+func (r *recordingGPURenderer) TransferFromHost(transfer GPUTransfer3D) error {
+	if r.fromHost == nil {
+		return nil
+	}
+	return transfer.Backing.WriteAt(transfer.Offset, r.fromHost)
+}
 
 func (r *recordingGPURenderer) Submit(_ uint32, commands []byte) error {
 	r.submitted = append([]byte(nil), commands...)

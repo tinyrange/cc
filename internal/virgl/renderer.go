@@ -265,17 +265,73 @@ func transferDataSize(description virtio.GPUResource3D, transfer virtio.GPUTrans
 func (r *Renderer) TransferFromHost(transfer virtio.GPUTransfer3D) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	resource := r.resources[transfer.ResourceID]
-	if resource == nil {
+	target := r.resources[transfer.ResourceID]
+	if target == nil {
 		return fmt.Errorf("unknown VirGL resource %d", transfer.ResourceID)
 	}
-	if uint64(len(resource.data)) > transfer.Backing.Size() {
-		return fmt.Errorf("VirGL resource %d host data exceeds guest backing", transfer.ResourceID)
+	if transfer.Backing == nil {
+		return fmt.Errorf("VirGL resource %d has no guest backing", transfer.ResourceID)
 	}
-	if err := r.host.transferFromHost(resource, transfer); err != nil {
+	data, normalized, err := stageTransferFromHost(target.description, transfer)
+	if err != nil {
 		return err
 	}
-	return transfer.Backing.WriteAt(0, resource.data)
+	staged := &resource{description: target.description, data: data}
+	if err := r.host.transferFromHost(staged, normalized); err != nil {
+		return err
+	}
+	return commitTransferFromHost(target.description, transfer, staged.data)
+}
+
+func stageTransferFromHost(description virtio.GPUResource3D, transfer virtio.GPUTransfer3D) ([]byte, virtio.GPUTransfer3D, error) {
+	size, err := transferDataSize(description, transfer)
+	if err != nil {
+		return nil, transfer, err
+	}
+	end := transfer.Offset + size
+	if end < transfer.Offset || end > transfer.Backing.Size() {
+		return nil, transfer, fmt.Errorf("VirGL resource %d transfer backing range %d..%d exceeds %d bytes",
+			transfer.ResourceID, transfer.Offset, end, transfer.Backing.Size())
+	}
+
+	packedSize := uint64(transfer.Box.Width)
+	if description.Target != 0 {
+		packedSize *= 4 * uint64(transfer.Box.Height)
+	}
+	if packedSize > maxResourceBytes {
+		return nil, transfer, fmt.Errorf("VirGL resource %d packed transfer is %d bytes, limit is %d",
+			transfer.ResourceID, packedSize, maxResourceBytes)
+	}
+	data := make([]byte, int(packedSize))
+	transfer.Offset = 0
+	if description.Target != 0 {
+		transfer.Stride = transfer.Box.Width * 4
+		transfer.LayerStride = uint32(packedSize)
+	}
+	return data, transfer, nil
+}
+
+func commitTransferFromHost(description virtio.GPUResource3D, transfer virtio.GPUTransfer3D, data []byte) error {
+	if description.Target == 0 {
+		return transfer.Backing.WriteAt(transfer.Offset, data)
+	}
+	rowBytes := uint64(transfer.Box.Width) * 4
+	stride := uint64(transfer.Stride)
+	if stride == 0 {
+		levelWidth := description.Width >> transfer.Level
+		if levelWidth == 0 {
+			levelWidth = 1
+		}
+		stride = uint64(levelWidth) * 4
+	}
+	for row := uint32(0); row < transfer.Box.Height; row++ {
+		source := uint64(row) * rowBytes
+		destination := transfer.Offset + uint64(row)*stride
+		if err := transfer.Backing.WriteAt(destination, data[int(source):int(source+rowBytes)]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Renderer) Submit(contextID uint32, stream []byte) error {
