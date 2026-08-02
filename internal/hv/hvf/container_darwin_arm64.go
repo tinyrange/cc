@@ -27,6 +27,7 @@ import (
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/timing"
+	"j5.nz/cc/internal/virgl"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -1072,6 +1073,9 @@ func (s *ContainerSession) Close() error {
 		_ = s.vsock.Close()
 	}
 	var closeErr error
+	if s.desktop != nil && s.desktop.GPU != nil {
+		closeErr = errors.Join(closeErr, s.desktop.GPU.Close())
+	}
 	if s.fsCloseErr != nil {
 		closeErr = *s.fsCloseErr
 	}
@@ -1267,6 +1271,13 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	vsockBackend := virtio.NewSimpleVsockBackend()
 	var desktop *virtio.Desktop
 	var displayDevices []virtio.MMIODevice
+	var displayGPU *virtio.GPU
+	displayGPUOwned := true
+	defer func() {
+		if displayGPUOwned && displayGPU != nil {
+			_ = displayGPU.Close()
+		}
+	}()
 	var clipboardListener virtio.VsockListener
 	var displayListener virtio.VsockListener
 	if req.DisplayWidth != 0 || req.DisplayHeight != 0 {
@@ -1275,7 +1286,13 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			vm.Close()
 			return nil, fmt.Errorf("create display: %w", err)
 		}
-		gpu := virtio.NewGPU(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer)
+		renderer, err := virgl.NewHostRendererWithShareGroup(req.OpenGLShareContext, req.OpenGLSharePixelFormat)
+		if err != nil {
+			vm.Close()
+			return nil, fmt.Errorf("create VirGL renderer: %w", err)
+		}
+		gpu := virtio.NewGPUWithRenderer(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer, renderer)
+		displayGPU = gpu
 		keyboard := virtio.NewKeyboardInput(arm64vm.KeyboardBase, arm64vm.KeyboardSize, arm64vm.KeyboardIRQ)
 		pointer := virtio.NewAbsolutePointerInput(arm64vm.PointerBase, arm64vm.PointerSize, arm64vm.PointerIRQ, req.DisplayWidth, req.DisplayHeight)
 		clipboard := virtio.NewClipboard()
@@ -1639,6 +1656,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 		}
 		displayListenersOwned = false
+		displayGPUOwned = false
 		return &ContainerSession{
 			cancel:            cancel,
 			runCtx:            runCtx,

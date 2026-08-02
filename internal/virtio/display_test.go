@@ -57,6 +57,32 @@ func TestGPU2DScanoutCopiesGuestBacking(t *testing.T) {
 	}
 }
 
+func TestGPUScanoutUsesGuestModeAfterHostWindowResize(t *testing.T) {
+	framebuffer, err := NewFramebuffer(1440, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpu := NewGPU(0x1000, 0x1000, 9, framebuffer)
+
+	create := gpuTestRequest(gpuCmdResourceCreate2D, 40)
+	binary.LittleEndian.PutUint32(create[24:28], 7)
+	binary.LittleEndian.PutUint32(create[28:32], gpuFormatB8G8R8X8)
+	binary.LittleEndian.PutUint32(create[32:36], 1440)
+	binary.LittleEndian.PutUint32(create[36:40], 900)
+	requireGPUResponse(t, gpu.dispatchLocked(create, gpuQueueControl), gpuRespOKNoData)
+
+	if err := gpu.Resize(1440, 891); err != nil {
+		t.Fatal(err)
+	}
+	scanout := gpuTestRequest(gpuCmdSetScanout, 48)
+	putGPUTestRect(scanout[24:40], 0, 0, 1440, 900)
+	binary.LittleEndian.PutUint32(scanout[44:48], 7)
+	requireGPUResponse(t, gpu.dispatchLocked(scanout, gpuQueueControl), gpuRespOKNoData)
+	if width, height := framebuffer.Size(); width != 1440 || height != 900 {
+		t.Fatalf("guest scanout framebuffer = %dx%d, want 1440x900", width, height)
+	}
+}
+
 func TestGPURejectsResourceLargerThanConfiguredDisplay(t *testing.T) {
 	framebuffer, err := NewFramebuffer(800, 600)
 	if err != nil {

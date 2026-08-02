@@ -200,6 +200,23 @@ type DisplaySize struct {
 	Height uint32
 }
 
+func (d *Desktop) Snapshot(request image.Rectangle, since uint64, incremental bool) (FramebufferUpdate, error) {
+	if d == nil || d.Framebuffer == nil {
+		return FramebufferUpdate{}, fmt.Errorf("desktop framebuffer is unavailable")
+	}
+	if d.GPU != nil {
+		return d.GPU.Snapshot(request, since, incremental)
+	}
+	return d.Framebuffer.Snapshot(request, since, incremental), nil
+}
+
+func (d *Desktop) AcquireNativeFrame(since uint64) (GPUNativeFrame, bool, error) {
+	if d == nil || d.GPU == nil {
+		return GPUNativeFrame{}, false, nil
+	}
+	return d.GPU.AcquireNativeFrame(since)
+}
+
 func (d *Desktop) Resize(width, height int) error {
 	if d == nil || d.GPU == nil || d.Framebuffer == nil {
 		return fmt.Errorf("desktop resize is unavailable")

@@ -25,15 +25,26 @@ type Client struct {
 	clipboard   string
 	resize      bool
 	readTimeout time.Duration
+	password    *string
 }
 
 func Dial(ctx context.Context, address string) (*Client, error) {
+	return dial(ctx, address, nil)
+}
+
+// DialPassword connects to an RFB server using standard VNC password
+// authentication. The protocol accepts at most eight password bytes.
+func DialPassword(ctx context.Context, address, password string) (*Client, error) {
+	return dial(ctx, address, &password)
+}
+
+func dial(ctx context.Context, address string, password *string) (*Client, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
-	client, err := NewClient(conn)
+	client, err := newClient(conn, password)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -42,6 +53,10 @@ func Dial(ctx context.Context, address string) (*Client, error) {
 }
 
 func NewClient(conn io.ReadWriteCloser) (*Client, error) {
+	return newClient(conn, nil)
+}
+
+func newClient(conn io.ReadWriteCloser, password *string) (*Client, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("RFB connection is nil")
 	}
@@ -49,6 +64,7 @@ func NewClient(conn io.ReadWriteCloser) (*Client, error) {
 		conn:        conn,
 		reader:      bufio.NewReaderSize(conn, 64<<10),
 		readTimeout: 30 * time.Second,
+		password:    password,
 	}
 	if err := client.handshake(); err != nil {
 		return nil, err
@@ -113,15 +129,32 @@ func (c *Client) handshake() error {
 	if _, err := io.ReadFull(c.input(), types); err != nil {
 		return err
 	}
-	foundNone := false
+	selected := byte(securityNone)
+	if c.password != nil {
+		selected = securityVNCAuthentication
+	}
+	found := false
 	for _, securityType := range types {
-		foundNone = foundNone || securityType == securityNone
+		found = found || securityType == selected
 	}
-	if !foundNone {
-		return fmt.Errorf("RFB server does not offer None security")
+	if !found {
+		return fmt.Errorf("RFB server does not offer requested security type %d", selected)
 	}
-	if _, err := c.conn.Write([]byte{securityNone}); err != nil {
+	if _, err := c.conn.Write([]byte{selected}); err != nil {
 		return err
+	}
+	if selected == securityVNCAuthentication {
+		challenge := make([]byte, 16)
+		if _, err := io.ReadFull(c.input(), challenge); err != nil {
+			return err
+		}
+		response, err := passwordChallengeResponse(*c.password, challenge)
+		if err != nil {
+			return err
+		}
+		if _, err := c.conn.Write(response); err != nil {
+			return err
+		}
 	}
 	var securityResult uint32
 	if err := binary.Read(c.input(), binary.BigEndian, &securityResult); err != nil {

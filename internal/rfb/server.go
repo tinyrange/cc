@@ -478,7 +478,10 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 			}
 			if request.incremental {
 				for {
-					update := s.Desktop.Framebuffer.Snapshot(request.rect, generation, true)
+					update, err := s.Desktop.Snapshot(request.rect, generation, true)
+					if err != nil {
+						return err
+					}
 					sendCursor := request.richCursor && (!cursorSent || cursorFormat != request.format)
 					if !update.Rect.Empty() || sendCursor || request.resize != nil {
 						if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
@@ -506,7 +509,10 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 							goto nextRequest
 						}
 						if !request.incremental {
-							update = s.Desktop.Framebuffer.Snapshot(request.rect, generation, false)
+							update, err = s.Desktop.Snapshot(request.rect, generation, false)
+							if err != nil {
+								return err
+							}
 							sendCursor = request.richCursor && (!cursorSent || cursorFormat != request.format)
 							if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
 								return err
@@ -528,7 +534,10 @@ func (s *Server) writeUpdates(ctx context.Context, conn io.Writer, requests <-ch
 					}
 				}
 			} else {
-				update := s.Desktop.Framebuffer.Snapshot(request.rect, generation, false)
+				update, err := s.Desktop.Snapshot(request.rect, generation, false)
+				if err != nil {
+					return err
+				}
 				sendCursor := request.richCursor && (!cursorSent || cursorFormat != request.format)
 				if err := writeFramebufferUpdate(conn, update, request.format, request.encoding, sendCursor, request.resize, zrle); err != nil {
 					return err

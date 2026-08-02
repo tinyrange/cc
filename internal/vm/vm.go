@@ -418,11 +418,25 @@ func (s desktopSession) Size() (int, int) {
 }
 
 func (s desktopSession) Snapshot(request image.Rectangle, since uint64, incremental bool) display.FramebufferUpdate {
-	update := s.desktop.Framebuffer.Snapshot(request, since, incremental)
+	update, err := s.desktop.Snapshot(request, since, incremental)
+	if err != nil {
+		return display.FramebufferUpdate{}
+	}
 	return display.FramebufferUpdate{
 		Width: update.Width, Height: update.Height, Generation: update.Generation,
 		Rect: update.Rect, Pixels: update.Pixels,
 	}
+}
+
+func (s desktopSession) AcquireOpenGLFrame(since uint64) (display.OpenGLFrame, bool, error) {
+	frame, available, err := s.desktop.AcquireNativeFrame(since)
+	if err != nil || !available {
+		return display.OpenGLFrame{}, available, err
+	}
+	return display.NewOpenGLFrame(
+		frame.Width, frame.Height, frame.Generation, frame.Damage,
+		frame.Texture, frame.ProducerFence, frame.ReleaseFrame,
+	), true, nil
 }
 
 func (s desktopSession) Changed() <-chan struct{} {
