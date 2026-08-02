@@ -84,6 +84,65 @@ func TestVsockBackendDeliveryWaitsForPeerCredit(t *testing.T) {
 	waitForVsockTxCount(t, device, key, 8)
 }
 
+func TestVsockDetachesBeforeGuestMemoryIsReleased(t *testing.T) {
+	memory := &lifecycleTestNetMemory{testGuestMemory: make(testGuestMemory, 4096)}
+	device := NewVsock(0, 0x1000, 11, 3, nil)
+	device.Attach(memory, &testIRQ{})
+	if memory.detach == nil {
+		t.Fatal("vsock did not register a guest-memory detach callback")
+	}
+
+	device.pendingRx = [][]byte{{1, 2, 3}}
+	memory.detach()
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	if device.mem != nil || device.irq != nil || len(device.pendingRx) != 0 {
+		t.Fatal("vsock retained guest-memory state after detach")
+	}
+	if err := device.processRXLocked(); err != nil {
+		t.Fatalf("detached RX processing returned an error: %v", err)
+	}
+}
+
+func TestVsockResetClosesDiscardedConnections(t *testing.T) {
+	backend := NewSimpleVsockBackend()
+	listener, err := backend.Listen(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	clientConn, err := backend.Connect(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	device := NewVsock(0, 0, 0, 3, backend)
+	key := vsockConnKey{localPort: 1024, remotePort: 2048}
+	device.connections[key] = &vsockConnection{
+		key: key, state: vsockConnStateConnected, backend: serverConn,
+	}
+	device.wg.Add(1)
+	readDone := make(chan struct{})
+	go func() {
+		device.readFromBackend(serverConn, key)
+		close(readDone)
+	}()
+
+	device.mu.Lock()
+	device.resetLocked()
+	device.mu.Unlock()
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("vsock reset left a discarded connection reader running")
+	}
+}
+
 func waitForVsockTxCount(t *testing.T, device *Vsock, key vsockConnKey, want uint32) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

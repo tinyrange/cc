@@ -1489,6 +1489,10 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	go func() {
 		defer close(closeDone)
 		defer func() {
+			_ = vm.Close()
+			exitTiming.Dump()
+		}()
+		defer func() {
 			var errs []error
 			for _, device := range fsdevs {
 				if device != nil {
@@ -1498,8 +1502,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			fsCloseErr = errors.Join(errs...)
 		}()
 		defer func() {
-			_ = vm.Close()
-			exitTiming.Dump()
+			_ = vsock.Close()
 		}()
 		defer cancel()
 		runner := newVMRunManager(vm)
