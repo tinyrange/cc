@@ -26,6 +26,62 @@ type FramebufferUpdate struct {
 	Pixels     []byte
 }
 
+type CursorUpdate struct {
+	Width      int
+	Height     int
+	HotX       int
+	HotY       int
+	Visible    bool
+	Generation uint64
+	Pixels     []byte
+}
+
+// Cursor is the host-visible virtio-gpu cursor plane.
+type Cursor struct {
+	mu         sync.Mutex
+	width      int
+	height     int
+	hotX       int
+	hotY       int
+	visible    bool
+	generation uint64
+	pixels     []byte
+}
+
+func (c *Cursor) Update(width, height, hotX, hotY int, pixels []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.width = width
+	c.height = height
+	c.hotX = hotX
+	c.hotY = hotY
+	c.visible = true
+	// Publish a new immutable backing slice so snapshots can be consumed after
+	// releasing the lock without racing the next cursor update.
+	c.pixels = append([]byte(nil), pixels...)
+	c.generation++
+}
+
+func (c *Cursor) Hide() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.visible {
+		return
+	}
+	c.visible = false
+	c.generation++
+}
+
+func (c *Cursor) Snapshot() CursorUpdate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return CursorUpdate{
+		Width: c.width, Height: c.height, HotX: c.hotX, HotY: c.hotY,
+		Visible: c.visible, Generation: c.generation,
+		Pixels: c.pixels,
+	}
+}
+
 func NewFramebuffer(width, height int) (*Framebuffer, error) {
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf("framebuffer dimensions must be positive")

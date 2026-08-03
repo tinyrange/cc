@@ -43,7 +43,6 @@ func BootCommandLine(dmesg bool, serialConsole bool) string {
 	if dmesg {
 		args = append([]string{
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
-			"keep_bootcon",
 			"loglevel=8",
 		}, args...)
 	}

@@ -174,6 +174,59 @@ func TestGPUCursorQueueDoesNotRequireResponseBuffer(t *testing.T) {
 	}
 }
 
+func TestGPUCursorUpdatePublishesGuestShape(t *testing.T) {
+	mem := make(testGuestMemory, 64<<10)
+	framebuffer, err := NewFramebuffer(800, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpu := NewGPU(0x1000, 0x1000, 9, framebuffer)
+	gpu.Attach(mem, &testIRQ{})
+
+	create := gpuTestRequest(gpuCmdResourceCreate2D, 40)
+	binary.LittleEndian.PutUint32(create[24:28], 7)
+	binary.LittleEndian.PutUint32(create[28:32], gpuFormatB8G8R8A8)
+	binary.LittleEndian.PutUint32(create[32:36], 2)
+	binary.LittleEndian.PutUint32(create[36:40], 2)
+	requireGPUResponse(t, gpu.dispatchLocked(create, gpuQueueControl), gpuRespOKNoData)
+
+	pixels := []byte{
+		0, 0, 0, 0, 10, 20, 30, 255,
+		40, 50, 60, 128, 70, 80, 90, 255,
+	}
+	copy(mem[0x4000:], pixels)
+	attach := gpuTestRequest(gpuCmdResourceAttachBacking, 48)
+	binary.LittleEndian.PutUint32(attach[24:28], 7)
+	binary.LittleEndian.PutUint32(attach[28:32], 1)
+	binary.LittleEndian.PutUint64(attach[32:40], 0x4000)
+	binary.LittleEndian.PutUint32(attach[40:44], uint32(len(pixels)))
+	requireGPUResponse(t, gpu.dispatchLocked(attach, gpuQueueControl), gpuRespOKNoData)
+
+	transfer := gpuTestRequest(gpuCmdTransferToHost2D, 56)
+	putGPUTestRect(transfer[24:40], 0, 0, 2, 2)
+	binary.LittleEndian.PutUint32(transfer[48:52], 7)
+	requireGPUResponse(t, gpu.dispatchLocked(transfer, gpuQueueControl), gpuRespOKNoData)
+
+	update := gpuTestRequest(gpuCmdUpdateCursor, 56)
+	binary.LittleEndian.PutUint32(update[40:44], 7)
+	binary.LittleEndian.PutUint32(update[44:48], 1)
+	requireGPUResponse(t, gpu.dispatchLocked(update, gpuQueueCursor), gpuRespOKNoData)
+
+	cursor := gpu.Cursor().Snapshot()
+	if !cursor.Visible || cursor.Width != 2 || cursor.Height != 2 || cursor.HotX != 1 || cursor.HotY != 0 {
+		t.Fatalf("cursor metadata = %+v", cursor)
+	}
+	if !bytes.Equal(cursor.Pixels, pixels) {
+		t.Fatalf("cursor pixels = %v, want %v", cursor.Pixels, pixels)
+	}
+
+	hide := gpuTestRequest(gpuCmdUpdateCursor, 56)
+	requireGPUResponse(t, gpu.dispatchLocked(hide, gpuQueueCursor), gpuRespOKNoData)
+	if cursor := gpu.Cursor().Snapshot(); cursor.Visible {
+		t.Fatal("zero-resource cursor update did not hide the cursor")
+	}
+}
+
 func TestInputDeliversOrderedEventsToPostedBuffers(t *testing.T) {
 	mem := make(testGuestMemory, 64<<10)
 	irq := &testIRQ{}

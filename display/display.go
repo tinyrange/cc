@@ -16,6 +16,18 @@ type FramebufferUpdate struct {
 	Pixels     []byte
 }
 
+// CursorUpdate is the guest-provided ARGB cursor image. Pixels are tightly
+// packed in blue, green, red, alpha byte order.
+type CursorUpdate struct {
+	Width      int
+	Height     int
+	HotX       int
+	HotY       int
+	Visible    bool
+	Generation uint64
+	Pixels     []byte
+}
+
 // Session provides direct access to a running VM's graphical desktop. Key
 // accepts Linux input-event key codes. Pointer uses absolute guest coordinates
 // and the conventional VNC button mask: left=1, middle=2, right=4, wheel=8/16.
@@ -35,4 +47,10 @@ type Session interface {
 // conventional wheel detent.
 type HighResolutionScroller interface {
 	Scroll(deltaX120, deltaY120 int32) error
+}
+
+// CursorProvider is implemented by display sessions that expose the guest's
+// hardware cursor independently from the framebuffer.
+type CursorProvider interface {
+	Cursor() CursorUpdate
 }
