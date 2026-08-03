@@ -57,7 +57,6 @@ func BootCommandLine(dmesg bool, extra ...string) string {
 	if dmesg {
 		args = append([]string{
 			fmt.Sprintf("earlycon=uart8250,io,0x%x,115200n8", COM1Base),
-			"keep_bootcon",
 			"loglevel=8",
 		}, args...)
 	}
