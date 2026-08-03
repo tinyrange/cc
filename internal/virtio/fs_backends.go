@@ -34,13 +34,18 @@ type passthroughFS struct {
 	nodes      map[uint64]string
 	pathToNode map[string]uint64
 	handles    map[uint64]*passthroughHandle
-	dirHandles map[uint64][]dirEntry
+	dirHandles map[uint64]*passthroughDirHandle
 }
 
 type passthroughHandle struct {
 	nodeID uint64
 	file   *os.File
 	append bool
+}
+
+type passthroughDirHandle struct {
+	nodeID  uint64
+	entries []dirEntry
 }
 
 type imageFS struct {
@@ -367,7 +372,7 @@ func newPassthroughFS(root string, meta map[string]fsmeta.Entry, uid, gid uint32
 		nodes:      map[uint64]string{1: "/"},
 		pathToNode: map[string]uint64{"/": 1},
 		handles:    map[uint64]*passthroughHandle{},
-		dirHandles: map[uint64][]dirEntry{},
+		dirHandles: map[uint64]*passthroughDirHandle{},
 	}
 	return fs
 }
@@ -912,13 +917,26 @@ func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence ui
 
 func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.logNode("opendir", nodeID)
-	host, guest, errno := p.hostAndGuestPath(nodeID)
+	dirEntries, errno := p.readDirEntries(nodeID)
 	if errno != 0 {
 		return 0, errno
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	handle := p.nextHandle
+	p.nextHandle++
+	p.dirHandles[handle] = &passthroughDirHandle{nodeID: nodeID, entries: dirEntries}
+	return handle, 0
+}
+
+func (p *passthroughFS) readDirEntries(nodeID uint64) ([]dirEntry, int32) {
+	host, guest, errno := p.hostAndGuestPath(nodeID)
+	if errno != 0 {
+		return nil, errno
+	}
 	entries, err := os.ReadDir(host)
 	if err != nil {
-		return 0, errnoFromError(err)
+		return nil, errnoFromError(err)
 	}
 	parentID := nodeID
 	if guest != "/" {
@@ -937,12 +955,7 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 			ino:  childID,
 		})
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	handle := p.nextHandle
-	p.nextHandle++
-	p.dirHandles[handle] = dirEntries
-	return handle, 0
+	return dirEntries, 0
 }
 
 func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
@@ -967,13 +980,27 @@ func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte,
 	return uint32(n), 0
 }
 
-func (p *passthroughFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
-	p.mu.Lock()
-	entries := append([]dirEntry(nil), p.dirHandles[fh]...)
-	p.mu.Unlock()
-	if entries == nil {
+func (p *passthroughFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+	p.mu.RLock()
+	handle := p.dirHandles[fh]
+	p.mu.RUnlock()
+	if handle == nil || handle.nodeID != nodeID {
 		return nil, -linuxEBADF
 	}
+	if off == 0 {
+		entries, errno := p.readDirEntries(nodeID)
+		if errno != 0 {
+			return nil, errno
+		}
+		p.mu.Lock()
+		if current := p.dirHandles[fh]; current == handle {
+			handle.entries = entries
+		}
+		p.mu.Unlock()
+	}
+	p.mu.RLock()
+	entries := append([]dirEntry(nil), handle.entries...)
+	p.mu.RUnlock()
 	var out []byte
 	for i := int(off); i < len(entries); i++ {
 		entry := entries[i]
