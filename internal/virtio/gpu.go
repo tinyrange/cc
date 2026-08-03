@@ -80,6 +80,8 @@ type GPU struct {
 	scanoutResource  uint32
 	scanoutRect      image.Rectangle
 	framebuffer      *Framebuffer
+	cursor           *Cursor
+	cursorResource   uint32
 }
 
 func NewGPU(base, size uint64, irq uint32, framebuffer *Framebuffer) *GPU {
@@ -88,6 +90,7 @@ func NewGPU(base, size uint64, irq uint32, framebuffer *Framebuffer) *GPU {
 		Size:        size,
 		IRQ:         irq,
 		framebuffer: framebuffer,
+		cursor:      &Cursor{},
 	}
 	g.resetLocked()
 	return g
@@ -95,6 +98,10 @@ func NewGPU(base, size uint64, irq uint32, framebuffer *Framebuffer) *GPU {
 
 func (g *GPU) Framebuffer() *Framebuffer {
 	return g.framebuffer
+}
+
+func (g *GPU) Cursor() *Cursor {
+	return g.cursor
 }
 
 func (g *GPU) Resize(width, height int) error {
@@ -390,6 +397,10 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 			return gpuResponse(request, gpuRespErrInvalidResourceID, nil)
 		}
 		delete(g.resources, id)
+		if g.cursorResource == id {
+			g.cursorResource = 0
+			g.cursor.Hide()
+		}
 		if g.scanoutResource == id {
 			g.scanoutResource = 0
 			g.scanoutRect = image.Rectangle{}
@@ -518,8 +529,26 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 		if binary.LittleEndian.Uint32(request[24:28]) != 0 {
 			return gpuResponse(request, gpuRespErrInvalidScanoutID, nil)
 		}
-		// Cursor shape transport is accepted here; the first RFB version uses
-		// the viewer's local pointer until cursor pseudo-encoding is enabled.
+		if command == gpuCmdMoveCursor {
+			return gpuResponse(request, gpuRespOKNoData, nil)
+		}
+		id := binary.LittleEndian.Uint32(request[40:44])
+		if id == 0 {
+			g.cursorResource = 0
+			g.cursor.Hide()
+			return gpuResponse(request, gpuRespOKNoData, nil)
+		}
+		resource := g.resources[id]
+		if resource == nil {
+			return gpuResponse(request, gpuRespErrInvalidResourceID, nil)
+		}
+		hotX := binary.LittleEndian.Uint32(request[44:48])
+		hotY := binary.LittleEndian.Uint32(request[48:52])
+		if hotX >= resource.width || hotY >= resource.height {
+			return gpuResponse(request, gpuRespErrInvalidParameter, nil)
+		}
+		g.cursorResource = id
+		g.cursor.Update(int(resource.width), int(resource.height), int(hotX), int(hotY), resource.pixels)
 		return gpuResponse(request, gpuRespOKNoData, nil)
 	}
 	return gpuResponse(request, gpuRespErrUnspecified, nil)
@@ -660,6 +689,8 @@ func (g *GPU) resetLocked() {
 	g.resources = make(map[uint32]*gpuResource)
 	g.scanoutResource = 0
 	g.scanoutRect = image.Rectangle{}
+	g.cursorResource = 0
+	g.cursor.Hide()
 	for index := range g.queues {
 		g.queues[index] = queue{}
 	}

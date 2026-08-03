@@ -429,6 +429,17 @@ func (s desktopSession) Changed() <-chan struct{} {
 	return s.desktop.Framebuffer.Changed()
 }
 
+func (s desktopSession) Cursor() display.CursorUpdate {
+	if s.desktop.GPU == nil || s.desktop.GPU.Cursor() == nil {
+		return display.CursorUpdate{}
+	}
+	update := s.desktop.GPU.Cursor().Snapshot()
+	return display.CursorUpdate{
+		Width: update.Width, Height: update.Height, HotX: update.HotX, HotY: update.HotY,
+		Visible: update.Visible, Generation: update.Generation, Pixels: update.Pixels,
+	}
+}
+
 func (s desktopSession) Resize(width, height int) error {
 	return s.desktop.Resize(width, height)
 }
