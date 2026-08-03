@@ -337,6 +337,7 @@ type mountedHandle struct {
 	fh      uint64
 	dir     bool
 	entries []dirEntry
+	started bool
 }
 
 type mountedBackendInode struct {
@@ -860,14 +861,37 @@ func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 }
 
 func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
-	if m.node(nodeID) == nil {
+	node := m.node(nodeID)
+	if node == nil {
 		return nil, -linuxENOENT
 	}
 	handle := m.handle(fh, true)
 	if handle == nil {
 		return nil, -linuxEBADF
 	}
-	return encodeDirEntries(handle.entries, off, maxBytes), 0
+	m.mu.Lock()
+	refresh := off == 0 && handle.started
+	if off == 0 {
+		handle.started = true
+	}
+	entries := append([]dirEntry(nil), handle.entries...)
+	m.mu.Unlock()
+	if refresh {
+		refreshed, errno := m.snapshotDirEntries(node, handle.backend, handle.nodeID, handle.fh)
+		if errno != 0 {
+			return nil, errno
+		}
+		m.mu.Lock()
+		if current := m.handles[fh]; current == handle {
+			handle.entries = refreshed
+			entries = append(entries[:0], refreshed...)
+		} else {
+			m.mu.Unlock()
+			return nil, -linuxEBADF
+		}
+		m.mu.Unlock()
+	}
+	return encodeDirEntries(entries, off, maxBytes), 0
 }
 
 func (m *mountedFS) snapshotDirEntries(node *mountedNode, backend FSBackend, backendNodeID uint64, fh uint64) ([]dirEntry, int32) {

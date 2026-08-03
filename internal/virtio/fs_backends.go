@@ -34,13 +34,19 @@ type passthroughFS struct {
 	nodes      map[uint64]string
 	pathToNode map[string]uint64
 	handles    map[uint64]*passthroughHandle
-	dirHandles map[uint64][]dirEntry
+	dirHandles map[uint64]*passthroughDirHandle
 }
 
 type passthroughHandle struct {
 	nodeID uint64
 	file   *os.File
 	append bool
+}
+
+type passthroughDirHandle struct {
+	nodeID  uint64
+	entries []dirEntry
+	started bool
 }
 
 type imageFS struct {
@@ -367,7 +373,7 @@ func newPassthroughFS(root string, meta map[string]fsmeta.Entry, uid, gid uint32
 		nodes:      map[uint64]string{1: "/"},
 		pathToNode: map[string]uint64{"/": 1},
 		handles:    map[uint64]*passthroughHandle{},
-		dirHandles: map[uint64][]dirEntry{},
+		dirHandles: map[uint64]*passthroughDirHandle{},
 	}
 	return fs
 }
@@ -912,13 +918,26 @@ func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence ui
 
 func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.logNode("opendir", nodeID)
-	host, guest, errno := p.hostAndGuestPath(nodeID)
+	dirEntries, errno := p.readDirEntries(nodeID)
 	if errno != 0 {
 		return 0, errno
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	handle := p.nextHandle
+	p.nextHandle++
+	p.dirHandles[handle] = &passthroughDirHandle{nodeID: nodeID, entries: dirEntries}
+	return handle, 0
+}
+
+func (p *passthroughFS) readDirEntries(nodeID uint64) ([]dirEntry, int32) {
+	host, guest, errno := p.hostAndGuestPath(nodeID)
+	if errno != 0 {
+		return nil, errno
+	}
 	entries, err := os.ReadDir(host)
 	if err != nil {
-		return 0, errnoFromError(err)
+		return nil, errnoFromError(err)
 	}
 	parentID := nodeID
 	if guest != "/" {
@@ -937,12 +956,7 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 			ino:  childID,
 		})
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	handle := p.nextHandle
-	p.nextHandle++
-	p.dirHandles[handle] = dirEntries
-	return handle, 0
+	return dirEntries, 0
 }
 
 func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
@@ -967,13 +981,32 @@ func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte,
 	return uint32(n), 0
 }
 
-func (p *passthroughFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+func (p *passthroughFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
 	p.mu.Lock()
-	entries := append([]dirEntry(nil), p.dirHandles[fh]...)
-	p.mu.Unlock()
-	if entries == nil {
+	handle := p.dirHandles[fh]
+	if handle == nil || handle.nodeID != nodeID {
+		p.mu.Unlock()
 		return nil, -linuxEBADF
 	}
+	refresh := off == 0 && handle.started
+	if off == 0 {
+		handle.started = true
+	}
+	p.mu.Unlock()
+	if refresh {
+		entries, errno := p.readDirEntries(nodeID)
+		if errno != 0 {
+			return nil, errno
+		}
+		p.mu.Lock()
+		if current := p.dirHandles[fh]; current == handle {
+			handle.entries = entries
+		}
+		p.mu.Unlock()
+	}
+	p.mu.RLock()
+	entries := append([]dirEntry(nil), handle.entries...)
+	p.mu.RUnlock()
 	var out []byte
 	for i := int(off); i < len(entries); i++ {
 		entry := entries[i]
@@ -1058,7 +1091,7 @@ func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
 	return 0
 }
 
-func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
+func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
 	oldParent, oldGuestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
@@ -1067,14 +1100,49 @@ func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, new
 	if errno != 0 {
 		return errno
 	}
-	oldRel := strings.TrimPrefix(path.Clean("/"+name), "/")
-	newRel := strings.TrimPrefix(path.Clean("/"+newName), "/")
+	oldRel, ok := cleanChildName(name)
+	if !ok {
+		return -linuxEINVAL
+	}
+	newRel, ok := cleanChildName(newName)
+	if !ok {
+		return -linuxEINVAL
+	}
+	if flags & ^uint32(linuxRenameNoReplace) != 0 {
+		return -linuxEINVAL
+	}
 	oldHost := filepath.Join(oldParent, filepath.FromSlash(oldRel))
 	newHost := filepath.Join(newParentPath, filepath.FromSlash(newRel))
-	if err := os.Rename(oldHost, newHost); err != nil {
+	oldGuest := joinGuestChild(oldGuestParent, oldRel)
+	newGuest := joinGuestChild(newGuestParent, newRel)
+	if oldGuest == newGuest {
+		return 0
+	}
+	oldInfo, err := os.Lstat(oldHost)
+	if err != nil {
 		return errnoFromError(err)
 	}
-	p.renameNodeGuestPath(joinGuestChild(oldGuestParent, oldRel), joinGuestChild(newGuestParent, newRel))
+	newInfo, newInfoErr := os.Lstat(newHost)
+	targetExists := newInfoErr == nil
+	if newInfoErr != nil && !errors.Is(newInfoErr, fs.ErrNotExist) {
+		return errnoFromError(newInfoErr)
+	}
+	sameFile := targetExists && os.SameFile(oldInfo, newInfo)
+	if flags&linuxRenameNoReplace != 0 {
+		err = renameNoReplace(oldHost, newHost)
+	} else {
+		err = os.Rename(oldHost, newHost)
+	}
+	if err != nil {
+		return errnoFromError(err)
+	}
+	// Renaming one hard link over another link to the same inode is a no-op:
+	// both directory entries remain. A case-only rename on a case-insensitive
+	// host does change the exact directory entry and still needs cache updates.
+	if sameFile && hostDirectoryHasExactEntry(oldHost) {
+		return 0
+	}
+	p.renameNodeGuestPath(oldGuest, newGuest)
 	return 0
 }
 
@@ -1227,11 +1295,70 @@ func (p *passthroughFS) removeNodeForGuestPath(guestPath string) {
 func (p *passthroughFS) renameNodeGuestPath(oldPath, newPath string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if id, ok := p.pathToNode[oldPath]; ok {
-		delete(p.pathToNode, oldPath)
-		p.pathToNode[newPath] = id
-		p.nodes[id] = newPath
+	oldPath = path.Clean(oldPath)
+	newPath = path.Clean(newPath)
+	if oldPath == newPath {
+		return
 	}
+	nodeUpdates := make(map[string]uint64)
+	for existingPath, id := range p.pathToNode {
+		if !pathWithin(existingPath, oldPath) {
+			continue
+		}
+		suffix := strings.TrimPrefix(existingPath, oldPath)
+		nodeUpdates[path.Clean(newPath+suffix)] = id
+	}
+	for existingPath, id := range p.pathToNode {
+		if pathWithin(existingPath, newPath) && !pathWithin(existingPath, oldPath) {
+			delete(p.pathToNode, existingPath)
+			delete(p.nodes, id)
+		}
+	}
+	for existingPath := range p.pathToNode {
+		if pathWithin(existingPath, oldPath) {
+			delete(p.pathToNode, existingPath)
+		}
+	}
+	for updatedPath, id := range nodeUpdates {
+		p.pathToNode[updatedPath] = id
+		p.nodes[id] = updatedPath
+	}
+	if p.meta != nil {
+		metaUpdates := make(map[string]fsmeta.Entry)
+		for existingPath, entry := range p.meta {
+			if !pathWithin(existingPath, oldPath) {
+				continue
+			}
+			suffix := strings.TrimPrefix(existingPath, oldPath)
+			metaUpdates[path.Clean(newPath+suffix)] = entry
+		}
+		for existingPath := range p.meta {
+			if pathWithin(existingPath, oldPath) || pathWithin(existingPath, newPath) {
+				delete(p.meta, existingPath)
+			}
+		}
+		for updatedPath, entry := range metaUpdates {
+			p.meta[updatedPath] = entry
+		}
+	}
+}
+
+func pathWithin(candidate, root string) bool {
+	return candidate == root || strings.HasPrefix(candidate, strings.TrimSuffix(root, "/")+"/")
+}
+
+func hostDirectoryHasExactEntry(hostPath string) bool {
+	entries, err := os.ReadDir(filepath.Dir(hostPath))
+	if err != nil {
+		return false
+	}
+	name := filepath.Base(hostPath)
+	for _, entry := range entries {
+		if entry.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *passthroughFS) fileAttr(nodeID uint64, hostPath string, info os.FileInfo) FuseAttr {
