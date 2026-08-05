@@ -63,6 +63,21 @@ func TestExplicitCacheKeepsRuntimeArtifactsInsideCache(t *testing.T) {
 	}
 }
 
+func TestPrepareCVMFSHostMountAcceptsMirrorOrigin(t *testing.T) {
+	mounts, err := prepareCVMFSHostMounts([]CVMFSHostMount{{
+		Mount:  "/cvmfs/neurodesk.ardc.edu.au",
+		Mirror: "http://cvmfs.example",
+		Repo:   "neurodesk.ardc.edu.au",
+		Path:   "/",
+	}}, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("prepare CVMFS host mount: %v", err)
+	}
+	if len(mounts) != 1 || mounts[0].guestPath != "/cvmfs/neurodesk.ardc.edu.au" || mounts[0].repo != "neurodesk.ardc.edu.au" {
+		t.Fatalf("prepared CVMFS host mounts = %+v", mounts)
+	}
+}
+
 func TestRunServerUsesConfiguredStartupWriter(t *testing.T) {
 	var startup bytes.Buffer
 	shutdownErr := make(chan error, 1)

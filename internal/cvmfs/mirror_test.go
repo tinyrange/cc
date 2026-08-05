@@ -47,3 +47,23 @@ func TestMirrorDownloadReportsLogicalTransfer(t *testing.T) {
 		t.Fatalf("completed transfer = %+v", completed)
 	}
 }
+
+func TestCatalogPathIndexIsBuiltOnceWithoutDuplicateChildren(t *testing.T) {
+	repo := &repository{repo: "repo.example"}
+	cat := &catalog{entries: []catalogEntry{
+		{Md5Path1: 1, Md5Path2: 1, Name: "containers"},
+		{Md5Path1: 2, Md5Path2: 2, Parent1: 1, Parent2: 1, Name: "tool"},
+	}}
+	if err := repo.indexCatalog(cat, "/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.indexCatalog(cat, "/"); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.entriesByPath["/containers/tool"].Name; got != "tool" {
+		t.Fatalf("indexed tool name = %q", got)
+	}
+	if got := len(repo.childrenByPath["/containers"]); got != 1 {
+		t.Fatalf("indexed child count = %d, want 1", got)
+	}
+}

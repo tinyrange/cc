@@ -199,6 +199,12 @@ type repository struct {
 	repo     string
 	manifest *manifest
 	catalogs map[string]*catalog
+
+	indexMu         sync.RWMutex
+	indexedCatalogs map[*catalog]bool
+	globalPaths     map[string]string
+	entriesByPath   map[string]catalogEntry
+	childrenByPath  map[string][]catalogEntry
 }
 
 type mirrorStat struct {
@@ -672,10 +678,14 @@ func (c *Client) newRepository(target Target) *repository {
 		return repo
 	}
 	repo := &repository{
-		client:   client,
-		mirrors:  mirrors,
-		repo:     target.Repo,
-		catalogs: map[string]*catalog{},
+		client:          client,
+		mirrors:         mirrors,
+		repo:            target.Repo,
+		catalogs:        map[string]*catalog{},
+		indexedCatalogs: map[*catalog]bool{},
+		globalPaths:     map[string]string{"0:0": "/"},
+		entriesByPath:   map[string]catalogEntry{},
+		childrenByPath:  map[string][]catalogEntry{},
 	}
 	client.repos[key] = repo
 	return repo
@@ -795,32 +805,27 @@ func walkLocal(root string, visit func(WalkEntry) error) error {
 
 func (r *repository) ReadDir(dirPath string) ([]DirEntry, error) {
 	dirPath = path.Clean("/" + strings.TrimPrefix(dirPath, "/"))
-	foundDir := dirPath == "/"
-	children := map[string]DirEntry{}
-	err := r.walkPrefix(dirPath, func(ent catalogEntry) error {
-		if ent.FullPath == dirPath && ent.isDir() {
-			foundDir = true
-			return nil
-		}
-		if path.Dir(ent.FullPath) != dirPath {
-			return nil
-		}
-		children[ent.Name] = DirEntry{
+	if err := r.ensurePrefixIndexed(dirPath); err != nil {
+		return nil, err
+	}
+	r.indexMu.RLock()
+	dir, foundDir := r.entriesByPath[dirPath]
+	children := append([]catalogEntry(nil), r.childrenByPath[dirPath]...)
+	r.indexMu.RUnlock()
+	if dirPath != "/" && (!foundDir || !dir.isDir()) {
+		return nil, os.ErrNotExist
+	}
+	byName := make(map[string]DirEntry, len(children))
+	for _, ent := range children {
+		byName[ent.Name] = DirEntry{
 			Name:    ent.Name,
 			Mode:    linuxModeToGo(uint32(ent.Mode)),
 			Size:    ent.Size,
 			ModTime: time.Unix(ent.Mtime, ent.MtimeNS),
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	if !foundDir {
-		return nil, os.ErrNotExist
-	}
-	out := make([]DirEntry, 0, len(children))
-	for _, entry := range children {
+	out := make([]DirEntry, 0, len(byName))
+	for _, entry := range byName {
 		out = append(out, entry)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -835,20 +840,9 @@ func (r *repository) Stat(nodePath string) (Entry, error) {
 		}
 		return Entry{Path: "/", Mode: fs.ModeDir | 0o555}, nil
 	}
-	var found *catalogEntry
-	err := r.walkPrefix(nodePath, func(ent catalogEntry) error {
-		if ent.FullPath != nodePath {
-			return nil
-		}
-		copy := ent
-		found = &copy
-		return errStopWalk
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	found, err := r.lookupIndexedEntry(nodePath)
+	if err != nil {
 		return Entry{}, err
-	}
-	if found == nil {
-		return Entry{}, os.ErrNotExist
 	}
 	return Entry{
 		Path: found.FullPath, Mode: linuxModeToGo(uint32(found.Mode)), Size: found.Size,
@@ -859,20 +853,9 @@ func (r *repository) Stat(nodePath string) (Entry, error) {
 
 func (r *repository) ReadFile(filePath string) ([]byte, error) {
 	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
-	var found *catalogEntry
-	err := r.walkPrefix(filePath, func(ent catalogEntry) error {
-		if ent.FullPath != filePath {
-			return nil
-		}
-		copy := ent
-		found = &copy
-		return errStopWalk
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	found, err := r.lookupIndexedEntry(filePath)
+	if err != nil {
 		return nil, err
-	}
-	if found == nil {
-		return nil, os.ErrNotExist
 	}
 	if found.isDir() {
 		return nil, fmt.Errorf("%q is a directory", filePath)
@@ -1417,20 +1400,9 @@ func maxInt64(a, b int64) int64 {
 }
 
 func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {
-	var found *catalogEntry
-	err := r.walkPrefix(filePath, func(ent catalogEntry) error {
-		if ent.FullPath != filePath {
-			return nil
-		}
-		copy := ent
-		found = &copy
-		return errStopWalk
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	found, err := r.lookupIndexedEntry(filePath)
+	if err != nil {
 		return nil, err
-	}
-	if found == nil {
-		return nil, os.ErrNotExist
 	}
 	if found.isDir() {
 		return nil, fmt.Errorf("%q is a directory", filePath)
@@ -1439,6 +1411,117 @@ func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {
 		return nil, fmt.Errorf("%q is a symlink", filePath)
 	}
 	return found, nil
+}
+
+func (r *repository) lookupIndexedEntry(entryPath string) (*catalogEntry, error) {
+	entryPath = path.Clean("/" + strings.TrimPrefix(entryPath, "/"))
+	if err := r.ensurePrefixIndexed(entryPath); err != nil {
+		return nil, err
+	}
+	r.indexMu.RLock()
+	entry, ok := r.entriesByPath[entryPath]
+	r.indexMu.RUnlock()
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &entry, nil
+}
+
+func (r *repository) ensurePrefixIndexed(prefix string) error {
+	root, err := r.rootCatalog()
+	if err != nil {
+		return err
+	}
+	return r.ensureCatalogPrefixIndexed(root, "/", prefix)
+}
+
+func (r *repository) ensureCatalogPrefixIndexed(cat *catalog, baseParent, prefix string) error {
+	if err := r.indexCatalog(cat, baseParent); err != nil {
+		return err
+	}
+	for _, nested := range cat.nested {
+		nestedPath := path.Clean("/" + strings.TrimPrefix(nested.Path, "/"))
+		if !shouldWalkNestedCatalog(nestedPath, prefix) {
+			continue
+		}
+		child, err := r.openCatalog(nested.Sha1)
+		if err != nil {
+			return err
+		}
+		if err := r.ensureCatalogPrefixIndexed(child, path.Dir(nestedPath), prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *repository) indexCatalog(cat *catalog, baseParent string) error {
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+	if r.indexedCatalogs == nil {
+		r.indexedCatalogs = make(map[*catalog]bool)
+	}
+	if r.globalPaths == nil {
+		r.globalPaths = map[string]string{"0:0": "/"}
+	}
+	if r.entriesByPath == nil {
+		r.entriesByPath = make(map[string]catalogEntry)
+	}
+	if r.childrenByPath == nil {
+		r.childrenByPath = make(map[string][]catalogEntry)
+	}
+	if r.indexedCatalogs[cat] {
+		return nil
+	}
+	local := make(map[string]catalogEntry, len(cat.entries))
+	for _, ent := range cat.entries {
+		local[ent.pathHash()] = ent
+	}
+	memo := make(map[string]string, len(cat.entries))
+	resolving := make(map[string]bool)
+	var resolve func(catalogEntry) (string, error)
+	resolve = func(ent catalogEntry) (string, error) {
+		hash := ent.pathHash()
+		if full, ok := memo[hash]; ok {
+			return full, nil
+		}
+		if resolving[hash] {
+			return "", fmt.Errorf("catalog parent cycle at %q in repo %q", ent.Name, r.repo)
+		}
+		resolving[hash] = true
+		defer delete(resolving, hash)
+		parentPath, ok := r.globalPaths[ent.parentHash()]
+		if !ok {
+			if ent.parentHash() == "0:0" {
+				parentPath = baseParent
+			} else if parent, exists := local[ent.parentHash()]; exists {
+				full, err := resolve(parent)
+				if err != nil {
+					return "", err
+				}
+				parentPath = full
+			} else {
+				return "", fmt.Errorf("parent not found for %q in repo %q", ent.Name, r.repo)
+			}
+		}
+		full := path.Clean(path.Join(parentPath, ent.Name))
+		memo[hash] = full
+		r.globalPaths[hash] = full
+		return full, nil
+	}
+	for index := range cat.entries {
+		full, err := resolve(cat.entries[index])
+		if err != nil {
+			return err
+		}
+		cat.entries[index].FullPath = full
+		entry := cat.entries[index]
+		r.entriesByPath[full] = entry
+		parent := path.Dir(full)
+		r.childrenByPath[parent] = append(r.childrenByPath[parent], entry)
+	}
+	r.indexedCatalogs[cat] = true
+	return nil
 }
 
 func (r *repository) walkPrefix(prefix string, visit func(ent catalogEntry) error) error {
@@ -1455,42 +1538,12 @@ func (r *repository) walkPrefixWithNested(prefix string, shouldWalkNested func(s
 }
 
 func (r *repository) walkCatalog(cat *catalog, baseParent, prefix string, globalPaths map[string]string, shouldWalkNested func(string, string) bool, visit func(ent catalogEntry) error) error {
-	local := make(map[string]catalogEntry, len(cat.entries))
-	for _, ent := range cat.entries {
-		local[ent.pathHash()] = ent
-	}
-	memo := map[string]string{}
-	var resolve func(catalogEntry) (string, error)
-	resolve = func(ent catalogEntry) (string, error) {
-		if full, ok := memo[ent.pathHash()]; ok {
-			return full, nil
-		}
-		parentPath, ok := globalPaths[ent.parentHash()]
-		if !ok {
-			if ent.parentHash() == "0:0" {
-				parentPath = baseParent
-			} else if parent, ok := local[ent.parentHash()]; ok {
-				full, err := resolve(parent)
-				if err != nil {
-					return "", err
-				}
-				parentPath = full
-			} else {
-				return "", fmt.Errorf("parent not found for %q in repo %q", ent.Name, r.repo)
-			}
-		}
-		full := path.Clean(path.Join(parentPath, ent.Name))
-		memo[ent.pathHash()] = full
-		globalPaths[ent.pathHash()] = full
-		return full, nil
+	if err := r.indexCatalog(cat, baseParent); err != nil {
+		return err
 	}
 	for i := range cat.entries {
-		full, err := resolve(cat.entries[i])
-		if err != nil {
-			return err
-		}
-		cat.entries[i].FullPath = full
-		if hasCommonFragment(full, prefix) {
+		globalPaths[cat.entries[i].pathHash()] = cat.entries[i].FullPath
+		if hasCommonFragment(cat.entries[i].FullPath, prefix) {
 			if err := visit(cat.entries[i]); err != nil {
 				return err
 			}

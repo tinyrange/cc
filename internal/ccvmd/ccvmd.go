@@ -137,6 +137,7 @@ func prepareCVMFSHostMounts(configs []CVMFSHostMount, cacheDir string, monitor *
 		if mirror == "" {
 			mirror = intcvmfs.DefaultMirror
 		}
+		mirror = intcvmfs.NormalizeMirror(mirror)
 		client := intcvmfs.NewClient()
 		client.CacheDir = cacheDir
 		client.Mirrors = append([]string(nil), config.Mirrors...)
