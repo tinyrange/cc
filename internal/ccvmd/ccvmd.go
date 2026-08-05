@@ -16,8 +16,10 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,10 +32,12 @@ import (
 	"j5.nz/cc/internal/cachepath"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/hv/hvf"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vm"
 )
 
@@ -88,6 +92,98 @@ type server struct {
 	images        *oci.Store
 	vms           *vm.Manager
 	cvmfsCacheDir string
+	cvmfsMonitor  *cvmfsMonitor
+	cvmfsMounts   []preparedCVMFSHostMount
+}
+
+type preparedCVMFSHostMount struct {
+	guestPath string
+	root      imagefs.Directory
+	repo      string
+	mirrors   []string
+	client    *intcvmfs.Client
+}
+
+func (s *server) cvmfsMount(repo string) *preparedCVMFSHostMount {
+	if s == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	for index := range s.cvmfsMounts {
+		if s.cvmfsMounts[index].repo == repo {
+			return &s.cvmfsMounts[index]
+		}
+	}
+	return nil
+}
+
+func prepareCVMFSHostMounts(configs []CVMFSHostMount, cacheDir string, monitor *cvmfsMonitor) ([]preparedCVMFSHostMount, error) {
+	prepared := make([]preparedCVMFSHostMount, 0, len(configs))
+	seen := make(map[string]bool, len(configs))
+	for _, config := range configs {
+		guestPath := path.Clean(strings.TrimSpace(config.Mount))
+		if !strings.HasPrefix(guestPath, "/") || guestPath == "/" {
+			return nil, fmt.Errorf("CVMFS host mount path %q must be an absolute non-root path", config.Mount)
+		}
+		if seen[guestPath] {
+			return nil, fmt.Errorf("duplicate CVMFS host mount path %q", guestPath)
+		}
+		seen[guestPath] = true
+		repo := strings.TrimSpace(config.Repo)
+		if repo == "" || strings.Contains(repo, "/") {
+			return nil, fmt.Errorf("invalid CVMFS repository %q", config.Repo)
+		}
+		mirror := strings.TrimSpace(config.Mirror)
+		if mirror == "" {
+			mirror = intcvmfs.DefaultMirror
+		}
+		mirror = intcvmfs.NormalizeMirror(mirror)
+		client := intcvmfs.NewClient()
+		client.CacheDir = cacheDir
+		client.Mirrors = append([]string(nil), config.Mirrors...)
+		if monitor != nil {
+			client.OnTransfer = monitor.Record
+		}
+		target, err := intcvmfs.FormatTarget(intcvmfs.Target{
+			Remote: true, Mirror: mirror, Repo: repo, Path: ensureAbsolutePath(config.Path),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure CVMFS host mount %q: %w", guestPath, err)
+		}
+		root, err := intcvmfs.NewImageFS(client, target)
+		if err != nil {
+			return nil, fmt.Errorf("configure CVMFS host mount %q: %w", guestPath, err)
+		}
+		mirrors := make([]string, 0, len(config.Mirrors)+1)
+		seenMirrors := make(map[string]bool, len(config.Mirrors)+1)
+		for _, candidate := range append([]string{mirror}, config.Mirrors...) {
+			candidate = intcvmfs.NormalizeMirror(candidate)
+			if candidate == "" || seenMirrors[candidate] {
+				continue
+			}
+			seenMirrors[candidate] = true
+			mirrors = append(mirrors, candidate)
+		}
+		prepared = append(prepared, preparedCVMFSHostMount{guestPath: guestPath, root: root, repo: repo, mirrors: mirrors, client: client})
+	}
+	return prepared, nil
+}
+
+func cvmfsHostCacheLimit(configs []CVMFSHostMount) (int64, error) {
+	var limit int64
+	for _, config := range configs {
+		if config.CacheLimitBytes < 0 {
+			return 0, fmt.Errorf("CVMFS cache limit must not be negative")
+		}
+		if config.CacheLimitBytes == 0 {
+			continue
+		}
+		if limit != 0 && limit != config.CacheLimitBytes {
+			return 0, fmt.Errorf("CVMFS host mounts sharing a cache must use one cache limit")
+		}
+		limit = config.CacheLimitBytes
+	}
+	return limit, nil
 }
 
 type ServerOptions struct {
@@ -107,6 +203,16 @@ type ServerOptions struct {
 	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
 	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
 	CompleteRequest        func(string, uint64, RuntimeView)
+	CVMFSMounts            []CVMFSHostMount
+}
+
+type CVMFSHostMount struct {
+	Mount           string
+	Mirror          string
+	Mirrors         []string
+	Repo            string
+	Path            string
+	CacheLimitBytes int64
 }
 
 type RuntimeView interface {
@@ -469,6 +575,30 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 		rootCache,
 		*worker,
 	)
+	if len(opts.CVMFSMounts) != 0 {
+		cacheLimit, err := cvmfsHostCacheLimit(opts.CVMFSMounts)
+		if err != nil {
+			return false, err
+		}
+		srvState.cvmfsMonitor = newCVMFSMonitor(srvState.cvmfsCacheDir, cacheLimit)
+		mounts, err := prepareCVMFSHostMounts(opts.CVMFSMounts, srvState.cvmfsCacheDir, srvState.cvmfsMonitor)
+		if err != nil {
+			return false, err
+		}
+		srvState.cvmfsMounts = mounts
+		srvState.vms.SetHostMountProvider(func(context.Context, string) ([]virtio.ShareMount, error) {
+			out := make([]virtio.ShareMount, 0, len(mounts))
+			for _, mount := range mounts {
+				out = append(out, virtio.ShareMount{
+					GuestPath: mount.guestPath,
+					Backend:   virtio.NewImageFS(mount.root, ""),
+					Writable:  false,
+					CacheMode: "aggressive",
+				})
+			}
+			return out, nil
+		})
+	}
 
 	if *worker {
 		if socketPath := strings.TrimSpace(os.Getenv("CCX3_WORKER_CONTROL_SOCKET")); socketPath != "" {
@@ -1719,6 +1849,60 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			})
 		}
 		writeJSON(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("GET /cvmfs/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, srvState.cvmfsMonitor.Status())
+	})
+
+	mux.HandleFunc("POST /cvmfs/mirrors/probe", func(w http.ResponseWriter, r *http.Request) {
+		var req client.CVMFSMirrorProbeRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		mount := srvState.cvmfsMount(req.Repo)
+		if mount == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("CVMFS repository %q is not configured as a host mount", req.Repo))
+			return
+		}
+		selected, measured, err := intcvmfs.ProbeMirrors(r.Context(), mount.client.HTTPClient, mount.repo, mount.mirrors)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		mount.client.SetPreferredMirror(selected)
+		srvState.cvmfsMonitor.SetSelectedMirror(selected)
+		results := make([]client.CVMFSMirrorProbeResult, 0, len(measured))
+		for _, result := range measured {
+			results = append(results, client.CVMFSMirrorProbeResult{
+				Mirror: result.Mirror, ManifestLatencyMillis: result.ManifestLatency.Milliseconds(),
+				RootCatalogMillis: result.RootCatalogDuration.Milliseconds(), RootCatalogBytes: result.RootCatalogBytes,
+				RootCatalogBytesPerSec: result.RootCatalogBytesPerSec, Error: result.Error,
+			})
+		}
+		writeJSON(w, http.StatusOK, client.CVMFSMirrorProbeResponse{SelectedMirror: selected, Results: results})
+	})
+
+	mux.HandleFunc("POST /cvmfs/mirrors/selection", func(w http.ResponseWriter, r *http.Request) {
+		var req client.CVMFSMirrorSelectionRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		mount := srvState.cvmfsMount(req.Repo)
+		if mount == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("CVMFS repository %q is not configured as a host mount", req.Repo))
+			return
+		}
+		selected := intcvmfs.NormalizeMirror(req.Mirror)
+		if !slices.Contains(mount.mirrors, selected) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("CVMFS mirror %q is not configured for repository %q", req.Mirror, req.Repo))
+			return
+		}
+		mount.client.SetPreferredMirror(selected)
+		srvState.cvmfsMonitor.SetSelectedMirror(selected)
+		writeJSON(w, http.StatusOK, map[string]string{"selected_mirror": selected})
 	})
 
 	mux.HandleFunc("POST /cvmfs/read", func(w http.ResponseWriter, r *http.Request) {

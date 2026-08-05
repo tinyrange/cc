@@ -342,6 +342,26 @@ func (c *Client) CapabilitiesContext(ctx context.Context) (CapabilitiesResponse,
 	return ret, err
 }
 
+func (c *Client) CVMFSStatus() (CVMFSStatusResponse, error) {
+	return c.CVMFSStatusContext(context.Background())
+}
+
+func (c *Client) CVMFSStatusContext(ctx context.Context) (CVMFSStatusResponse, error) {
+	var ret CVMFSStatusResponse
+	err := c.getJSONContext(ctx, "/cvmfs/status", &ret)
+	return ret, err
+}
+
+func (c *Client) ProbeCVMFSMirrorsContext(ctx context.Context, req CVMFSMirrorProbeRequest) (CVMFSMirrorProbeResponse, error) {
+	var ret CVMFSMirrorProbeResponse
+	err := c.postJSONExpectOKContext(ctx, "/cvmfs/mirrors/probe", req, &ret)
+	return ret, err
+}
+
+func (c *Client) SelectCVMFSMirrorContext(ctx context.Context, req CVMFSMirrorSelectionRequest) error {
+	return c.postJSONExpectOKContext(ctx, "/cvmfs/mirrors/selection", req, nil)
+}
+
 func (c *Client) CreateWatchdogLease(req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
 	return c.CreateWatchdogLeaseContext(context.Background(), req)
 }

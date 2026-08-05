@@ -27,18 +27,22 @@ func TestOpenAPIContract(t *testing.T) {
 		t.Fatalf("validate OpenAPI document: %v", err)
 	}
 	for name, value := range map[string]any{
-		"ErrorResponse":           client.ErrorResponse{},
-		"ImagePullPlan":           client.ImagePullPlan{},
-		"CreateInstanceRequest":   client.CreateInstanceRequest{},
-		"StartInstanceRequest":    client.StartInstanceRequest{},
-		"RunRequest":              client.RunRequest{},
-		"ExecResponse":            client.ExecResponse{},
-		"ExecRequest":             client.ExecRequest{},
-		"ExecInput":               client.ExecInput{},
-		"ExecEvent":               client.ExecEvent{},
-		"PortForward":             client.PortForward{},
-		"ServiceProxyPortRequest": client.ServiceProxyPortRequest{},
-		"BootEvent":               client.BootEvent{},
+		"ErrorResponse":               client.ErrorResponse{},
+		"ImagePullPlan":               client.ImagePullPlan{},
+		"CreateInstanceRequest":       client.CreateInstanceRequest{},
+		"StartInstanceRequest":        client.StartInstanceRequest{},
+		"CVMFSMirrorProbeRequest":     client.CVMFSMirrorProbeRequest{},
+		"CVMFSMirrorProbeResult":      client.CVMFSMirrorProbeResult{},
+		"CVMFSMirrorProbeResponse":    client.CVMFSMirrorProbeResponse{},
+		"CVMFSMirrorSelectionRequest": client.CVMFSMirrorSelectionRequest{},
+		"RunRequest":                  client.RunRequest{},
+		"ExecResponse":                client.ExecResponse{},
+		"ExecRequest":                 client.ExecRequest{},
+		"ExecInput":                   client.ExecInput{},
+		"ExecEvent":                   client.ExecEvent{},
+		"PortForward":                 client.PortForward{},
+		"ServiceProxyPortRequest":     client.ServiceProxyPortRequest{},
+		"BootEvent":                   client.BootEvent{},
 	} {
 		assertSchemaFields(t, document, name, reflect.TypeOf(value))
 	}

@@ -26,6 +26,18 @@ type ServerOptions struct {
 	NormalizeStartRequest  func(*client.StartInstanceRequest, RuntimeView) error
 	NormalizeRunRequest    func(*client.RunRequest, RuntimeView) error
 	CompleteRequest        func(string, uint64, RuntimeView)
+	CVMFSMounts            []CVMFSHostMount
+}
+
+// CVMFSHostMount configures a host-served CVMFS repository that is attached
+// read-only to every VM started by this daemon.
+type CVMFSHostMount struct {
+	Mount           string
+	Mirror          string
+	Mirrors         []string
+	Repo            string
+	Path            string
+	CacheLimitBytes int64
 }
 
 // ServerAuthentication is a validated transport authentication policy for a
@@ -68,6 +80,13 @@ func Main(args []string) {
 }
 
 func RunServer(args []string, opts ServerOptions) (bool, error) {
+	cvmfsMounts := make([]internal.CVMFSHostMount, 0, len(opts.CVMFSMounts))
+	for _, mount := range opts.CVMFSMounts {
+		cvmfsMounts = append(cvmfsMounts, internal.CVMFSHostMount{
+			Mount: mount.Mount, Mirror: mount.Mirror, Mirrors: append([]string(nil), mount.Mirrors...),
+			Repo: mount.Repo, Path: mount.Path, CacheLimitBytes: mount.CacheLimitBytes,
+		})
+	}
 	return internal.RunServer(args, internal.ServerOptions{
 		Kind:      opts.Kind,
 		TokenPath: opts.TokenPath,
@@ -110,6 +129,7 @@ func RunServer(args []string, opts ServerOptions) (bool, error) {
 			}
 		},
 		WrapHandler: opts.WrapHandler,
+		CVMFSMounts: cvmfsMounts,
 	})
 }
 

@@ -177,6 +177,52 @@ type CVMFSReadResponse struct {
 	EOF    bool   `json:"eof,omitempty"`
 }
 
+type CVMFSTransferState struct {
+	ID         uint64  `json:"id"`
+	Path       string  `json:"path"`
+	Mirror     string  `json:"mirror,omitempty"`
+	Bytes      int64   `json:"bytes"`
+	TotalBytes int64   `json:"total_bytes,omitempty"`
+	Progress   float64 `json:"progress,omitempty"`
+	StartedAt  string  `json:"started_at,omitempty"`
+}
+
+type CVMFSStatusResponse struct {
+	State           string               `json:"state"`
+	SelectedMirror  string               `json:"selected_mirror,omitempty"`
+	Bytes           int64                `json:"bytes"`
+	TotalBytes      int64                `json:"total_bytes,omitempty"`
+	Progress        float64              `json:"progress,omitempty"`
+	CacheBytes      int64                `json:"cache_bytes,omitempty"`
+	CacheLimitBytes int64                `json:"cache_limit_bytes,omitempty"`
+	ActiveTransfers []CVMFSTransferState `json:"active_transfers"`
+	LastError       string               `json:"last_error,omitempty"`
+	LastErrorUnix   int64                `json:"last_error_unix,omitempty"`
+}
+
+type CVMFSMirrorProbeRequest struct {
+	Repo string `json:"repo"`
+}
+
+type CVMFSMirrorProbeResult struct {
+	Mirror                 string  `json:"mirror"`
+	ManifestLatencyMillis  int64   `json:"manifest_latency_millis,omitempty"`
+	RootCatalogMillis      int64   `json:"root_catalog_millis,omitempty"`
+	RootCatalogBytes       int64   `json:"root_catalog_bytes,omitempty"`
+	RootCatalogBytesPerSec float64 `json:"root_catalog_bytes_per_second,omitempty"`
+	Error                  string  `json:"error,omitempty"`
+}
+
+type CVMFSMirrorProbeResponse struct {
+	SelectedMirror string                   `json:"selected_mirror"`
+	Results        []CVMFSMirrorProbeResult `json:"results"`
+}
+
+type CVMFSMirrorSelectionRequest struct {
+	Repo   string `json:"repo"`
+	Mirror string `json:"mirror"`
+}
+
 func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	payload := map[string]any{}
 	switch {
@@ -448,6 +494,7 @@ type CreateInstanceRequest struct {
 	Display          *DisplayConfig      `json:"display,omitempty"`
 	SharedMemory     *SharedMemoryConfig `json:"shared_memory,omitempty"`
 	KernelModules    []string            `json:"kernel_modules,omitempty"`
+	Env              []string            `json:"env,omitempty"`
 	MemoryMB         uint64              `json:"memory_mb,omitempty"`
 	BalloonMB        uint64              `json:"balloon_mb,omitempty"`
 	CPUs             int                 `json:"cpus,omitempty"`
@@ -472,6 +519,7 @@ type StartInstanceRequest struct {
 	Display          *DisplayConfig      `json:"display,omitempty"`
 	SharedMemory     *SharedMemoryConfig `json:"shared_memory,omitempty"`
 	KernelModules    []string            `json:"kernel_modules,omitempty"`
+	Env              []string            `json:"env,omitempty"`
 	MemoryMB         uint64              `json:"memory_mb,omitempty"`
 	BalloonMB        uint64              `json:"balloon_mb,omitempty"`
 	CPUs             int                 `json:"cpus,omitempty"`

@@ -123,6 +123,16 @@ type Manager struct {
 	maxCPUs       int
 	closing       bool
 	sharedMemory  *shmem.Registry
+	hostMounts    func(context.Context, string) ([]virtio.ShareMount, error)
+}
+
+// SetHostMountProvider configures read-only host-managed filesystems that are
+// attached to every newly started instance. It must be called before starts
+// are accepted.
+func (m *Manager) SetHostMountProvider(provider func(context.Context, string) ([]virtio.ShareMount, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hostMounts = provider
 }
 
 type resourceReservation struct {
@@ -555,6 +565,12 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if attachment != nil {
 		startCtx = shmem.WithAttachment(startCtx, attachment)
 	}
+	startCtx, err = m.prepareHostMountContext(startCtx, id)
+	if err != nil {
+		_ = attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, err
+	}
 	inst, err := m.host.StartStream(startCtx, req, onEvent)
 	if err != nil {
 		_ = attachment.Release()
@@ -723,6 +739,12 @@ func (m *Manager) StartBlankInstanceStream(
 	}
 	if attachment != nil {
 		startCtx = shmem.WithAttachment(startCtx, attachment)
+	}
+	startCtx, err = m.prepareHostMountContext(startCtx, id)
+	if err != nil {
+		_ = attachment.Release()
+		m.finishStart(id, start)
+		return client.InstanceState{}, err
 	}
 	inst, err := m.host.StartBlankStream(startCtx, req, onEvent)
 	if err != nil {
@@ -1093,6 +1115,33 @@ func addInstanceShares(ctx context.Context, instance vmhost.Instance, shares []c
 	return nil
 }
 
+type hostMountContextKey struct{}
+
+func withHostMounts(ctx context.Context, mounts []virtio.ShareMount) context.Context {
+	if len(mounts) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, hostMountContextKey{}, append([]virtio.ShareMount(nil), mounts...))
+}
+
+func hostMountsFromContext(ctx context.Context) []virtio.ShareMount {
+	mounts, _ := ctx.Value(hostMountContextKey{}).([]virtio.ShareMount)
+	return append([]virtio.ShareMount(nil), mounts...)
+}
+
+func (m *Manager) prepareHostMountContext(ctx context.Context, id string) (context.Context, error) {
+	m.mu.Lock()
+	provider := m.hostMounts
+	m.mu.Unlock()
+	if provider == nil {
+		return ctx, nil
+	}
+	mounts, err := provider(ctx, id)
+	if err != nil {
+		return ctx, fmt.Errorf("prepare host-managed filesystems: %w", err)
+	}
+	return withHostMounts(ctx, mounts), nil
+}
 func validateRuntimeShares(shares []client.ShareMount) error {
 	seen := make(map[string]client.ShareMount, len(shares))
 	for _, share := range shares {

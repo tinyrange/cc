@@ -123,6 +123,9 @@ type WalkEntry struct {
 	Symlink string
 }
 
+// Entry describes one logical node in a CVMFS repository.
+type Entry = WalkEntry
+
 type Client struct {
 	HTTPClient             *http.Client
 	Context                context.Context
@@ -130,12 +133,14 @@ type Client struct {
 	CacheDir               string
 	TraceLogPath           string
 	OnActivity             func(ActivityEvent)
+	OnTransfer             func(TransferEvent)
 	Mirrors                []string
 
 	mu           sync.Mutex
 	repos        map[string]*repository
 	mirrorStats  map[string]*mirrorStat
 	mirrorCursor uint64
+	preferred    string
 }
 
 func (c *Client) expandedObjectBudget() int64 {
@@ -154,6 +159,19 @@ type ActivityEvent struct {
 	CachePath string
 }
 
+type TransferEvent struct {
+	Time       time.Time
+	ID         uint64
+	State      string
+	Repo       string
+	Path       string
+	URL        string
+	Mirror     string
+	Bytes      int64
+	TotalBytes int64
+	Error      string
+}
+
 type traceEvent struct {
 	Time       string  `json:"time"`
 	ID         uint64  `json:"id"`
@@ -169,6 +187,7 @@ type traceEvent struct {
 }
 
 var traceID atomic.Uint64
+var transferID atomic.Uint64
 
 type manifest struct {
 	RootCatalogHash string
@@ -180,6 +199,12 @@ type repository struct {
 	repo     string
 	manifest *manifest
 	catalogs map[string]*catalog
+
+	indexMu         sync.RWMutex
+	indexedCatalogs map[*catalog]bool
+	globalPaths     map[string]string
+	entriesByPath   map[string]catalogEntry
+	childrenByPath  map[string][]catalogEntry
 }
 
 type mirrorStat struct {
@@ -328,6 +353,26 @@ func (c *Client) ReadDir(target string) ([]DirEntry, error) {
 	entries, err := repo.ReadDir(parsed.Path)
 	c.traceDone(id, started, "ReadDir", target, "", "", len(entries), 0, err)
 	return entries, err
+}
+
+// Stat resolves a single logical CVMFS path without reading its contents.
+func (c *Client) Stat(target string) (Entry, error) {
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		return Entry{}, err
+	}
+	if !parsed.Remote {
+		info, err := os.Lstat(parsed.LocalPath)
+		if err != nil {
+			return Entry{}, err
+		}
+		entry := Entry{Path: parsed.LocalPath, Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			entry.Symlink, err = os.Readlink(parsed.LocalPath)
+		}
+		return entry, err
+	}
+	return c.newRepository(parsed).Stat(parsed.Path)
 }
 
 func (c *Client) ReadFile(target string) ([]byte, error) {
@@ -633,19 +678,27 @@ func (c *Client) newRepository(target Target) *repository {
 		return repo
 	}
 	repo := &repository{
-		client:   client,
-		mirrors:  mirrors,
-		repo:     target.Repo,
-		catalogs: map[string]*catalog{},
+		client:          client,
+		mirrors:         mirrors,
+		repo:            target.Repo,
+		catalogs:        map[string]*catalog{},
+		indexedCatalogs: map[*catalog]bool{},
+		globalPaths:     map[string]string{"0:0": "/"},
+		entriesByPath:   map[string]catalogEntry{},
+		childrenByPath:  map[string][]catalogEntry{},
 	}
 	client.repos[key] = repo
 	return repo
 }
 
 func (c *Client) candidateMirrors(primary string) []string {
+	c.mu.Lock()
+	preferred := c.preferred
+	configured := append([]string(nil), c.Mirrors...)
+	c.mu.Unlock()
 	seen := map[string]bool{}
-	candidates := make([]string, 0, len(c.Mirrors)+1)
-	for _, raw := range append([]string{primary}, c.Mirrors...) {
+	candidates := make([]string, 0, len(configured)+2)
+	for _, raw := range append([]string{preferred, primary}, configured...) {
 		mirror := normalizeMirror(raw)
 		if mirror == "" || seen[mirror] {
 			continue
@@ -659,7 +712,8 @@ func (c *Client) candidateMirrors(primary string) []string {
 	return candidates
 }
 
-func normalizeMirror(raw string) string {
+// NormalizeMirror returns the canonical CVMFS HTTP base used by the client.
+func NormalizeMirror(raw string) string {
 	raw = strings.TrimSpace(strings.TrimRight(raw, "/"))
 	if raw == "" {
 		return ""
@@ -674,6 +728,19 @@ func normalizeMirror(raw string) string {
 		u.Path = strings.TrimRight(u.Path, "/") + "/cvmfs"
 	}
 	return strings.TrimRight(u.String(), "/")
+}
+
+func normalizeMirror(raw string) string { return NormalizeMirror(raw) }
+
+// SetPreferredMirror makes a measured or user-selected mirror the first
+// choice for future repository operations while retaining failover mirrors.
+func (c *Client) SetPreferredMirror(mirror string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.preferred = normalizeMirror(mirror)
+	c.mu.Unlock()
 }
 
 func readLocalDir(dir string) ([]DirEntry, error) {
@@ -738,54 +805,57 @@ func walkLocal(root string, visit func(WalkEntry) error) error {
 
 func (r *repository) ReadDir(dirPath string) ([]DirEntry, error) {
 	dirPath = path.Clean("/" + strings.TrimPrefix(dirPath, "/"))
-	foundDir := dirPath == "/"
-	children := map[string]DirEntry{}
-	err := r.walkPrefix(dirPath, func(ent catalogEntry) error {
-		if ent.FullPath == dirPath && ent.isDir() {
-			foundDir = true
-			return nil
-		}
-		if path.Dir(ent.FullPath) != dirPath {
-			return nil
-		}
-		children[ent.Name] = DirEntry{
+	if err := r.ensurePrefixIndexed(dirPath); err != nil {
+		return nil, err
+	}
+	r.indexMu.RLock()
+	dir, foundDir := r.entriesByPath[dirPath]
+	children := append([]catalogEntry(nil), r.childrenByPath[dirPath]...)
+	r.indexMu.RUnlock()
+	if dirPath != "/" && (!foundDir || !dir.isDir()) {
+		return nil, os.ErrNotExist
+	}
+	byName := make(map[string]DirEntry, len(children))
+	for _, ent := range children {
+		byName[ent.Name] = DirEntry{
 			Name:    ent.Name,
 			Mode:    linuxModeToGo(uint32(ent.Mode)),
 			Size:    ent.Size,
 			ModTime: time.Unix(ent.Mtime, ent.MtimeNS),
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	if !foundDir {
-		return nil, os.ErrNotExist
-	}
-	out := make([]DirEntry, 0, len(children))
-	for _, entry := range children {
+	out := make([]DirEntry, 0, len(byName))
+	for _, entry := range byName {
 		out = append(out, entry)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
+func (r *repository) Stat(nodePath string) (Entry, error) {
+	nodePath = path.Clean("/" + strings.TrimPrefix(nodePath, "/"))
+	if nodePath == "/" {
+		if _, err := r.rootCatalog(); err != nil {
+			return Entry{}, err
+		}
+		return Entry{Path: "/", Mode: fs.ModeDir | 0o555}, nil
+	}
+	found, err := r.lookupIndexedEntry(nodePath)
+	if err != nil {
+		return Entry{}, err
+	}
+	return Entry{
+		Path: found.FullPath, Mode: linuxModeToGo(uint32(found.Mode)), Size: found.Size,
+		ModTime: time.Unix(found.Mtime, found.MtimeNS), UID: uint32(found.UID), GID: uint32(found.GID),
+		Symlink: found.Symlink,
+	}, nil
+}
+
 func (r *repository) ReadFile(filePath string) ([]byte, error) {
 	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
-	var found *catalogEntry
-	err := r.walkPrefix(filePath, func(ent catalogEntry) error {
-		if ent.FullPath != filePath {
-			return nil
-		}
-		copy := ent
-		found = &copy
-		return errStopWalk
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	found, err := r.lookupIndexedEntry(filePath)
+	if err != nil {
 		return nil, err
-	}
-	if found == nil {
-		return nil, os.ErrNotExist
 	}
 	if found.isDir() {
 		return nil, fmt.Errorf("%q is a directory", filePath)
@@ -874,7 +944,7 @@ func (r *repository) orderedMirrors() []string {
 	ranked := make([]rankedMirror, 0, len(r.mirrors))
 	for i, mirror := range r.mirrors {
 		stat := r.client.mirrorStats[mirror]
-		if stat == nil || stat.successes == 0 {
+		if stat == nil {
 			ranked = append(ranked, rankedMirror{
 				mirror: mirror,
 				index:  int((uint64(i) + cursor) % uint64(len(r.mirrors))),
@@ -907,6 +977,19 @@ func (r *repository) orderedMirrors() []string {
 	for _, item := range ranked {
 		out = append(out, item.mirror)
 	}
+	preferred := r.client.preferred
+	if preferred != "" {
+		stat := r.client.mirrorStats[preferred]
+		if stat == nil || stat.failures == 0 {
+			for index, mirror := range out {
+				if mirror == preferred {
+					copy(out[1:index+1], out[:index])
+					out[0] = preferred
+					break
+				}
+			}
+		}
+	}
 	return out
 }
 
@@ -937,7 +1020,7 @@ func (c *Client) recordMirrorResult(mirror string, duration time.Duration, err e
 	}
 }
 
-func (r *repository) getFromMirrors(op string, urlFor func(string) string, handle func(url string, resp *http.Response, id uint64, started time.Time) error) error {
+func (r *repository) getFromMirrors(op, logicalPath string, urlFor func(string) string, handle func(url string, resp *http.Response, id uint64, started time.Time) error) error {
 	var lastErr error
 	for _, mirror := range r.orderedMirrors() {
 		url := urlFor(mirror)
@@ -981,12 +1064,37 @@ func (r *repository) getFromMirrors(op string, urlFor func(string) string, handl
 			lastErr = err
 			continue
 		}
+		var transfer *transferReader
+		if logicalPath != "" && r.client != nil && r.client.OnTransfer != nil {
+			total := resp.ContentLength
+			if total < 0 {
+				total = 0
+			}
+			transfer = &transferReader{
+				reader: resp.Body, client: r.client,
+				event: TransferEvent{ID: transferID.Add(1), Repo: r.repo, Path: logicalPath, URL: url, Mirror: mirror, TotalBytes: total},
+			}
+			transfer.emit("started", "")
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{Reader: transfer, Closer: resp.Body}
+		}
 		err = handle(url, resp, id, started)
 		closeErr := resp.Body.Close()
 		if err == nil {
 			err = closeErr
 		}
 		r.client.recordMirrorResult(mirror, time.Since(started), err, resp.StatusCode)
+		if transfer != nil {
+			state := "completed"
+			detail := ""
+			if err != nil {
+				state = "failed"
+				detail = err.Error()
+			}
+			transfer.emit(state, detail)
+		}
 		if err == nil {
 			return nil
 		}
@@ -996,6 +1104,32 @@ func (r *repository) getFromMirrors(op string, urlFor func(string) string, handl
 		lastErr = fmt.Errorf("no CVMFS mirrors configured for %s", r.repo)
 	}
 	return lastErr
+}
+
+type transferReader struct {
+	reader io.Reader
+	client *Client
+	event  TransferEvent
+}
+
+func (r *transferReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.event.Bytes += int64(n)
+		r.emit("progress", "")
+	}
+	return n, err
+}
+
+func (r *transferReader) emit(state, detail string) {
+	if r == nil || r.client == nil || r.client.OnTransfer == nil {
+		return
+	}
+	event := r.event
+	event.Time = time.Now()
+	event.State = state
+	event.Error = detail
+	r.client.OnTransfer(event)
 }
 
 func (r *repository) Walk(rootPath string, visit func(WalkEntry) error) error {
@@ -1043,7 +1177,7 @@ func (r *repository) readEntryData(ent catalogEntry) ([]byte, error) {
 
 func (r *repository) streamEntryData(ent catalogEntry, dst io.Writer, cacheCompressed bool) error {
 	if ent.Flags&flagExternalFile == 0 && !ent.isChunked() {
-		return r.streamDataObject(stringifyHash(ent.Hash), false, dst, cacheCompressed)
+		return r.streamDataObject(stringifyHash(ent.Hash), false, ent.FullPath, dst, cacheCompressed)
 	}
 	if len(ent.Chunks) == 0 {
 		return fmt.Errorf("chunk metadata missing for %q", ent.FullPath)
@@ -1059,7 +1193,7 @@ func (r *repository) streamEntryData(ent catalogEntry, dst io.Writer, cacheCompr
 			chunkWriter = &limitedWriter{w: dst, n: remaining}
 		}
 		counting := &countingWriter{w: chunkWriter}
-		if err := r.streamDataObject(stringifyHash(chunk.Hash), true, counting, cacheCompressed); err != nil {
+		if err := r.streamDataObject(stringifyHash(chunk.Hash), true, ent.FullPath, counting, cacheCompressed); err != nil {
 			return err
 		}
 		written += counting.n
@@ -1072,7 +1206,7 @@ func (r *repository) streamEntryDataRange(ent catalogEntry, offset, length int64
 		return nil
 	}
 	if ent.Flags&flagExternalFile == 0 && !ent.isChunked() {
-		return r.streamDataObjectRange(stringifyHash(ent.Hash), false, offset, length, dst)
+		return r.streamDataObjectRange(stringifyHash(ent.Hash), false, ent.FullPath, offset, length, dst)
 	}
 	if len(ent.Chunks) == 0 {
 		return fmt.Errorf("chunk metadata missing for %q", ent.FullPath)
@@ -1099,6 +1233,7 @@ func (r *repository) streamEntryDataRange(ent catalogEntry, offset, length int64
 		if err := r.streamDataObjectRange(
 			stringifyHash(chunk.Hash),
 			true,
+			ent.FullPath,
 			overlapStart-chunkStart,
 			overlapEnd-overlapStart,
 			dst,
@@ -1109,7 +1244,7 @@ func (r *repository) streamEntryDataRange(ent catalogEntry, offset, length int64
 	return nil
 }
 
-func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, cacheCompressed bool) error {
+func (r *repository) streamDataObject(hash string, partial bool, logicalPath string, dst io.Writer, cacheCompressed bool) error {
 	suffix := ""
 	if partial {
 		suffix = "P"
@@ -1127,7 +1262,7 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 	}
 
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
-	return r.getFromMirrors("HTTPObject", func(mirror string) string {
+	return r.getFromMirrors("HTTPObject", logicalPath, func(mirror string) string {
 		return r.objectURL(mirror, hash, suffix)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		reader := r.client.activityReader("HTTPObject", "", url, cachePath, resp.Body)
@@ -1169,7 +1304,7 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 	})
 }
 
-func (r *repository) streamDataObjectRange(hash string, partial bool, offset, length int64, dst io.Writer) error {
+func (r *repository) streamDataObjectRange(hash string, partial bool, logicalPath string, offset, length int64, dst io.Writer) error {
 	suffix := ""
 	if partial {
 		suffix = "P"
@@ -1186,7 +1321,7 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 	}
 
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
-	return r.getFromMirrors("HTTPObjectRange", func(mirror string) string {
+	return r.getFromMirrors("HTTPObjectRange", logicalPath, func(mirror string) string {
 		return r.objectURL(mirror, hash, suffix)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		reader := r.client.activityReader("HTTPObjectRange", "", url, cachePath, resp.Body)
@@ -1265,20 +1400,9 @@ func maxInt64(a, b int64) int64 {
 }
 
 func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {
-	var found *catalogEntry
-	err := r.walkPrefix(filePath, func(ent catalogEntry) error {
-		if ent.FullPath != filePath {
-			return nil
-		}
-		copy := ent
-		found = &copy
-		return errStopWalk
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	found, err := r.lookupIndexedEntry(filePath)
+	if err != nil {
 		return nil, err
-	}
-	if found == nil {
-		return nil, os.ErrNotExist
 	}
 	if found.isDir() {
 		return nil, fmt.Errorf("%q is a directory", filePath)
@@ -1287,6 +1411,117 @@ func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {
 		return nil, fmt.Errorf("%q is a symlink", filePath)
 	}
 	return found, nil
+}
+
+func (r *repository) lookupIndexedEntry(entryPath string) (*catalogEntry, error) {
+	entryPath = path.Clean("/" + strings.TrimPrefix(entryPath, "/"))
+	if err := r.ensurePrefixIndexed(entryPath); err != nil {
+		return nil, err
+	}
+	r.indexMu.RLock()
+	entry, ok := r.entriesByPath[entryPath]
+	r.indexMu.RUnlock()
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &entry, nil
+}
+
+func (r *repository) ensurePrefixIndexed(prefix string) error {
+	root, err := r.rootCatalog()
+	if err != nil {
+		return err
+	}
+	return r.ensureCatalogPrefixIndexed(root, "/", prefix)
+}
+
+func (r *repository) ensureCatalogPrefixIndexed(cat *catalog, baseParent, prefix string) error {
+	if err := r.indexCatalog(cat, baseParent); err != nil {
+		return err
+	}
+	for _, nested := range cat.nested {
+		nestedPath := path.Clean("/" + strings.TrimPrefix(nested.Path, "/"))
+		if !shouldWalkNestedCatalog(nestedPath, prefix) {
+			continue
+		}
+		child, err := r.openCatalog(nested.Sha1)
+		if err != nil {
+			return err
+		}
+		if err := r.ensureCatalogPrefixIndexed(child, path.Dir(nestedPath), prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *repository) indexCatalog(cat *catalog, baseParent string) error {
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+	if r.indexedCatalogs == nil {
+		r.indexedCatalogs = make(map[*catalog]bool)
+	}
+	if r.globalPaths == nil {
+		r.globalPaths = map[string]string{"0:0": "/"}
+	}
+	if r.entriesByPath == nil {
+		r.entriesByPath = make(map[string]catalogEntry)
+	}
+	if r.childrenByPath == nil {
+		r.childrenByPath = make(map[string][]catalogEntry)
+	}
+	if r.indexedCatalogs[cat] {
+		return nil
+	}
+	local := make(map[string]catalogEntry, len(cat.entries))
+	for _, ent := range cat.entries {
+		local[ent.pathHash()] = ent
+	}
+	memo := make(map[string]string, len(cat.entries))
+	resolving := make(map[string]bool)
+	var resolve func(catalogEntry) (string, error)
+	resolve = func(ent catalogEntry) (string, error) {
+		hash := ent.pathHash()
+		if full, ok := memo[hash]; ok {
+			return full, nil
+		}
+		if resolving[hash] {
+			return "", fmt.Errorf("catalog parent cycle at %q in repo %q", ent.Name, r.repo)
+		}
+		resolving[hash] = true
+		defer delete(resolving, hash)
+		parentPath, ok := r.globalPaths[ent.parentHash()]
+		if !ok {
+			if ent.parentHash() == "0:0" {
+				parentPath = baseParent
+			} else if parent, exists := local[ent.parentHash()]; exists {
+				full, err := resolve(parent)
+				if err != nil {
+					return "", err
+				}
+				parentPath = full
+			} else {
+				return "", fmt.Errorf("parent not found for %q in repo %q", ent.Name, r.repo)
+			}
+		}
+		full := path.Clean(path.Join(parentPath, ent.Name))
+		memo[hash] = full
+		r.globalPaths[hash] = full
+		return full, nil
+	}
+	for index := range cat.entries {
+		full, err := resolve(cat.entries[index])
+		if err != nil {
+			return err
+		}
+		cat.entries[index].FullPath = full
+		entry := cat.entries[index]
+		r.entriesByPath[full] = entry
+		parent := path.Dir(full)
+		r.childrenByPath[parent] = append(r.childrenByPath[parent], entry)
+	}
+	r.indexedCatalogs[cat] = true
+	return nil
 }
 
 func (r *repository) walkPrefix(prefix string, visit func(ent catalogEntry) error) error {
@@ -1303,42 +1538,12 @@ func (r *repository) walkPrefixWithNested(prefix string, shouldWalkNested func(s
 }
 
 func (r *repository) walkCatalog(cat *catalog, baseParent, prefix string, globalPaths map[string]string, shouldWalkNested func(string, string) bool, visit func(ent catalogEntry) error) error {
-	local := make(map[string]catalogEntry, len(cat.entries))
-	for _, ent := range cat.entries {
-		local[ent.pathHash()] = ent
-	}
-	memo := map[string]string{}
-	var resolve func(catalogEntry) (string, error)
-	resolve = func(ent catalogEntry) (string, error) {
-		if full, ok := memo[ent.pathHash()]; ok {
-			return full, nil
-		}
-		parentPath, ok := globalPaths[ent.parentHash()]
-		if !ok {
-			if ent.parentHash() == "0:0" {
-				parentPath = baseParent
-			} else if parent, ok := local[ent.parentHash()]; ok {
-				full, err := resolve(parent)
-				if err != nil {
-					return "", err
-				}
-				parentPath = full
-			} else {
-				return "", fmt.Errorf("parent not found for %q in repo %q", ent.Name, r.repo)
-			}
-		}
-		full := path.Clean(path.Join(parentPath, ent.Name))
-		memo[ent.pathHash()] = full
-		globalPaths[ent.pathHash()] = full
-		return full, nil
+	if err := r.indexCatalog(cat, baseParent); err != nil {
+		return err
 	}
 	for i := range cat.entries {
-		full, err := resolve(cat.entries[i])
-		if err != nil {
-			return err
-		}
-		cat.entries[i].FullPath = full
-		if hasCommonFragment(full, prefix) {
+		globalPaths[cat.entries[i].pathHash()] = cat.entries[i].FullPath
+		if hasCommonFragment(cat.entries[i].FullPath, prefix) {
 			if err := visit(cat.entries[i]); err != nil {
 				return err
 			}
@@ -1386,7 +1591,7 @@ func (r *repository) getManifest() (*manifest, error) {
 
 func (r *repository) fetchManifest() ([]byte, error) {
 	var body []byte
-	err := r.getFromMirrors("HTTPManifest", func(mirror string) string {
+	err := r.getFromMirrors("HTTPManifest", "", func(mirror string) string {
 		return fmt.Sprintf("%s/%s/.cvmfspublished", mirror, r.repo)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		ctx := r.client.Context
@@ -1504,7 +1709,7 @@ func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) 
 	}
 
 	var buf bytes.Buffer
-	err := r.getFromMirrors("HTTPObject", func(mirror string) string {
+	err := r.getFromMirrors("HTTPObject", "", func(mirror string) string {
 		return r.objectURL(mirror, hash, suffix)
 	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
 		buf.Reset()

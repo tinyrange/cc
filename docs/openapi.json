@@ -468,6 +468,49 @@
         }
       }
     },
+    "/cvmfs/status": {
+      "get": {
+        "tags": ["cvmfs"],
+        "summary": "Inspect host CVMFS transfers and cache usage",
+        "responses": {
+          "200": {
+            "description": "CVMFS status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CVMFSStatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cvmfs/mirrors/probe": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "Measure configured mirrors using the repository root catalog",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorProbeRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Measured mirrors and automatic selection",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorProbeResponse" } } }
+          }
+        }
+      }
+    },
+    "/cvmfs/mirrors/selection": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "Select the preferred mirror for a configured host mount",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorSelectionRequest" } } }
+        },
+        "responses": { "200": { "description": "Mirror selected" } }
+      }
+    },
     "/vm/supported": {
       "get": {
         "tags": ["vms"],
@@ -1110,6 +1153,68 @@
           "eof": { "type": "boolean" }
         }
       },
+      "CVMFSTransferState": {
+        "type": "object",
+        "required": ["id", "path", "bytes"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "path": { "type": "string" },
+          "mirror": { "type": "string" },
+          "bytes": { "type": "integer", "format": "int64" },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "progress": { "type": "number", "format": "double" },
+          "started_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CVMFSStatusResponse": {
+        "type": "object",
+        "required": ["state", "bytes", "active_transfers"],
+        "properties": {
+          "state": { "type": "string", "enum": ["idle", "downloading", "error"] },
+          "selected_mirror": { "type": "string" },
+          "bytes": { "type": "integer", "format": "int64" },
+          "total_bytes": { "type": "integer", "format": "int64" },
+          "progress": { "type": "number", "format": "double" },
+          "cache_bytes": { "type": "integer", "format": "int64" },
+          "cache_limit_bytes": { "type": "integer", "format": "int64" },
+          "active_transfers": { "type": "array", "items": { "$ref": "#/components/schemas/CVMFSTransferState" } },
+          "last_error": { "type": "string" },
+          "last_error_unix": { "type": "integer", "format": "int64" }
+        }
+      },
+      "CVMFSMirrorProbeRequest": {
+        "type": "object",
+        "required": ["repo"],
+        "properties": { "repo": { "type": "string" } }
+      },
+      "CVMFSMirrorProbeResult": {
+        "type": "object",
+        "required": ["mirror"],
+        "properties": {
+          "mirror": { "type": "string" },
+          "manifest_latency_millis": { "type": "integer", "format": "int64" },
+          "root_catalog_millis": { "type": "integer", "format": "int64" },
+          "root_catalog_bytes": { "type": "integer", "format": "int64" },
+          "root_catalog_bytes_per_second": { "type": "number", "format": "double" },
+          "error": { "type": "string" }
+        }
+      },
+      "CVMFSMirrorProbeResponse": {
+        "type": "object",
+        "required": ["selected_mirror", "results"],
+        "properties": {
+          "selected_mirror": { "type": "string" },
+          "results": { "type": "array", "items": { "$ref": "#/components/schemas/CVMFSMirrorProbeResult" } }
+        }
+      },
+      "CVMFSMirrorSelectionRequest": {
+        "type": "object",
+        "required": ["repo", "mirror"],
+        "properties": {
+          "repo": { "type": "string" },
+          "mirror": { "type": "string" }
+        }
+      },
       "VMSupportedResponse": {
         "type": "object",
         "required": ["supported"],
@@ -1231,6 +1336,7 @@
           "default_user": { "type": "string", "description": "Default guest user for commands. An explicit per-command user takes precedence." },
           "init": { "type": "string" },
           "kernel": { "type": "string" },
+          "env": { "type": "array", "items": { "type": "string" } },
           "shares": { "type": "array", "items": { "$ref": "#/components/schemas/ShareMount" } },
           "persistent_mounts": { "type": "array", "items": { "$ref": "#/components/schemas/PersistentMount" } },
           "network": { "$ref": "#/components/schemas/NetworkConfig" },

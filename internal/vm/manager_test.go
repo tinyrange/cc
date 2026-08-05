@@ -29,6 +29,25 @@ func TestInstanceStatusPreservesSubsecondStartIdentity(t *testing.T) {
 	}
 }
 
+func TestManagerMakesHostMountsAvailableDuringVMStart(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 1})
+	host.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	manager.SetHostMountProvider(func(context.Context, string) ([]virtio.ShareMount, error) {
+		return []virtio.ShareMount{{GuestPath: "/cvmfs/repo"}}, nil
+	})
+	defer manager.ShutdownAll(ctx)
+	if _, err := manager.Start(ctx, client.CreateInstanceRequest{ID: "mounted", Image: "image"}); err != nil {
+		t.Fatal(err)
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if len(host.hostMounts) != 1 || len(host.hostMounts[0]) != 1 || host.hostMounts[0][0].GuestPath != "/cvmfs/repo" {
+		t.Fatalf("host mounts observed at start = %+v", host.hostMounts)
+	}
+}
+
 func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
@@ -1339,6 +1358,7 @@ type fakeHost struct {
 	execInStreams     []fakeExecInCall
 	closeCalled       bool
 	hostCapabilitiesN int
+	hostMounts        [][]virtio.ShareMount
 }
 
 type blockingStartHost struct {
@@ -1435,9 +1455,10 @@ func (h *fakeHost) Start(ctx context.Context, req client.CreateInstanceRequest) 
 	return h.StartStream(ctx, req, nil)
 }
 
-func (h *fakeHost) StartStream(_ context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+func (h *fakeHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	h.mu.Lock()
 	h.starts = append(h.starts, req)
+	h.hostMounts = append(h.hostMounts, hostMountsFromContext(ctx))
 	inst := h.popInstanceLocked()
 	h.mu.Unlock()
 	if controller, ok := inst.(interface{ SetBalloonMB(uint64) error }); ok {
