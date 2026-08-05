@@ -81,7 +81,11 @@ func BuildPersistentImageMounts(storeRoot string, image *oci.Image, requested []
 			GuestPath: mount,
 			Backend:   backend,
 			Writable:  true,
-			CacheMode: "strict",
+			// The lower image is immutable and the upper is exclusively owned by
+			// this guest while its store lock is held. Guest-side mutations keep
+			// the kernel's own dentries coherent, so retaining lookup and attr
+			// results avoids turning package extraction into millions of RPCs.
+			CacheMode: "aggressive",
 		})
 	}
 	cleanup = false

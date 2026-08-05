@@ -28,6 +28,7 @@ type fuseServer struct {
 	device              *FS
 	backend             FSBackend
 	backingUsageTracker *FSBackingUsageTracker
+	locks               *fuseLockManager
 }
 
 func (s *fuseServer) Dispatch(raw []byte) (fsDispatchResult, error) {
@@ -312,10 +313,16 @@ func (s *fuseServer) dispatch(request fuseRequest) (fsReply, error) {
 		if err := request.requireBody(24, "RELEASE"); err != nil {
 			return fsReply{}, err
 		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		releaseFlags := binary.LittleEndian.Uint32(req[52:56])
+		lockOwner := binary.LittleEndian.Uint64(req[56:64])
 		if logEnabled {
-			s.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
+			s.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", fh))
 		}
-		s.backend.Release(nodeID, binary.LittleEndian.Uint64(req[40:48]))
+		if releaseFlags&fuseReleaseFlockUnlock != 0 {
+			s.locks.releaseOwner(nodeID, lockOwner)
+		}
+		s.backend.Release(nodeID, fh)
 		return reply(0, nil), nil
 	case fuseFsync:
 		if err := request.requireBody(16, "FSYNC"); err != nil {
@@ -400,20 +407,47 @@ func (s *fuseServer) dispatch(request fuseRequest) (fsReply, error) {
 			return fsReply{}, err
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
+		owner := binary.LittleEndian.Uint64(req[48:56])
+		requested := fuseFileLock{
+			nodeID: nodeID, owner: owner,
+			start:  binary.LittleEndian.Uint64(req[56:64]),
+			end:    binary.LittleEndian.Uint64(req[64:72]),
+			typeID: binary.LittleEndian.Uint32(req[72:76]),
+			pid:    binary.LittleEndian.Uint32(req[76:80]),
+		}
 		if logEnabled {
 			s.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
 		}
-		return reply(-linuxENOSYS, nil), nil
+		if !validFuseGetLock(requested) {
+			return reply(-linuxEINVAL, nil), nil
+		}
+		conflict, found := s.locks.get(requested)
+		if !found {
+			conflict = fuseFileLock{typeID: linuxFUnlck}
+		}
+		extra := make([]byte, fuseLKOutSize)
+		binary.LittleEndian.PutUint64(extra[0:8], conflict.start)
+		binary.LittleEndian.PutUint64(extra[8:16], conflict.end)
+		binary.LittleEndian.PutUint32(extra[16:20], conflict.typeID)
+		binary.LittleEndian.PutUint32(extra[20:24], conflict.pid)
+		return reply(0, extra), nil
 	case fuseSetLK, fuseSetLKW:
 		if err := request.requireBody(fuseLKInSize, fuseOpcodeName(opcode)); err != nil {
 			return fsReply{}, err
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
-		lockType := binary.LittleEndian.Uint32(req[72:76])
-		if logEnabled {
-			s.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lockType))
+		lock := fuseFileLock{
+			nodeID: nodeID,
+			owner:  binary.LittleEndian.Uint64(req[48:56]),
+			start:  binary.LittleEndian.Uint64(req[56:64]),
+			end:    binary.LittleEndian.Uint64(req[64:72]),
+			typeID: binary.LittleEndian.Uint32(req[72:76]),
+			pid:    binary.LittleEndian.Uint32(req[76:80]),
 		}
-		return reply(-linuxENOSYS, nil), nil
+		if logEnabled {
+			s.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lock.typeID))
+		}
+		return reply(s.locks.set(lock, opcode == fuseSetLKW), nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
 		if logEnabled {
@@ -597,9 +631,13 @@ func (s *fuseServer) dispatch(request fuseRequest) (fsReply, error) {
 			return fsReply{}, err
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
+		flushFlags := binary.LittleEndian.Uint32(req[48:52])
 		lockOwner := binary.LittleEndian.Uint64(req[56:64])
 		if logEnabled {
 			s.logPathf("flush", nodeID, fmt.Sprintf(" fh=%d lockOwner=%d", fh, lockOwner))
+		}
+		if flushFlags&fuseFlushLockOwner != 0 {
+			s.locks.releaseOwner(nodeID, lockOwner)
 		}
 		if be, ok := s.backend.(fsFlushBackend); ok {
 			return reply(be.Flush(nodeID, fh, lockOwner), nil), nil
@@ -674,6 +712,9 @@ func (s *fuseServer) dispatch(request fuseRequest) (fsReply, error) {
 		encodeFuseStatx(extra[32:], attr)
 		return reply(0, extra), nil
 	case fuseSyncFS:
+		if be, ok := s.backend.(fsSyncFSBackend); ok {
+			return reply(be.SyncFS(), nil), nil
+		}
 		return reply(0, nil), nil
 	case fuseTmpfile:
 		if logEnabled {
@@ -681,6 +722,7 @@ func (s *fuseServer) dispatch(request fuseRequest) (fsReply, error) {
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseDestroy:
+		s.locks.close()
 		return reply(0, nil), nil
 	case fuseIoctl:
 		if logEnabled {

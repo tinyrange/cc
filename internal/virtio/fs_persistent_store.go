@@ -75,6 +75,7 @@ type persistentImageStore struct {
 	pendingRemove   map[uint64]struct{}
 	newDataDirs     map[uint64]string
 	dirtyData       map[uint64]struct{}
+	durableState    *persistentImageState
 	recovery        persistentImageRecovery
 	dataUsage       map[uint64]uint64
 	dataPhysical    map[uint64]uint64
@@ -129,6 +130,10 @@ type persistentImageNode struct {
 	ATimeUnixNano int64                   `json:"atime_unix_nano,omitempty"`
 	MTimeUnixNano int64                   `json:"mtime_unix_nano,omitempty"`
 	CTimeUnixNano int64                   `json:"ctime_unix_nano,omitempty"`
+	// PreserveNamespace is used only by WAL deltas for file fsync. File
+	// durability must not accidentally make an un-fsynced rename or link
+	// durable as well.
+	PreserveNamespace bool `json:"preserve_namespace,omitempty"`
 }
 
 type persistentImageDirent struct {
@@ -240,6 +245,7 @@ func openPersistentImageStore(dir, lowerID string) (*persistentImageStore, *pers
 			return nil, nil, err
 		}
 		store.durableSequence = store.sequence
+		store.durableState = clonePersistentImageState(state)
 		if err := store.preserveUnreferencedData(state); err != nil {
 			_ = store.close()
 			return nil, nil, err
@@ -636,6 +642,7 @@ func (s *persistentImageStore) save(state *persistentImageState, durable bool) e
 	if durable {
 		s.durableSequence = s.sequence
 		s.lastCheckpoint = time.Now()
+		s.durableState = clonePersistentImageState(state)
 	}
 	return nil
 }
@@ -942,6 +949,7 @@ func (s *persistentImageStore) reclaimDurableData() error {
 		}
 		delete(s.pendingRemove, nodeID)
 		delete(s.newDataDirs, nodeID)
+		delete(s.dirtyData, nodeID)
 		s.setDataUsage(nodeID, 0, 0)
 	}
 	if didWork && len(s.pendingRemove) == 0 && len(s.pendingTrim) == 0 {
@@ -950,6 +958,36 @@ func (s *persistentImageStore) reclaimDurableData() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (s *persistentImageStore) reclaimDurableFileData(nodeID uint64) error {
+	if s == nil {
+		return nil
+	}
+	size, pending := s.pendingTrim[nodeID]
+	if !pending {
+		return nil
+	}
+	err := os.Truncate(s.dataPath(nodeID), int64(size))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("trim inode %d: %w", nodeID, err)
+	}
+	delete(s.pendingTrim, nodeID)
+	s.refreshPhysicalUsage(nodeID)
+	return nil
+}
+
+func (s *persistentImageStore) reclaimDurableNamespaceData() error {
+	if s == nil || len(s.pendingRemove) == 0 {
+		return nil
+	}
+	// Namespace fsync makes every pending unlink durable, but deliberately
+	// leaves truncation reclamation to the affected file's own fsync.
+	trims := s.pendingTrim
+	s.pendingTrim = make(map[uint64]uint64)
+	err := s.reclaimDurableData()
+	s.pendingTrim = trims
+	return err
 }
 
 func (s *persistentImageStore) setDataUsage(nodeID, current, physical uint64) {

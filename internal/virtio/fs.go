@@ -49,6 +49,8 @@ const (
 	fuseLKInSize           = 48
 	fuseLKOutSize          = 24
 	linuxFUnlck            = 2
+	fuseFlushLockOwner     = 1 << 1
+	fuseReleaseFlockUnlock = 1 << 1
 )
 
 const (
@@ -401,7 +403,7 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		completions: make(map[fsCompletionKey]fsCompletion),
 	}
 	fs.resetQueueStateLocked()
-	fs.filesystem = &fuseServer{device: fs, backend: backend}
+	fs.filesystem = &fuseServer{device: fs, backend: backend, locks: newFuseLockManager()}
 	fs.dispatcher = fs.filesystem
 	if be, ok := backend.(fsWritebackCacheBackend); ok {
 		be.SetWritebackCache(fs.writebackCache)
@@ -422,6 +424,9 @@ func (f *FS) closeWithin(timeout time.Duration) error {
 	started := time.Now()
 	f.closeStart.Do(func() {
 		close(f.closed)
+		if f.filesystem != nil && f.filesystem.locks != nil {
+			f.filesystem.locks.close()
+		}
 		// Prevent a concurrent enqueue from adding workers after the wait starts.
 		f.workerOnce.Do(func() {})
 		f.mu.Lock()
@@ -596,10 +601,10 @@ func resolveVirtioFSAsync() bool {
 
 func resolveVirtioFSWorkerCount() int {
 	const maxWorkers = 64
-	// One worker per device preserves concurrency between VMs without retaining
-	// GOMAXPROCS-sized worker sets for every mostly idle guest. Workloads that
-	// benefit from parallel requests within one guest can raise this explicitly.
-	workers := 1
+	// Four request queues are exposed to the guest. Keep one worker available
+	// per queue so a blocking lock request or slow durability operation cannot
+	// prevent an unlock or unrelated filesystem request from being dispatched.
+	workers := fsRequestQueueCount
 	if value := strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WORKERS")); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil {
 			workers = parsed

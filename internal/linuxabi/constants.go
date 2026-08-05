@@ -15,9 +15,11 @@ const (
 const (
 	EPERM      int32 = 1
 	ENOENT     int32 = 2
+	EINTR      int32 = 4
 	EIO        int32 = 5
 	ENXIO      int32 = 6
 	EBADF      int32 = 9
+	EAGAIN     int32 = 11
 	EACCES     int32 = 13
 	EBUSY      int32 = 16
 	EEXIST     int32 = 17
