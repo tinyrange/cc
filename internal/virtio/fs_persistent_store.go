@@ -12,8 +12,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,6 +87,7 @@ type persistentImageStore struct {
 	usageErr        error
 	lastCheckpoint  time.Time
 	lastErr         error
+	dataSyncMu      sync.Mutex
 }
 
 type persistentImageRecovery struct {
@@ -866,12 +869,18 @@ func (s *persistentImageStore) syncData(nodeID uint64) error {
 	if err := runPersistentImageFaultTestHook("before-data-sync"); err != nil {
 		return err
 	}
+	s.dataSyncMu.Lock()
+	usage := s.dataUsage[nodeID]
+	shard, newData := s.newDataDirs[nodeID]
+	s.dataSyncMu.Unlock()
 	file, err := s.openData(nodeID, os.O_RDWR)
 	if errors.Is(err, os.ErrNotExist) {
-		if s.dataUsage[nodeID] != 0 {
+		if usage != 0 {
 			return fmt.Errorf("persistent inode %d data file is missing: %w", nodeID, syscall.EIO)
 		}
+		s.dataSyncMu.Lock()
 		delete(s.dirtyData, nodeID)
+		s.dataSyncMu.Unlock()
 		return nil
 	}
 	if err != nil {
@@ -882,16 +891,18 @@ func (s *persistentImageStore) syncData(nodeID uint64) error {
 	if err != nil {
 		return err
 	}
-	if shard, ok := s.newDataDirs[nodeID]; ok {
+	if newData {
 		if err := syncPersistentDirectory(shard); err != nil {
 			return err
 		}
 		if err := syncPersistentDirectory(filepath.Join(s.dir, "data")); err != nil {
 			return err
 		}
-		delete(s.newDataDirs, nodeID)
 	}
+	s.dataSyncMu.Lock()
+	delete(s.newDataDirs, nodeID)
 	delete(s.dirtyData, nodeID)
+	s.dataSyncMu.Unlock()
 	return nil
 }
 
@@ -904,12 +915,26 @@ func (s *persistentImageStore) syncDirtyData() error {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	var errs []error
-	for _, id := range ids {
-		if err := s.syncData(id); err != nil {
-			errs = append(errs, fmt.Errorf("sync dirty inode %d: %w", id, err))
-		}
+	workers := min(len(ids), max(1, min(runtime.GOMAXPROCS(0), 16)))
+	jobs := make(chan int)
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if err := s.syncData(ids[index]); err != nil {
+					errs[index] = fmt.Errorf("sync dirty inode %d: %w", ids[index], err)
+				}
+			}
+		}()
 	}
+	for index := range ids {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
 	return errors.Join(errs...)
 }
 
@@ -1058,16 +1083,11 @@ func (p *imageFS) syncAllPersistentDataLocked() error {
 	if p == nil || p.persistent == nil {
 		return nil
 	}
-	var errs []error
-	for id, node := range p.nodes {
-		if node == nil || len(node.data.extents) == 0 {
-			continue
-		}
-		if err := p.persistent.syncData(id); err != nil {
-			errs = append(errs, fmt.Errorf("sync inode %d: %w", id, err))
-		}
-	}
-	return errors.Join(errs...)
+	// Data removed from dirtyData has already completed a durable file or
+	// filesystem barrier. Re-syncing every referenced inode made clean shutdown
+	// proportional to the entire persistent home rather than this session's
+	// outstanding writes.
+	return p.persistent.syncDirtyData()
 }
 
 func (p *imageFS) persistentStateLocked() *persistentImageState {

@@ -1359,6 +1359,70 @@ func TestPersistentImageFSReadsRemainResponsiveDuringHostDataSync(t *testing.T) 
 	}
 }
 
+func TestPersistentImageFSCloseDoesNotResyncDurableHome(t *testing.T) {
+	t.Cleanup(func() { persistentImageFaultTestHook = nil })
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), filepath.Join(t.TempDir(), "home"))
+	nodeID, fh, _, errno := backend.Create(1, "state", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create state: errno %d", errno)
+	}
+	if written, errno := backend.Write(nodeID, fh, 0, []byte("durable"), 0); errno != 0 || written != 7 {
+		t.Fatalf("write state: written=%d errno=%d", written, errno)
+	}
+	if errno := backend.SyncFS(); errno != 0 {
+		t.Fatalf("sync baseline: errno %d", errno)
+	}
+	backend.Release(nodeID, fh)
+	persistentImageFaultTestHook = func(stage string) error {
+		if stage == "before-data-sync" {
+			return errors.New("durable inode was synchronized again")
+		}
+		return nil
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentImageFSCloseSynchronizesDirtyFilesConcurrently(t *testing.T) {
+	t.Cleanup(func() { persistentImageFaultTestHook = nil })
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), filepath.Join(t.TempDir(), "home"))
+	for _, name := range []string{"first", "second"} {
+		nodeID, fh, _, errno := backend.Create(1, name, linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create %s: errno %d", name, errno)
+		}
+		if written, errno := backend.Write(nodeID, fh, 0, []byte(name), 0); errno != 0 || written != uint32(len(name)) {
+			t.Fatalf("write %s: written=%d errno=%d", name, written, errno)
+		}
+		backend.Release(nodeID, fh)
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	persistentImageFaultTestHook = func(stage string) error {
+		if stage == "before-data-sync" {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- backend.closeWithin(time.Second) }()
+	for count := 0; count < 2; count++ {
+		select {
+		case <-entered:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("independent dirty files were synchronized serially")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPersistentImageFSFileAndDirectoryFsyncHaveSeparateDurability(t *testing.T) {
 	for _, test := range []struct {
 		name    string
