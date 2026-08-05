@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"j5.nz/cc/internal/download"
@@ -40,7 +41,7 @@ func (s *Store) tryReconstructStargzLayer(
 	reg *registryContext,
 	imageName string,
 	layer descriptor,
-	progress func(int64),
+	progress func(int64, float64),
 ) (bool, error) {
 	document, tocOffset, err := fetchRemoteStargzTOCDocument(ctx, reg, imageName, layer)
 	if err != nil {
@@ -100,6 +101,18 @@ func (s *Store) tryReconstructStargzLayer(
 	}
 
 	var reconstructed int64
+	var networkBytes int64
+	networkStarted := time.Now()
+	report := func(current int64) {
+		if progress == nil {
+			return
+		}
+		var rate float64
+		if elapsed := time.Since(networkStarted).Seconds(); elapsed > 0 {
+			rate = float64(networkBytes) / elapsed
+		}
+		progress(current, rate)
+	}
 	for index := 0; index < len(planned); {
 		item := planned[index]
 		if item.local != nil {
@@ -107,9 +120,7 @@ func (s *Store) tryReconstructStargzLayer(
 				return false, err
 			}
 			reconstructed += item.target.Size
-			if progress != nil {
-				progress(reconstructed)
-			}
+			report(reconstructed)
 			index++
 			continue
 		}
@@ -120,16 +131,19 @@ func (s *Store) tryReconstructStargzLayer(
 			end += planned[index].target.Size
 			index++
 		}
-		if err := copyRemoteBlobRange(ctx, reg, "/"+imageName+"/blobs/"+layer.Digest, out, start, end-1, layer.Size); err != nil {
+		rangeBase := networkBytes
+		if err := copyRemoteBlobRange(ctx, reg, "/"+imageName+"/blobs/"+layer.Digest, out, start, end-1, layer.Size, func(downloaded int64) {
+			networkBytes = rangeBase + downloaded
+			report(reconstructed + downloaded)
+		}); err != nil {
 			if errors.Is(err, errRegistryRangeUnsupported) {
 				return false, nil
 			}
 			return false, err
 		}
 		reconstructed += end - start
-		if progress != nil {
-			progress(reconstructed)
-		}
+		networkBytes = rangeBase + end - start
+		report(reconstructed)
 	}
 	if err := out.Sync(); err != nil {
 		return false, err
@@ -245,7 +259,7 @@ func copyFileRange(dst *os.File, dstOffset int64, srcPath string, srcOffset, siz
 	return nil
 }
 
-func copyRemoteBlobRange(ctx context.Context, reg *registryContext, path string, dst *os.File, start, end, total int64) error {
+func copyRemoteBlobRange(ctx context.Context, reg *registryContext, path string, dst *os.File, start, end, total int64, progress func(int64)) error {
 	resp, err := reg.doByteRange(ctx, path, start, end)
 	if err != nil {
 		return err
@@ -255,8 +269,30 @@ func copyRemoteBlobRange(ctx context.Context, reg *registryContext, path string,
 		return err
 	}
 	size := end - start + 1
-	_, err = download.Copy(ctx, io.NewOffsetWriter(dst, start), resp, download.Budget{MaxBytes: size, ExpectedBytes: size})
+	writer := &stargzRangeProgressWriter{dst: io.NewOffsetWriter(dst, start), report: progress}
+	_, err = download.Copy(ctx, writer, resp, download.Budget{MaxBytes: size, ExpectedBytes: size})
+	if err == nil && progress != nil {
+		progress(size)
+	}
 	return err
+}
+
+type stargzRangeProgressWriter struct {
+	dst        io.Writer
+	written    int64
+	lastReport time.Time
+	report     func(int64)
+}
+
+func (w *stargzRangeProgressWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	w.written += int64(n)
+	now := time.Now()
+	if n > 0 && w.report != nil && (w.lastReport.IsZero() || now.Sub(w.lastReport) >= 200*time.Millisecond) {
+		w.lastReport = now
+		w.report(w.written)
+	}
+	return n, err
 }
 
 func readRemoteBlobRange(ctx context.Context, reg *registryContext, path string, start, end, total, maxBytes int64) ([]byte, error) {

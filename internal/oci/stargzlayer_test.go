@@ -293,6 +293,35 @@ func TestStargzDeltaReconstructionFetchesOnlyMissingTargetRanges(t *testing.T) {
 	}
 }
 
+func TestCopyRemoteBlobRangeReportsIntermediateProgress(t *testing.T) {
+	data := deterministicTestBytes(1 << 20)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	dst, err := os.CreateTemp(t.TempDir(), "range-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	var reports []int64
+	if err := copyRemoteBlobRange(t.Context(), &registryContext{client: server.Client(), registry: server.URL}, "/blob", dst, 0, int64(len(data)-1), int64(len(data)), func(current int64) {
+		reports = append(reports, current)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) < 2 || reports[0] <= 0 || reports[0] >= int64(len(data)) {
+		t.Fatalf("range progress reports = %v, want an intermediate update", reports)
+	}
+	if got := reports[len(reports)-1]; got != int64(len(data)) {
+		t.Fatalf("final range progress = %d, want %d", got, len(data))
+	}
+}
+
 func TestPullEnhancedStargzImageKeepsCompressedLayerAndOpensFilesystem(t *testing.T) {
 	payload := deterministicTestBytes(700 << 10)
 	inputPath := filepath.Join(t.TempDir(), "layer.tar")

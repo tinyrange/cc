@@ -2285,8 +2285,8 @@ func (s *Store) ensureLayerArchive(
 		return s.prepareLayerArchiveFromBlob(layer, reportIndex)
 	}
 	if keepCompressed {
-		reconstructed, err := s.tryReconstructStargzLayer(ctx, reg, imageName, layer, func(current int64) {
-			reportDownload(current, 0)
+		reconstructed, err := s.tryReconstructStargzLayer(ctx, reg, imageName, layer, func(current int64, rate float64) {
+			reportDownload(current, rate)
 		})
 		if err != nil {
 			return err
