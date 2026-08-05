@@ -1297,10 +1297,15 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		missingLayers++
 	}
 	close(prepareJobs)
-	// Downloading, decompressing, and writing layer contents all share the same
-	// stream. Bound that combined work so large images do not saturate host CPU,
-	// disk, or network.
-	for range min(2, missingLayers) {
+	// Ordinary layers are decompressed and indexed while they download, so keep
+	// that CPU and disk-heavy pipeline conservative. Enhanced layers remain
+	// compressed and are predominantly independent registry I/O, where four
+	// workers avoid idle gaps between layer and range requests.
+	prepareWorkers := 2
+	if options.KeepCompressedLayers {
+		prepareWorkers = 4
+	}
+	for range min(prepareWorkers, missingLayers) {
 		go func() {
 			for layerIndex := range prepareJobs {
 				layer := mani.Layers[layerIndex]

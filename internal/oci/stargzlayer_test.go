@@ -13,7 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"j5.nz/cc/client"
@@ -415,6 +418,96 @@ func TestPullEnhancedStargzImageKeepsCompressedLayerAndOpensFilesystem(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(sharedRoot, layerArchiveDirName, digestToFileName(repacked.BlobDigest), layerContentsName)); !os.IsNotExist(err) {
 		t.Fatalf("pull expanded the enhanced layer: %v", err)
+	}
+}
+
+func TestPullCompressedImageDownloadsLayersInParallel(t *testing.T) {
+	configData := []byte(`{"architecture":"amd64","config":{"User":"root"}}`)
+	configSum := sha256.Sum256(configData)
+	configDigest := fmt.Sprintf("sha256:%x", configSum)
+	layerData := make(map[string][]byte)
+	layers := make([]descriptor, 0, 4)
+	for index := range 4 {
+		data := compressedTestLayer(t, testLayerEntry{
+			header: tar.Header{Name: fmt.Sprintf("layer-%d", index), Mode: 0o644},
+			body:   deterministicTestBytes((index + 1) * 64 << 10),
+		})
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		layerData[digest] = data
+		layers = append(layers, descriptor{
+			MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+			Digest:    digest,
+			Size:      int64(len(data)),
+		})
+	}
+	manifestData, err := json.Marshal(manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		Config: descriptor{
+			MediaType: "application/vnd.oci.image.config.v1+json",
+			Digest:    configDigest,
+			Size:      int64(len(configData)),
+		},
+		Layers: layers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	timeout := time.AfterFunc(2*time.Second, func() { releaseOnce.Do(func() { close(release) }) })
+	defer timeout.Stop()
+	var active atomic.Int64
+	var maximum atomic.Int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/team/parallel/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = w.Write(manifestData)
+		case r.URL.Path == "/v2/team/parallel/blobs/"+configDigest:
+			_, _ = w.Write(configData)
+		default:
+			digest := strings.TrimPrefix(r.URL.Path, "/v2/team/parallel/blobs/")
+			data := layerData[digest]
+			if data == nil {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+				_, _ = w.Write(data)
+				return
+			}
+			current := active.Add(1)
+			defer active.Add(-1)
+			for observed := maximum.Load(); current > observed && !maximum.CompareAndSwap(observed, current); observed = maximum.Load() {
+			}
+			if current == 4 {
+				releaseOnce.Do(func() { close(release) })
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(data)
+		}
+	}))
+	defer server.Close()
+
+	store := NewStoreWithSharedCache(filepath.Join(t.TempDir(), "images"), filepath.Join(t.TempDir(), "shared"))
+	store.httpClient = server.Client()
+	source := strings.TrimPrefix(server.URL, "https://") + "/team/parallel:latest"
+	if _, err := store.Pull(t.Context(), "parallel", source, PullOptions{
+		Architecture:         "amd64",
+		KeepCompressedLayers: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := maximum.Load(); got < 4 {
+		t.Fatalf("maximum concurrent layer downloads = %d, want at least 4", got)
 	}
 }
 
