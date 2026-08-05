@@ -476,4 +476,27 @@ func TestFinalizedBinaryIndexOpensWithoutDuplicateMetadata(t *testing.T) {
 	}
 }
 
+func TestLinkOrCopyLayerContentsReusesExistingHardLink(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "cached-layer")
+	dstPath := filepath.Join(dir, "image", "layer")
+	want := []byte("compressed layer contents")
+	if err := os.WriteFile(srcPath, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkOrCopyLayerContents(srcPath, dstPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkOrCopyLayerContents(srcPath, dstPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("cached layer contents = %q, want %q", got, want)
+	}
+}
+
 var _ io.Reader = failOnRead{}

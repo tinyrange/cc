@@ -553,6 +553,18 @@ func linkOrCopyLayerContents(srcPath, dstPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
+	if dstInfo, err := os.Stat(dstPath); err == nil {
+		srcInfo, err := os.Stat(srcPath)
+		if err != nil {
+			return err
+		}
+		if os.SameFile(srcInfo, dstInfo) {
+			return nil
+		}
+		return fmt.Errorf("layer contents destination already exists: %s", dstPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.Link(srcPath, dstPath); err == nil {
 		return nil
 	}
