@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/containerd/stargz-snapshotter/estargz"
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -348,11 +349,20 @@ func TestPullEnhancedStargzImageKeepsCompressedLayerAndOpensFilesystem(t *testin
 	store := NewStoreWithSharedCache(filepath.Join(t.TempDir(), "images"), sharedRoot)
 	store.httpClient = server.Client()
 	source := strings.TrimPrefix(server.URL, "https://") + "/team/neuro:latest"
+	var reportedDownloadRate bool
 	if _, err := store.Pull(t.Context(), "neuro", source, PullOptions{
 		Architecture:         "amd64",
 		KeepCompressedLayers: true,
+		Report: func(event client.ProgressEvent) {
+			if event.Status == "downloading" && event.RateBytesPerSecond > 0 {
+				reportedDownloadRate = true
+			}
+		},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if !reportedDownloadRate {
+		t.Fatal("compressed image pull did not report a download rate")
 	}
 	image, err := store.Open("neuro")
 	if err != nil {

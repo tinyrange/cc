@@ -110,7 +110,7 @@ func TestUncachedLayerIndexesWhileItDownloads(t *testing.T) {
 			"test/image",
 			"test",
 			layer,
-			func(int64) {},
+			func(int64, float64) {},
 			func(current int64) {
 				if current > 0 && !reported {
 					reported = true

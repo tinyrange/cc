@@ -1208,6 +1208,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 	prepareStarted := time.Now()
 	downloadedByLayer := make([]int64, len(mani.Layers))
 	indexedByLayer := make([]int64, len(mani.Layers))
+	downloadRateByLayer := make([]float64, len(mani.Layers))
 	for layerIndex, layer := range mani.Layers {
 		switch {
 		case s.cachedLayerArchiveAvailable(layer) || s.cachedStargzLayerAvailable(layer):
@@ -1222,7 +1223,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			}
 		}
 	}
-	reportPipeline := func(layerIndex int, layer descriptor, downloaded, indexed *int64) {
+	reportPipeline := func(layerIndex int, layer descriptor, downloaded, indexed *int64, downloadRate *float64) {
 		pipelineMu.Lock()
 		if downloaded != nil {
 			downloadedByLayer[layerIndex] = min(layer.Size, max(0, *downloaded))
@@ -1230,10 +1231,15 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		if indexed != nil {
 			indexedByLayer[layerIndex] = min(layer.Size, max(0, *indexed))
 		}
+		if downloadRate != nil {
+			downloadRateByLayer[layerIndex] = max(0, *downloadRate)
+		}
 		var downloadedBytes, indexedBytes, indexedLayers int64
+		var rateBytesPerSecond float64
 		for index := range mani.Layers {
 			downloadedBytes += downloadedByLayer[index]
 			indexedBytes += indexedByLayer[index]
+			rateBytesPerSecond += downloadRateByLayer[index]
 			if indexedByLayer[index] >= mani.Layers[index].Size {
 				indexedLayers++
 			}
@@ -1252,17 +1258,18 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			status = "downloading"
 		}
 		report(client.ProgressEvent{
-			Status:           status,
-			Artifact:         name,
-			Blob:             layer.Digest,
-			Progress:         progress,
-			DownloadProgress: downloadProgress,
-			IndexProgress:    indexProgress,
-			BytesDownloaded:  downloadedBytes,
-			BytesTotal:       totalLayerBytes,
-			FilesDownloaded:  indexedLayers,
-			FilesTotal:       int64(len(mani.Layers)),
-			ETASeconds:       eta,
+			Status:             status,
+			Artifact:           name,
+			Blob:               layer.Digest,
+			Progress:           progress,
+			DownloadProgress:   downloadProgress,
+			IndexProgress:      indexProgress,
+			BytesDownloaded:    downloadedBytes,
+			BytesTotal:         totalLayerBytes,
+			RateBytesPerSecond: rateBytesPerSecond,
+			FilesDownloaded:    indexedLayers,
+			FilesTotal:         int64(len(mani.Layers)),
+			ETASeconds:         eta,
 		})
 	}
 	prepareCtx, cancelPrepare := context.WithCancel(ctx)
@@ -1303,11 +1310,11 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 					imageName,
 					name,
 					layer,
-					func(current int64) {
-						reportPipeline(layerIndex, layer, &current, nil)
+					func(current int64, rate float64) {
+						reportPipeline(layerIndex, layer, &current, nil, &rate)
 					},
 					func(current int64) {
-						reportPipeline(layerIndex, layer, nil, &current)
+						reportPipeline(layerIndex, layer, nil, &current, nil)
 					},
 					options.KeepCompressedLayers,
 				)
@@ -1337,7 +1344,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			return fmt.Errorf("apply layer %s: %w", layer.Digest, err)
 		}
 		complete := layer.Size
-		reportPipeline(layerIndex, layer, &complete, &complete)
+		reportPipeline(layerIndex, layer, &complete, &complete, nil)
 	}
 	report(client.ProgressEvent{
 		Status:           "processing",
@@ -2249,22 +2256,22 @@ func (s *Store) ensureLayerArchive(
 	imageName string,
 	artifact string,
 	layer descriptor,
-	reportDownload func(int64),
+	reportDownload func(int64, float64),
 	reportIndex func(int64),
 	keepCompressed bool,
 ) error {
 	if keepCompressed && s.cachedStargzLayerAvailable(layer) {
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
 		reportIndex(layer.Size)
 		return nil
 	}
 	if s.cachedLayerArchiveAvailable(layer) {
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
 		reportIndex(layer.Size)
 		return nil
 	}
 	if s.cachedLayerBlobAvailable(layer) {
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
 		if keepCompressed {
 			recognized, err := s.prepareStargzLayerFromBlob(layer)
 			if err != nil {
@@ -2278,7 +2285,9 @@ func (s *Store) ensureLayerArchive(
 		return s.prepareLayerArchiveFromBlob(layer, reportIndex)
 	}
 	if keepCompressed {
-		reconstructed, err := s.tryReconstructStargzLayer(ctx, reg, imageName, layer, reportDownload)
+		reconstructed, err := s.tryReconstructStargzLayer(ctx, reg, imageName, layer, func(current int64) {
+			reportDownload(current, 0)
+		})
 		if err != nil {
 			return err
 		}
@@ -2290,17 +2299,17 @@ func (s *Store) ensureLayerArchive(
 			if !recognized {
 				return fmt.Errorf("reconstructed layer %s is not valid eStargz", layer.Digest)
 			}
-			reportDownload(layer.Size)
+			reportDownload(layer.Size, 0)
 			reportIndex(layer.Size)
 			return nil
 		}
 		progress := newParallelBlobProgress(artifact, layer.Size, func(event client.ProgressEvent) {
-			reportDownload(event.BytesDownloaded)
+			reportDownload(event.BytesDownloaded, event.RateBytesPerSecond)
 		})
 		if err := s.cacheLayerBlob(ctx, reg, imageName, layer, progress); err != nil {
 			return err
 		}
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
 		recognized, err := s.prepareStargzLayerFromBlob(layer)
 		if err != nil {
 			return err
@@ -2327,11 +2336,11 @@ func (s *Store) ensureLayerArchive(
 	}
 	if errors.Is(partialErr, os.ErrNotExist) {
 		err := s.downloadAndPrepareLayer(ctx, reg, imageName, layer, func(current int64) {
-			reportDownload(current)
+			reportDownload(current, 0)
 			reportIndex(current)
 		})
 		if err == nil {
-			reportDownload(layer.Size)
+			reportDownload(layer.Size, 0)
 			reportIndex(layer.Size)
 			return nil
 		}
@@ -2345,12 +2354,12 @@ func (s *Store) ensureLayerArchive(
 	}
 
 	resumeProgress := newParallelBlobProgress(artifact, layer.Size, func(event client.ProgressEvent) {
-		reportDownload(event.BytesDownloaded)
+		reportDownload(event.BytesDownloaded, event.RateBytesPerSecond)
 	})
 	if err := s.cacheLayerBlob(ctx, reg, imageName, layer, resumeProgress); err != nil {
 		return err
 	}
-	reportDownload(layer.Size)
+	reportDownload(layer.Size, 0)
 	if err := s.prepareLayerArchiveFromBlob(layer, reportIndex); err != nil {
 		return err
 	}
