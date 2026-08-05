@@ -348,6 +348,16 @@ func (c *Client) CVMFSStatusContext(ctx context.Context) (CVMFSStatusResponse, e
 	return ret, err
 }
 
+func (c *Client) ProbeCVMFSMirrorsContext(ctx context.Context, req CVMFSMirrorProbeRequest) (CVMFSMirrorProbeResponse, error) {
+	var ret CVMFSMirrorProbeResponse
+	err := c.postJSONExpectOKContext(ctx, "/cvmfs/mirrors/probe", req, &ret)
+	return ret, err
+}
+
+func (c *Client) SelectCVMFSMirrorContext(ctx context.Context, req CVMFSMirrorSelectionRequest) error {
+	return c.postJSONExpectOKContext(ctx, "/cvmfs/mirrors/selection", req, nil)
+}
+
 func (c *Client) CreateWatchdogLease(req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
 	return c.CreateWatchdogLeaseContext(context.Background(), req)
 }

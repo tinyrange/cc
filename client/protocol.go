@@ -198,6 +198,29 @@ type CVMFSStatusResponse struct {
 	LastErrorUnix   int64                `json:"last_error_unix,omitempty"`
 }
 
+type CVMFSMirrorProbeRequest struct {
+	Repo string `json:"repo"`
+}
+
+type CVMFSMirrorProbeResult struct {
+	Mirror                 string  `json:"mirror"`
+	ManifestLatencyMillis  int64   `json:"manifest_latency_millis,omitempty"`
+	RootCatalogMillis      int64   `json:"root_catalog_millis,omitempty"`
+	RootCatalogBytes       int64   `json:"root_catalog_bytes,omitempty"`
+	RootCatalogBytesPerSec float64 `json:"root_catalog_bytes_per_second,omitempty"`
+	Error                  string  `json:"error,omitempty"`
+}
+
+type CVMFSMirrorProbeResponse struct {
+	SelectedMirror string                   `json:"selected_mirror"`
+	Results        []CVMFSMirrorProbeResult `json:"results"`
+}
+
+type CVMFSMirrorSelectionRequest struct {
+	Repo   string `json:"repo"`
+	Mirror string `json:"mirror"`
+}
+
 func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	payload := map[string]any{}
 	switch {

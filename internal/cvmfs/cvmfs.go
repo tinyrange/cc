@@ -140,6 +140,7 @@ type Client struct {
 	repos        map[string]*repository
 	mirrorStats  map[string]*mirrorStat
 	mirrorCursor uint64
+	preferred    string
 }
 
 func (c *Client) expandedObjectBudget() int64 {
@@ -681,9 +682,13 @@ func (c *Client) newRepository(target Target) *repository {
 }
 
 func (c *Client) candidateMirrors(primary string) []string {
+	c.mu.Lock()
+	preferred := c.preferred
+	configured := append([]string(nil), c.Mirrors...)
+	c.mu.Unlock()
 	seen := map[string]bool{}
-	candidates := make([]string, 0, len(c.Mirrors)+1)
-	for _, raw := range append([]string{primary}, c.Mirrors...) {
+	candidates := make([]string, 0, len(configured)+2)
+	for _, raw := range append([]string{preferred, primary}, configured...) {
 		mirror := normalizeMirror(raw)
 		if mirror == "" || seen[mirror] {
 			continue
@@ -697,7 +702,8 @@ func (c *Client) candidateMirrors(primary string) []string {
 	return candidates
 }
 
-func normalizeMirror(raw string) string {
+// NormalizeMirror returns the canonical CVMFS HTTP base used by the client.
+func NormalizeMirror(raw string) string {
 	raw = strings.TrimSpace(strings.TrimRight(raw, "/"))
 	if raw == "" {
 		return ""
@@ -712,6 +718,19 @@ func normalizeMirror(raw string) string {
 		u.Path = strings.TrimRight(u.Path, "/") + "/cvmfs"
 	}
 	return strings.TrimRight(u.String(), "/")
+}
+
+func normalizeMirror(raw string) string { return NormalizeMirror(raw) }
+
+// SetPreferredMirror makes a measured or user-selected mirror the first
+// choice for future repository operations while retaining failover mirrors.
+func (c *Client) SetPreferredMirror(mirror string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.preferred = normalizeMirror(mirror)
+	c.mu.Unlock()
 }
 
 func readLocalDir(dir string) ([]DirEntry, error) {
@@ -974,6 +993,19 @@ func (r *repository) orderedMirrors() []string {
 	out := make([]string, 0, len(ranked))
 	for _, item := range ranked {
 		out = append(out, item.mirror)
+	}
+	preferred := r.client.preferred
+	if preferred != "" {
+		stat := r.client.mirrorStats[preferred]
+		if stat == nil || stat.failures == 0 {
+			for index, mirror := range out {
+				if mirror == preferred {
+					copy(out[1:index+1], out[:index])
+					out[0] = preferred
+					break
+				}
+			}
+		}
 	}
 	return out
 }

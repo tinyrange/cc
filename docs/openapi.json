@@ -484,6 +484,33 @@
         }
       }
     },
+    "/cvmfs/mirrors/probe": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "Measure configured mirrors using the repository root catalog",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorProbeRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Measured mirrors and automatic selection",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorProbeResponse" } } }
+          }
+        }
+      }
+    },
+    "/cvmfs/mirrors/selection": {
+      "post": {
+        "tags": ["cvmfs"],
+        "summary": "Select the preferred mirror for a configured host mount",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CVMFSMirrorSelectionRequest" } } }
+        },
+        "responses": { "200": { "description": "Mirror selected" } }
+      }
+    },
     "/vm/supported": {
       "get": {
         "tags": ["vms"],
@@ -1153,6 +1180,39 @@
           "active_transfers": { "type": "array", "items": { "$ref": "#/components/schemas/CVMFSTransferState" } },
           "last_error": { "type": "string" },
           "last_error_unix": { "type": "integer", "format": "int64" }
+        }
+      },
+      "CVMFSMirrorProbeRequest": {
+        "type": "object",
+        "required": ["repo"],
+        "properties": { "repo": { "type": "string" } }
+      },
+      "CVMFSMirrorProbeResult": {
+        "type": "object",
+        "required": ["mirror"],
+        "properties": {
+          "mirror": { "type": "string" },
+          "manifest_latency_millis": { "type": "integer", "format": "int64" },
+          "root_catalog_millis": { "type": "integer", "format": "int64" },
+          "root_catalog_bytes": { "type": "integer", "format": "int64" },
+          "root_catalog_bytes_per_second": { "type": "number", "format": "double" },
+          "error": { "type": "string" }
+        }
+      },
+      "CVMFSMirrorProbeResponse": {
+        "type": "object",
+        "required": ["selected_mirror", "results"],
+        "properties": {
+          "selected_mirror": { "type": "string" },
+          "results": { "type": "array", "items": { "$ref": "#/components/schemas/CVMFSMirrorProbeResult" } }
+        }
+      },
+      "CVMFSMirrorSelectionRequest": {
+        "type": "object",
+        "required": ["repo", "mirror"],
+        "properties": {
+          "repo": { "type": "string" },
+          "mirror": { "type": "string" }
         }
       },
       "VMSupportedResponse": {

@@ -25,6 +25,15 @@ type cvmfsMonitor struct {
 	janitorActive bool
 }
 
+func (m *cvmfsMonitor) SetSelectedMirror(mirror string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.selected = mirror
+	m.mu.Unlock()
+}
+
 func newCVMFSMonitor(cacheRoot string, cacheLimit int64) *cvmfsMonitor {
 	m := &cvmfsMonitor{
 		cacheRoot: strings.TrimSpace(cacheRoot), cacheLimit: cacheLimit,
