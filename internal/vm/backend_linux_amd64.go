@@ -100,7 +100,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: kvmhost.RuntimeImageFS(image),
 		Shares: mounts.ConvertShareMounts(req.Shares),
-		Mounts: persistentMounts,
+		Mounts: append(persistentMounts, hostMountsFromContext(ctx)...),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -122,7 +122,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
 	initCfg.InitSystem = req.InitSystem
 	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
+	initCfg.Env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
 	initCfg.WorkDir = workDir
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
@@ -159,7 +159,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			osName:         "Linux",
 			session:        started.Session,
 			root:           image.RootFS,
-			baseEnv:        vmruntime.WithDefaultEnv(image.Config.Env),
+			baseEnv:        vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env)),
 			defaultUser:    req.DefaultUser,
 			workDir:        workDir,
 			network:        network,
@@ -201,6 +201,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Display:          req.Display,
 			SharedMemory:     req.SharedMemory,
 			KernelModules:    append([]string(nil), req.KernelModules...),
+			Env:              append([]string(nil), req.Env...),
 			MemoryMB:         req.MemoryMB,
 			BalloonMB:        req.BalloonMB,
 			CPUs:             req.CPUs,
@@ -255,6 +256,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	rootFSBackend := virtio.NewImageFS(blankLinuxRuntimeRootFS(), "")
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: rootFSBackend,
+		Mounts: hostMountsFromContext(ctx),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -265,7 +267,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
 	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(nil)
+	initCfg.Env = vmruntime.WithDefaultEnv(req.Env)
 	initCfg.WorkDir = "/"
 	if strings.TrimSpace(req.SnapshotDir) != "" {
 		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
@@ -300,7 +302,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		managedInstance: &managedInstance{
 			osName:         "Linux",
 			session:        started.Session,
-			baseEnv:        vmruntime.WithDefaultEnv(nil),
+			baseEnv:        vmruntime.WithDefaultEnv(req.Env),
 			workDir:        "/",
 			network:        network,
 			caps:           managedguest.LinuxProfile.Caps,

@@ -589,6 +589,8 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 		return vmruntime.RunRequest{}, err
 	}
 	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
+	runReq.Mounts = append(runReq.Mounts, hostMountsFromContext(ctx)...)
+	runReq.Env = append([]string(nil), req.Env...)
 	runReq.DisplayWidth = displayWidthDarwin(req.Display)
 	runReq.DisplayHeight = displayHeightDarwin(req.Display)
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
@@ -624,6 +626,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Modules:           append([]alpine.Module(nil), bundle.Modules...),
 			Image:             sidecarBundleImage(bundle),
 			InitSystem:        req.InitSystem,
+			Env:               append([]string(nil), req.Env...),
 			RootFS:            rootFS,
 			Shares:            shares,
 			MemoryMB:          req.MemoryMB,
@@ -712,9 +715,10 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Modules:           modules,
 		Image:             image,
 		InitSystem:        req.InitSystem,
+		Env:               append([]string(nil), req.Env...),
 		RootFS:            rootFS,
 		Shares:            shares,
-		Mounts:            persistentMounts,
+		Mounts:            append(persistentMounts, hostMountsFromContext(ctx)...),
 		MemoryMB:          req.MemoryMB,
 		BalloonMB:         req.BalloonMB,
 		CPUs:              req.CPUs,
@@ -772,9 +776,10 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 	return vmruntime.RunRequest{
 		Image:           image,
 		InitSystem:      req.InitSystem,
+		Env:             append([]string(nil), req.Env...),
 		RootFS:          rootFS,
 		Shares:          shares,
-		Mounts:          persistentMounts,
+		Mounts:          append(persistentMounts, hostMountsFromContext(ctx)...),
 		MemoryMB:        req.MemoryMB,
 		BalloonMB:       req.BalloonMB,
 		CPUs:            req.CPUs,

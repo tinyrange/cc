@@ -338,6 +338,16 @@ func (c *Client) CapabilitiesContext(ctx context.Context) (CapabilitiesResponse,
 	return ret, err
 }
 
+func (c *Client) CVMFSStatus() (CVMFSStatusResponse, error) {
+	return c.CVMFSStatusContext(context.Background())
+}
+
+func (c *Client) CVMFSStatusContext(ctx context.Context) (CVMFSStatusResponse, error) {
+	var ret CVMFSStatusResponse
+	err := c.getJSONContext(ctx, "/cvmfs/status", &ret)
+	return ret, err
+}
+
 func (c *Client) CreateWatchdogLease(req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
 	return c.CreateWatchdogLeaseContext(context.Background(), req)
 }

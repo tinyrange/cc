@@ -83,6 +83,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		Image:  image,
 		Shares: mounts.ConvertShareMounts(req.Shares),
+		Mounts: hostMountsFromContext(ctx),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -112,7 +113,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			return nil, err
 		}
 		return &windowsInstance{
-			managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
+			managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env)), workDir),
 			image:               image,
 			rootFS:              rootFS,
 			fsdevs:              fsdevs,
@@ -138,7 +139,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}
 	initCfg := windowsGuestInitConfig(modules, true, req.InitSystem)
 	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
+	initCfg.Env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
 	initCfg.WorkDir = workDir
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
@@ -172,7 +173,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	return &windowsInstance{
-		managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(image.Config.Env), workDir),
+		managedInstanceCore: newWindowsManagedCore(started.Session, image, vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env)), workDir),
 		image:               image,
 		rootFS:              rootFS,
 		fsdevs:              fsdevs,
@@ -206,6 +207,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			Network:         req.Network,
 			Display:         req.Display,
 			KernelModules:   append([]string(nil), req.KernelModules...),
+			Env:             append([]string(nil), req.Env...),
 			MemoryMB:        req.MemoryMB,
 			BalloonMB:       req.BalloonMB,
 			CPUs:            req.CPUs,
@@ -230,6 +232,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	rootFSBackend := virtio.NewImageFS(blankWindowsRuntimeRootFS(), "")
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: rootFSBackend,
+		Mounts: hostMountsFromContext(ctx),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -256,7 +259,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			return nil, err
 		}
 		return &windowsInstance{
-			managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(nil), "/"),
+			managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(req.Env), "/"),
 			rootFS:              rootFS,
 			fsdevs:              fsdevs,
 			network:             network,
@@ -280,7 +283,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	initCfg := windowsGuestInitConfig(modules, true, req.InitSystem)
 	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(nil)
+	initCfg.Env = vmruntime.WithDefaultEnv(req.Env)
 	initCfg.WorkDir = "/"
 	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	if strings.TrimSpace(req.SnapshotDir) != "" {
@@ -314,7 +317,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		return nil, err
 	}
 	return &windowsInstance{
-		managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(nil), "/"),
+		managedInstanceCore: newWindowsManagedCore(started.Session, nil, vmruntime.WithDefaultEnv(req.Env), "/"),
 		rootFS:              rootFS,
 		fsdevs:              fsdevs,
 		network:             network,
