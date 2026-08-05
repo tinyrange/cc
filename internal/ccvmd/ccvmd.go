@@ -1597,6 +1597,15 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if req.ActivateFrom != "" {
+			state, err := srvState.images.ActivateStaged(imageName, req.ActivateFrom)
+			if err != nil {
+				writeError(w, http.StatusConflict, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, state)
+			return
+		}
 		source, err := req.SourceString()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -1614,11 +1623,12 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			go func() {
 				defer close(events)
 				_, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
-					Architecture:    req.Architecture,
-					Prefetch:        req.Prefetch,
-					PrefetchWorkers: req.PrefetchWorkers,
-					CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
-					Refresh:         req.Refresh,
+					Architecture:         req.Architecture,
+					Prefetch:             req.Prefetch,
+					PrefetchWorkers:      req.PrefetchWorkers,
+					CVMFSMirrors:         cvmfsSourceMirrors(req.SourceRef),
+					Refresh:              req.Refresh,
+					KeepCompressedLayers: req.KeepCompressed,
 					Report: func(event client.ProgressEvent) {
 						if event.Artifact == "" {
 							event.Artifact = imageName
@@ -1647,11 +1657,12 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		state, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
-			Architecture:    req.Architecture,
-			Prefetch:        req.Prefetch,
-			PrefetchWorkers: req.PrefetchWorkers,
-			CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
-			Refresh:         req.Refresh,
+			Architecture:         req.Architecture,
+			Prefetch:             req.Prefetch,
+			PrefetchWorkers:      req.PrefetchWorkers,
+			CVMFSMirrors:         cvmfsSourceMirrors(req.SourceRef),
+			Refresh:              req.Refresh,
+			KeepCompressedLayers: req.KeepCompressed,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)

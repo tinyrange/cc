@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/stargz-snapshotter/estargz"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/download"
 	"j5.nz/cc/internal/fsmeta"
@@ -76,6 +78,8 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 	root := newIndexedDir(fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
 	byPath := map[string]*indexedDir{"/": root}
 	tarPaths := make(map[string]string)
+	stargzReaders := make(map[string]*estargz.Reader)
+	stargzCache := newStargzBlockCache(64 << 20)
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Path < nodes[j].Path })
 	for _, node := range nodes {
 		if node.Path == "/" {
@@ -102,7 +106,7 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile(baseDir, "", node, modTime, nil, tarPaths)
+			file, err := buildIndexedFile(baseDir, "", node, modTime, nil, tarPaths, stargzReaders, stargzCache)
 			if err != nil {
 				return nil, err
 			}
@@ -157,7 +161,7 @@ func buildCVMFSIndexedRootFS(client *intcvmfs.Client, packedPath string, nodes [
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile("", packedPath, node, modTime, client, nil)
+			file, err := buildIndexedFile("", packedPath, node, modTime, client, nil, nil, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -197,7 +201,7 @@ func attachIndexedNamespace(namespace *imagefs.Namespace) {
 	}
 }
 
-func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client, tarPaths map[string]string) (imagefs.File, error) {
+func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client, tarPaths map[string]string, stargzReaders map[string]*estargz.Reader, stargzCache *stargzBlockCache) (imagefs.File, error) {
 	if node.Packed {
 		if packedPath == "" {
 			return nil, fmt.Errorf("packed path is required for %q", node.Path)
@@ -226,6 +230,37 @@ func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTi
 			modTime: modTime,
 			target:  node.CVMFSTarget,
 			client:  cvmfsClient,
+		}, nil
+	}
+	if strings.HasPrefix(node.TarPath, stargzContentsPrefix) {
+		if stargzReaders == nil {
+			return nil, fmt.Errorf("eStargz reader cache is required for %q", node.Path)
+		}
+		rel := strings.TrimPrefix(node.TarPath, stargzContentsPrefix)
+		blobPath := filepath.Join(baseDir, rel)
+		reader := stargzReaders[blobPath]
+		if reader == nil {
+			var err error
+			reader, err = openStargzReader(blobPath)
+			if err != nil {
+				return nil, fmt.Errorf("open eStargz layer for %q: %w", node.Path, err)
+			}
+			stargzReaders[blobPath] = reader
+		}
+		contents, err := reader.OpenFile(node.Path)
+		if err != nil {
+			return nil, fmt.Errorf("open %q in eStargz layer: %w", node.Path, err)
+		}
+		return &indexedStargzFile{
+			mode:     imagefsMode(node.Mode, 0o644),
+			uid:      node.UID,
+			gid:      node.GID,
+			rdev:     node.RDev,
+			size:     node.Size,
+			modTime:  modTime,
+			contents: contents,
+			cache:    stargzCache,
+			cacheKey: blobPath + "\x00" + node.Path,
 		}, nil
 	}
 	tarPath := filepath.Join(baseDir, node.TarPath)
@@ -350,6 +385,78 @@ type indexedPackedFile struct {
 	offset       uint64
 }
 
+type indexedStargzFile struct {
+	mode     fs.FileMode
+	uid      uint32
+	gid      uint32
+	rdev     uint32
+	size     uint64
+	modTime  time.Time
+	contents *io.SectionReader
+	cache    *stargzBlockCache
+	cacheKey string
+}
+
+const stargzReadBlockSize = uint64(256 << 10)
+
+type stargzCacheEntry struct {
+	key  string
+	data []byte
+}
+
+// stargzBlockCache prevents the VM's page-sized reads from repeatedly
+// inflating the same compressed chunk. It is shared by all layers in one open
+// image and bounded independently of the image's uncompressed size.
+type stargzBlockCache struct {
+	mu       sync.Mutex
+	maximum  int
+	used     int
+	entries  map[string]*list.Element
+	recently *list.List
+}
+
+func newStargzBlockCache(maximum int) *stargzBlockCache {
+	return &stargzBlockCache{maximum: maximum, entries: make(map[string]*list.Element), recently: list.New()}
+}
+
+func (c *stargzBlockCache) get(key string) []byte {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	element := c.entries[key]
+	if element == nil {
+		return nil
+	}
+	c.recently.MoveToFront(element)
+	return element.Value.(stargzCacheEntry).data
+}
+
+func (c *stargzBlockCache) put(key string, data []byte) []byte {
+	if c == nil || len(data) > c.maximum {
+		return data
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element := c.entries[key]; element != nil {
+		c.recently.MoveToFront(element)
+		return element.Value.(stargzCacheEntry).data
+	}
+	owned := append([]byte(nil), data...)
+	element := c.recently.PushFront(stargzCacheEntry{key: key, data: owned})
+	c.entries[key] = element
+	c.used += len(owned)
+	for c.used > c.maximum {
+		oldest := c.recently.Back()
+		entry := oldest.Value.(stargzCacheEntry)
+		delete(c.entries, entry.key)
+		c.used -= len(entry.data)
+		c.recently.Remove(oldest)
+	}
+	return owned
+}
+
 type indexedCVMFSFile struct {
 	mode    fs.FileMode
 	uid     uint32
@@ -429,6 +536,74 @@ func (f *indexedPackedFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	}
 	return buf[:n], nil
 }
+
+func (f *indexedStargzFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
+func (f *indexedStargzFile) ModTime() time.Time          { return f.modTime }
+func (f *indexedStargzFile) Owner() (uint32, uint32)     { return f.uid, f.gid }
+func (f *indexedStargzFile) RDev() uint32                { return f.rdev }
+func (f *indexedStargzFile) OpenReader() (io.ReaderAt, io.Closer, error) {
+	return indexedStargzReaderAt{file: f}, noOpCloser{}, nil
+}
+func (f *indexedStargzFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	if off >= f.size || size == 0 {
+		return nil, nil
+	}
+	remaining := min(f.size-off, uint64(size))
+	buf := make([]byte, remaining)
+	n, err := f.readAt(buf, int64(off))
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+type indexedStargzReaderAt struct{ file *indexedStargzFile }
+
+func (r indexedStargzReaderAt) ReadAt(buf []byte, offset int64) (int, error) {
+	return r.file.readAt(buf, offset)
+}
+
+func (f *indexedStargzFile) readAt(buf []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative eStargz read offset")
+	}
+	if offset >= int64(f.size) {
+		return 0, io.EOF
+	}
+	requested := len(buf)
+	buf = buf[:min(uint64(len(buf)), f.size-uint64(offset))]
+	total := 0
+	for len(buf) > 0 {
+		blockOffset := uint64(offset) / stargzReadBlockSize * stargzReadBlockSize
+		key := fmt.Sprintf("%s\x00%d", f.cacheKey, blockOffset)
+		block := f.cache.get(key)
+		if block == nil {
+			blockLength := min(stargzReadBlockSize, f.size-blockOffset)
+			block = make([]byte, blockLength)
+			n, err := f.contents.ReadAt(block, int64(blockOffset))
+			if err != nil && err != io.EOF {
+				return total, err
+			}
+			block = f.cache.put(key, block[:n])
+		}
+		within := uint64(offset) - blockOffset
+		if within >= uint64(len(block)) {
+			return total, io.ErrUnexpectedEOF
+		}
+		n := copy(buf, block[within:])
+		total += n
+		offset += int64(n)
+		buf = buf[n:]
+	}
+	if total < requested {
+		return total, io.EOF
+	}
+	return total, nil
+}
+
+type noOpCloser struct{}
+
+func (noOpCloser) Close() error { return nil }
 
 type offsetReaderAt struct {
 	reader io.ReaderAt

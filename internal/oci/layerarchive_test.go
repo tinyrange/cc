@@ -117,6 +117,7 @@ func TestUncachedLayerIndexesWhileItDownloads(t *testing.T) {
 					close(indexStarted)
 				}
 			},
+			false,
 		)
 	}()
 

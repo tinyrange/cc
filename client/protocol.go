@@ -128,6 +128,8 @@ type PullImageRequest struct {
 	Prefetch        bool         `json:"prefetch,omitempty"`
 	PrefetchWorkers int          `json:"prefetch_workers,omitempty"`
 	Refresh         bool         `json:"refresh,omitempty"`
+	KeepCompressed  bool         `json:"keep_compressed,omitempty"`
+	ActivateFrom    string       `json:"activate_from,omitempty"`
 }
 
 type ImageSource struct {
@@ -200,6 +202,12 @@ func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	if r.Refresh {
 		payload["refresh"] = true
 	}
+	if r.KeepCompressed {
+		payload["keep_compressed"] = true
+	}
+	if r.ActivateFrom != "" {
+		payload["activate_from"] = r.ActivateFrom
+	}
 	return json.Marshal(payload)
 }
 
@@ -211,6 +219,8 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 		Prefetch        bool            `json:"prefetch,omitempty"`
 		PrefetchWorkers int             `json:"prefetch_workers,omitempty"`
 		Refresh         bool            `json:"refresh,omitempty"`
+		KeepCompressed  bool            `json:"keep_compressed,omitempty"`
+		ActivateFrom    string          `json:"activate_from,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -222,6 +232,8 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	r.Prefetch = raw.Prefetch
 	r.PrefetchWorkers = raw.PrefetchWorkers
 	r.Refresh = raw.Refresh
+	r.KeepCompressed = raw.KeepCompressed
+	r.ActivateFrom = raw.ActivateFrom
 	if len(raw.Source) == 0 || string(raw.Source) == "null" {
 		return nil
 	}

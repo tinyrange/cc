@@ -276,6 +276,10 @@ func (c *Client) PullImageStreamContext(ctx context.Context, name string, req Pu
 	return c.postJSONProgressStreamContext(ctx, "/image/"+imagePathName(name), req, onEvent, progressStatusDownloaded)
 }
 
+func (c *Client) ActivateStagedImageContext(ctx context.Context, name, stagedName string) error {
+	return c.postJSONExpectOKContext(ctx, "/image/"+imagePathName(name), PullImageRequest{ActivateFrom: stagedName}, nil)
+}
+
 func (c *Client) DeleteImage(name string) error {
 	return c.DeleteImageContext(context.Background(), name)
 }
