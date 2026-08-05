@@ -102,6 +102,52 @@ func TestStoreSharedCacheCanBeKeptInsidePortableRoot(t *testing.T) {
 	}
 }
 
+func TestActivateStagedImageReplacesActiveOnlyAfterStageIsComplete(t *testing.T) {
+	store := NewStore(t.TempDir())
+	for _, item := range []struct {
+		name     string
+		resolved string
+		marker   string
+	}{
+		{name: "active", resolved: "example/image@sha256:old", marker: "old"},
+		{name: "active-staged", resolved: "example/image@sha256:new", marker: "new"},
+	} {
+		dir := store.imageDir(item.name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "marker"), []byte(item.marker), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.writeMetadata(item.name, metadata{
+			Name:           item.name,
+			Source:         "example/image:latest",
+			ResolvedSource: item.resolved,
+			SourceKind:     SourceKindOCI,
+			RootFSDir:      dir,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := store.ActivateStaged("active", "active-staged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ResolvedSource != "example/image@sha256:new" {
+		t.Fatalf("activated source = %q", state.ResolvedSource)
+	}
+	marker, err := os.ReadFile(filepath.Join(store.imageDir("active"), "marker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(marker) != "new" {
+		t.Fatalf("active marker = %q", marker)
+	}
+	if _, err := os.Stat(store.imageDir("active-staged")); !os.IsNotExist(err) {
+		t.Fatalf("staged image remains after activation: %v", err)
+	}
+}
+
 func TestAggregateLayerProgressReportsWholeImageBytes(t *testing.T) {
 	var events []client.ProgressEvent
 	reader := newAggregateDownloadProgressReader(
@@ -166,6 +212,9 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(shared, "_blobs", digestToFileName(firstDigest)), make([]byte, 100), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(shared, "_blobs", digestToFileName(secondDigest))+".partial", make([]byte, 50), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	store := NewStore(filepath.Join(t.TempDir(), "store"))
 	store.httpClient = server.Client()
 	source := strings.TrimPrefix(server.URL, "https://") + "/team/squad:edge"
@@ -173,7 +222,7 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Available || plan.BytesTotal != 350 || plan.BytesCached != 100 || plan.BytesToDownload != 250 {
+	if plan.Available || plan.BytesTotal != 350 || plan.BytesCached != 150 || plan.BytesToDownload != 200 {
 		t.Fatalf("pull plan = %+v", plan)
 	}
 	if plan.LayersTotal != 2 || plan.LayersCached != 1 {
@@ -198,7 +247,7 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !update.Installed || update.Available || update.BytesToDownload != 250 {
+	if !update.Installed || update.Available || update.BytesToDownload != 200 {
 		t.Fatalf("update plan = %+v", update)
 	}
 

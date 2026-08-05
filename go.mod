@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/containerd/stargz-snapshotter/estargz v0.18.2
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/klauspost/compress v1.18.6
 	github.com/ulikunitz/xz v0.5.15
@@ -22,6 +23,9 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/oasdiff/yaml v0.1.0 // indirect
 	github.com/oasdiff/yaml3 v0.0.13 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
+	github.com/vbatts/tar-split v0.12.2 // indirect
+	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 )
