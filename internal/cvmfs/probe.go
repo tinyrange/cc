@@ -120,21 +120,33 @@ func probeRootCatalog(ctx context.Context, httpClient *http.Client, repo string,
 	if result == nil || len(result.rootHash) < 3 {
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	defer cancel()
-	started := time.Now()
-	url := fmt.Sprintf("%s/%s/data/%s/%sC?cvmfs_probe=%d", result.Mirror, repo, result.rootHash[:2], result.rootHash[2:], started.UnixNano())
-	body, err := probeDownload(probeCtx, httpClient, url, catalogProbeLimit)
-	result.RootCatalogDuration = time.Since(started)
-	if err != nil {
-		result.Error = err.Error()
-		return
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		started := time.Now()
+		url := fmt.Sprintf("%s/%s/data/%s/%sC?cvmfs_probe=%d-%d", result.Mirror, repo, result.rootHash[:2], result.rootHash[2:], started.UnixNano(), attempt)
+		body, err := probeDownload(probeCtx, httpClient, url, catalogProbeLimit)
+		duration := time.Since(started)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		bytes := int64(len(body))
+		rate := float64(0)
+		if seconds := duration.Seconds(); seconds > 0 && bytes > 0 {
+			rate = float64(bytes) / seconds
+		}
+		if rate > result.RootCatalogBytesPerSec {
+			result.RootCatalogDuration = duration
+			result.RootCatalogBytes = bytes
+			result.RootCatalogBytesPerSec = rate
+		}
 	}
-	result.Error = ""
-	result.RootCatalogBytes = int64(len(body))
-	seconds := result.RootCatalogDuration.Seconds()
-	if seconds > 0 && result.RootCatalogBytes > 0 {
-		result.RootCatalogBytesPerSec = float64(result.RootCatalogBytes) / seconds
+	if result.RootCatalogBytesPerSec > 0 {
+		result.Error = ""
+	} else if lastErr != nil {
+		result.Error = lastErr.Error()
 	}
 }
 
