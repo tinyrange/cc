@@ -110,13 +110,14 @@ func TestUncachedLayerIndexesWhileItDownloads(t *testing.T) {
 			"test/image",
 			"test",
 			layer,
-			func(int64) {},
+			func(int64, float64) {},
 			func(current int64) {
 				if current > 0 && !reported {
 					reported = true
 					close(indexStarted)
 				}
 			},
+			false,
 		)
 	}()
 
@@ -472,6 +473,29 @@ func TestFinalizedBinaryIndexOpensWithoutDuplicateMetadata(t *testing.T) {
 	}
 	if !bytes.Equal(clonedBody, body) {
 		t.Fatalf("cloned contents = %q, want %q", clonedBody, body)
+	}
+}
+
+func TestLinkOrCopyLayerContentsReusesExistingHardLink(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "cached-layer")
+	dstPath := filepath.Join(dir, "image", "layer")
+	want := []byte("compressed layer contents")
+	if err := os.WriteFile(srcPath, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkOrCopyLayerContents(srcPath, dstPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkOrCopyLayerContents(srcPath, dstPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("cached layer contents = %q, want %q", got, want)
 	}
 }
 

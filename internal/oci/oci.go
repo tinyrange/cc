@@ -115,12 +115,13 @@ type SourceSpec struct {
 }
 
 type PullOptions struct {
-	Architecture    string
-	Prefetch        bool
-	PrefetchWorkers int
-	CVMFSMirrors    []string
-	Report          func(client.ProgressEvent)
-	Refresh         bool
+	Architecture         string
+	Prefetch             bool
+	PrefetchWorkers      int
+	CVMFSMirrors         []string
+	Report               func(client.ProgressEvent)
+	Refresh              bool
+	KeepCompressedLayers bool
 }
 
 type SaveOptions struct {
@@ -559,6 +560,43 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	return state, nil
 }
 
+// ActivateStaged replaces a named image with an already prepared image in the
+// same store. Store readers see either the old or new image because activation
+// is serialized by the store lock. Callers must ensure no running VM still
+// uses name.
+func (s *Store) ActivateStaged(name, stagedName string) (client.ImageState, error) {
+	if name == "" || stagedName == "" || name == stagedName {
+		return client.ImageState{}, fmt.Errorf("distinct active and staged image names are required")
+	}
+	stagedMeta, err := s.readMetadata(stagedName)
+	if err != nil {
+		return client.ImageState{}, fmt.Errorf("read staged image: %w", err)
+	}
+	spec := SourceSpec{Kind: stagedMeta.SourceKind, Raw: stagedMeta.Source}
+	if spec.Kind == "" || spec.Raw == "" {
+		return client.ImageState{}, fmt.Errorf("staged image metadata is incomplete")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.downloading[name] || s.downloading[stagedName] {
+		return client.ImageState{}, fmt.Errorf("image preparation is still in progress")
+	}
+	delete(s.opened, name)
+	if err := s.cloneFromStore(s, stagedName, name, spec); err != nil {
+		return client.ImageState{}, err
+	}
+	state, err := s.getLocked(name)
+	if err != nil {
+		return client.ImageState{}, err
+	}
+	// The stage is no longer addressable through a client while the store is
+	// locked. Removing it directly avoids recursively taking s.mu.
+	delete(s.opened, stagedName)
+	delete(s.lastErr, stagedName)
+	_ = os.RemoveAll(s.imageDir(stagedName))
+	return state, nil
+}
+
 func (s *Store) PlanPull(ctx context.Context, name, source string, options ...PullOptions) (client.ImagePullPlan, error) {
 	if name == "" {
 		return client.ImagePullPlan{}, fmt.Errorf("image name is required")
@@ -627,12 +665,17 @@ func (s *Store) PlanPull(ctx context.Context, name, source string, options ...Pu
 		plan.LayersTotal++
 		plan.BytesTotal += layer.Size
 		blobPath := filepath.Join(shared.root, "_blobs", digestToFileName(layer.Digest))
-		if shared.cachedLayerArchiveAvailable(layer) {
+		if shared.cachedLayerArchiveAvailable(layer) || shared.cachedStargzLayerAvailable(layer) {
 			plan.LayersCached++
 			plan.BytesCached += layer.Size
 		} else if info, statErr := os.Stat(blobPath); statErr == nil && info.Mode().IsRegular() && info.Size() == layer.Size {
 			plan.LayersCached++
 			plan.BytesCached += layer.Size
+		} else if info, statErr := os.Stat(blobPath + ".partial"); statErr == nil && info.Mode().IsRegular() {
+			// A normal partial blob is a verified prefix that cacheLayerBlob will
+			// resume. Delta partials are intentionally excluded because they are
+			// sparse, target-sized assembly files rather than downloaded prefixes.
+			plan.BytesCached += min(layer.Size, max(int64(0), info.Size()))
 		}
 	}
 	plan.BytesToDownload = max(0, plan.BytesTotal-plan.BytesCached)
@@ -1170,9 +1213,10 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 	prepareStarted := time.Now()
 	downloadedByLayer := make([]int64, len(mani.Layers))
 	indexedByLayer := make([]int64, len(mani.Layers))
+	downloadRateByLayer := make([]float64, len(mani.Layers))
 	for layerIndex, layer := range mani.Layers {
 		switch {
-		case s.cachedLayerArchiveAvailable(layer):
+		case s.cachedLayerArchiveAvailable(layer) || s.cachedStargzLayerAvailable(layer):
 			downloadedByLayer[layerIndex] = layer.Size
 			indexedByLayer[layerIndex] = layer.Size
 		case s.cachedLayerBlobAvailable(layer):
@@ -1184,7 +1228,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			}
 		}
 	}
-	reportPipeline := func(layerIndex int, layer descriptor, downloaded, indexed *int64) {
+	reportPipeline := func(layerIndex int, layer descriptor, downloaded, indexed *int64, downloadRate *float64) {
 		pipelineMu.Lock()
 		if downloaded != nil {
 			downloadedByLayer[layerIndex] = min(layer.Size, max(0, *downloaded))
@@ -1192,10 +1236,15 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		if indexed != nil {
 			indexedByLayer[layerIndex] = min(layer.Size, max(0, *indexed))
 		}
+		if downloadRate != nil {
+			downloadRateByLayer[layerIndex] = max(0, *downloadRate)
+		}
 		var downloadedBytes, indexedBytes, indexedLayers int64
+		var rateBytesPerSecond float64
 		for index := range mani.Layers {
 			downloadedBytes += downloadedByLayer[index]
 			indexedBytes += indexedByLayer[index]
+			rateBytesPerSecond += downloadRateByLayer[index]
 			if indexedByLayer[index] >= mani.Layers[index].Size {
 				indexedLayers++
 			}
@@ -1214,17 +1263,18 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			status = "downloading"
 		}
 		report(client.ProgressEvent{
-			Status:           status,
-			Artifact:         name,
-			Blob:             layer.Digest,
-			Progress:         progress,
-			DownloadProgress: downloadProgress,
-			IndexProgress:    indexProgress,
-			BytesDownloaded:  downloadedBytes,
-			BytesTotal:       totalLayerBytes,
-			FilesDownloaded:  indexedLayers,
-			FilesTotal:       int64(len(mani.Layers)),
-			ETASeconds:       eta,
+			Status:             status,
+			Artifact:           name,
+			Blob:               layer.Digest,
+			Progress:           progress,
+			DownloadProgress:   downloadProgress,
+			IndexProgress:      indexProgress,
+			BytesDownloaded:    downloadedBytes,
+			BytesTotal:         totalLayerBytes,
+			RateBytesPerSecond: rateBytesPerSecond,
+			FilesDownloaded:    indexedLayers,
+			FilesTotal:         int64(len(mani.Layers)),
+			ETASeconds:         eta,
 		})
 	}
 	prepareCtx, cancelPrepare := context.WithCancel(ctx)
@@ -1238,7 +1288,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 	prepareJobs := make(chan int, len(mani.Layers))
 	missingLayers := 0
 	for layerIndex, layer := range mani.Layers {
-		if s.cachedLayerArchiveAvailable(layer) {
+		if s.cachedLayerArchiveAvailable(layer) || s.cachedStargzLayerAvailable(layer) {
 			continue
 		}
 		if existing := resultsByDigest[layer.Digest]; existing != nil {
@@ -1252,10 +1302,15 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		missingLayers++
 	}
 	close(prepareJobs)
-	// Downloading, decompressing, and writing layer contents all share the same
-	// stream. Bound that combined work so large images do not saturate host CPU,
-	// disk, or network.
-	for range min(2, missingLayers) {
+	// Ordinary layers are decompressed and indexed while they download, so keep
+	// that CPU and disk-heavy pipeline conservative. Enhanced layers remain
+	// compressed and are predominantly independent registry I/O, where four
+	// workers avoid idle gaps between layer and range requests.
+	prepareWorkers := 2
+	if options.KeepCompressedLayers {
+		prepareWorkers = 4
+	}
+	for range min(prepareWorkers, missingLayers) {
 		go func() {
 			for layerIndex := range prepareJobs {
 				layer := mani.Layers[layerIndex]
@@ -1265,12 +1320,13 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 					imageName,
 					name,
 					layer,
-					func(current int64) {
-						reportPipeline(layerIndex, layer, &current, nil)
+					func(current int64, rate float64) {
+						reportPipeline(layerIndex, layer, &current, nil, &rate)
 					},
 					func(current int64) {
-						reportPipeline(layerIndex, layer, nil, &current)
+						reportPipeline(layerIndex, layer, nil, &current, nil)
 					},
+					options.KeepCompressedLayers,
 				)
 				result := prepareResults[layerIndex]
 				result.err = err
@@ -1280,8 +1336,6 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 	}
 
 	for layerIndex, layer := range mani.Layers {
-		layerContentsRel := filepath.Join("layers", digestToFileName(layer.Digest)+".contents")
-		layerContentsPath := filepath.Join(tmpDir, layerContentsRel)
 		if result := prepareResults[layerIndex]; result != nil {
 			<-result.done
 			if err := result.err; err != nil {
@@ -1289,12 +1343,18 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 				return fmt.Errorf("prepare layer %s: %w", layer.Digest, err)
 			}
 		}
+		layerSuffix := ".contents"
+		if s.cachedStargzLayerAvailable(layer) {
+			layerSuffix = ".stargz"
+		}
+		layerContentsRel := filepath.Join("layers", digestToFileName(layer.Digest)+layerSuffix)
+		layerContentsPath := filepath.Join(tmpDir, layerContentsRel)
 		if err := s.writeAndApplyCachedLayer(layer, layerContentsPath, layerContentsRel, build.merged, build.fsEntries, nil); err != nil {
 			cancelPrepare()
 			return fmt.Errorf("apply layer %s: %w", layer.Digest, err)
 		}
 		complete := layer.Size
-		reportPipeline(layerIndex, layer, &complete, &complete)
+		reportPipeline(layerIndex, layer, &complete, &complete, nil)
 	}
 	report(client.ProgressEvent{
 		Status:           "processing",
@@ -1503,11 +1563,30 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceS
 	if err := os.WriteFile(filepath.Join(tmpDir, "image.json"), buf, 0o644); err != nil {
 		return fmt.Errorf("write image metadata: %w", err)
 	}
-	if err := os.RemoveAll(dstDir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove old image dir: %w", err)
+	return replaceImageDir(tmpDir, dstDir)
+}
+
+// replaceImageDir keeps the previous complete directory available for
+// rollback until the prepared directory has been installed.
+func replaceImageDir(tmpDir, dstDir string) error {
+	previousDir := dstDir + ".previous"
+	if err := os.RemoveAll(previousDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove previous image backup: %w", err)
+	}
+	hadPrevious := false
+	if err := os.Rename(dstDir, previousDir); err == nil {
+		hadPrevious = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("preserve old image dir: %w", err)
 	}
 	if err := os.Rename(tmpDir, dstDir); err != nil {
+		if hadPrevious {
+			_ = os.Rename(previousDir, dstDir)
+		}
 		return fmt.Errorf("activate image dir: %w", err)
+	}
+	if hadPrevious {
+		_ = os.RemoveAll(previousDir)
 	}
 	return nil
 }
@@ -2187,17 +2266,73 @@ func (s *Store) ensureLayerArchive(
 	imageName string,
 	artifact string,
 	layer descriptor,
-	reportDownload func(int64),
+	reportDownload func(int64, float64),
 	reportIndex func(int64),
+	keepCompressed bool,
 ) error {
+	if keepCompressed && s.cachedStargzLayerAvailable(layer) {
+		reportDownload(layer.Size, 0)
+		reportIndex(layer.Size)
+		return nil
+	}
 	if s.cachedLayerArchiveAvailable(layer) {
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
 		reportIndex(layer.Size)
 		return nil
 	}
 	if s.cachedLayerBlobAvailable(layer) {
-		reportDownload(layer.Size)
+		reportDownload(layer.Size, 0)
+		if keepCompressed {
+			recognized, err := s.prepareStargzLayerFromBlob(layer)
+			if err != nil {
+				return err
+			}
+			if recognized {
+				reportIndex(layer.Size)
+				return nil
+			}
+		}
 		return s.prepareLayerArchiveFromBlob(layer, reportIndex)
+	}
+	if keepCompressed {
+		reconstructed, err := s.tryReconstructStargzLayer(ctx, reg, imageName, layer, func(current int64, rate float64) {
+			reportDownload(current, rate)
+		})
+		if err != nil {
+			return err
+		}
+		if reconstructed {
+			recognized, err := s.prepareStargzLayerFromBlob(layer)
+			if err != nil {
+				return err
+			}
+			if !recognized {
+				return fmt.Errorf("reconstructed layer %s is not valid eStargz", layer.Digest)
+			}
+			reportDownload(layer.Size, 0)
+			reportIndex(layer.Size)
+			return nil
+		}
+		progress := newParallelBlobProgress(artifact, layer.Size, func(event client.ProgressEvent) {
+			reportDownload(event.BytesDownloaded, event.RateBytesPerSecond)
+		})
+		if err := s.cacheLayerBlob(ctx, reg, imageName, layer, progress); err != nil {
+			return err
+		}
+		reportDownload(layer.Size, 0)
+		recognized, err := s.prepareStargzLayerFromBlob(layer)
+		if err != nil {
+			return err
+		}
+		if recognized {
+			reportIndex(layer.Size)
+			return nil
+		}
+		if err := s.prepareLayerArchiveFromBlob(layer, reportIndex); err != nil {
+			return err
+		}
+		reportIndex(layer.Size)
+		return nil
 	}
 
 	partialPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest)) + ".partial"
@@ -2211,11 +2346,11 @@ func (s *Store) ensureLayerArchive(
 	}
 	if errors.Is(partialErr, os.ErrNotExist) {
 		err := s.downloadAndPrepareLayer(ctx, reg, imageName, layer, func(current int64) {
-			reportDownload(current)
+			reportDownload(current, 0)
 			reportIndex(current)
 		})
 		if err == nil {
-			reportDownload(layer.Size)
+			reportDownload(layer.Size, 0)
 			reportIndex(layer.Size)
 			return nil
 		}
@@ -2229,12 +2364,12 @@ func (s *Store) ensureLayerArchive(
 	}
 
 	resumeProgress := newParallelBlobProgress(artifact, layer.Size, func(event client.ProgressEvent) {
-		reportDownload(event.BytesDownloaded)
+		reportDownload(event.BytesDownloaded, event.RateBytesPerSecond)
 	})
 	if err := s.cacheLayerBlob(ctx, reg, imageName, layer, resumeProgress); err != nil {
 		return err
 	}
-	reportDownload(layer.Size)
+	reportDownload(layer.Size, 0)
 	if err := s.prepareLayerArchiveFromBlob(layer, reportIndex); err != nil {
 		return err
 	}
@@ -2249,6 +2384,13 @@ func (s *Store) writeAndApplyCachedLayer(
 	entries map[string]fsmeta.Entry,
 	progress func(int64),
 ) error {
+	if s.cachedStargzLayerAvailable(layer) {
+		blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
+		if err := linkOrCopyLayerContents(blobPath, dstPath); err != nil {
+			return fmt.Errorf("link cached eStargz layer: %w", err)
+		}
+		return applyLayerArchive(s.stargzLayerIndexPath(layer.Digest), stargzContentsPrefix+tarRef, merged, entries)
+	}
 	indexPath, contentsPath := s.layerArchivePaths(layer.Digest)
 	if s.cachedLayerArchiveAvailable(layer) {
 		if err := linkOrCopyLayerContents(contentsPath, dstPath); err != nil {
