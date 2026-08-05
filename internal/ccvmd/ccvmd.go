@@ -1535,8 +1535,9 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			return
 		}
 		plan, err := srvState.images.PlanPull(r.Context(), imageName, source, oci.PullOptions{
-			Architecture: req.Architecture,
-			CVMFSMirrors: cvmfsSourceMirrors(req.SourceRef),
+			Architecture:         req.Architecture,
+			CVMFSMirrors:         cvmfsSourceMirrors(req.SourceRef),
+			KeepCompressedLayers: req.KeepCompressed,
 		})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
