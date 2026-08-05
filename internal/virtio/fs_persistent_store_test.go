@@ -683,8 +683,8 @@ func TestPersistentImageFSTornWALTailIsPreservedAndRemovedFromReplay(t *testing.
 	backend = openPersistentImageFSTest(t, lower, storeDir)
 	defer backend.Close()
 	lookupPersistentTest(t, backend, 1, "after-recovery")
-	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "discarded-torn-wal-tail" || statuses[0].DiscardedBytes != uint64(len("torn-journal-tail")) {
-		t.Fatalf("persisted recovery status = %+v", statuses)
+	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "" || statuses[0].DiscardedBytes != 0 {
+		t.Fatalf("completed recovery repeated on next attachment: %+v", statuses)
 	}
 }
 
@@ -1015,7 +1015,7 @@ func TestPersistentImageFSCheckpointENOSPCLeavesRecoverableWAL(t *testing.T) {
 	if got := readPersistentTest(t, backend, nodeID, 0, 4); string(got) != "safe" {
 		t.Fatalf("state recovered from WAL = %q", got)
 	}
-	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "recovered-incomplete-close" || statuses[0].LastError == "" {
+	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "recovered-incomplete-close" || statuses[0].LastError != "" {
 		t.Fatalf("incomplete close recovery status = %+v", statuses)
 	}
 }
@@ -1502,8 +1502,17 @@ func TestPersistentImageFSPreservesUnreferencedCrashData(t *testing.T) {
 	if string(content) != "possibly useful crash data" {
 		t.Fatalf("quarantined data = %q", content)
 	}
+	// Simulate recovery metadata written by an older build. Completed recovery
+	// diagnostics must not surface as an error on every later attachment.
+	backend.persistent.lastErr = errors.New("preserved 1 unreferenced inode data files in " + statuses[0].QuarantinePath)
 	if err := backend.Close(); err != nil {
 		t.Fatal(err)
+	}
+	backend = openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	defer backend.Close()
+	statuses = backend.PersistentFSStatus()
+	if len(statuses) != 1 || statuses[0].RecoveryStatus != "" || statuses[0].LastError != "" {
+		t.Fatalf("completed recovery repeated on next attachment: %+v", statuses)
 	}
 }
 

@@ -237,11 +237,10 @@ func openPersistentImageStore(dir, lowerID string) (*persistentImageStore, *pers
 	}
 	if state != nil {
 		store.sequence = state.Sequence
-		if store.recovery.Status == "" {
-			store.recovery = state.Recovery
-		}
-		if state.LastError != "" {
-			store.lastErr = errors.New(state.LastError)
+		// Recovery describes work performed while opening this attachment. Do
+		// not replay a completed recovery warning on every future startup.
+		if lastError := activePersistentLastError(state.LastError); lastError != "" {
+			store.lastErr = errors.New(lastError)
 		}
 		if err := store.replayWAL(state); err != nil {
 			_ = store.close()
@@ -295,6 +294,7 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 	if err := os.Mkdir(quarantine, 0o700); err != nil {
 		return fmt.Errorf("create unreferenced data quarantine: %w", err)
 	}
+	sourceDirs := make(map[string]struct{})
 	for _, source := range orphaned {
 		relative, err := filepath.Rel(dataRoot, source)
 		if err != nil {
@@ -304,8 +304,11 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 		if err := os.Rename(source, target); err != nil {
 			return fmt.Errorf("preserve unreferenced data %q: %w", source, err)
 		}
-		if err := syncPersistentDirectory(filepath.Dir(source)); err != nil {
-			return fmt.Errorf("publish removal of unreferenced data %q: %w", source, err)
+		sourceDirs[filepath.Dir(source)] = struct{}{}
+	}
+	for sourceDir := range sourceDirs {
+		if err := syncPersistentDirectory(sourceDir); err != nil {
+			return fmt.Errorf("publish removal of unreferenced data from %q: %w", sourceDir, err)
 		}
 	}
 	if err := syncPersistentDirectory(quarantine); err != nil {
@@ -318,8 +321,22 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 		s.recovery.Status = "preserved-unreferenced-data"
 		s.recovery.QuarantinePath = quarantine
 	}
-	s.lastErr = errors.Join(s.lastErr, fmt.Errorf("preserved %d unreferenced inode data files in %s", len(orphaned), quarantine))
 	return nil
+}
+
+func activePersistentLastError(value string) string {
+	var active []string
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "previous persistent image attachment did not detach cleanly" {
+			continue
+		}
+		if strings.HasPrefix(line, "preserved ") && strings.Contains(line, " unreferenced inode data files in ") {
+			continue
+		}
+		active = append(active, line)
+	}
+	return strings.Join(active, "\n")
 }
 
 func (s *persistentImageStore) ensureEmptyUninitialized() error {
@@ -381,7 +398,6 @@ func (s *persistentImageStore) recoverIncompleteAttachment() error {
 		s.recovery.Status = "recovered-incomplete-close"
 		s.recovery.QuarantinePath = recoveryPath
 	}
-	s.lastErr = errors.Join(s.lastErr, errors.New("previous persistent image attachment did not detach cleanly"))
 	return nil
 }
 
