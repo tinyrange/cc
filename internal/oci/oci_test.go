@@ -212,6 +212,9 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(shared, "_blobs", digestToFileName(firstDigest)), make([]byte, 100), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(shared, "_blobs", digestToFileName(secondDigest))+".partial", make([]byte, 50), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	store := NewStore(filepath.Join(t.TempDir(), "store"))
 	store.httpClient = server.Client()
 	source := strings.TrimPrefix(server.URL, "https://") + "/team/squad:edge"
@@ -219,7 +222,7 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Available || plan.BytesTotal != 350 || plan.BytesCached != 100 || plan.BytesToDownload != 250 {
+	if plan.Available || plan.BytesTotal != 350 || plan.BytesCached != 150 || plan.BytesToDownload != 200 {
 		t.Fatalf("pull plan = %+v", plan)
 	}
 	if plan.LayersTotal != 2 || plan.LayersCached != 1 {
@@ -244,7 +247,7 @@ func TestPlanPullReportsOnlyUncachedOCILayerBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !update.Installed || update.Available || update.BytesToDownload != 250 {
+	if !update.Installed || update.Available || update.BytesToDownload != 200 {
 		t.Fatalf("update plan = %+v", update)
 	}
 

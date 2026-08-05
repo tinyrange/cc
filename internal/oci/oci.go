@@ -671,6 +671,11 @@ func (s *Store) PlanPull(ctx context.Context, name, source string, options ...Pu
 		} else if info, statErr := os.Stat(blobPath); statErr == nil && info.Mode().IsRegular() && info.Size() == layer.Size {
 			plan.LayersCached++
 			plan.BytesCached += layer.Size
+		} else if info, statErr := os.Stat(blobPath + ".partial"); statErr == nil && info.Mode().IsRegular() {
+			// A normal partial blob is a verified prefix that cacheLayerBlob will
+			// resume. Delta partials are intentionally excluded because they are
+			// sparse, target-sized assembly files rather than downloaded prefixes.
+			plan.BytesCached += min(layer.Size, max(int64(0), info.Size()))
 		}
 	}
 	plan.BytesToDownload = max(0, plan.BytesTotal-plan.BytesCached)
