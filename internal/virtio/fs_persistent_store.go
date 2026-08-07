@@ -1249,12 +1249,7 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 	}
 	nodeSeen := make(map[uint64]struct{}, len(state.Nodes))
 	savedByPath := make(map[string]*imageNode, len(state.Nodes)+1)
-	linkedNodes := map[uint64]struct{}{1: {}}
-	for _, saved := range state.Nodes {
-		for _, entry := range saved.Entries {
-			linkedNodes[entry.Inode] = struct{}{}
-		}
-	}
+	savedNodes := make(map[uint64]*persistentImageNode, len(state.Nodes))
 	for _, saved := range state.Nodes {
 		if saved.ID == 0 || saved.ID == ^uint64(0) {
 			return fmt.Errorf("invalid node ID %d", saved.ID)
@@ -1266,12 +1261,29 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 		if _, removed := removedSeen[saved.ID]; removed {
 			return fmt.Errorf("node ID %d is both present and removed", saved.ID)
 		}
+		savedNodes[saved.ID] = &saved
+	}
+	reachableNodes := make(map[uint64]struct{}, len(state.Nodes))
+	queue := []uint64{1}
+	for len(queue) != 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, seen := reachableNodes[id]; seen {
+			continue
+		}
+		reachableNodes[id] = struct{}{}
+		if saved := savedNodes[id]; saved != nil {
+			for _, entry := range saved.Entries {
+				queue = append(queue, entry.Inode)
+			}
+		}
+	}
+	for _, saved := range state.Nodes {
 		// Older writers could checkpoint an inode kept alive only by an open
-		// handle after it had been unlinked or atomically replaced. Handles
-		// cannot survive restart, so restore only nodes reached by the saved
-		// directory namespace (plus the root).
-		_, linked := linkedNodes[saved.ID]
-		if !linked && len(saved.LowerPath) == 0 {
+		// handle, or a whole orphaned directory tree, after it had been
+		// unlinked or atomically replaced. Handles cannot survive restart, so
+		// restore only nodes actually reachable from the saved root directory.
+		if _, reachable := reachableNodes[saved.ID]; !reachable {
 			continue
 		}
 		guestPath := string(saved.GuestPath)

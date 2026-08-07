@@ -641,6 +641,56 @@ func TestPersistentImageFSRestoreRepairsDanglingDirectoryEntry(t *testing.T) {
 	}
 }
 
+func TestPersistentImageFSRestoreDiscardsOrphanedDirectoryTree(t *testing.T) {
+	storeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(storeDir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := newImageFS(imagefs.NewOverlay(nil).Root(), storeDir, 0, 0, false).(*imageFS)
+	backend.persistent = &persistentImageStore{
+		dir:           storeDir,
+		dataUsage:     make(map[uint64]uint64),
+		dataPhysical:  make(map[uint64]uint64),
+		pendingTrim:   make(map[uint64]uint64),
+		pendingRemove: make(map[uint64]struct{}),
+	}
+	backend.persistentNodes = make(map[uint64]struct{})
+	directory := func(id, parent uint64, name, guestPath string, entries ...persistentImageDirent) persistentImageNode {
+		return persistentImageNode{
+			ID: id, Parent: parent, Name: []byte(name), GuestPath: []byte(guestPath),
+			Kind: "dir", Mode: uint32(fs.ModeDir | 0o755), NLink: 1, EntriesDone: true, Entries: entries,
+		}
+	}
+	file := func(id, parent uint64, name, guestPath string) persistentImageNode {
+		return persistentImageNode{
+			ID: id, Parent: parent, Name: []byte(name), GuestPath: []byte(guestPath),
+			Kind: "file", Mode: 0o600, NLink: 1,
+		}
+	}
+	err := backend.restorePersistentState(&persistentImageState{
+		NextNodeID: 6,
+		Nodes: []persistentImageNode{
+			directory(1, 1, "/", "/", persistentImageDirent{Name: []byte("tree"), Inode: 2}),
+			directory(2, 1, "tree", "/tree", persistentImageDirent{Name: []byte("value"), Inode: 3}),
+			file(3, 2, "value", "/tree/value"),
+			directory(4, 1, "tree", "/tree", persistentImageDirent{Name: []byte("value"), Inode: 5}),
+			file(5, 4, "value", "/tree/value"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("restore checkpoint with orphaned tree: %v", err)
+	}
+	if _, exists := backend.nodes[4]; exists {
+		t.Fatal("orphaned directory survived recovery")
+	}
+	if _, exists := backend.nodes[5]; exists {
+		t.Fatal("orphaned file survived recovery")
+	}
+	if nodeID, _, errno := backend.Lookup(2, "value"); errno != 0 || nodeID != 3 {
+		t.Fatalf("lookup reachable file = inode %d, errno %d", nodeID, errno)
+	}
+}
+
 func TestPersistentImageFSTornWALTailIsPreservedAndRemovedFromReplay(t *testing.T) {
 	storeDir := filepath.Join(t.TempDir(), "home")
 	lower := imagefs.NewOverlay(nil).Root()
