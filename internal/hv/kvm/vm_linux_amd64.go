@@ -505,6 +505,17 @@ func (v *VM) GetPC() (uint64, error) {
 	return v.GetVCPUPC(0)
 }
 
+func (v *VM) GetFaultAddress() (uint64, error) {
+	if v == nil || len(v.vcpus) == 0 {
+		return 0, fmt.Errorf("vcpu 0 out of range")
+	}
+	sregs, err := getSRegs(v.vcpus[0].fd)
+	if err != nil {
+		return 0, err
+	}
+	return sregs.Cr2, nil
+}
+
 func (v *VM) GetVCPUPC(index int) (uint64, error) {
 	if v == nil || index < 0 || index >= len(v.vcpus) {
 		return 0, fmt.Errorf("vcpu %d out of range", index)
@@ -856,6 +867,57 @@ func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	})
 }
 
+// SetFreestandingLongMode enters a direct-boot amd64 kernel with identity
+// mappings for low memory and a matching alias at 0xffffffff80000000. RDI
+// contains the guest-physical address of the boot information structure.
+func (v *VM) SetFreestandingLongMode(entry, bootInfo, stack, pagingBase uint64) error {
+	if v == nil || len(v.vcpus) == 0 {
+		return fmt.Errorf("missing bootstrap vcpu")
+	}
+	if err := v.setupFreestandingPageTables(pagingBase); err != nil {
+		return err
+	}
+	bsp := v.vcpus[0]
+	sregs, err := getSRegs(bsp.fd)
+	if err != nil {
+		return err
+	}
+	const (
+		cr0PE   = 1 << 0
+		cr0MP   = 1 << 1
+		cr0ET   = 1 << 4
+		cr0NE   = 1 << 5
+		cr0WP   = 1 << 16
+		cr0AM   = 1 << 18
+		cr0PG   = 1 << 31
+		cr4PAE  = 1 << 5
+		eferLME = 1 << 8
+		eferLMA = 1 << 10
+	)
+	sregs.Cr3 = pagingBase
+	sregs.Cr4 |= cr4PAE
+	sregs.Cr0 |= cr0PE | cr0MP | cr0ET | cr0NE | cr0WP | cr0AM | cr0PG
+	sregs.Efer = eferLME | eferLMA
+
+	code := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x10, Type: 11, Present: 1, S: 1, L: 1, G: 1}
+	data := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x18, Type: 3, Present: 1, S: 1, Db: 1, G: 1}
+	sregs.Cs = code
+	sregs.Ds = data
+	sregs.Es = data
+	sregs.Fs = data
+	sregs.Gs = data
+	sregs.Ss = data
+	if err := setSRegs(bsp.fd, &sregs); err != nil {
+		return err
+	}
+	return setRegs(bsp.fd, &kvmRegs{
+		Rip:    entry,
+		Rdi:    bootInfo,
+		Rsp:    stack,
+		Rflags: 0x2,
+	})
+}
+
 func (v *VM) SetFreeBSDLongMode(entry, stack, pagingBase uint64) error {
 	if v == nil || len(v.vcpus) == 0 {
 		return fmt.Errorf("missing bootstrap vcpu")
@@ -964,6 +1026,43 @@ func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 			phys := (uint64(g) << 30) | (uint64(i) << 21)
 			put64(pd+uint64(i)*8, phys|p|rw|us|ps)
 		}
+	}
+	return nil
+}
+
+func (v *VM) setupFreestandingPageTables(pagingBase uint64) error {
+	const tableBytes = uint64(5 * 0x1000)
+	if pagingBase > v.lowMemLimit || tableBytes > v.lowMemLimit-pagingBase {
+		return fmt.Errorf("freestanding paging structures do not fit in low memory")
+	}
+	clear(v.mem[pagingBase : pagingBase+tableBytes])
+	put64 := func(addr, value uint64) {
+		binary.LittleEndian.PutUint64(v.mem[addr:addr+8], value)
+	}
+	pml4 := pagingBase
+	pdpt := pagingBase + 0x1000
+	pd := pagingBase + 0x2000
+	pt := pagingBase + 0x3000
+	const (
+		present = 1 << 0
+		write   = 1 << 1
+		user    = 1 << 2
+		large   = 1 << 7
+	)
+	// Identity-map the first GiB for bootstrap data and alias that same range
+	// at 0xffffffff80000000 for the kernel's higher-half image.
+	put64(pml4+0*8, pdpt|present|write|user)
+	put64(pml4+511*8, pdpt|present|write)
+	put64(pdpt+0*8, pd|present|write|user)
+	put64(pdpt+510*8, pd|present|write)
+	for index := uint64(0); index < 512; index++ {
+		put64(pd+index*8, index*0x200000|present|write|large)
+	}
+	// Reserve one lower-half 2 MiB window for the first userspace task. Leaves
+	// begin supervisor-only; the kernel memory service grants individual pages.
+	put64(pd+2*8, pt|present|write|user)
+	for index := uint64(0); index < 512; index++ {
+		put64(pt+index*8, 0x400000+index*0x1000|present|write)
 	}
 	return nil
 }
