@@ -5,6 +5,7 @@ package kvm
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -39,6 +40,9 @@ func BootFreestandingELFToMarker(ctx context.Context, kernel []byte, memoryMB ui
 	}
 	if err := vm.SetFreestandingLongMode(plan.EntryGVA, plan.BootInfoGPA, plan.StackTopGPA, plan.PagingGPA); err != nil {
 		return "", fmt.Errorf("set freestanding long mode: %w", err)
+	}
+	if got := binary.LittleEndian.Uint64(memory[plan.PagingGPA+0x2000+2*8:]); got != (plan.PagingGPA+0x3000)|7 {
+		return "", fmt.Errorf("invalid bootstrap user PDE %#x", got)
 	}
 
 	var serialOut bytes.Buffer
@@ -80,7 +84,18 @@ func BootFreestandingELFToMarker(ctx context.Context, kernel []byte, memoryMB ui
 			return serialOut.String(), fmt.Errorf("freestanding guest halted before marker")
 		case ExitShutdown:
 			pc, _ := vm.GetPC()
-			return serialOut.String(), fmt.Errorf("freestanding guest shut down before marker at pc=%#x", pc)
+			fault, _ := vm.GetFaultAddress()
+			registers := vm.VCPURegisters(0)
+			faultEntries := traceFreestandingPageTables(memory, plan.PagingGPA, fault)
+			code := []byte(nil)
+			if physical, ok := walkFreestandingPageTables(memory, plan.PagingGPA, pc); ok && physical < uint64(len(memory)) {
+				end := physical + 8
+				if end > uint64(len(memory)) {
+					end = uint64(len(memory))
+				}
+				code = memory[physical:end]
+			}
+			return serialOut.String(), fmt.Errorf("freestanding guest shut down before marker at pc=%#x fault=%#x code=% x pages=%#x registers=%v", pc, fault, code, faultEntries, registers)
 		case ExitSystemEvent:
 			return serialOut.String(), fmt.Errorf("unexpected system event %d before marker", exit.SystemEvent)
 		default:
@@ -91,4 +106,51 @@ func BootFreestandingELFToMarker(ctx context.Context, kernel []byte, memoryMB ui
 			return serialOut.String(), nil
 		}
 	}
+}
+
+func traceFreestandingPageTables(memory []byte, root uint64, virtual uint64) [4]uint64 {
+	var entries [4]uint64
+	indices := [4]uint64{(virtual >> 39) & 511, (virtual >> 30) & 511, (virtual >> 21) & 511, (virtual >> 12) & 511}
+	table := root
+	for level := 0; level < len(entries); level++ {
+		address := table + indices[level]*8
+		if address > uint64(len(memory)) || 8 > uint64(len(memory))-address {
+			break
+		}
+		entries[level] = binary.LittleEndian.Uint64(memory[address : address+8])
+		if entries[level]&1 == 0 || level == 2 && entries[level]&(1<<7) != 0 {
+			break
+		}
+		table = entries[level] & 0x000ffffffffff000
+	}
+	return entries
+}
+
+func walkFreestandingPageTables(memory []byte, root uint64, virtual uint64) (uint64, bool) {
+	read := func(address uint64) (uint64, bool) {
+		if address > uint64(len(memory)) || 8 > uint64(len(memory))-address {
+			return 0, false
+		}
+		return binary.LittleEndian.Uint64(memory[address : address+8]), true
+	}
+	entry, ok := read(root + ((virtual>>39)&511)*8)
+	if !ok || entry&1 == 0 {
+		return 0, false
+	}
+	entry, ok = read(entry&0x000ffffffffff000 + ((virtual>>30)&511)*8)
+	if !ok || entry&1 == 0 {
+		return 0, false
+	}
+	entry, ok = read(entry&0x000ffffffffff000 + ((virtual>>21)&511)*8)
+	if !ok || entry&1 == 0 {
+		return 0, false
+	}
+	if entry&(1<<7) != 0 {
+		return entry&0x000fffffffe00000 + (virtual & 0x1fffff), true
+	}
+	entry, ok = read(entry&0x000ffffffffff000 + ((virtual>>12)&511)*8)
+	if !ok || entry&1 == 0 {
+		return 0, false
+	}
+	return entry&0x000ffffffffff000 + (virtual & 0xfff), true
 }

@@ -505,6 +505,17 @@ func (v *VM) GetPC() (uint64, error) {
 	return v.GetVCPUPC(0)
 }
 
+func (v *VM) GetFaultAddress() (uint64, error) {
+	if v == nil || len(v.vcpus) == 0 {
+		return 0, fmt.Errorf("vcpu 0 out of range")
+	}
+	sregs, err := getSRegs(v.vcpus[0].fd)
+	if err != nil {
+		return 0, err
+	}
+	return sregs.Cr2, nil
+}
+
 func (v *VM) GetVCPUPC(index int) (uint64, error) {
 	if v == nil || index < 0 || index >= len(v.vcpus) {
 		return 0, fmt.Errorf("vcpu %d out of range", index)
@@ -1020,7 +1031,7 @@ func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 }
 
 func (v *VM) setupFreestandingPageTables(pagingBase uint64) error {
-	const tableBytes = uint64(3 * 0x1000)
+	const tableBytes = uint64(5 * 0x1000)
 	if pagingBase > v.lowMemLimit || tableBytes > v.lowMemLimit-pagingBase {
 		return fmt.Errorf("freestanding paging structures do not fit in low memory")
 	}
@@ -1031,19 +1042,27 @@ func (v *VM) setupFreestandingPageTables(pagingBase uint64) error {
 	pml4 := pagingBase
 	pdpt := pagingBase + 0x1000
 	pd := pagingBase + 0x2000
+	pt := pagingBase + 0x3000
 	const (
 		present = 1 << 0
 		write   = 1 << 1
+		user    = 1 << 2
 		large   = 1 << 7
 	)
 	// Identity-map the first GiB for bootstrap data and alias that same range
 	// at 0xffffffff80000000 for the kernel's higher-half image.
-	put64(pml4+0*8, pdpt|present|write)
+	put64(pml4+0*8, pdpt|present|write|user)
 	put64(pml4+511*8, pdpt|present|write)
-	put64(pdpt+0*8, pd|present|write)
+	put64(pdpt+0*8, pd|present|write|user)
 	put64(pdpt+510*8, pd|present|write)
 	for index := uint64(0); index < 512; index++ {
 		put64(pd+index*8, index*0x200000|present|write|large)
+	}
+	// Reserve one lower-half 2 MiB window for the first userspace task. Leaves
+	// begin supervisor-only; the kernel memory service grants individual pages.
+	put64(pd+2*8, pt|present|write|user)
+	for index := uint64(0); index < 512; index++ {
+		put64(pt+index*8, 0x400000+index*0x1000|present|write)
 	}
 	return nil
 }

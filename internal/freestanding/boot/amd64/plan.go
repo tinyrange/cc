@@ -16,7 +16,7 @@ const (
 	defaultStackTopGPA = 0x00080000
 	defaultPagingGPA   = 0x00090000
 	pageSize           = 4096
-	pageTableSize      = 3 * pageSize
+	pageTableSize      = 5 * pageSize
 	directMapSize      = 1 << 30
 
 	BootInfoMagic   = uint64(0x3436544f4f424343) // "CCBOOT64"
@@ -49,14 +49,18 @@ type BootPlan struct {
 // BootInfo is passed to the kernel in RDI. All addresses are guest physical
 // addresses unless explicitly named otherwise.
 type BootInfo struct {
-	Magic             uint64
-	Version           uint64
-	Size              uint64
-	MemorySize        uint64
-	HigherHalfBase    uint64
-	KernelPhysicalMin uint64
-	KernelPhysicalEnd uint64
-	PageSize          uint64
+	Magic              uint64
+	Version            uint64
+	Size               uint64
+	MemorySize         uint64
+	HigherHalfBase     uint64
+	KernelPhysicalMin  uint64
+	KernelPhysicalEnd  uint64
+	PageSize           uint64
+	PagingPhysicalBase uint64
+	PagingSize         uint64
+	BootstrapStackTop  uint64
+	BootstrapStackSize uint64
 }
 
 func PrepareBoot(memory []byte, kernel []byte, opts BootOptions) (*BootPlan, error) {
@@ -90,15 +94,20 @@ func PrepareBoot(memory []byte, kernel []byte, opts BootOptions) (*BootPlan, err
 		return nil, err
 	}
 	info := BootInfo{
-		Magic:             BootInfoMagic,
-		Version:           BootInfoVersion,
-		Size:              64,
-		MemorySize:        opts.MemorySize,
-		HigherHalfBase:    HigherHalfBase,
-		KernelPhysicalMin: physicalMin,
-		KernelPhysicalEnd: physicalEnd,
-		PageSize:          pageSize,
+		Magic:              BootInfoMagic,
+		Version:            BootInfoVersion,
+		Size:               64,
+		MemorySize:         opts.MemorySize,
+		HigherHalfBase:     HigherHalfBase,
+		KernelPhysicalMin:  physicalMin,
+		KernelPhysicalEnd:  physicalEnd,
+		PageSize:           pageSize,
+		PagingPhysicalBase: opts.PagingGPA,
+		PagingSize:         pageTableSize,
+		BootstrapStackTop:  opts.StackTopGPA,
+		BootstrapStackSize: pageSize,
 	}
+	info.Size = uint64(binary.Size(info))
 	encoded := encodeBootInfo(info)
 	if rangesOverlap(opts.BootInfoGPA, uint64(len(encoded)), physicalMin, physicalEnd-physicalMin) {
 		return nil, fmt.Errorf("boot info at %#x overlaps kernel image", opts.BootInfoGPA)
@@ -192,6 +201,10 @@ func encodeBootInfo(info BootInfo) []byte {
 		info.KernelPhysicalMin,
 		info.KernelPhysicalEnd,
 		info.PageSize,
+		info.PagingPhysicalBase,
+		info.PagingSize,
+		info.BootstrapStackTop,
+		info.BootstrapStackSize,
 	}
 	out := make([]byte, len(values)*8)
 	for index, value := range values {
