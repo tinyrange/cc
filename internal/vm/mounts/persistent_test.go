@@ -21,7 +21,7 @@ func TestBuildPersistentImageMountsUsesImageHomeAndReleasesFailedPreparation(t *
 	if err != nil {
 		t.Fatalf("build persistent image mount: %v", err)
 	}
-	if len(prepared) != 1 || prepared[0].GuestPath != "/home/scientist" || !prepared[0].Writable || prepared[0].CacheMode != "strict" {
+	if len(prepared) != 1 || prepared[0].GuestPath != "/home/scientist" || !prepared[0].Writable || prepared[0].CacheMode != "aggressive" {
 		t.Fatalf("persistent mount = %+v", prepared)
 	}
 	statusProvider, ok := prepared[0].Backend.(interface {

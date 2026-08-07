@@ -60,6 +60,10 @@ type imageFS struct {
 	mapOwner        bool
 	debugPaths      []string
 	debugLog        io.Writer
+	// mutationMu lets a durability barrier release mu during slow host syncs.
+	// Readers remain responsive while persistent mutations wait for the stable
+	// snapshot being committed.
+	mutationMu sync.RWMutex
 
 	mu                    sync.Mutex
 	nextNodeID            uint64
@@ -1724,6 +1728,11 @@ func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 }
 
 func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uint32) (uint64, int32) {
+	mutating := flags&linuxOACCMODE != linuxORDONLY
+	if mutating {
+		p.mutationMu.RLock()
+		defer p.mutationMu.RUnlock()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.imageNodeLocked(nodeID)
@@ -1788,31 +1797,71 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 	handle, ok := p.handles[fh]
 	delete(p.handles, fh)
 	p.compactImageHandleMapsLocked()
+	collect := false
 	if ok {
+		node := p.imageNodeLocked(handle.nodeID)
+		collect = node != nil && node.nlink == 0
+	}
+	if ok && !collect {
 		p.collectImageNodeLocked(handle.nodeID)
 	}
 	p.mu.Unlock()
+	if collect {
+		// Reclaiming an unlinked inode changes persistent state. Ordinary closes,
+		// including the read-only opens used by SSH authentication, need not wait
+		// behind an unrelated file's host fsync.
+		p.mutationMu.RLock()
+		p.mu.Lock()
+		p.collectImageNodeLocked(handle.nodeID)
+		p.mu.Unlock()
+		p.mutationMu.RUnlock()
+	}
 	if ok && handle.closer != nil {
 		_ = handle.closer.Close()
 	}
 }
 
 func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
-	p.mu.Lock()
-	err := p.flushPersistentLocked(false)
-	p.mu.Unlock()
-	if err != nil {
-		return errnoFromError(err)
-	}
+	// FUSE FLUSH is a close-time error-reporting hook, not a durability
+	// barrier. Keep mutations coalesced in memory until fsync, fsyncdir, or a
+	// clean filesystem close instead of emitting uncommitted WAL records that
+	// force a later unrelated fsync to synchronize their data.
 	return 0
 }
 
 func (p *imageFS) Fsync(nodeID uint64, _ uint64, _ uint32) int32 {
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
 	p.mu.Lock()
 	if p.persistent != nil {
+		delta := p.persistentFileDeltaLocked(nodeID)
+		if delta == nil {
+			p.mu.Unlock()
+			return -linuxEINVAL
+		}
+		// Mutations are excluded by mutationMu. Release the namespace mutex
+		// while the host performs the potentially slow data sync so lookups,
+		// reads, SSH authentication, and other unrelated traffic stay live.
+		p.mu.Unlock()
 		err := p.persistent.syncData(nodeID)
+		p.mu.Lock()
 		if err == nil {
-			err = p.flushPersistentLocked(true)
+			// Reads may update atime while the slow host sync is in progress.
+			// Capture that final inode metadata rather than clearing it as though
+			// the earlier snapshot had included it.
+			delta = p.persistentFileDeltaLocked(nodeID)
+			if delta == nil {
+				err = fmt.Errorf("fsync inode %d disappeared during data sync", nodeID)
+			}
+		}
+		committedCreation := err == nil && !delta.Nodes[0].PreserveNamespace
+		if err == nil {
+			err = p.persistent.appendDelta(delta, true)
+		}
+		if err == nil {
+			p.persistent.clearFilePending(nodeID, committedCreation)
+			p.persistent.refreshPhysicalUsage(nodeID)
+			err = p.persistent.reclaimDurableFileData(nodeID)
 		}
 		if err == nil {
 			err = p.maybeCheckpointPersistentLocked()
@@ -1831,9 +1880,49 @@ func (p *imageFS) Fsync(nodeID uint64, _ uint64, _ uint32) int32 {
 }
 
 func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
 	p.mu.Lock()
 	if p.persistent != nil {
-		err := p.flushPersistentLocked(true)
+		delta := p.persistentNamespaceDeltaLocked()
+		var err error
+		if delta != nil {
+			// Namespace durability does not imply durability of unrelated file
+			// contents. Dirty file records in this delta retain their last
+			// durable data state.
+			err = p.persistent.appendDelta(delta, true)
+		}
+		if err == nil {
+			p.persistent.clearNamespacePending()
+			err = p.persistent.reclaimDurableNamespaceData()
+		}
+		if err == nil {
+			err = p.maybeCheckpointPersistentLocked()
+		}
+		p.mu.Unlock()
+		if err != nil {
+			return errnoFromError(err)
+		}
+		return 0
+	}
+	p.mu.Unlock()
+	if err := p.dataStore.sync(); err != nil {
+		return errnoFromError(err)
+	}
+	return 0
+}
+
+func (p *imageFS) SyncFS() int32 {
+	p.mutationMu.Lock()
+	defer p.mutationMu.Unlock()
+	p.mu.Lock()
+	if p.persistent != nil {
+		p.mu.Unlock()
+		err := p.persistent.syncDirtyData()
+		p.mu.Lock()
+		if err == nil {
+			err = p.flushPersistentLocked(true)
+		}
 		if err == nil {
 			err = p.maybeCheckpointPersistentLocked()
 		}
@@ -2099,6 +2188,8 @@ func (p *imageFS) inheritImageCreateLocked(parent *imageNode, mode uint32, gid u
 }
 
 func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2145,6 +2236,8 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 }
 
 func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2207,6 +2300,8 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 }
 
 func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2257,6 +2352,8 @@ func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64,
 }
 
 func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.imageNodeLocked(nodeID)
@@ -2308,6 +2405,8 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 }
 
 func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2350,6 +2449,8 @@ func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, 
 }
 
 func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2451,6 +2552,8 @@ func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uin
 }
 
 func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32, uid uint32, gid uint32) (uint32, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	handle, ok := p.handles[fh]
@@ -2495,6 +2598,8 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 }
 
 func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.mutableImageNodeLocked(nodeID)
@@ -2574,6 +2679,8 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 }
 
 func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2624,6 +2731,8 @@ func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName s
 }
 
 func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, newName string, flags uint32, uid uint32, gid uint32) int32 {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.imageNodeLocked(parent)
@@ -2867,6 +2976,8 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 	if name == "" || len(name) > 255 || len(value) > 64<<10 || flags&^uint32(3) != 0 || flags == 3 {
 		return -linuxEINVAL
 	}
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.imageNodeLocked(nodeID)
@@ -2901,6 +3012,8 @@ func (p *imageFS) SetXattr(nodeID uint64, name string, value []byte, flags uint3
 }
 
 func (p *imageFS) RemoveXattr(nodeID uint64, name string) int32 {
+	p.mutationMu.RLock()
+	defer p.mutationMu.RUnlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.imageNodeLocked(nodeID)
@@ -3181,6 +3294,8 @@ func (p *imageFS) closeWithin(timeout time.Duration) error {
 		// actually returns, but do not make VM teardown wait without a bound.
 		go func() {
 			p.materializationWG.Wait()
+			p.mutationMu.Lock()
+			defer p.mutationMu.Unlock()
 			p.mu.Lock()
 			persistErr := p.syncAllPersistentDataLocked()
 			if persistErr == nil {
@@ -3766,7 +3881,9 @@ const (
 
 const (
 	linuxEPERM      = linuxabi.EPERM
+	linuxEINTR      = linuxabi.EINTR
 	linuxENOENT     = linuxabi.ENOENT
+	linuxEAGAIN     = linuxabi.EAGAIN
 	linuxENXIO      = linuxabi.ENXIO
 	linuxEIO        = linuxabi.EIO
 	linuxEBADF      = linuxabi.EBADF

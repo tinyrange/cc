@@ -97,6 +97,65 @@ func TestDecodeFUSERequestExcludesDescriptorPadding(t *testing.T) {
 	}
 }
 
+func TestFUSEDispatcherEnforcesAndReleasesPOSIXLocks(t *testing.T) {
+	device := NewFS(0, 0, 0, "locks", inertFSBackend{})
+	dispatchLock := func(opcode uint32, owner uint64, lockType uint32) fsReply {
+		raw := make([]byte, fuseInHeaderSize+fuseLKInSize)
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(len(raw)))
+		binary.LittleEndian.PutUint32(raw[4:8], opcode)
+		binary.LittleEndian.PutUint64(raw[8:16], uint64(opcode)+owner)
+		binary.LittleEndian.PutUint64(raw[16:24], 9)
+		binary.LittleEndian.PutUint64(raw[40:48], 1)
+		binary.LittleEndian.PutUint64(raw[48:56], owner)
+		binary.LittleEndian.PutUint64(raw[64:72], ^uint64(0))
+		binary.LittleEndian.PutUint32(raw[72:76], lockType)
+		binary.LittleEndian.PutUint32(raw[76:80], uint32(owner))
+		result, err := device.dispatcher.Dispatch(raw)
+		if err != nil {
+			t.Fatalf("dispatch %s: %v", fuseOpcodeName(opcode), err)
+		}
+		return result.reply
+	}
+
+	if reply := dispatchLock(fuseSetLK, 100, linuxFWrLck); reply.errno != 0 {
+		t.Fatalf("first SETLK errno = %d", reply.errno)
+	}
+	get := dispatchLock(fuseGetLK, 200, linuxFRdLck)
+	if get.errno != 0 || len(get.extra) != fuseLKOutSize || binary.LittleEndian.Uint32(get.extra[16:20]) != linuxFWrLck || binary.LittleEndian.Uint32(get.extra[20:24]) == 0 {
+		t.Fatalf("GETLK reply = errno %d extra %x", get.errno, get.extra)
+	}
+	if reply := dispatchLock(fuseSetLK, 200, linuxFRdLck); reply.errno != -linuxEAGAIN {
+		t.Fatalf("conflicting SETLK errno = %d", reply.errno)
+	}
+
+	flush := make([]byte, fuseInHeaderSize+24)
+	binary.LittleEndian.PutUint32(flush[0:4], uint32(len(flush)))
+	binary.LittleEndian.PutUint32(flush[4:8], fuseFlush)
+	binary.LittleEndian.PutUint64(flush[8:16], 77)
+	binary.LittleEndian.PutUint64(flush[16:24], 9)
+	binary.LittleEndian.PutUint32(flush[48:52], fuseFlushLockOwner)
+	binary.LittleEndian.PutUint64(flush[56:64], 100)
+	if result, err := device.dispatcher.Dispatch(flush); err != nil || result.reply.errno != 0 {
+		t.Fatalf("FLUSH lock owner = reply %+v, err %v", result.reply, err)
+	}
+	if reply := dispatchLock(fuseSetLK, 200, linuxFRdLck); reply.errno != 0 {
+		t.Fatalf("SETLK after FLUSH errno = %d", reply.errno)
+	}
+	release := make([]byte, fuseInHeaderSize+24)
+	binary.LittleEndian.PutUint32(release[0:4], uint32(len(release)))
+	binary.LittleEndian.PutUint32(release[4:8], fuseRelease)
+	binary.LittleEndian.PutUint64(release[8:16], 78)
+	binary.LittleEndian.PutUint64(release[16:24], 9)
+	binary.LittleEndian.PutUint32(release[52:56], fuseReleaseFlockUnlock)
+	binary.LittleEndian.PutUint64(release[56:64], 200)
+	if result, err := device.dispatcher.Dispatch(release); err != nil || result.reply.errno != 0 {
+		t.Fatalf("RELEASE flock owner = reply %+v, err %v", result.reply, err)
+	}
+	if reply := dispatchLock(fuseSetLK, 300, linuxFWrLck); reply.errno != 0 {
+		t.Fatalf("SETLK after RELEASE errno = %d", reply.errno)
+	}
+}
+
 func FuzzDecodeFUSERequest(f *testing.F) {
 	valid := make([]byte, fuseInHeaderSize+4)
 	binary.LittleEndian.PutUint32(valid[:4], uint32(len(valid)))

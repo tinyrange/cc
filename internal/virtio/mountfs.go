@@ -566,6 +566,33 @@ func (m *mountedFS) SetWritebackCache(enabled bool) {
 	}
 }
 
+func (m *mountedFS) SyncFS() int32 {
+	m.mu.RLock()
+	backends := make([]FSBackend, 0, len(m.mounts)+1)
+	backends = append(backends, m.root)
+	for _, mount := range m.mounts {
+		duplicate := false
+		for _, backend := range backends {
+			if sameFSBackend(backend, mount.backend) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			backends = append(backends, mount.backend)
+		}
+	}
+	m.mu.RUnlock()
+	for _, backend := range backends {
+		if syncer, ok := backend.(fsSyncFSBackend); ok {
+			if errno := syncer.SyncFS(); errno != 0 {
+				return errno
+			}
+		}
+	}
+	return 0
+}
+
 func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
 	node := m.node(nodeID)
 	if node == nil {

@@ -119,9 +119,10 @@ func (p *imageFS) setPersistentDirentLocked(parent *imageNode, name string, inod
 }
 
 func (p *imageFS) deletePersistentDirentLocked(parent *imageNode, name string) {
+	inode := parent.entries[name]
 	delete(parent.entries, name)
 	if p.persistent != nil {
-		p.persistent.markDirent(parent.id, name, 0, false)
+		p.persistent.markDirent(parent.id, name, inode, false)
 	}
 }
 
@@ -193,6 +194,184 @@ func (p *imageFS) persistentDeltaLocked() *persistentImageDelta {
 	return delta
 }
 
+func (p *imageFS) persistentFileDeltaLocked(nodeID uint64) *persistentImageDelta {
+	if p == nil || p.persistent == nil {
+		return nil
+	}
+	node := p.imageNodeLocked(nodeID)
+	if node == nil || node.isDir() {
+		return nil
+	}
+	saved := persistentNodeFromImageNode(node, p.pathForNode(nodeID), p.persistentNodes)
+	// A file fsync covers inode data and metadata, not directory entries or
+	// link/rename operations. Existing durable namespace fields are retained
+	// when this delta is applied.
+	saved.Entries = nil
+	saved.Whiteouts = nil
+	delta := &persistentImageDelta{
+		Version: persistentImageFormatVersion, NextNodeID: p.nextNodeID,
+		Nodes: []persistentImageNode{saved},
+	}
+	_, existedDurably := p.persistent.durableNode(nodeID)
+	if existedDurably {
+		// fsync(2) makes the inode durable. Renames and new hard links for an
+		// already-durable inode still require fsync on the containing directory.
+		delta.Nodes[0].PreserveNamespace = true
+		return delta
+	}
+	pending := p.persistent.pending
+	if pending == nil {
+		delta.Nodes[0].PreserveNamespace = true
+		return delta
+	}
+	parents := make(map[uint64]struct{})
+	selectedKeys := make(map[persistentDirentKey]struct{})
+	for key, op := range pending.dirents {
+		if op.Inode != nodeID {
+			continue
+		}
+		delta.Dirents = append(delta.Dirents, op)
+		parents[op.Parent] = struct{}{}
+		selectedKeys[key] = struct{}{}
+	}
+	if len(delta.Dirents) == 0 {
+		delta.Nodes[0].PreserveNamespace = true
+		return delta
+	}
+	for key, op := range pending.whiteouts {
+		if _, selected := selectedKeys[key]; selected {
+			delta.Whiteouts = append(delta.Whiteouts, op)
+		}
+	}
+	for parentID := range parents {
+		parent := p.imageNodeLocked(parentID)
+		if parent == nil {
+			continue
+		}
+		parentSaved := persistentNodeFromImageNode(parent, p.pathForNode(parentID), p.persistentNodes)
+		parentSaved.Entries = nil
+		parentSaved.Whiteouts = nil
+		delta.Nodes = append(delta.Nodes, parentSaved)
+	}
+	if _, deleted := pending.deleted[nodeID]; deleted {
+		delta.Deleted = append(delta.Deleted, nodeID)
+	}
+	sort.Slice(delta.Nodes, func(i, j int) bool { return delta.Nodes[i].ID < delta.Nodes[j].ID })
+	sort.Slice(delta.Dirents, func(i, j int) bool {
+		if delta.Dirents[i].Parent == delta.Dirents[j].Parent {
+			return string(delta.Dirents[i].Name) < string(delta.Dirents[j].Name)
+		}
+		return delta.Dirents[i].Parent < delta.Dirents[j].Parent
+	})
+	return delta
+}
+
+func (p *imageFS) persistentNamespaceDeltaLocked() *persistentImageDelta {
+	delta := p.persistentDeltaLocked()
+	if delta == nil {
+		return nil
+	}
+	for i := range delta.Nodes {
+		node := &delta.Nodes[i]
+		if _, dirty := p.persistent.dirtyData[node.ID]; !dirty || node.Kind != "file" {
+			continue
+		}
+		if durable, ok := p.persistent.durableNode(node.ID); ok {
+			preservePersistentNodeData(node, durable)
+			continue
+		}
+		// Directory durability must be able to publish a newly-created name
+		// without claiming that un-fsynced file contents survived a crash.
+		// A copied-up lower file falls back to its immutable lower contents; a
+		// brand-new file becomes an empty durable inode until its own fsync.
+		if len(node.LowerPath) != 0 {
+			node.Size = node.LowerSize
+			node.CopiedUp = false
+			node.Independent = false
+		} else {
+			node.Size = 0
+			node.LowerSize = 0
+			node.Independent = true
+		}
+		node.Data = nil
+	}
+	return delta
+}
+
+func preservePersistentNodeData(target *persistentImageNode, durable persistentImageNode) {
+	target.Size = durable.Size
+	target.Data = append([]persistentImageExtent(nil), durable.Data...)
+	target.CopiedUp = durable.CopiedUp
+	target.Independent = durable.Independent
+	target.LowerSize = durable.LowerSize
+	target.LowerPath = append([]byte(nil), durable.LowerPath...)
+}
+
+func (s *persistentImageStore) durableNode(nodeID uint64) (persistentImageNode, bool) {
+	if s == nil || s.durableState == nil {
+		return persistentImageNode{}, false
+	}
+	for _, node := range s.durableState.Nodes {
+		if node.ID == nodeID {
+			return node, true
+		}
+	}
+	return persistentImageNode{}, false
+}
+
+func (s *persistentImageStore) clearFilePending(nodeID uint64, committedCreation bool) {
+	if s == nil || s.pending == nil {
+		return
+	}
+	if committedCreation {
+		for key, op := range s.pending.dirents {
+			if op.Inode == nodeID {
+				delete(s.pending.dirents, key)
+				delete(s.pending.whiteouts, key)
+			}
+		}
+		delete(s.pending.deleted, nodeID)
+	}
+	keepNodeForNamespace := false
+	if !committedCreation {
+		_, keepNodeForNamespace = s.pending.deleted[nodeID]
+		if !keepNodeForNamespace {
+			for _, op := range s.pending.dirents {
+				if op.Inode == nodeID {
+					keepNodeForNamespace = true
+					break
+				}
+			}
+		}
+	}
+	if !keepNodeForNamespace {
+		delete(s.pending.nodes, nodeID)
+	}
+	if len(s.pending.nodes) == 0 && len(s.pending.deleted) == 0 && len(s.pending.dirents) == 0 && len(s.pending.whiteouts) == 0 {
+		s.pending = nil
+	}
+}
+
+func (s *persistentImageStore) clearNamespacePending() {
+	if s == nil || s.pending == nil {
+		return
+	}
+	dirty := make(map[uint64]struct{}, len(s.dirtyData))
+	for id := range s.dirtyData {
+		if _, deleted := s.pending.deleted[id]; !deleted {
+			dirty[id] = struct{}{}
+		}
+	}
+	s.pending = nil
+	if len(dirty) != 0 {
+		s.pending = &persistentImagePending{
+			nodes: dirty, deleted: make(map[uint64]struct{}),
+			dirents:   make(map[persistentDirentKey]persistentImageDirentOp),
+			whiteouts: make(map[persistentDirentKey]persistentImageWhiteoutOp),
+		}
+	}
+}
+
 func (s *persistentImageStore) clearPending() {
 	s.pending = nil
 }
@@ -214,6 +393,16 @@ func (s *persistentImageStore) appendDelta(delta *persistentImageDelta, durable 
 	delta.Version = persistentImageFormatVersion
 	delta.Sequence = s.sequence + 1
 	delta.Committed = durable
+	var nextDurable *persistentImageState
+	if durable {
+		nextDurable = clonePersistentImageState(s.durableState)
+		if nextDurable == nil {
+			nextDurable = &persistentImageState{Version: persistentImageFormatVersion, LowerID: s.lowerID}
+		}
+		if err := applyPersistentImageDelta(nextDurable, delta); err != nil {
+			return fmt.Errorf("apply persistent metadata delta: %w", err)
+		}
+	}
 	if err := runPersistentImageFaultTestHook("before-wal-append"); err != nil {
 		return err
 	}
@@ -257,6 +446,7 @@ func (s *persistentImageStore) appendDelta(delta *persistentImageDelta, durable 
 	s.sequence = delta.Sequence
 	if durable {
 		s.durableSequence = s.sequence
+		s.durableState = nextDurable
 	}
 	return nil
 }
@@ -430,9 +620,16 @@ func applyPersistentImageDelta(state *persistentImageState, delta *persistentIma
 	}
 	for _, update := range delta.Nodes {
 		if old, ok := nodes[update.ID]; ok {
+			if update.PreserveNamespace {
+				update.Parent = old.Parent
+				update.Name = append([]byte(nil), old.Name...)
+				update.GuestPath = append([]byte(nil), old.GuestPath...)
+				update.NLink = old.NLink
+			}
 			update.Entries = old.Entries
 			update.Whiteouts = old.Whiteouts
 		}
+		update.PreserveNamespace = false
 		nodes[update.ID] = update
 	}
 	for _, id := range delta.Deleted {
@@ -608,7 +805,14 @@ func (p *imageFS) maybeCheckpointPersistentLocked() error {
 	if info.Size() < persistentImageCheckpointWALBytes {
 		return nil
 	}
-	if err := p.savePersistentLocked(true); err != nil {
+	state := clonePersistentImageState(p.persistent.durableState)
+	if state == nil {
+		return nil
+	}
+	// A selective fsync may leave unrelated live mutations dirty. Compact only
+	// the already-durable state; checkpointing must never promote those live
+	// mutations merely because the WAL crossed its size threshold.
+	if err := p.persistent.save(state, true); err != nil {
 		p.persistent.lastErr = err
 		return err
 	}

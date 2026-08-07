@@ -12,8 +12,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -75,6 +77,7 @@ type persistentImageStore struct {
 	pendingRemove   map[uint64]struct{}
 	newDataDirs     map[uint64]string
 	dirtyData       map[uint64]struct{}
+	durableState    *persistentImageState
 	recovery        persistentImageRecovery
 	dataUsage       map[uint64]uint64
 	dataPhysical    map[uint64]uint64
@@ -84,6 +87,7 @@ type persistentImageStore struct {
 	usageErr        error
 	lastCheckpoint  time.Time
 	lastErr         error
+	dataSyncMu      sync.Mutex
 }
 
 type persistentImageRecovery struct {
@@ -129,6 +133,10 @@ type persistentImageNode struct {
 	ATimeUnixNano int64                   `json:"atime_unix_nano,omitempty"`
 	MTimeUnixNano int64                   `json:"mtime_unix_nano,omitempty"`
 	CTimeUnixNano int64                   `json:"ctime_unix_nano,omitempty"`
+	// PreserveNamespace is used only by WAL deltas for file fsync. File
+	// durability must not accidentally make an un-fsynced rename or link
+	// durable as well.
+	PreserveNamespace bool `json:"preserve_namespace,omitempty"`
 }
 
 type persistentImageDirent struct {
@@ -229,17 +237,17 @@ func openPersistentImageStore(dir, lowerID string) (*persistentImageStore, *pers
 	}
 	if state != nil {
 		store.sequence = state.Sequence
-		if store.recovery.Status == "" {
-			store.recovery = state.Recovery
-		}
-		if state.LastError != "" {
-			store.lastErr = errors.New(state.LastError)
+		// Recovery describes work performed while opening this attachment. Do
+		// not replay a completed recovery warning on every future startup.
+		if lastError := activePersistentLastError(state.LastError); lastError != "" {
+			store.lastErr = errors.New(lastError)
 		}
 		if err := store.replayWAL(state); err != nil {
 			_ = store.close()
 			return nil, nil, err
 		}
 		store.durableSequence = store.sequence
+		store.durableState = clonePersistentImageState(state)
 		if err := store.preserveUnreferencedData(state); err != nil {
 			_ = store.close()
 			return nil, nil, err
@@ -286,6 +294,7 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 	if err := os.Mkdir(quarantine, 0o700); err != nil {
 		return fmt.Errorf("create unreferenced data quarantine: %w", err)
 	}
+	sourceDirs := make(map[string]struct{})
 	for _, source := range orphaned {
 		relative, err := filepath.Rel(dataRoot, source)
 		if err != nil {
@@ -295,8 +304,11 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 		if err := os.Rename(source, target); err != nil {
 			return fmt.Errorf("preserve unreferenced data %q: %w", source, err)
 		}
-		if err := syncPersistentDirectory(filepath.Dir(source)); err != nil {
-			return fmt.Errorf("publish removal of unreferenced data %q: %w", source, err)
+		sourceDirs[filepath.Dir(source)] = struct{}{}
+	}
+	for sourceDir := range sourceDirs {
+		if err := syncPersistentDirectory(sourceDir); err != nil {
+			return fmt.Errorf("publish removal of unreferenced data from %q: %w", sourceDir, err)
 		}
 	}
 	if err := syncPersistentDirectory(quarantine); err != nil {
@@ -309,8 +321,22 @@ func (s *persistentImageStore) preserveUnreferencedData(state *persistentImageSt
 		s.recovery.Status = "preserved-unreferenced-data"
 		s.recovery.QuarantinePath = quarantine
 	}
-	s.lastErr = errors.Join(s.lastErr, fmt.Errorf("preserved %d unreferenced inode data files in %s", len(orphaned), quarantine))
 	return nil
+}
+
+func activePersistentLastError(value string) string {
+	var active []string
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "previous persistent image attachment did not detach cleanly" {
+			continue
+		}
+		if strings.HasPrefix(line, "preserved ") && strings.Contains(line, " unreferenced inode data files in ") {
+			continue
+		}
+		active = append(active, line)
+	}
+	return strings.Join(active, "\n")
 }
 
 func (s *persistentImageStore) ensureEmptyUninitialized() error {
@@ -372,7 +398,6 @@ func (s *persistentImageStore) recoverIncompleteAttachment() error {
 		s.recovery.Status = "recovered-incomplete-close"
 		s.recovery.QuarantinePath = recoveryPath
 	}
-	s.lastErr = errors.Join(s.lastErr, errors.New("previous persistent image attachment did not detach cleanly"))
 	return nil
 }
 
@@ -636,6 +661,7 @@ func (s *persistentImageStore) save(state *persistentImageState, durable bool) e
 	if durable {
 		s.durableSequence = s.sequence
 		s.lastCheckpoint = time.Now()
+		s.durableState = clonePersistentImageState(state)
 	}
 	return nil
 }
@@ -859,12 +885,18 @@ func (s *persistentImageStore) syncData(nodeID uint64) error {
 	if err := runPersistentImageFaultTestHook("before-data-sync"); err != nil {
 		return err
 	}
+	s.dataSyncMu.Lock()
+	usage := s.dataUsage[nodeID]
+	shard, newData := s.newDataDirs[nodeID]
+	s.dataSyncMu.Unlock()
 	file, err := s.openData(nodeID, os.O_RDWR)
 	if errors.Is(err, os.ErrNotExist) {
-		if s.dataUsage[nodeID] != 0 {
+		if usage != 0 {
 			return fmt.Errorf("persistent inode %d data file is missing: %w", nodeID, syscall.EIO)
 		}
+		s.dataSyncMu.Lock()
 		delete(s.dirtyData, nodeID)
+		s.dataSyncMu.Unlock()
 		return nil
 	}
 	if err != nil {
@@ -875,16 +907,18 @@ func (s *persistentImageStore) syncData(nodeID uint64) error {
 	if err != nil {
 		return err
 	}
-	if shard, ok := s.newDataDirs[nodeID]; ok {
+	if newData {
 		if err := syncPersistentDirectory(shard); err != nil {
 			return err
 		}
 		if err := syncPersistentDirectory(filepath.Join(s.dir, "data")); err != nil {
 			return err
 		}
-		delete(s.newDataDirs, nodeID)
 	}
+	s.dataSyncMu.Lock()
+	delete(s.newDataDirs, nodeID)
 	delete(s.dirtyData, nodeID)
+	s.dataSyncMu.Unlock()
 	return nil
 }
 
@@ -897,12 +931,26 @@ func (s *persistentImageStore) syncDirtyData() error {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	var errs []error
-	for _, id := range ids {
-		if err := s.syncData(id); err != nil {
-			errs = append(errs, fmt.Errorf("sync dirty inode %d: %w", id, err))
-		}
+	workers := min(len(ids), max(1, min(runtime.GOMAXPROCS(0), 16)))
+	jobs := make(chan int)
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if err := s.syncData(ids[index]); err != nil {
+					errs[index] = fmt.Errorf("sync dirty inode %d: %w", ids[index], err)
+				}
+			}
+		}()
 	}
+	for index := range ids {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
 	return errors.Join(errs...)
 }
 
@@ -942,6 +990,7 @@ func (s *persistentImageStore) reclaimDurableData() error {
 		}
 		delete(s.pendingRemove, nodeID)
 		delete(s.newDataDirs, nodeID)
+		delete(s.dirtyData, nodeID)
 		s.setDataUsage(nodeID, 0, 0)
 	}
 	if didWork && len(s.pendingRemove) == 0 && len(s.pendingTrim) == 0 {
@@ -950,6 +999,36 @@ func (s *persistentImageStore) reclaimDurableData() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (s *persistentImageStore) reclaimDurableFileData(nodeID uint64) error {
+	if s == nil {
+		return nil
+	}
+	size, pending := s.pendingTrim[nodeID]
+	if !pending {
+		return nil
+	}
+	err := os.Truncate(s.dataPath(nodeID), int64(size))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("trim inode %d: %w", nodeID, err)
+	}
+	delete(s.pendingTrim, nodeID)
+	s.refreshPhysicalUsage(nodeID)
+	return nil
+}
+
+func (s *persistentImageStore) reclaimDurableNamespaceData() error {
+	if s == nil || len(s.pendingRemove) == 0 {
+		return nil
+	}
+	// Namespace fsync makes every pending unlink durable, but deliberately
+	// leaves truncation reclamation to the affected file's own fsync.
+	trims := s.pendingTrim
+	s.pendingTrim = make(map[uint64]uint64)
+	err := s.reclaimDurableData()
+	s.pendingTrim = trims
+	return err
 }
 
 func (s *persistentImageStore) setDataUsage(nodeID, current, physical uint64) {
@@ -1020,16 +1099,11 @@ func (p *imageFS) syncAllPersistentDataLocked() error {
 	if p == nil || p.persistent == nil {
 		return nil
 	}
-	var errs []error
-	for id, node := range p.nodes {
-		if node == nil || len(node.data.extents) == 0 {
-			continue
-		}
-		if err := p.persistent.syncData(id); err != nil {
-			errs = append(errs, fmt.Errorf("sync inode %d: %w", id, err))
-		}
-	}
-	return errors.Join(errs...)
+	// Data removed from dirtyData has already completed a durable file or
+	// filesystem barrier. Re-syncing every referenced inode made clean shutdown
+	// proportional to the entire persistent home rather than this session's
+	// outstanding writes.
+	return p.persistent.syncDirtyData()
 }
 
 func (p *imageFS) persistentStateLocked() *persistentImageState {
@@ -1175,12 +1249,7 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 	}
 	nodeSeen := make(map[uint64]struct{}, len(state.Nodes))
 	savedByPath := make(map[string]*imageNode, len(state.Nodes)+1)
-	linkedNodes := map[uint64]struct{}{1: {}}
-	for _, saved := range state.Nodes {
-		for _, entry := range saved.Entries {
-			linkedNodes[entry.Inode] = struct{}{}
-		}
-	}
+	savedNodes := make(map[uint64]*persistentImageNode, len(state.Nodes))
 	for _, saved := range state.Nodes {
 		if saved.ID == 0 || saved.ID == ^uint64(0) {
 			return fmt.Errorf("invalid node ID %d", saved.ID)
@@ -1192,12 +1261,29 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 		if _, removed := removedSeen[saved.ID]; removed {
 			return fmt.Errorf("node ID %d is both present and removed", saved.ID)
 		}
+		savedNodes[saved.ID] = &saved
+	}
+	reachableNodes := make(map[uint64]struct{}, len(state.Nodes))
+	queue := []uint64{1}
+	for len(queue) != 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, seen := reachableNodes[id]; seen {
+			continue
+		}
+		reachableNodes[id] = struct{}{}
+		if saved := savedNodes[id]; saved != nil {
+			for _, entry := range saved.Entries {
+				queue = append(queue, entry.Inode)
+			}
+		}
+	}
+	for _, saved := range state.Nodes {
 		// Older writers could checkpoint an inode kept alive only by an open
-		// handle after it had been unlinked or atomically replaced. Handles
-		// cannot survive restart, so restore only nodes reached by the saved
-		// directory namespace (plus the root).
-		_, linked := linkedNodes[saved.ID]
-		if !linked && len(saved.LowerPath) == 0 {
+		// handle, or a whole orphaned directory tree, after it had been
+		// unlinked or atomically replaced. Handles cannot survive restart, so
+		// restore only nodes actually reachable from the saved root directory.
+		if _, reachable := reachableNodes[saved.ID]; !reachable {
 			continue
 		}
 		guestPath := string(saved.GuestPath)

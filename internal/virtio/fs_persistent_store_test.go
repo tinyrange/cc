@@ -641,6 +641,56 @@ func TestPersistentImageFSRestoreRepairsDanglingDirectoryEntry(t *testing.T) {
 	}
 }
 
+func TestPersistentImageFSRestoreDiscardsOrphanedDirectoryTree(t *testing.T) {
+	storeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(storeDir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := newImageFS(imagefs.NewOverlay(nil).Root(), storeDir, 0, 0, false).(*imageFS)
+	backend.persistent = &persistentImageStore{
+		dir:           storeDir,
+		dataUsage:     make(map[uint64]uint64),
+		dataPhysical:  make(map[uint64]uint64),
+		pendingTrim:   make(map[uint64]uint64),
+		pendingRemove: make(map[uint64]struct{}),
+	}
+	backend.persistentNodes = make(map[uint64]struct{})
+	directory := func(id, parent uint64, name, guestPath string, entries ...persistentImageDirent) persistentImageNode {
+		return persistentImageNode{
+			ID: id, Parent: parent, Name: []byte(name), GuestPath: []byte(guestPath),
+			Kind: "dir", Mode: uint32(fs.ModeDir | 0o755), NLink: 1, EntriesDone: true, Entries: entries,
+		}
+	}
+	file := func(id, parent uint64, name, guestPath string) persistentImageNode {
+		return persistentImageNode{
+			ID: id, Parent: parent, Name: []byte(name), GuestPath: []byte(guestPath),
+			Kind: "file", Mode: 0o600, NLink: 1,
+		}
+	}
+	err := backend.restorePersistentState(&persistentImageState{
+		NextNodeID: 6,
+		Nodes: []persistentImageNode{
+			directory(1, 1, "/", "/", persistentImageDirent{Name: []byte("tree"), Inode: 2}),
+			directory(2, 1, "tree", "/tree", persistentImageDirent{Name: []byte("value"), Inode: 3}),
+			file(3, 2, "value", "/tree/value"),
+			directory(4, 1, "tree", "/tree", persistentImageDirent{Name: []byte("value"), Inode: 5}),
+			file(5, 4, "value", "/tree/value"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("restore checkpoint with orphaned tree: %v", err)
+	}
+	if _, exists := backend.nodes[4]; exists {
+		t.Fatal("orphaned directory survived recovery")
+	}
+	if _, exists := backend.nodes[5]; exists {
+		t.Fatal("orphaned file survived recovery")
+	}
+	if nodeID, _, errno := backend.Lookup(2, "value"); errno != 0 || nodeID != 3 {
+		t.Fatalf("lookup reachable file = inode %d, errno %d", nodeID, errno)
+	}
+}
+
 func TestPersistentImageFSTornWALTailIsPreservedAndRemovedFromReplay(t *testing.T) {
 	storeDir := filepath.Join(t.TempDir(), "home")
 	lower := imagefs.NewOverlay(nil).Root()
@@ -683,8 +733,8 @@ func TestPersistentImageFSTornWALTailIsPreservedAndRemovedFromReplay(t *testing.
 	backend = openPersistentImageFSTest(t, lower, storeDir)
 	defer backend.Close()
 	lookupPersistentTest(t, backend, 1, "after-recovery")
-	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "discarded-torn-wal-tail" || statuses[0].DiscardedBytes != uint64(len("torn-journal-tail")) {
-		t.Fatalf("persisted recovery status = %+v", statuses)
+	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "" || statuses[0].DiscardedBytes != 0 {
+		t.Fatalf("completed recovery repeated on next attachment: %+v", statuses)
 	}
 }
 
@@ -925,8 +975,8 @@ func TestPersistentImageFSENOSPCPreservesPendingDataAndMetadata(t *testing.T) {
 		}
 		return nil
 	}
-	if errno := backend.Flush(nodeID, fh, 0); errno != -linuxENOSPC {
-		t.Fatalf("flush under ENOSPC: errno %d", errno)
+	if errno := backend.Fsync(nodeID, fh, 0); errno != -linuxENOSPC {
+		t.Fatalf("fsync under ENOSPC: errno %d", errno)
 	}
 	persistentImageFaultTestHook = nil
 	if errno := backend.Fsync(nodeID, fh, 0); errno != 0 {
@@ -962,8 +1012,8 @@ func TestPersistentImageFSMetadataENOSPCDoesNotReportFalseOperationFailure(t *te
 	if lookupPersistentTest(t, backend, 1, "research") != dirID {
 		t.Fatal("successful mkdir was not visible")
 	}
-	if errno := backend.Flush(dirID, 0, 0); errno != -linuxENOSPC {
-		t.Fatalf("flush metadata under ENOSPC: errno %d", errno)
+	if errno := backend.FsyncDir(dirID, 0, 0); errno != -linuxENOSPC {
+		t.Fatalf("fsync metadata under ENOSPC: errno %d", errno)
 	}
 	if lookupPersistentTest(t, backend, 1, "research") != dirID {
 		t.Fatal("failed metadata flush rolled back or hid live state")
@@ -1015,7 +1065,7 @@ func TestPersistentImageFSCheckpointENOSPCLeavesRecoverableWAL(t *testing.T) {
 	if got := readPersistentTest(t, backend, nodeID, 0, 4); string(got) != "safe" {
 		t.Fatalf("state recovered from WAL = %q", got)
 	}
-	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "recovered-incomplete-close" || statuses[0].LastError == "" {
+	if statuses := backend.PersistentFSStatus(); len(statuses) != 1 || statuses[0].RecoveryStatus != "recovered-incomplete-close" || statuses[0].LastError != "" {
 		t.Fatalf("incomplete close recovery status = %+v", statuses)
 	}
 }
@@ -1224,7 +1274,7 @@ func TestPersistentImageFSDiscardsCompleteUncommittedWALAfterCrash(t *testing.T)
 	}
 }
 
-func TestPersistentImageFSDurableBarrierSyncsAllReferencedData(t *testing.T) {
+func TestPersistentImageFSFileFsyncLeavesUnrelatedDataDirty(t *testing.T) {
 	storeDir := filepath.Join(t.TempDir(), "home")
 	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
 	firstID, firstFH, _, errno := backend.Create(1, "first", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
@@ -1244,8 +1294,17 @@ func TestPersistentImageFSDurableBarrierSyncsAllReferencedData(t *testing.T) {
 	if errno := backend.Fsync(firstID, firstFH, 0); errno != 0 {
 		t.Fatalf("fsync first: errno %d", errno)
 	}
+	if _, dirty := backend.persistent.dirtyData[firstID]; dirty {
+		t.Fatalf("fsynced inode remained dirty: %v", backend.persistent.dirtyData)
+	}
+	if _, dirty := backend.persistent.dirtyData[secondID]; !dirty {
+		t.Fatalf("unrelated inode was made durable: %v", backend.persistent.dirtyData)
+	}
+	if errno := backend.SyncFS(); errno != 0 {
+		t.Fatalf("syncfs: errno %d", errno)
+	}
 	if len(backend.persistent.dirtyData) != 0 {
-		t.Fatalf("committed barrier retained dirty data: %v", backend.persistent.dirtyData)
+		t.Fatalf("syncfs retained dirty data: %v", backend.persistent.dirtyData)
 	}
 	backend.Release(firstID, firstFH)
 	backend.Release(secondID, secondFH)
@@ -1264,6 +1323,196 @@ func TestPersistentImageFSDurableBarrierSyncsAllReferencedData(t *testing.T) {
 	}
 	if err := backend.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPersistentImageFSFileFsyncDoesNotCommitUnrelatedDataAfterCrash(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "home")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentImageFSHardCrashHelper$")
+	cmd.Env = append(os.Environ(),
+		"CC_PERSISTENT_IMAGE_CRASH_HELPER=1",
+		"CC_PERSISTENT_IMAGE_CRASH_OPERATION=selective-fsync",
+		"CC_PERSISTENT_IMAGE_CRASH_STORE="+storeDir,
+	)
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 91 {
+		t.Fatalf("crash helper = %v, output:\n%s", err, output)
+	}
+
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	defer backend.Close()
+	firstID := lookupPersistentTest(t, backend, 1, "first")
+	if got := readPersistentTest(t, backend, firstID, 0, uint32(len("first-data"))); string(got) != "first-data" {
+		t.Fatalf("fsynced data after crash = %q", got)
+	}
+	if _, _, errno := backend.Lookup(1, "second"); errno != -linuxENOENT {
+		t.Fatalf("un-fsynced file survived crash: errno %d", errno)
+	}
+}
+
+func TestPersistentImageFSReadsRemainResponsiveDuringHostDataSync(t *testing.T) {
+	t.Cleanup(func() { persistentImageFaultTestHook = nil })
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), filepath.Join(t.TempDir(), "home"))
+	defer backend.Close()
+	nodeID, fh, _, errno := backend.Create(1, "state", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create state: errno %d", errno)
+	}
+	if written, errno := backend.Write(nodeID, fh, 0, []byte("data"), 0); errno != 0 || written != 4 {
+		t.Fatalf("write state: written=%d errno=%d", written, errno)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	persistentImageFaultTestHook = func(stage string) error {
+		if stage == "before-data-sync" {
+			once.Do(func() { close(entered) })
+			<-release
+		}
+		return nil
+	}
+	fsyncDone := make(chan int32, 1)
+	go func() { fsyncDone <- backend.Fsync(nodeID, fh, 0) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("fsync did not enter host data sync")
+	}
+	lookupDone := make(chan int32, 1)
+	go func() {
+		lookupID, _, errno := backend.Lookup(1, "state")
+		if errno != 0 {
+			lookupDone <- errno
+			return
+		}
+		readFH, errno := backend.Open(lookupID, linuxORDONLY)
+		if errno != 0 {
+			lookupDone <- errno
+			return
+		}
+		_, errno = backend.Read(lookupID, readFH, 0, 4)
+		backend.Release(lookupID, readFH)
+		lookupDone <- errno
+	}()
+	select {
+	case errno := <-lookupDone:
+		if errno != 0 {
+			t.Fatalf("lookup during fsync: errno %d", errno)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("read-only open blocked behind host data sync")
+	}
+	close(release)
+	if errno := <-fsyncDone; errno != 0 {
+		t.Fatalf("fsync after release: errno %d", errno)
+	}
+}
+
+func TestPersistentImageFSCloseDoesNotResyncDurableHome(t *testing.T) {
+	t.Cleanup(func() { persistentImageFaultTestHook = nil })
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), filepath.Join(t.TempDir(), "home"))
+	nodeID, fh, _, errno := backend.Create(1, "state", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+	if errno != 0 {
+		t.Fatalf("create state: errno %d", errno)
+	}
+	if written, errno := backend.Write(nodeID, fh, 0, []byte("durable"), 0); errno != 0 || written != 7 {
+		t.Fatalf("write state: written=%d errno=%d", written, errno)
+	}
+	if errno := backend.SyncFS(); errno != 0 {
+		t.Fatalf("sync baseline: errno %d", errno)
+	}
+	backend.Release(nodeID, fh)
+	persistentImageFaultTestHook = func(stage string) error {
+		if stage == "before-data-sync" {
+			return errors.New("durable inode was synchronized again")
+		}
+		return nil
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentImageFSCloseSynchronizesDirtyFilesConcurrently(t *testing.T) {
+	t.Cleanup(func() { persistentImageFaultTestHook = nil })
+	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), filepath.Join(t.TempDir(), "home"))
+	for _, name := range []string{"first", "second"} {
+		nodeID, fh, _, errno := backend.Create(1, name, linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create %s: errno %d", name, errno)
+		}
+		if written, errno := backend.Write(nodeID, fh, 0, []byte(name), 0); errno != 0 || written != uint32(len(name)) {
+			t.Fatalf("write %s: written=%d errno=%d", name, written, errno)
+		}
+		backend.Release(nodeID, fh)
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	persistentImageFaultTestHook = func(stage string) error {
+		if stage == "before-data-sync" {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- backend.closeWithin(time.Second) }()
+	for count := 0; count < 2; count++ {
+		select {
+		case <-entered:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("independent dirty files were synchronized serially")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentImageFSFileAndDirectoryFsyncHaveSeparateDurability(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		syncDir bool
+	}{
+		{name: "file-only"},
+		{name: "file-and-directory", syncDir: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			storeDir := filepath.Join(t.TempDir(), "home")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestPersistentImageFSHardCrashHelper$")
+			cmd.Env = append(os.Environ(),
+				"CC_PERSISTENT_IMAGE_CRASH_HELPER=1",
+				"CC_PERSISTENT_IMAGE_CRASH_OPERATION=selective-namespace",
+				"CC_PERSISTENT_IMAGE_CRASH_STORE="+storeDir,
+				fmt.Sprintf("CC_PERSISTENT_IMAGE_CRASH_SYNC_DIR=%t", test.syncDir),
+			)
+			output, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 91 {
+				t.Fatalf("crash helper = %v, output:\n%s", err, output)
+			}
+			backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+			defer backend.Close()
+			firstID := lookupPersistentTest(t, backend, 1, "first")
+			if got := readPersistentTest(t, backend, firstID, 0, 7); string(got) != "initial" {
+				t.Fatalf("baseline file after crash = %q", got)
+			}
+			durableName, missingName := "second", "moved"
+			if test.syncDir {
+				durableName, missingName = "moved", "second"
+			}
+			secondID := lookupPersistentTest(t, backend, 1, durableName)
+			if got := readPersistentTest(t, backend, secondID, 0, 7); string(got) != "updated" {
+				t.Fatalf("fsynced inode after crash = %q", got)
+			}
+			if _, _, errno := backend.Lookup(1, missingName); errno != -linuxENOENT {
+				t.Fatalf("non-durable name %q survived crash: errno %d", missingName, errno)
+			}
+		})
 	}
 }
 
@@ -1303,8 +1552,17 @@ func TestPersistentImageFSPreservesUnreferencedCrashData(t *testing.T) {
 	if string(content) != "possibly useful crash data" {
 		t.Fatalf("quarantined data = %q", content)
 	}
+	// Simulate recovery metadata written by an older build. Completed recovery
+	// diagnostics must not surface as an error on every later attachment.
+	backend.persistent.lastErr = errors.New("preserved 1 unreferenced inode data files in " + statuses[0].QuarantinePath)
 	if err := backend.Close(); err != nil {
 		t.Fatal(err)
+	}
+	backend = openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	defer backend.Close()
+	statuses = backend.PersistentFSStatus()
+	if len(statuses) != 1 || statuses[0].RecoveryStatus != "" || statuses[0].LastError != "" {
+		t.Fatalf("completed recovery repeated on next attachment: %+v", statuses)
 	}
 }
 
@@ -1393,6 +1651,57 @@ func TestPersistentImageFSHardCrashHelper(t *testing.T) {
 	stage := os.Getenv("CC_PERSISTENT_IMAGE_CRASH_STAGE")
 	storeDir := os.Getenv("CC_PERSISTENT_IMAGE_CRASH_STORE")
 	backend := openPersistentImageFSTest(t, imagefs.NewOverlay(nil).Root(), storeDir)
+	if os.Getenv("CC_PERSISTENT_IMAGE_CRASH_OPERATION") == "selective-namespace" {
+		firstID, firstFH, _, errno := backend.Create(1, "first", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create first: errno %d", errno)
+		}
+		secondID, secondFH, _, errno := backend.Create(1, "second", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create second: errno %d", errno)
+		}
+		if written, errno := backend.Write(firstID, firstFH, 0, []byte("initial"), 0); errno != 0 || written != 7 {
+			t.Fatalf("write initial: written=%d errno=%d", written, errno)
+		}
+		if errno := backend.SyncFS(); errno != 0 {
+			t.Fatalf("sync baseline: errno %d", errno)
+		}
+		if errno := backend.Rename(1, "second", 1, "moved", 0); errno != 0 {
+			t.Fatalf("rename second: errno %d", errno)
+		}
+		if written, errno := backend.Write(secondID, secondFH, 0, []byte("updated"), 0); errno != 0 || written != 7 {
+			t.Fatalf("write updated: written=%d errno=%d", written, errno)
+		}
+		if errno := backend.Fsync(secondID, secondFH, 0); errno != 0 {
+			t.Fatalf("fsync renamed inode: errno %d", errno)
+		}
+		if os.Getenv("CC_PERSISTENT_IMAGE_CRASH_SYNC_DIR") == "true" {
+			if errno := backend.FsyncDir(1, 0, 0); errno != 0 {
+				t.Fatalf("fsync root directory: errno %d", errno)
+			}
+		}
+		os.Exit(91)
+	}
+	if os.Getenv("CC_PERSISTENT_IMAGE_CRASH_OPERATION") == "selective-fsync" {
+		firstID, firstFH, _, errno := backend.Create(1, "first", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create first: errno %d", errno)
+		}
+		secondID, secondFH, _, errno := backend.Create(1, "second", linuxORDWR|linuxOCREAT|linuxOEXCL, 0o600, 0, 0)
+		if errno != 0 {
+			t.Fatalf("create second: errno %d", errno)
+		}
+		if written, errno := backend.Write(firstID, firstFH, 0, []byte("first-data"), 0); errno != 0 || written != 10 {
+			t.Fatalf("write first: written=%d errno=%d", written, errno)
+		}
+		if written, errno := backend.Write(secondID, secondFH, 0, []byte("second-data"), 0); errno != 0 || written != 11 {
+			t.Fatalf("write second: written=%d errno=%d", written, errno)
+		}
+		if errno := backend.Fsync(firstID, firstFH, 0); errno != 0 {
+			t.Fatalf("fsync first: errno %d", errno)
+		}
+		os.Exit(91)
+	}
 	if os.Getenv("CC_PERSISTENT_IMAGE_CRASH_OPERATION") == "uncommitted" {
 		persistentImageSaveTestHook = func(current string) {
 			if current == stage {
@@ -1402,8 +1711,11 @@ func TestPersistentImageFSHardCrashHelper(t *testing.T) {
 		if _, _, errno := backend.Mkdir(1, "not-durable", 0o700, 0, 0); errno != 0 {
 			t.Fatalf("mkdir not-durable: errno %d", errno)
 		}
-		if errno := backend.Flush(1, 0, 0); errno != 0 {
-			t.Fatalf("flush not-durable: errno %d", errno)
+		backend.mu.Lock()
+		err := backend.flushPersistentLocked(false)
+		backend.mu.Unlock()
+		if err != nil {
+			t.Fatalf("write legacy uncommitted WAL: %v", err)
 		}
 		t.Fatalf("crash stage %q was not reached", stage)
 	}

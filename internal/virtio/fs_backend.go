@@ -74,6 +74,10 @@ type fsFsyncDirBackend interface {
 	FsyncDir(nodeID uint64, fh uint64, flags uint32) int32
 }
 
+type fsSyncFSBackend interface {
+	SyncFS() int32
+}
+
 type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
 }
