@@ -82,3 +82,75 @@ func TestPartialTextureTransferGathersRowsFromFullGuestStride(t *testing.T) {
 			normalized.Offset, normalized.Stride, normalized.LayerStride)
 	}
 }
+
+func TestStencilTransferPreservesOneBytePixelsAndGuestRows(t *testing.T) {
+	description := virtio.GPUResource3D{
+		ID: 1, Target: 2, Format: 20,
+		Width: 4, Height: 2, Depth: 1, ArraySize: 1,
+	}
+	backing := transferBacking{0, 1, 2, 3, 4, 5, 6, 7}
+	transfer := virtio.GPUTransfer3D{
+		ResourceID: description.ID,
+		Box:        virtio.GPUBox{X: 1, Width: 2, Height: 2, Depth: 1},
+		Offset:     1,
+		Backing:    backing,
+	}
+
+	data, normalized, err := stageTransferData(description, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := data, []byte{1, 2, 5, 6}; string(got) != string(want) {
+		t.Fatalf("staged stencil rows = %v, want %v", got, want)
+	}
+	if normalized.Stride != 2 || normalized.LayerStride != 4 {
+		t.Fatalf("normalized stencil transfer stride/layer stride = %d/%d, want 2/4",
+			normalized.Stride, normalized.LayerStride)
+	}
+}
+
+func TestArrayTextureTransferPreservesLayerStride(t *testing.T) {
+	description := virtio.GPUResource3D{
+		ID: 1, Target: 7, Format: 67,
+		Width: 2, Height: 2, Depth: 1, ArraySize: 4,
+	}
+	backing := make(transferBacking, 48)
+	for index := range backing {
+		backing[index] = byte(index)
+	}
+	transfer := virtio.GPUTransfer3D{
+		ResourceID:  description.ID,
+		Box:         virtio.GPUBox{X: 1, Width: 1, Height: 2, Depth: 2},
+		Offset:      4,
+		Stride:      8,
+		LayerStride: 24,
+		Backing:     backing,
+	}
+
+	data, normalized, err := stageTransferData(description, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{
+		4, 5, 6, 7, 12, 13, 14, 15,
+		28, 29, 30, 31, 36, 37, 38, 39,
+	}
+	if string(data) != string(want) {
+		t.Fatalf("staged array texture layers = %v, want %v", data, want)
+	}
+	if normalized.Offset != 0 || normalized.Stride != 4 || normalized.LayerStride != 8 {
+		t.Fatalf("normalized array transfer = offset %d stride %d layer stride %d, want 0, 4, 8",
+			normalized.Offset, normalized.Stride, normalized.LayerStride)
+	}
+
+	destination := make(transferBacking, len(backing))
+	transfer.Backing = destination
+	if err := commitTransferFromHost(description, transfer, data); err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{4, 12, 28, 36} {
+		if got := destination[offset : offset+4]; string(got) != string(backing[offset:offset+4]) {
+			t.Fatalf("committed array bytes at %d = %v, want %v", offset, got, backing[offset:offset+4])
+		}
+	}
+}

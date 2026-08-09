@@ -51,11 +51,18 @@ type Renderer struct {
 
 func NewRenderer(host hostBackend) *Renderer {
 	r := &Renderer{
-		capsets: []virtio.GPUCapset{{
-			ID:      capsetVirGL,
-			Version: capsetVersion,
-			Data:    buildCapsetV1(),
-		}},
+		capsets: []virtio.GPUCapset{
+			{
+				ID:      capsetVirGL,
+				Version: capsetVersion,
+				Data:    buildCapsetV1(),
+			},
+			{
+				ID:      capsetVirGL2,
+				Version: capsetVersion2,
+				Data:    buildCapsetV2(),
+			},
+		},
 		host: host,
 	}
 	r.Reset()
@@ -204,34 +211,27 @@ func stageTransferData(description virtio.GPUResource3D, transfer virtio.GPUTran
 		return data, transfer, nil
 	}
 
-	rowBytes := uint64(transfer.Box.Width) * 4
-	stride := uint64(transfer.Stride)
-	if stride == 0 {
-		levelWidth := description.Width >> transfer.Level
-		if levelWidth == 0 {
-			levelWidth = 1
-		}
-		stride = uint64(levelWidth) * 4
+	layout, err := describeTextureTransfer(description, transfer)
+	if err != nil {
+		return nil, transfer, err
 	}
-	packedSize := rowBytes * uint64(transfer.Box.Height)
-	if transfer.Box.Height != 0 && packedSize/uint64(transfer.Box.Height) != rowBytes {
-		return nil, transfer, fmt.Errorf("VirGL resource %d packed transfer size overflows", transfer.ResourceID)
-	}
-	if packedSize > maxResourceBytes {
+	if layout.packedSize > maxResourceBytes {
 		return nil, transfer, fmt.Errorf("VirGL resource %d packed transfer is %d bytes, limit is %d",
-			transfer.ResourceID, packedSize, maxResourceBytes)
+			transfer.ResourceID, layout.packedSize, maxResourceBytes)
 	}
-	data := make([]byte, int(packedSize))
-	for row := uint32(0); row < transfer.Box.Height; row++ {
-		destination := uint64(row) * rowBytes
-		source := transfer.Offset + uint64(row)*stride
-		if err := transfer.Backing.ReadAt(source, data[int(destination):int(destination+rowBytes)]); err != nil {
-			return nil, transfer, err
+	data := make([]byte, int(layout.packedSize))
+	for layer := uint32(0); layer < transfer.Box.Depth; layer++ {
+		for row := uint32(0); row < transfer.Box.Height; row++ {
+			destination := uint64(layer)*layout.packedLayer + uint64(row)*layout.rowBytes
+			source := transfer.Offset + uint64(layer)*layout.layerStride + uint64(row)*layout.stride
+			if err := transfer.Backing.ReadAt(source, data[int(destination):int(destination+layout.rowBytes)]); err != nil {
+				return nil, transfer, err
+			}
 		}
 	}
 	transfer.Offset = 0
-	transfer.Stride = uint32(rowBytes)
-	transfer.LayerStride = uint32(packedSize)
+	transfer.Stride = uint32(layout.rowBytes)
+	transfer.LayerStride = uint32(layout.packedLayer)
 	return data, transfer, nil
 }
 
@@ -239,27 +239,90 @@ func transferDataSize(description virtio.GPUResource3D, transfer virtio.GPUTrans
 	if description.Target == 0 {
 		return uint64(transfer.Box.Width), nil
 	}
-	rowBytes := uint64(transfer.Box.Width) * 4
-	stride := uint64(transfer.Stride)
-	if stride == 0 {
-		levelWidth := description.Width >> transfer.Level
-		if levelWidth == 0 {
-			levelWidth = 1
+	layout, err := describeTextureTransfer(description, transfer)
+	return layout.span, err
+}
+
+type textureTransferLayout struct {
+	rowBytes, stride, layerStride uint64
+	packedLayer, packedSize, span uint64
+}
+
+func describeTextureTransfer(description virtio.GPUResource3D, transfer virtio.GPUTransfer3D) (textureTransferLayout, error) {
+	var layout textureTransferLayout
+	checkedMultiply := func(left, right uint64) (uint64, bool) {
+		if left != 0 && right > ^uint64(0)/left {
+			return 0, false
 		}
-		stride = uint64(levelWidth) * 4
+		return left * right, true
 	}
-	if stride < rowBytes {
-		return 0, fmt.Errorf("VirGL texture transfer stride %d is smaller than row size %d", stride, rowBytes)
-	}
-	size := rowBytes
-	if transfer.Box.Height > 1 {
-		extra := uint64(transfer.Box.Height-1) * stride
-		if extra > ^uint64(0)-size {
-			return 0, fmt.Errorf("VirGL resource %d transfer size overflows", transfer.ResourceID)
+	checkedAdd := func(left, right uint64) (uint64, bool) {
+		if right > ^uint64(0)-left {
+			return 0, false
 		}
-		size += extra
+		return left + right, true
 	}
-	return size, nil
+	var ok bool
+	layout.rowBytes, ok = checkedMultiply(uint64(transfer.Box.Width), textureFormatBytes(description.Format))
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d transfer row size overflows", transfer.ResourceID)
+	}
+	layout.stride = uint64(transfer.Stride)
+	levelWidth := description.Width >> transfer.Level
+	if levelWidth == 0 {
+		levelWidth = 1
+	}
+	levelHeight := description.Height >> transfer.Level
+	if levelHeight == 0 {
+		levelHeight = 1
+	}
+	if layout.stride == 0 {
+		layout.stride, ok = checkedMultiply(uint64(levelWidth), textureFormatBytes(description.Format))
+		if !ok {
+			return layout, fmt.Errorf("VirGL resource %d transfer stride overflows", transfer.ResourceID)
+		}
+	}
+	if layout.stride < layout.rowBytes {
+		return layout, fmt.Errorf("VirGL texture transfer stride %d is smaller than row size %d", layout.stride, layout.rowBytes)
+	}
+	layout.layerStride = uint64(transfer.LayerStride)
+	if layout.layerStride == 0 {
+		layout.layerStride, ok = checkedMultiply(layout.stride, uint64(levelHeight))
+		if !ok {
+			return layout, fmt.Errorf("VirGL resource %d transfer layer stride overflows", transfer.ResourceID)
+		}
+	}
+	if transfer.Box.Height == 0 || transfer.Box.Depth == 0 {
+		return layout, nil
+	}
+	rowsTail, ok := checkedMultiply(uint64(transfer.Box.Height-1), layout.stride)
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d transfer size overflows", transfer.ResourceID)
+	}
+	layerSpan, ok := checkedAdd(layout.rowBytes, rowsTail)
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d transfer size overflows", transfer.ResourceID)
+	}
+	if transfer.Box.Depth > 1 && layout.layerStride < layerSpan {
+		return layout, fmt.Errorf("VirGL texture transfer layer stride %d is smaller than layer size %d", layout.layerStride, layerSpan)
+	}
+	layersTail, ok := checkedMultiply(uint64(transfer.Box.Depth-1), layout.layerStride)
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d transfer size overflows", transfer.ResourceID)
+	}
+	layout.span, ok = checkedAdd(layerSpan, layersTail)
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d transfer size overflows", transfer.ResourceID)
+	}
+	layout.packedLayer, ok = checkedMultiply(layout.rowBytes, uint64(transfer.Box.Height))
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d packed layer size overflows", transfer.ResourceID)
+	}
+	layout.packedSize, ok = checkedMultiply(layout.packedLayer, uint64(transfer.Box.Depth))
+	if !ok {
+		return layout, fmt.Errorf("VirGL resource %d packed transfer size overflows", transfer.ResourceID)
+	}
+	return layout, nil
 }
 
 func (r *Renderer) TransferFromHost(transfer virtio.GPUTransfer3D) error {
@@ -295,8 +358,14 @@ func stageTransferFromHost(description virtio.GPUResource3D, transfer virtio.GPU
 	}
 
 	packedSize := uint64(transfer.Box.Width)
+	packedLayer := packedSize
 	if description.Target != 0 {
-		packedSize *= 4 * uint64(transfer.Box.Height)
+		layout, err := describeTextureTransfer(description, transfer)
+		if err != nil {
+			return nil, transfer, err
+		}
+		packedSize = layout.packedSize
+		packedLayer = layout.packedLayer
 	}
 	if packedSize > maxResourceBytes {
 		return nil, transfer, fmt.Errorf("VirGL resource %d packed transfer is %d bytes, limit is %d",
@@ -305,8 +374,8 @@ func stageTransferFromHost(description virtio.GPUResource3D, transfer virtio.GPU
 	data := make([]byte, int(packedSize))
 	transfer.Offset = 0
 	if description.Target != 0 {
-		transfer.Stride = transfer.Box.Width * 4
-		transfer.LayerStride = uint32(packedSize)
+		transfer.Stride = transfer.Box.Width * uint32(textureFormatBytes(description.Format))
+		transfer.LayerStride = uint32(packedLayer)
 	}
 	return data, transfer, nil
 }
@@ -315,23 +384,31 @@ func commitTransferFromHost(description virtio.GPUResource3D, transfer virtio.GP
 	if description.Target == 0 {
 		return transfer.Backing.WriteAt(transfer.Offset, data)
 	}
-	rowBytes := uint64(transfer.Box.Width) * 4
-	stride := uint64(transfer.Stride)
-	if stride == 0 {
-		levelWidth := description.Width >> transfer.Level
-		if levelWidth == 0 {
-			levelWidth = 1
-		}
-		stride = uint64(levelWidth) * 4
+	layout, err := describeTextureTransfer(description, transfer)
+	if err != nil {
+		return err
 	}
-	for row := uint32(0); row < transfer.Box.Height; row++ {
-		source := uint64(row) * rowBytes
-		destination := transfer.Offset + uint64(row)*stride
-		if err := transfer.Backing.WriteAt(destination, data[int(source):int(source+rowBytes)]); err != nil {
-			return err
+	for layer := uint32(0); layer < transfer.Box.Depth; layer++ {
+		for row := uint32(0); row < transfer.Box.Height; row++ {
+			source := uint64(layer)*layout.packedLayer + uint64(row)*layout.rowBytes
+			destination := transfer.Offset + uint64(layer)*layout.layerStride + uint64(row)*layout.stride
+			if err := transfer.Backing.WriteAt(destination, data[int(source):int(source+layout.rowBytes)]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func textureFormatBytes(format uint32) uint64 {
+	switch format {
+	case 16: // PIPE_FORMAT_Z16_UNORM
+		return 2
+	case 20: // PIPE_FORMAT_S8_UINT
+		return 1
+	default:
+		return 4
+	}
 }
 
 func (r *Renderer) Submit(contextID uint32, stream []byte) error {

@@ -615,6 +615,7 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 			return gpuResponse(request, gpuRespErrInvalidParameter, nil)
 		}
 		if err := g.renderer.CreateResource(resource); err != nil {
+			log.Printf("virtio-gpu rejected 3D resource %+v: %v", resource, err)
 			return gpuResponse(request, gpuRespErrUnspecified, nil)
 		}
 		g.resources[resource.ID] = &gpuResource{

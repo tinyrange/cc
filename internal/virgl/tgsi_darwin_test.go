@@ -186,6 +186,214 @@ DCL TEMP[0]
 	}
 }
 
+func TestCubeSamplerTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0]
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+  0: TEX TEMP[0], IMM[0], SAMP[0], 2D
+  1: MUL TEMP[0], TEMP[0], IMM[0].xxxx
+  2: ADD OUT[0], IMM[0], TEMP[0]
+  3: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], CUBE, FLOAT
+DCL TEMP[0..2]
+IMM[0] FLT32 {1.0, 0.0, 0.0, 0.5}
+  0: TEX TEMP[0], IMM[0], SAMP[0], CUBE
+  1: TXB TEMP[1], IMM[0], SAMP[0], CUBE
+  2: TXL TEMP[2], IMM[0], SAMP[0], CUBE
+  3: ADD TEMP[0], TEMP[0], TEMP[1]
+  4: ADD OUT[0], TEMP[0], TEMP[2]
+  5: END`
+
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArraySamplerTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+  0: MOV OUT[0], IMM[0]
+  1: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D_ARRAY, FLOAT
+DCL TEMP[0..2]
+IMM[0] FLT32 {0.25, 0.75, 1.0, 0.5}
+  0: TEX TEMP[0], IMM[0], SAMP[0], 2D_ARRAY
+  1: TXB TEMP[1], IMM[0], SAMP[0], 2D_ARRAY
+  2: TXL TEMP[2], IMM[0], SAMP[0], 2D_ARRAY
+  3: ADD TEMP[0], TEMP[0], TEMP[1]
+  4: ADD OUT[0], TEMP[0], TEMP[2]
+  5: END`
+
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVertexCubeExplicitLODUsesESMagnificationCrossover(t *testing.T) {
+	const vertex = `VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL SAMP[0]
+DCL SVIEW[0], CUBE, FLOAT
+IMM[0] FLT32 {1.0, 0.0, 0.0, 0.19264513}
+  0: MOV OUT[0], IN[0]
+  1: TXL OUT[1], IMM[0], SAMP[0], CUBE
+  2: END`
+	const fragment = `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+  0: MOV OUT[0], IN[0]
+  1: END`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vertexGLSL = linkTGSIInterfaces(vertexGLSL, fragmentGLSL)
+
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	output := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	cube := virtio.GPUResource3D{ID: 2, Target: 4, Format: 67, Width: 2, Height: 2, Depth: 1, ArraySize: 6, LastLevel: 1}
+	positions := virtio.GPUResource3D{ID: 3, Target: 0, Width: 24}
+	for _, description := range []virtio.GPUResource3D{output, cube, positions} {
+		if err := host.createResource(description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	black, white := [4]byte{0, 0, 0, 255}, [4]byte{255, 255, 255, 255}
+	level0 := append(append(append(append([]byte{}, black[:]...), white[:]...), white[:]...), black[:]...)
+	for face := uint32(0); face < 6; face++ {
+		if err := host.transferToHost(&resource{description: cube, data: level0}, virtio.GPUTransfer3D{
+			ResourceID: cube.ID,
+			Box:        virtio.GPUBox{Z: face, Width: 2, Height: 2, Depth: 1},
+		}); err != nil {
+			t.Fatalf("upload cube face %d level 0: %v", face, err)
+		}
+		if err := host.transferToHost(&resource{description: cube, data: black[:]}, virtio.GPUTransfer3D{
+			ResourceID: cube.ID,
+			Level:      1,
+			Box:        virtio.GPUBox{Z: face, Width: 1, Height: 1, Depth: 1},
+		}); err != nil {
+			t.Fatalf("upload cube face %d level 1: %v", face, err)
+		}
+	}
+	identitySwizzle := uint32(0 | (1 << 3) | (2 << 6) | (3 << 9))
+	if err := host.execute(contextID, []command{
+		{Opcode: 1, Object: 6, Payload: []uint32{20, cube.ID, 67, 0, 1 << 8, identitySwizzle}},
+		{Opcode: 1, Object: 7, Payload: []uint32{
+			21, 1 << 13,
+			math.Float32bits(0), math.Float32bits(0), math.Float32bits(1000),
+			math.Float32bits(0), math.Float32bits(0), math.Float32bits(0), math.Float32bits(0),
+		}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	positionData := make([]byte, positions.Width)
+	for index, value := range []float32{-1, -1, 3, -1, -1, 3} {
+		binary.LittleEndian.PutUint32(positionData[index*4:], math.Float32bits(value))
+	}
+
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err != nil {
+			return err
+		}
+		defer host.gl.deleteProgram(program)
+		context := host.contexts[contextID]
+		view, state := context.samplerViews[20], context.samplerStates[21]
+		host.gl.bindFramebuffer(glFramebuffer, host.resources[output.ID].framebuffer)
+		host.gl.viewport(0, 0, 1, 1)
+		host.gl.useProgram(program)
+		host.gl.uniform1f(uniformLocation(host.gl, program, "uWinsysAdjustY"), 1)
+		host.gl.uniform1i(uniformLocation(host.gl, program, "vertexSampler0"), 0)
+		host.gl.uniform1f(uniformLocation(host.gl, program, "vertexSampler0LODCrossover"), explicitLODCrossover(view, state))
+		host.gl.activeTexture(glTexture0)
+		host.gl.bindTexture(host.resources[cube.ID].textureTarget, host.resources[cube.ID].texture)
+		if err := host.applySamplerView(view); err != nil {
+			return err
+		}
+		host.gl.bindSampler(0, state.id)
+		host.gl.bindVertexArray(host.vao)
+		host.gl.bindBuffer(glArrayBuffer, host.resources[positions.ID].buffer)
+		host.gl.bufferSubData(glArrayBuffer, 0, len(positionData), glPointer(positionData))
+		host.gl.vertexAttribPtr(0, 2, glFloat, false, 8, 0)
+		host.gl.enableVertexAttrib(0)
+		host.gl.drawArrays(glTriangles, 0, 3)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pixels, _, err := host.readScanout(&resource{description: output}, image.Rect(0, 0, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for channel, value := range pixels[:3] {
+		if value < 120 || value > 136 {
+			t.Fatalf("explicit-LOD cube magnification channel %d = %d, want linear-filtered value near 128 (BGRA %v)", channel, value, pixels)
+		}
+	}
+}
+
 func TestPointSizeAndPointCoordinatesUseGLBuiltins(t *testing.T) {
 	const vertex = `VERT
 DCL IN[0]
@@ -359,11 +567,12 @@ func TestGlmarkArithmeticTGSICompilesInDarwinHostContext(t *testing.T) {
 	const fragment = `FRAG
 DCL OUT[0], COLOR
 DCL IN[0], POSITION
-DCL TEMP[0..7]
+DCL TEMP[0..7], ARRAY(1)
 DCL CONST[0..7]
 DCL ADDR[0]
-DCL SAMP[0]
+DCL SAMP[0..1]
 DCL SVIEW[0], SHADOW2D, FLOAT
+DCL SVIEW[1], 2D, FLOAT
 IMM[0] FLT32 {0.25, 0.5, 1.0, 2.0}
 IMM[1] UINT32 {0, 1, 2, 3}
   0: MOV TEMP[0], IMM[0]
@@ -415,7 +624,19 @@ IMM[1] UINT32 {0, 1, 2, 3}
  46: F2U TEMP[1], TEMP[0]
  47: I2F TEMP[1], TEMP[0]
  48: U2F TEMP[1], TEMP[0]
- 49: END`
+ 49: TRUNC TEMP[1], TEMP[0]
+ 50: INEG TEMP[1], IMM[1]
+ 51: ISLT TEMP[1], IMM[1], TEMP[1]
+ 52: UMAX TEMP[1], IMM[1], TEMP[1]
+ 53: TXP TEMP[1], TEMP[0], SAMP[1], 2D
+ 54: TXB TEMP[1], TEMP[0], SAMP[1], 2D
+ 55: TXL TEMP[1], TEMP[0], SAMP[1], 2D
+ 56: MOV TEMP[ADDR[0].x](1).xy, TEMP[0]
+ 57: CEIL TEMP[1], TEMP[0]
+ 58: IDIV TEMP[1], TEMP[1], IMM[1]
+ 59: IMIN TEMP[1], TEMP[1], IMM[1]
+ 60: KILL
+ 61: END`
 	_, fragmentGLSL, err := translateTGSI(fragment)
 	if err != nil {
 		t.Fatal(err)

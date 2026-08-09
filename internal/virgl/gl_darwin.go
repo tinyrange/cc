@@ -15,25 +15,32 @@ const (
 	glStreamDraw              = 0x88e0
 	glStaticDraw              = 0x88e4
 	glTexture2D               = 0x0de1
+	glTexture2DArray          = 0x8c1a
+	glTextureCubeMap          = 0x8513
+	glTextureCubeMapPositiveX = 0x8515
 	glTexture0                = 0x84c0
 	glRGBA8                   = 0x8058
 	glRGBA                    = 0x1908
 	glBGRA                    = 0x80e1
 	glUnsignedByte            = 0x1401
+	glByte                    = 0x1400
 	glShort                   = 0x1402
 	glUnsignedShort           = 0x1403
 	glUnsignedInt             = 0x1405
 	glUnsignedInt248          = 0x84fa
 	glFloat                   = 0x1406
+	glFixed                   = 0x140c
 	glFramebuffer             = 0x8d40
 	glReadFramebuffer         = 0x8ca8
 	glDrawFramebuffer         = 0x8ca9
 	glColorAttachment0        = 0x8ce0
 	glDepthAttachment         = 0x8d00
+	glStencilAttachment       = 0x8d20
 	glDepthStencilAttachment  = 0x821a
 	glFramebufferComplete     = 0x8cd5
 	glDepthComponent          = 0x1902
 	glDepthComponent24        = 0x81a6
+	glStencilIndex8           = 0x8d48
 	glDepthStencil            = 0x84f9
 	glDepth24Stencil8         = 0x88f0
 	glVertexShader            = 0x8b31
@@ -58,10 +65,16 @@ const (
 	glCW                      = 0x0900
 	glCCW                     = 0x0901
 	glDepthTest               = 0x0b71
+	glStencilTest             = 0x0b90
 	glBlend                   = 0x0be2
+	glDither                  = 0x0bd0
 	glScissorTest             = 0x0c11
 	glPrimitiveRestart        = 0x8f9d
 	glProgramPointSize        = 0x8642
+	glPointSpriteCoordOrigin  = 0x8ca0
+	glLowerLeft               = 0x8ca1
+	glUpperLeft               = 0x8ca2
+	glPolygonOffsetFill       = 0x8037
 	glNever                   = 0x0200
 	glLess                    = 0x0201
 	glEqual                   = 0x0202
@@ -70,6 +83,14 @@ const (
 	glNotEqual                = 0x0205
 	glGEqual                  = 0x0206
 	glAlways                  = 0x0207
+	glKeep                    = 0x1e00
+	glReplace                 = 0x1e01
+	glIncrement               = 0x1e02
+	glDecrement               = 0x1e03
+	glIncrementWrap           = 0x8507
+	glDecrementWrap           = 0x8508
+	glInvert                  = 0x150a
+	glStencilIndex            = 0x1901
 	glUnpackAlignment         = 0x0cf5
 	glPackAlignment           = 0x0d05
 	glTextureMinFilter        = 0x2801
@@ -96,6 +117,7 @@ const (
 	glMirroredRepeat          = 0x8370
 	glTextureWrapS            = 0x2802
 	glTextureWrapT            = 0x2803
+	glTextureWrapR            = 0x8072
 	glTextureSwizzleR         = 0x8e42
 	glTextureSwizzleG         = 0x8e43
 	glTextureSwizzleB         = 0x8e44
@@ -133,83 +155,103 @@ const (
 )
 
 type hostGL struct {
-	genTextures            func(int32, *uint32)
-	deleteTextures         func(int32, *uint32)
-	bindTexture            func(uint32, uint32)
-	activeTexture          func(uint32)
-	texImage2D             func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
-	texSubImage2D          func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
-	texParameteri          func(uint32, uint32, int32)
-	texParameterf          func(uint32, uint32, float32)
-	texParameterfv         func(uint32, uint32, *float32)
-	pixelStorei            func(uint32, int32)
-	genBuffers             func(int32, *uint32)
-	deleteBuffers          func(int32, *uint32)
-	bindBuffer             func(uint32, uint32)
-	bufferData             func(uint32, int, uintptr, uint32)
-	bufferSubData          func(uint32, int, int, uintptr)
-	getBufferSubData       func(uint32, int, int, uintptr)
-	genVertexArrays        func(int32, *uint32)
-	deleteVertexArrays     func(int32, *uint32)
-	bindVertexArray        func(uint32)
-	vertexAttribPtr        func(uint32, int32, uint32, bool, int32, uintptr)
-	vertexAttrib4f         func(uint32, float32, float32, float32, float32)
-	enableVertexAttrib     func(uint32)
-	disableVertexAttrib    func(uint32)
-	genFramebuffers        func(int32, *uint32)
-	deleteFramebuffers     func(int32, *uint32)
-	bindFramebuffer        func(uint32, uint32)
-	framebufferTexture     func(uint32, uint32, uint32, uint32, int32)
-	checkFramebuffer       func(uint32) uint32
-	blitFramebuffer        func(int32, int32, int32, int32, int32, int32, int32, int32, uint32, uint32)
-	createShader           func(uint32) uint32
-	shaderSource           func(uint32, int32, **byte, *int32)
-	compileShader          func(uint32)
-	getShaderiv            func(uint32, uint32, *int32)
-	getShaderInfoLog       func(uint32, int32, *int32, *byte)
-	deleteShader           func(uint32)
-	createProgram          func() uint32
-	attachShader           func(uint32, uint32)
-	linkProgram            func(uint32)
-	getProgramiv           func(uint32, uint32, *int32)
-	getProgramInfoLog      func(uint32, int32, *int32, *byte)
-	deleteProgram          func(uint32)
-	useProgram             func(uint32)
-	getUniformLocation     func(uint32, *byte) int32
-	uniformMatrix4fv       func(int32, int32, bool, *float32)
-	uniform4fv             func(int32, int32, *float32)
-	uniform1f              func(int32, float32)
-	uniform1i              func(int32, int32)
-	viewport               func(int32, int32, int32, int32)
-	depthRange             func(float64, float64)
-	scissor                func(int32, int32, int32, int32)
-	clearColor             func(float32, float32, float32, float32)
-	clearDepth             func(float64)
-	clearStencil           func(int32)
-	clear                  func(uint32)
-	enable                 func(uint32)
-	disable                func(uint32)
-	cullFace               func(uint32)
-	frontFace              func(uint32)
-	depthFunc              func(uint32)
-	depthMask              func(bool)
-	blendColor             func(float32, float32, float32, float32)
-	blendFuncSeparate      func(uint32, uint32, uint32, uint32)
-	blendEquationSeparate  func(uint32, uint32)
-	colorMask              func(bool, bool, bool, bool)
-	drawArrays             func(uint32, int32, int32)
-	drawElements           func(uint32, int32, uint32, uintptr)
-	drawElementsBaseVertex func(uint32, int32, uint32, uintptr, int32)
-	primitiveRestartIndex  func(uint32)
-	readPixels             func(int32, int32, int32, int32, uint32, uint32, uintptr)
-	drawBuffer             func(uint32)
-	readBuffer             func(uint32)
-	fenceSync              func(uint32, uint32) uintptr
-	waitSync               func(uintptr, uint32, uint64)
-	deleteSync             func(uintptr)
-	flush                  func()
-	finish                 func()
-	getError               func() uint32
+	genTextures                     func(int32, *uint32)
+	deleteTextures                  func(int32, *uint32)
+	bindTexture                     func(uint32, uint32)
+	activeTexture                   func(uint32)
+	texImage2D                      func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
+	texSubImage2D                   func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
+	texImage3D                      func(uint32, int32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
+	texSubImage3D                   func(uint32, int32, int32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
+	texParameteri                   func(uint32, uint32, int32)
+	texParameterf                   func(uint32, uint32, float32)
+	texParameterfv                  func(uint32, uint32, *float32)
+	genSamplers                     func(int32, *uint32)
+	deleteSamplers                  func(int32, *uint32)
+	bindSampler                     func(uint32, uint32)
+	samplerParameteri               func(uint32, uint32, int32)
+	samplerParameterf               func(uint32, uint32, float32)
+	samplerParameterfv              func(uint32, uint32, *float32)
+	pixelStorei                     func(uint32, int32)
+	genBuffers                      func(int32, *uint32)
+	deleteBuffers                   func(int32, *uint32)
+	bindBuffer                      func(uint32, uint32)
+	bufferData                      func(uint32, int, uintptr, uint32)
+	bufferSubData                   func(uint32, int, int, uintptr)
+	getBufferSubData                func(uint32, int, int, uintptr)
+	genVertexArrays                 func(int32, *uint32)
+	deleteVertexArrays              func(int32, *uint32)
+	bindVertexArray                 func(uint32)
+	vertexAttribPtr                 func(uint32, int32, uint32, bool, int32, uintptr)
+	vertexAttrib4f                  func(uint32, float32, float32, float32, float32)
+	vertexAttribDivisor             func(uint32, uint32)
+	enableVertexAttrib              func(uint32)
+	disableVertexAttrib             func(uint32)
+	genFramebuffers                 func(int32, *uint32)
+	deleteFramebuffers              func(int32, *uint32)
+	bindFramebuffer                 func(uint32, uint32)
+	framebufferTexture              func(uint32, uint32, uint32, uint32, int32)
+	framebufferTextureLayer         func(uint32, uint32, uint32, int32, int32)
+	checkFramebuffer                func(uint32) uint32
+	blitFramebuffer                 func(int32, int32, int32, int32, int32, int32, int32, int32, uint32, uint32)
+	createShader                    func(uint32) uint32
+	shaderSource                    func(uint32, int32, **byte, *int32)
+	compileShader                   func(uint32)
+	getShaderiv                     func(uint32, uint32, *int32)
+	getShaderInfoLog                func(uint32, int32, *int32, *byte)
+	deleteShader                    func(uint32)
+	createProgram                   func() uint32
+	attachShader                    func(uint32, uint32)
+	linkProgram                     func(uint32)
+	getProgramiv                    func(uint32, uint32, *int32)
+	getProgramInfoLog               func(uint32, int32, *int32, *byte)
+	deleteProgram                   func(uint32)
+	useProgram                      func(uint32)
+	getUniformLocation              func(uint32, *byte) int32
+	uniformMatrix4fv                func(int32, int32, bool, *float32)
+	uniform4fv                      func(int32, int32, *float32)
+	uniform1f                       func(int32, float32)
+	uniform1i                       func(int32, int32)
+	viewport                        func(int32, int32, int32, int32)
+	pointSize                       func(float32)
+	pointParameteri                 func(uint32, int32)
+	depthRange                      func(float64, float64)
+	scissor                         func(int32, int32, int32, int32)
+	clearColor                      func(float32, float32, float32, float32)
+	clearDepth                      func(float64)
+	clearStencil                    func(int32)
+	clear                           func(uint32)
+	enable                          func(uint32)
+	disable                         func(uint32)
+	cullFace                        func(uint32)
+	frontFace                       func(uint32)
+	depthFunc                       func(uint32)
+	depthMask                       func(bool)
+	stencilFuncSeparate             func(uint32, uint32, int32, uint32)
+	stencilOpSeparate               func(uint32, uint32, uint32, uint32)
+	stencilMaskSeparate             func(uint32, uint32)
+	blendColor                      func(float32, float32, float32, float32)
+	blendFuncSeparate               func(uint32, uint32, uint32, uint32)
+	blendEquationSeparate           func(uint32, uint32)
+	colorMask                       func(bool, bool, bool, bool)
+	drawArrays                      func(uint32, int32, int32)
+	drawArraysInstanced             func(uint32, int32, int32, int32)
+	drawElements                    func(uint32, int32, uint32, uintptr)
+	drawElementsInstanced           func(uint32, int32, uint32, uintptr, int32)
+	drawElementsBaseVertex          func(uint32, int32, uint32, uintptr, int32)
+	drawElementsInstancedBaseVertex func(uint32, int32, uint32, uintptr, int32, int32)
+	primitiveRestartIndex           func(uint32)
+	polygonOffset                   func(float32, float32)
+	readPixels                      func(int32, int32, int32, int32, uint32, uint32, uintptr)
+	drawBuffer                      func(uint32)
+	drawBuffers                     func(int32, *uint32)
+	readBuffer                      func(uint32)
+	fenceSync                       func(uint32, uint32) uintptr
+	waitSync                        func(uintptr, uint32, uint64)
+	deleteSync                      func(uintptr)
+	flush                           func()
+	finish                          func()
+	getError                        func() uint32
 }
 
 func loadHostGL() (*hostGL, error) {
@@ -227,9 +269,17 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.activeTexture, "glActiveTexture")
 	register(&gl.texImage2D, "glTexImage2D")
 	register(&gl.texSubImage2D, "glTexSubImage2D")
+	register(&gl.texImage3D, "glTexImage3D")
+	register(&gl.texSubImage3D, "glTexSubImage3D")
 	register(&gl.texParameteri, "glTexParameteri")
 	register(&gl.texParameterf, "glTexParameterf")
 	register(&gl.texParameterfv, "glTexParameterfv")
+	register(&gl.genSamplers, "glGenSamplers")
+	register(&gl.deleteSamplers, "glDeleteSamplers")
+	register(&gl.bindSampler, "glBindSampler")
+	register(&gl.samplerParameteri, "glSamplerParameteri")
+	register(&gl.samplerParameterf, "glSamplerParameterf")
+	register(&gl.samplerParameterfv, "glSamplerParameterfv")
 	register(&gl.pixelStorei, "glPixelStorei")
 	register(&gl.genBuffers, "glGenBuffers")
 	register(&gl.deleteBuffers, "glDeleteBuffers")
@@ -242,12 +292,14 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.bindVertexArray, "glBindVertexArray")
 	register(&gl.vertexAttribPtr, "glVertexAttribPointer")
 	register(&gl.vertexAttrib4f, "glVertexAttrib4f")
+	register(&gl.vertexAttribDivisor, "glVertexAttribDivisor")
 	register(&gl.enableVertexAttrib, "glEnableVertexAttribArray")
 	register(&gl.disableVertexAttrib, "glDisableVertexAttribArray")
 	register(&gl.genFramebuffers, "glGenFramebuffers")
 	register(&gl.deleteFramebuffers, "glDeleteFramebuffers")
 	register(&gl.bindFramebuffer, "glBindFramebuffer")
 	register(&gl.framebufferTexture, "glFramebufferTexture2D")
+	register(&gl.framebufferTextureLayer, "glFramebufferTextureLayer")
 	register(&gl.checkFramebuffer, "glCheckFramebufferStatus")
 	register(&gl.blitFramebuffer, "glBlitFramebuffer")
 	register(&gl.createShader, "glCreateShader")
@@ -269,6 +321,8 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.uniform1f, "glUniform1f")
 	register(&gl.uniform1i, "glUniform1i")
 	register(&gl.viewport, "glViewport")
+	register(&gl.pointSize, "glPointSize")
+	register(&gl.pointParameteri, "glPointParameteri")
 	register(&gl.depthRange, "glDepthRange")
 	register(&gl.scissor, "glScissor")
 	register(&gl.clearColor, "glClearColor")
@@ -281,16 +335,24 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.frontFace, "glFrontFace")
 	register(&gl.depthFunc, "glDepthFunc")
 	register(&gl.depthMask, "glDepthMask")
+	register(&gl.stencilFuncSeparate, "glStencilFuncSeparate")
+	register(&gl.stencilOpSeparate, "glStencilOpSeparate")
+	register(&gl.stencilMaskSeparate, "glStencilMaskSeparate")
 	register(&gl.blendColor, "glBlendColor")
 	register(&gl.blendFuncSeparate, "glBlendFuncSeparate")
 	register(&gl.blendEquationSeparate, "glBlendEquationSeparate")
 	register(&gl.colorMask, "glColorMask")
 	register(&gl.drawArrays, "glDrawArrays")
+	register(&gl.drawArraysInstanced, "glDrawArraysInstanced")
 	register(&gl.drawElements, "glDrawElements")
+	register(&gl.drawElementsInstanced, "glDrawElementsInstanced")
 	register(&gl.drawElementsBaseVertex, "glDrawElementsBaseVertex")
+	register(&gl.drawElementsInstancedBaseVertex, "glDrawElementsInstancedBaseVertex")
 	register(&gl.primitiveRestartIndex, "glPrimitiveRestartIndex")
+	register(&gl.polygonOffset, "glPolygonOffset")
 	register(&gl.readPixels, "glReadPixels")
 	register(&gl.drawBuffer, "glDrawBuffer")
+	register(&gl.drawBuffers, "glDrawBuffers")
 	register(&gl.readBuffer, "glReadBuffer")
 	register(&gl.fenceSync, "glFenceSync")
 	register(&gl.waitSync, "glWaitSync")

@@ -15,8 +15,32 @@ func main() {
 	draw := flag.Int("draw", 0, "render immediately after this draw within the selected frame")
 	traceResource := flag.Uint("trace-resource", 0, "report draw state using this texture resource")
 	traceDraws := flag.Bool("trace-draws", false, "report every draw state in the selected frame")
+	findShader := flag.String("find-shader", "", "report checkpoints whose TGSI shader text contains this string")
+	findProjective := flag.Bool("find-projective", false, "report draws with varying clip-space W")
 	summary := flag.Bool("summary", false, "print capture protocol statistics without replaying")
 	flag.Parse()
+	if *findProjective {
+		if flag.NArg() != 1 {
+			fmt.Fprintln(os.Stderr, "usage: virgl-replay -find-projective CAPTURE")
+			os.Exit(2)
+		}
+		if err := virgl.FindCaptureProjectiveDraws(flag.Arg(0), os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *findShader != "" {
+		if flag.NArg() != 1 {
+			fmt.Fprintln(os.Stderr, "usage: virgl-replay -find-shader TEXT CAPTURE")
+			os.Exit(2)
+		}
+		if err := virgl.FindCaptureShaderText(flag.Arg(0), *findShader, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *summary {
 		if flag.NArg() != 1 {
 			fmt.Fprintln(os.Stderr, "usage: virgl-replay -summary CAPTURE")
