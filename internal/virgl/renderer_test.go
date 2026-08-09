@@ -85,7 +85,7 @@ func TestPartialTextureTransferGathersRowsFromFullGuestStride(t *testing.T) {
 
 func TestStencilTransferPreservesOneBytePixelsAndGuestRows(t *testing.T) {
 	description := virtio.GPUResource3D{
-		ID: 1, Target: 2, Format: 20,
+		ID: 1, Target: 2, Format: virglFormatS8UInt,
 		Width: 4, Height: 2, Depth: 1, ArraySize: 1,
 	}
 	backing := transferBacking{0, 1, 2, 3, 4, 5, 6, 7}
@@ -106,6 +106,48 @@ func TestStencilTransferPreservesOneBytePixelsAndGuestRows(t *testing.T) {
 	if normalized.Stride != 2 || normalized.LayerStride != 4 {
 		t.Fatalf("normalized stencil transfer stride/layer stride = %d/%d, want 2/4",
 			normalized.Stride, normalized.LayerStride)
+	}
+}
+
+func TestModernTextureTransfersUseProtocolFormatByteWidths(t *testing.T) {
+	tests := []struct {
+		name          string
+		format        uint32
+		bytesPerPixel uint64
+	}{
+		{"r8", virglFormatR8UNorm, 1},
+		{"rg8", virglFormatR8G8UNorm, 2},
+		{"r16f", virglFormatR16Float, 2},
+		{"rg16f", virglFormatR16G16Float, 4},
+		{"rgba16f", virglFormatR16G16B16A16Float, 8},
+		{"r32f", virglFormatR32Float, 4},
+		{"rg32f", virglFormatR32G32Float, 8},
+		{"rgba32f", virglFormatR32G32B32A32Float, 16},
+		{"rgba32ui", virglFormatR32G32B32A32UInt, 16},
+		{"rgba32i", virglFormatR32G32B32A32SInt, 16},
+		{"z32f-s8", virglFormatZ32FloatS8X24UInt, 8},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			description := virtio.GPUResource3D{
+				ID: 1, Target: 2, Format: test.format,
+				Width: 4, Height: 2, Depth: 1, ArraySize: 1,
+			}
+			transfer := virtio.GPUTransfer3D{
+				ResourceID: description.ID,
+				Box:        virtio.GPUBox{X: 1, Width: 2, Height: 2, Depth: 1},
+			}
+			layout, err := describeTextureTransfer(description, transfer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := uint64(2) * test.bytesPerPixel; layout.rowBytes != want {
+				t.Fatalf("row bytes = %d, want %d", layout.rowBytes, want)
+			}
+			if want := uint64(description.Width) * test.bytesPerPixel; layout.stride != want {
+				t.Fatalf("full guest stride = %d, want %d", layout.stride, want)
+			}
+		})
 	}
 }
 

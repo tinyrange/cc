@@ -202,17 +202,16 @@ func (h *captureHost) transferFromHost(resource *resource, transfer virtio.GPUTr
 }
 
 func (h *captureHost) execute(contextID uint32, commands []command, resources map[uint32]*resource) error {
-	if err := h.next.execute(contextID, commands, resources); err != nil {
-		return err
-	}
+	executeErr := h.next.execute(contextID, commands, resources)
 	if h.closed {
-		return nil
+		return executeErr
 	}
 	stream := encodeCommands(commands)
 	var payload bytes.Buffer
 	writeUint32s(&payload, contextID, uint32(len(stream)))
 	payload.Write(stream)
-	return h.writeRecord(captureExecute, payload.Bytes())
+	captureErr := h.writeRecord(captureExecute, payload.Bytes())
+	return errors.Join(executeErr, captureErr)
 }
 
 func encodeCommands(commands []command) []byte {
@@ -352,8 +351,13 @@ func SummarizeCapture(path string, output io.Writer) error {
 	dsa := make(map[uint32]int)
 	vertexFormats := make(map[uint32]int)
 	resourceFormats := make(map[uint32]int)
+	resourceFormatIDs := make(map[uint32][]uint32)
 	scanouts := make(map[uint32]int)
 	resourceSizes := make(map[uint32][3]uint32)
+	resourceFormatByID := make(map[uint32]uint32)
+	var blitDetails []string
+	blitResources := make(map[uint32]bool)
+	transferDetails := make(map[uint32][]string)
 	matchingScanoutResources := make(map[uint32]int)
 	for {
 		kind, payload, err := decoder.next()
@@ -371,11 +375,14 @@ func SummarizeCapture(path string, output io.Writer) error {
 				return errors.New("invalid resource record in VirGL capture")
 			}
 			count.resources++
-			resourceFormats[binary.LittleEndian.Uint32(payload[8:])]++
+			format := binary.LittleEndian.Uint32(payload[8:])
+			id := binary.LittleEndian.Uint32(payload)
+			resourceFormats[format]++
+			resourceFormatIDs[format] = append(resourceFormatIDs[format], id)
+			resourceFormatByID[id] = format
 			if binary.LittleEndian.Uint32(payload[40:]) != 0 {
 				count.flaggedResources++
 			}
-			id := binary.LittleEndian.Uint32(payload)
 			resourceSizes[id] = [3]uint32{
 				binary.LittleEndian.Uint32(payload[4:]),
 				binary.LittleEndian.Uint32(payload[16:]),
@@ -383,7 +390,9 @@ func SummarizeCapture(path string, output io.Writer) error {
 			}
 		case captureUnrefResource:
 			if len(payload) == 4 {
-				delete(resourceSizes, binary.LittleEndian.Uint32(payload))
+				id := binary.LittleEndian.Uint32(payload)
+				delete(resourceSizes, id)
+				delete(resourceFormatByID, id)
 			}
 		case captureTransferToHost:
 			if len(payload) < 56 {
@@ -391,6 +400,9 @@ func SummarizeCapture(path string, output io.Writer) error {
 			}
 			count.transfers++
 			length := uint64(binary.LittleEndian.Uint32(payload[52:]))
+			if length > uint64(len(payload)-56) {
+				return errors.New("truncated transfer data in VirGL capture")
+			}
 			count.transferBytes += length
 			resourceID := binary.LittleEndian.Uint32(payload[4:])
 			if description, ok := resourceSizes[resourceID]; ok && description[0] == 0 {
@@ -401,6 +413,18 @@ func SummarizeCapture(path string, output io.Writer) error {
 					binary.LittleEndian.Uint32(payload[20:]) == description[1] {
 					count.fullBufferTransfers++
 				}
+			} else if len(transferDetails[resourceID]) < 16 {
+				previewLength := int(length)
+				if previewLength > 16 {
+					previewLength = 16
+				}
+				transferDetails[resourceID] = append(transferDetails[resourceID], fmt.Sprintf(
+					"transfer resource=%d(format=%#x) box=%dx%dx%d@%d,%d,%d level=%d stride=%d layer_stride=%d bytes=%d preview=%x",
+					resourceID, resourceFormatByID[resourceID],
+					binary.LittleEndian.Uint32(payload[20:]), binary.LittleEndian.Uint32(payload[24:]), binary.LittleEndian.Uint32(payload[28:]),
+					binary.LittleEndian.Uint32(payload[8:]), binary.LittleEndian.Uint32(payload[12:]), binary.LittleEndian.Uint32(payload[16:]),
+					binary.LittleEndian.Uint32(payload[40:]), binary.LittleEndian.Uint32(payload[44:]), binary.LittleEndian.Uint32(payload[48:]),
+					length, payload[56:56+previewLength]))
 			}
 		case captureExecute:
 			if len(payload) < 8 {
@@ -468,6 +492,14 @@ func SummarizeCapture(path string, output io.Writer) error {
 					count.scissors++
 				case command.Opcode == 16:
 					count.blits++
+					if len(command.Payload) == 21 {
+						dst, src := command.Payload[3], command.Payload[12]
+						blitResources[src] = true
+						blitResources[dst] = true
+						blitDetails = append(blitDetails, fmt.Sprintf(
+							"blit source=%d(format=%#x) destination=%d(format=%#x) payload=%v",
+							src, resourceFormatByID[src], dst, resourceFormatByID[dst], command.Payload))
+					}
 				case command.Opcode == 17:
 					count.copies++
 				}
@@ -493,6 +525,14 @@ func SummarizeCapture(path string, output io.Writer) error {
 		count.draws, count.indexed, count.nonzeroStart, count.instanced, count.startInstance, count.vertexElements, count.instanceDivisors)
 	fmt.Fprintf(output, "viewports=%d scissors=%d blits=%d copies=%d\n",
 		count.viewports, count.scissors, count.blits, count.copies)
+	for _, detail := range blitDetails {
+		fmt.Fprintln(output, detail)
+	}
+	for _, id := range sortedUint32Keys(blitResources) {
+		for _, detail := range transferDetails[id] {
+			fmt.Fprintln(output, detail)
+		}
+	}
 	fmt.Fprintf(output, "transfers=%d bytes=%d buffer_transfers=%d full_buffer_transfers=%d buffer_bytes=%d buffer_storage_bytes=%d\n",
 		count.transfers, count.transferBytes, count.bufferTransfers, count.fullBufferTransfers,
 		count.bufferTransferBytes, count.bufferStorageBytes)
@@ -504,6 +544,17 @@ func SummarizeCapture(path string, output io.Writer) error {
 	printUint32Counts(output, "dsa", dsa)
 	printUint32Counts(output, "vertex_formats", vertexFormats)
 	printUint32Counts(output, "resource_formats", resourceFormats)
+	formats := make([]uint32, 0, len(resourceFormatIDs))
+	for format := range resourceFormatIDs {
+		formats = append(formats, format)
+	}
+	sort.Slice(formats, func(i, j int) bool { return formats[i] < formats[j] })
+	for _, format := range formats {
+		ids := resourceFormatIDs[format]
+		if len(ids) <= 16 {
+			fmt.Fprintf(output, "resource_format_%#x_ids=%v\n", format, ids)
+		}
+	}
 	printUint32Counts(output, "scanouts", scanouts)
 	printUint32Counts(output, "final_scanout_sized_textures", matchingScanoutResources)
 	return nil
@@ -520,4 +571,13 @@ func printUint32Counts(output io.Writer, label string, counts map[uint32]int) {
 		fmt.Fprintf(output, " %#x=%d", key, counts[key])
 	}
 	_, _ = fmt.Fprintln(output)
+}
+
+func sortedUint32Keys(values map[uint32]bool) []uint32 {
+	keys := make([]uint32, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
 }

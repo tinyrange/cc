@@ -54,8 +54,8 @@ func ReplayCaptureResourceDraw(capturePath, outputPath string, frame int, resour
 // ReplayCaptureTraceResource writes the final scanout and reports draw state
 // whenever the selected texture resource is bound during one captured frame.
 func ReplayCaptureTraceResource(capturePath, outputPath string, frame int, resourceID uint32, output io.Writer) (int, error) {
-	if frame <= 0 || resourceID == 0 {
-		return 0, errors.New("VirGL replay trace frame and resource ID must be positive")
+	if frame < 0 || resourceID == 0 {
+		return 0, errors.New("VirGL replay trace frame must be nonnegative and resource ID must be positive")
 	}
 	if output == nil {
 		return 0, errors.New("VirGL replay trace output must be non-nil")
@@ -63,11 +63,12 @@ func ReplayCaptureTraceResource(capturePath, outputPath string, frame int, resou
 	return replayCapture(capturePath, outputPath, frame, 0, 0, 0, resourceID, output, nil)
 }
 
-// ReplayCaptureTraceDraws writes the final scanout and reports the complete
-// draw-state sequence for one captured frame.
+// ReplayCaptureTraceDraws writes the selected scanout and reports the complete
+// draw-state sequence for one captured frame. Frame zero traces a headless
+// capture that has no scanout checkpoints.
 func ReplayCaptureTraceDraws(capturePath, outputPath string, frame int, output io.Writer) (int, error) {
-	if frame <= 0 {
-		return 0, errors.New("VirGL replay trace frame must be positive")
+	if frame < 0 {
+		return 0, errors.New("VirGL replay trace frame cannot be negative")
 	}
 	if output == nil {
 		return 0, errors.New("VirGL replay trace output must be non-nil")
@@ -104,6 +105,17 @@ func FindCaptureShaderText(capturePath, match string, output io.Writer) error {
 	defer decoder.close()
 
 	checkpoint := 0
+	type shaderKey struct {
+		context, subcontext, handle uint32
+	}
+	type shaderTextAssembly struct {
+		stage, totalBytes uint32
+		text              []byte
+		streamOutputs     uint32
+		strides           [4]uint32
+	}
+	activeSubcontexts := make(map[uint32]uint32)
+	assemblies := make(map[shaderKey]*shaderTextAssembly)
 	for {
 		kind, payload, err := decoder.next()
 		if errors.Is(err, io.EOF) {
@@ -125,15 +137,115 @@ func FindCaptureShaderText(capturePath, match string, output io.Writer) error {
 				return err
 			}
 			for _, item := range commands {
+				if item.Opcode == 28 && len(item.Payload) == 1 {
+					activeSubcontexts[contextID] = item.Payload[0]
+					continue
+				}
 				if item.Opcode != 1 || item.Object != 4 || len(item.Payload) < 6 {
 					continue
 				}
-				chunk := shaderBytes(item.Payload[5:])
-				if !strings.Contains(string(chunk), match) {
+				handle, stage, offlen, streamOutputs := item.Payload[0], item.Payload[1], item.Payload[2], item.Payload[4]
+				key := shaderKey{context: contextID, subcontext: activeSubcontexts[contextID], handle: handle}
+				if offlen&(1<<31) == 0 {
+					shaderStart := 5
+					assembly := &shaderTextAssembly{stage: stage, totalBytes: offlen, streamOutputs: streamOutputs}
+					if streamOutputs != 0 {
+						if streamOutputs > 64 || len(item.Payload) < 9+int(streamOutputs)*2 {
+							return fmt.Errorf("shader %d has invalid stream output count %d", handle, streamOutputs)
+						}
+						copy(assembly.strides[:], item.Payload[5:9])
+						shaderStart = 9 + int(streamOutputs)*2
+					}
+					assembly.text = make([]byte, (offlen+3)&^3)
+					copy(assembly.text, shaderBytes(item.Payload[shaderStart:]))
+					assemblies[key] = assembly
+				} else if assembly := assemblies[key]; assembly != nil {
+					offset := offlen &^ (1 << 31)
+					copy(assembly.text[offset:], shaderBytes(item.Payload[5:]))
+				}
+				assembly := assemblies[key]
+				if assembly == nil || assembly.totalBytes == 0 || !strings.Contains(string(assembly.text[:assembly.totalBytes]), match) {
 					continue
 				}
-				fmt.Fprintf(output, "checkpoint=%d context=%d shader=%d stage=%d match=%q\n",
-					checkpoint, contextID, item.Payload[0], item.Payload[1], match)
+				text := strings.TrimRight(string(assembly.text[:assembly.totalBytes]), "\x00")
+				fmt.Fprintf(output, "checkpoint=%d context=%d subcontext=%d shader=%d stage=%d stream_outputs=%d strides=%v match=%q\n%s\n",
+					checkpoint, contextID, key.subcontext, handle, assembly.stage, assembly.streamOutputs, assembly.strides, match, text)
+				delete(assemblies, key)
+			}
+		}
+	}
+}
+
+// TraceCaptureStreamout reports the guest stream-output declarations and
+// bindings around transform-feedback draws. It is intended for diagnosing
+// protocol/layout mismatches without adding logging to the live renderer.
+func TraceCaptureStreamout(capturePath string, output io.Writer) error {
+	if output == nil {
+		return errors.New("VirGL streamout trace output must be non-nil")
+	}
+	decoder, err := openCapture(capturePath)
+	if err != nil {
+		return fmt.Errorf("open VirGL capture: %w", err)
+	}
+	defer decoder.close()
+
+	type stateKey struct{ context, subcontext uint32 }
+	type shaderInfo struct {
+		outputs []uint32
+		strides [4]uint32
+	}
+	activeSubcontexts := make(map[uint32]uint32)
+	boundVertexShader := make(map[stateKey]uint32)
+	shaders := make(map[[4]uint32]shaderInfo)
+	boundTargets := make(map[stateKey][]uint32)
+	draw := 0
+	for {
+		kind, payload, err := decoder.next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read VirGL capture record: %w", err)
+		}
+		if kind != captureExecute || len(payload) < 8 {
+			continue
+		}
+		contextID := binary.LittleEndian.Uint32(payload)
+		commands, err := decodeCommands(payload[8:])
+		if err != nil {
+			return err
+		}
+		for _, item := range commands {
+			if item.Opcode == 28 && len(item.Payload) == 1 {
+				activeSubcontexts[contextID] = item.Payload[0]
+				continue
+			}
+			key := stateKey{context: contextID, subcontext: activeSubcontexts[contextID]}
+			switch {
+			case item.Opcode == 1 && item.Object == 4 && len(item.Payload) >= 5 && item.Payload[2]&(1<<31) == 0:
+				handle, stage, count := item.Payload[0], item.Payload[1], item.Payload[4]
+				info := shaderInfo{}
+				if count != 0 && count <= 64 && len(item.Payload) >= 9+int(count)*2 {
+					copy(info.strides[:], item.Payload[5:9])
+					info.outputs = append(info.outputs, item.Payload[9:9+int(count)*2]...)
+				}
+				shaders[[4]uint32{contextID, key.subcontext, handle, stage}] = info
+			case item.Opcode == 31 && len(item.Payload) == 2 && item.Payload[1] == tgsiVertex:
+				boundVertexShader[key] = item.Payload[0]
+			case item.Opcode == 25 && len(item.Payload) >= 1:
+				boundTargets[key] = append(boundTargets[key][:0], item.Payload[1:]...)
+				handle := boundVertexShader[key]
+				info := shaders[[4]uint32{contextID, key.subcontext, handle, tgsiVertex}]
+				fmt.Fprintf(output, "context=%d subcontext=%d set_targets=%v append=%#x vertex_shader=%d outputs=%v strides=%v\n",
+					contextID, key.subcontext, item.Payload[1:], item.Payload[0], handle, info.outputs, info.strides)
+			case item.Opcode == 8:
+				draw++
+				if len(boundTargets[key]) != 0 {
+					handle := boundVertexShader[key]
+					info := shaders[[4]uint32{contextID, key.subcontext, handle, tgsiVertex}]
+					fmt.Fprintf(output, "draw=%d context=%d subcontext=%d targets=%v vertex_shader=%d output_count=%d\n",
+						draw, contextID, key.subcontext, boundTargets[key], handle, len(info.outputs)/2)
+				}
 			}
 		}
 	}
@@ -223,6 +335,17 @@ func replayCapture(capturePath, outputPath string, frame int, resourceID, resour
 			if err := replayTransfer(host, resources, payload); err != nil {
 				return 0, err
 			}
+			if traceOutput != nil && len(payload) >= 56 {
+				transferResource := binary.LittleEndian.Uint32(payload[4:])
+				if traceResourceID == transferResource {
+					preview := payload[56:]
+					if len(preview) > 96 {
+						preview = preview[:96]
+					}
+					fmt.Fprintf(traceOutput, "transfer_resource=%d bytes=%d preview=%x\n",
+						transferResource, len(payload)-56, preview)
+				}
+			}
 		case captureExecute:
 			if len(payload) < 8 {
 				return 0, errors.New("truncated VirGL execute record")
@@ -242,11 +365,14 @@ func replayCapture(capturePath, outputPath string, frame int, resourceID, resour
 				}
 				isolatedDrawFrame = true
 			}
-			traceFrame := traceOutput != nil && checkpoint == frame-1
-			if (selectedDraw != 0 || traceFrame) && checkpoint == frame-1 {
+			traceFrame := traceOutput != nil && (frame == 0 || checkpoint == frame-1)
+			if (selectedDraw != 0 || traceFrame) && (frame == 0 || checkpoint == frame-1) {
 				for _, item := range commands {
 					if err := host.execute(contextID, []command{item}, resources); err != nil {
 						return 0, err
+					}
+					if traceFrame && item.Opcode == 16 {
+						traceResourceBlit(traceOutput, host, resources, traceResourceID, item)
 					}
 					if item.Opcode != 8 {
 						continue
@@ -354,6 +480,9 @@ func replayCapture(capturePath, outputPath string, frame int, resourceID, resour
 		if projectiveOutput != nil {
 			return checkpoint, nil
 		}
+		if traceOutput != nil && frame == 0 {
+			return checkpoint, nil
+		}
 		if selectedDraw != 0 {
 			return 0, fmt.Errorf("VirGL frame %d has %d draws, requested %d", frame, draw, selectedDraw)
 		}
@@ -414,7 +543,7 @@ func traceProjectiveDraw(output io.Writer, host *darwinHost, contextID uint32, c
 	rasterizer := context.rasterizers[context.boundRasterizer]
 	fmt.Fprintf(output, "checkpoint=%d draw=%d context=%d subcontext=%d framebuffer_resource=%d viewport_adjust_y=%g rasterizer_state=%#x position_w=%v\n",
 		checkpoint, draw, contextID, root.activeSubcontext, colorResource,
-		context.viewport.adjustY, rasterizer.state, w)
+		context.viewports[0].adjustY, rasterizer.state, w)
 }
 
 func clearReplayDrawTarget(host *darwinHost, resource *resource) error {
@@ -453,12 +582,13 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 			slots = append(slots, slot)
 		}
 	}
-	if !traceAll && len(slots) == 0 {
-		return
-	}
-	colorResource := uint32(0)
+	colorResource, colorFormat := uint32(0), uint32(0)
 	if surface, ok := context.surfaces[context.firstColorSurface()]; ok {
 		colorResource = surface.resourceID
+		colorFormat = surface.format
+	}
+	if !traceAll && len(slots) == 0 && colorResource != resourceID {
+		return
 	}
 	depthResource, depthFormat := uint32(0), uint32(0)
 	if surface, ok := context.surfaces[context.depthSurface]; ok {
@@ -467,13 +597,11 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 			depthFormat = surface.resource.description.Format
 		}
 	}
-	vertexHandle := context.boundShaders[tgsiVertex]
-	fragmentHandle := context.boundShaders[tgsiFragment]
-	stateKey := fmt.Sprintf("%p/%d/%d/%d/%v", context, context.boundVertexElements, vertexHandle, fragmentHandle, slots)
-	fmt.Fprintf(output, "draw=%d context=%d subcontext=%d framebuffers=%v framebuffer_resource=%d depth_surface=%d depth_resource=%d depth_format=%d resource=%d fragment_slots=%v vertex_elements=%d shaders=%d/%d rasterizer=%d dsa=%d\n",
+	stateKey := fmt.Sprintf("%p/%d/%v/%v", context, context.boundVertexElements, context.boundShaders, slots)
+	fmt.Fprintf(output, "draw=%d context=%d subcontext=%d framebuffers=%v framebuffer_resource=%d framebuffer_format=%d depth_surface=%d depth_resource=%d depth_format=%d resource=%d fragment_slots=%v vertex_elements=%d shaders=%v rasterizer=%d dsa=%d\n",
 		draw, contextID, root.activeSubcontext, context.colorSurfaces, colorResource,
-		context.depthSurface, depthResource, depthFormat, resourceID, slots,
-		context.boundVertexElements, vertexHandle, fragmentHandle, context.boundRasterizer, context.boundDSA)
+		colorFormat, context.depthSurface, depthResource, depthFormat, resourceID, slots,
+		context.boundVertexElements, context.boundShaders, context.boundRasterizer, context.boundDSA)
 	fmt.Fprintf(output, "  draw_payload=%v index_resource=%d index_size=%d index_offset=%d\n",
 		command.Payload, context.indexBuffer, context.indexSize, context.indexOffset)
 	dsa := context.depthStencilAlpha[context.boundDSA]
@@ -481,8 +609,73 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 	fmt.Fprintf(output, "  rasterizer_state=%#x point_size=%g sprite_coordinates=%#x dsa_state=%#x stencil=%#x/%#x stencil_ref=%v\n",
 		rasterizer.state, rasterizer.pointSize, rasterizer.spriteCoordinateEnable,
 		dsa.state, dsa.stencil[0], dsa.stencil[1], context.stencilRef)
+	fmt.Fprintf(output, "  viewport_set=%#x viewport0=%+v scissor0=%+v blend=%d blend_target0=%#x\n",
+		context.viewportSet, context.viewports[0], context.scissors[0], context.boundBlend,
+		context.blendStates[context.boundBlend].renderTargets[0])
 	fmt.Fprintf(output, "  vertex_constants=%v fragment_constants=%v\n",
 		context.constants[tgsiVertex], context.constants[tgsiFragment])
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for slot, binding := range context.uniformBuffers[stage] {
+			if binding.resource == nil || binding.length == 0 {
+				continue
+			}
+			words := binding.resource.bufferBytes[binding.offset : binding.offset+binding.length]
+			first, last := uint32(0), uint32(0)
+			if len(words) >= 4 {
+				first = binary.LittleEndian.Uint32(words)
+				last = binary.LittleEndian.Uint32(words[len(words)-4:])
+			}
+			fmt.Fprintf(output, "  uniform_buffer_stage=%d slot=%d resource=%d offset=%d length=%d first=%#x last=%#x\n",
+				stage, slot, binding.resourceID, binding.offset, binding.length, first, last)
+			if colorResource == resourceID {
+				preview := words
+				if len(preview) > 96 {
+					preview = preview[:96]
+				}
+				fmt.Fprintf(output, "  uniform_buffer_stage=%d slot=%d preview=%x\n", stage, slot, preview)
+			}
+			if traceAll {
+				nonzero := make([]string, 0, 16)
+				for byteOffset := 0; byteOffset+4 <= len(words) && len(nonzero) < cap(nonzero); byteOffset += 4 {
+					value := binary.LittleEndian.Uint32(words[byteOffset:])
+					if value != 0 {
+						nonzero = append(nonzero, fmt.Sprintf("%d:%#x", byteOffset/4, value))
+					}
+				}
+				fmt.Fprintf(output, "  uniform_buffer_stage=%d slot=%d nonzero=%v\n", stage, slot, nonzero)
+			}
+		}
+	}
+	if (traceAll || colorResource == resourceID) && (colorFormat == virglFormatR32SInt || colorFormat == virglFormatR32UInt) {
+		var raw [4]byte
+		valueType := uint32(glInt)
+		if colorFormat == virglFormatR32UInt {
+			valueType = glUnsignedInt
+		}
+		if err := host.dispatch(func() error {
+			host.gl.readPixels(0, 0, 1, 1, glRedInteger, valueType, glPointer(raw[:]))
+			fmt.Fprintf(output, "  framebuffer_integer_error=%#x\n", host.gl.getError())
+			return nil
+		}); err == nil {
+			fmt.Fprintf(output, "  framebuffer_integer_pixel=%#x\n", binary.LittleEndian.Uint32(raw[:]))
+		}
+	}
+	if len(command.Payload) > 11 && command.Payload[11] != 0 {
+		// Stream-output buffers are written by native GL, so their CPU shadows
+		// are intentionally stale. Refresh vertex buffers before tracing a
+		// draw-from-stream-output command so the reported attributes describe
+		// the bytes the draw actually consumed.
+		_ = host.dispatch(func() error {
+			for _, binding := range context.vertexBuffers {
+				if binding.resource == nil || binding.resource.buffer == 0 || len(binding.resource.bufferBytes) == 0 {
+					continue
+				}
+				host.gl.bindBuffer(glArrayBuffer, binding.resource.buffer)
+				host.gl.getBufferSubData(glArrayBuffer, 0, len(binding.resource.bufferBytes), glPointer(binding.resource.bufferBytes))
+			}
+			return nil
+		})
+	}
 	if _, ok := seen[stateKey]; ok {
 		return
 	}
@@ -522,9 +715,9 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 		stateHandle := context.boundSamplerStates[tgsiFragment][slot]
 		state := context.samplerStates[stateHandle]
 		description := view.resource.description
-		fmt.Fprintf(output, "  sampler_slot=%d view=%d resource=%d target=%d size=%dx%d last_level=%d flags=%#x format=%d levels=%d..%d state=%d bits=%#x lod=%g..%g bias=%g\n",
+		fmt.Fprintf(output, "  sampler_slot=%d view=%d resource=%d target=%d size=%dx%d last_level=%d flags=%#x format=%d levels=%d..%d swizzle=%v state=%d bits=%#x lod=%g..%g bias=%g\n",
 			slot, viewHandle, view.resourceID, description.Target, description.Width, description.Height,
-			description.LastLevel, description.Flags, view.format, view.firstLevel, view.lastLevel,
+			description.LastLevel, description.Flags, view.format, view.firstLevel, view.lastLevel, view.swizzle,
 			stateHandle, state.state, state.minLOD, state.maxLOD, state.lodBias)
 	}
 	for slot, viewHandle := range context.boundSamplerViews[tgsiVertex] {
@@ -535,19 +728,88 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 		stateHandle := context.boundSamplerStates[tgsiVertex][slot]
 		state := context.samplerStates[stateHandle]
 		description := view.resource.description
-		fmt.Fprintf(output, "  vertex_sampler_slot=%d view=%d resource=%d target=%d size=%dx%d last_level=%d flags=%#x format=%d levels=%d..%d state=%d bits=%#x lod=%g..%g bias=%g\n",
+		fmt.Fprintf(output, "  vertex_sampler_slot=%d view=%d resource=%d target=%d size=%dx%d last_level=%d flags=%#x format=%d levels=%d..%d swizzle=%v state=%d bits=%#x lod=%g..%g bias=%g\n",
 			slot, viewHandle, view.resourceID, description.Target, description.Width, description.Height,
-			description.LastLevel, description.Flags, view.format, view.firstLevel, view.lastLevel,
+			description.LastLevel, description.Flags, view.format, view.firstLevel, view.lastLevel, view.swizzle,
 			stateHandle, state.state, state.minLOD, state.maxLOD, state.lodBias)
 	}
 	writeShader := func(label string, shader hostShader) {
+		if shader.tgsi != "" {
+			fmt.Fprintf(output, "  %s_tgsi:\n", label)
+			for _, line := range strings.Split(shader.tgsi, "\n") {
+				fmt.Fprintf(output, "    %s\n", line)
+			}
+		}
 		fmt.Fprintf(output, "  %s_shader:\n", label)
 		for _, line := range strings.Split(shader.source, "\n") {
 			fmt.Fprintf(output, "    %s\n", line)
 		}
 	}
-	writeShader("vertex", context.shaders[vertexHandle])
-	writeShader("fragment", context.shaders[fragmentHandle])
+	stageLabels := [...]string{"vertex", "fragment", "geometry", "tess_control", "tess_evaluation"}
+	for stage, label := range stageLabels {
+		handle := context.boundShaders[stage]
+		if handle != 0 {
+			writeShader(label, context.shaders[handle])
+		}
+	}
+	if (colorFormat == virglFormatR32SInt || colorFormat == virglFormatR32UInt) && context.boundShaders[tgsiFragment] != 0 {
+		fragment := context.shaders[context.boundShaders[tgsiFragment]].source
+		typed := typedFragmentOutputSource(fragment, context.fragmentOutputClasses(), context.usesDualSourceBlend())
+		tail := typed
+		if len(tail) > 400 {
+			tail = tail[len(tail)-400:]
+		}
+		fmt.Fprintf(output, "  typed_fragment_tail:\n    %s\n", strings.ReplaceAll(tail, "\n", "\n    "))
+	}
+}
+
+func traceResourceBlit(output io.Writer, host *darwinHost, resources map[uint32]*resource, selectedID uint32, item command) {
+	if len(item.Payload) != 21 {
+		return
+	}
+	dstID, srcID := item.Payload[3], item.Payload[12]
+	if selectedID != srcID && selectedID != dstID {
+		return
+	}
+	fmt.Fprintf(output, "blit source=%d destination=%d", srcID, dstID)
+	for _, id := range []uint32{srcID, dstID} {
+		guestResource := resources[id]
+		if guestResource == nil || guestResource.description.Target == 0 || guestResource.description.Samples != 0 {
+			continue
+		}
+		description := guestResource.description
+		width, height := description.Width>>item.Payload[13], description.Height>>item.Payload[13]
+		level := item.Payload[13]
+		if id == dstID {
+			width, height = description.Width>>item.Payload[4], description.Height>>item.Payload[4]
+			level = item.Payload[4]
+		}
+		if width == 0 {
+			width = 1
+		}
+		if height == 0 {
+			height = 1
+		}
+		bytesPerPixel := textureFormatBytes(description.Format)
+		if bytesPerPixel == 0 || uint64(width)*uint64(height)*bytesPerPixel > 1<<24 {
+			continue
+		}
+		readback := &resource{description: description, data: make([]byte, int(uint64(width)*uint64(height)*bytesPerPixel))}
+		readErr := host.transferFromHost(readback, virtio.GPUTransfer3D{
+			ResourceID: id, Level: level, Stride: uint32(uint64(width) * bytesPerPixel),
+			Box: virtio.GPUBox{Width: width, Height: height, Depth: 1},
+		})
+		if readErr != nil {
+			fmt.Fprintf(output, " resource=%d_error=%q", id, readErr)
+			continue
+		}
+		preview := readback.data
+		if len(preview) > 64 {
+			preview = preview[:64]
+		}
+		fmt.Fprintf(output, " resource=%d_format=%d_data=%x", id, description.Format, preview)
+	}
+	fmt.Fprintln(output)
 }
 
 func replayTransfer(host hostBackend, resources map[uint32]*resource, payload []byte) error {

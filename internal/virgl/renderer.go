@@ -250,6 +250,10 @@ type textureTransferLayout struct {
 
 func describeTextureTransfer(description virtio.GPUResource3D, transfer virtio.GPUTransfer3D) (textureTransferLayout, error) {
 	var layout textureTransferLayout
+	bytesPerPixel := textureFormatBytes(description.Format)
+	if bytesPerPixel == 0 {
+		return layout, fmt.Errorf("VirGL resource %d uses unsupported texture format %d", transfer.ResourceID, description.Format)
+	}
 	checkedMultiply := func(left, right uint64) (uint64, bool) {
 		if left != 0 && right > ^uint64(0)/left {
 			return 0, false
@@ -263,7 +267,7 @@ func describeTextureTransfer(description virtio.GPUResource3D, transfer virtio.G
 		return left + right, true
 	}
 	var ok bool
-	layout.rowBytes, ok = checkedMultiply(uint64(transfer.Box.Width), textureFormatBytes(description.Format))
+	layout.rowBytes, ok = checkedMultiply(uint64(transfer.Box.Width), bytesPerPixel)
 	if !ok {
 		return layout, fmt.Errorf("VirGL resource %d transfer row size overflows", transfer.ResourceID)
 	}
@@ -277,7 +281,7 @@ func describeTextureTransfer(description virtio.GPUResource3D, transfer virtio.G
 		levelHeight = 1
 	}
 	if layout.stride == 0 {
-		layout.stride, ok = checkedMultiply(uint64(levelWidth), textureFormatBytes(description.Format))
+		layout.stride, ok = checkedMultiply(uint64(levelWidth), bytesPerPixel)
 		if !ok {
 			return layout, fmt.Errorf("VirGL resource %d transfer stride overflows", transfer.ResourceID)
 		}
@@ -398,17 +402,6 @@ func commitTransferFromHost(description virtio.GPUResource3D, transfer virtio.GP
 		}
 	}
 	return nil
-}
-
-func textureFormatBytes(format uint32) uint64 {
-	switch format {
-	case 16: // PIPE_FORMAT_Z16_UNORM
-		return 2
-	case 20: // PIPE_FORMAT_S8_UINT
-		return 1
-	default:
-		return 4
-	}
 }
 
 func (r *Renderer) Submit(contextID uint32, stream []byte) error {

@@ -17,6 +17,7 @@ func main() {
 	traceDraws := flag.Bool("trace-draws", false, "report every draw state in the selected frame")
 	findShader := flag.String("find-shader", "", "report checkpoints whose TGSI shader text contains this string")
 	findProjective := flag.Bool("find-projective", false, "report draws with varying clip-space W")
+	traceStreamout := flag.Bool("trace-streamout", false, "report transform-feedback shader declarations and bindings")
 	summary := flag.Bool("summary", false, "print capture protocol statistics without replaying")
 	flag.Parse()
 	if *findProjective {
@@ -25,6 +26,17 @@ func main() {
 			os.Exit(2)
 		}
 		if err := virgl.FindCaptureProjectiveDraws(flag.Arg(0), os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *traceStreamout {
+		if flag.NArg() != 1 {
+			fmt.Fprintln(os.Stderr, "usage: virgl-replay -trace-streamout CAPTURE")
+			os.Exit(2)
+		}
+		if err := virgl.TraceCaptureStreamout(flag.Arg(0), os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

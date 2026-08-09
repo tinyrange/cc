@@ -4,6 +4,7 @@ package virgl
 
 import (
 	"encoding/binary"
+	"fmt"
 	"image"
 	"math"
 	"strings"
@@ -11,6 +12,37 @@ import (
 
 	"j5.nz/cc/internal/virtio"
 )
+
+func TestNativeHostEmulatesVertexIDAtSixteenAttributeLimit(t *testing.T) {
+	var vertex strings.Builder
+	vertex.WriteString("#version 410 core\n")
+	for index := 0; index < 16; index++ {
+		fmt.Fprintf(&vertex, "layout(location = %d) in vec4 attribute%d;\n", index, index)
+	}
+	vertex.WriteString("out float value;\nvoid main() { value = float(gl_VertexID)")
+	for index := 0; index < 16; index++ {
+		fmt.Fprintf(&vertex, " + attribute%d.x", index)
+	}
+	vertex.WriteString("; gl_Position = vec4(0.0); }\n")
+	const fragment = "#version 410 core\nvoid main() { discard; }\n"
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		source := emulateVertexSystemValueSource(vertex.String(), hostVertexSystemEmulation{
+			systemValue: emulatedVertexID, attribute: 15,
+		})
+		program, err := host.gl.compileProgram(source, fragment)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestVertexTGSIRequestsPositionInvarianceForMultipassDepth(t *testing.T) {
 	const vertex = `VERT
@@ -124,6 +156,9 @@ DCL TEMP[0..3]
 	if vertexStage != tgsiVertex || fragmentStage != tgsiFragment {
 		t.Fatalf("translated stages = %d/%d", vertexStage, fragmentStage)
 	}
+	if !strings.Contains(fragmentGLSL, "fragmentColor7 = fragmentColor0;") {
+		t.Fatalf("translated all-color-buffer shader does not replicate color zero:\n%s", fragmentGLSL)
+	}
 
 	host, err := newDarwinHost()
 	if err != nil {
@@ -132,6 +167,74 @@ DCL TEMP[0..3]
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGeometryTGSICompilesAndLinksInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[20]
+0: MOV OUT[0], IN[0]
+1: MOV OUT[1], IN[0]
+2: END
+`
+	const geometry = `GEOM
+PROPERTY GS_INPUT_PRIMITIVE TRIANGLES
+PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP
+PROPERTY GS_MAX_OUTPUT_VERTICES 3
+PROPERTY GS_INVOCATIONS 1
+DCL IN[][0], POSITION
+DCL IN[][1], GENERIC[20]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[20]
+IMM[0] INT32 {0, 0, 0, 0}
+0: MOV OUT[0], IN[0][0]
+1: MOV OUT[1], IN[0][1]
+2: EMIT IMM[0].xxxx
+3: MOV OUT[0], IN[1][0]
+4: MOV OUT[1], IN[1][1]
+5: EMIT IMM[0].xxxx
+6: MOV OUT[0], IN[2][0]
+7: MOV OUT[1], IN[2][1]
+8: EMIT IMM[0].xxxx
+9: ENDPRIM
+10: END
+`
+	const fragment = `FRAG
+DCL IN[0], GENERIC[20]
+DCL OUT[0], COLOR
+0: MOV OUT[0], IN[0]
+1: END
+`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, geometryGLSL, err := translateTGSI(geometry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vertexGLSL = linkTGSIInterfaces(vertexGLSL, geometryGLSL)
+	geometryGLSL = linkTGSIInterfaces(geometryGLSL, fragmentGLSL)
+
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgramWithGeometryTransformFeedback(vertexGLSL, geometryGLSL, fragmentGLSL, nil)
 		if err == nil {
 			host.gl.deleteProgram(program)
 		}
@@ -225,6 +328,327 @@ IMM[0] FLT32 {1.0, 0.0, 0.0, 0.5}
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTextureQueryLODTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+  0: MOV OUT[0], IMM[0]
+  1: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0..2]
+DCL SVIEW[0], 1D, FLOAT
+DCL SVIEW[1], 2D, FLOAT
+DCL SVIEW[2], 3D, FLOAT
+DCL TEMP[0..2]
+IMM[0] FLT32 {0.25, 0.5, 0.75, 1.0}
+  0: LODQ TEMP[0], IMM[0], SAMP[0], 1D
+  1: LODQ TEMP[1], IMM[0], SAMP[1], 2D
+  2: LODQ TEMP[2], IMM[0], SAMP[2], 3D
+  3: ADD TEMP[0], TEMP[0], TEMP[1]
+  4: ADD OUT[0], TEMP[0], TEMP[2]
+  5: END`
+
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSampleShadingTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: MOV OUT[1], IMM[0]
+2: END`
+	const fragment = `FRAG
+DCL SV[0], SAMPLEID
+DCL SV[1], SAMPLEPOS
+DCL SV[2], SAMPLEMASK
+DCL OUT[0], COLOR
+DCL OUT[1], SAMPLEMASK
+DCL TEMP[0]
+0: ADD TEMP[0], SV[0], SV[1]
+1: ADD OUT[0], TEMP[0], SV[2]
+2: MOV OUT[1], SV[2]
+3: END`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTextureBufferTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0..2]
+DCL SVIEW[0], BUFFER, FLOAT
+DCL SVIEW[1], BUFFER, UINT
+DCL SVIEW[2], BUFFER, SINT
+DCL TEMP[0..2]
+IMM[0] INT32 {0, 0, 0, 0}
+0: TXF TEMP[0], IMM[0], SAMP[0], BUFFER
+1: TXF TEMP[1], IMM[0], SAMP[1], BUFFER
+2: TXF TEMP[2], IMM[0], SAMP[2], BUFFER
+3: ADD TEMP[0], TEMP[0], TEMP[1]
+4: ADD OUT[0], TEMP[0], TEMP[2]
+5: END`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCubeArrayTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], CUBE_ARRAY, FLOAT
+DCL TEMP[0..4]
+IMM[0] FLT32 {1.0, 0.0, 0.0, 1.0}
+IMM[1] FLT32 {0.5, 0.0, 0.0, 0.0}
+0: TEX TEMP[0], IMM[0], SAMP[0], CUBE_ARRAY
+1: TEX2 TEMP[1], IMM[0], IMM[1], SAMP[0], CUBE_ARRAY
+2: TXL2 TEMP[2], IMM[0], IMM[1], SAMP[0], CUBE_ARRAY
+3: TXB2 TEMP[3], IMM[0], IMM[1], SAMP[0], CUBE_ARRAY
+4: LODQ TEMP[4], IMM[0], SAMP[0], CUBE_ARRAY
+5: MOV OUT[0], TEMP[0]
+6: END`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFP64TGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+DCL TEMP[0..30]
+IMM[0] FLT64 {1.25, 2.0}
+IMM[1] FLT32 {6.5, 0.0, 0.0, 0.0}
+IMM[2] FLT32 {1.0, 0.0, 0.0, 1.0}
+IMM[3] FLT32 {0.0, 1.0, 0.0, 1.0}
+IMM[4] INT32 {2, -2, 0, 0}
+IMM[5] UINT32 {3, 0, 0, 0}
+0: DADD TEMP[0].xy, IMM[0].xyxy, IMM[0].zwzw
+1: DMUL TEMP[1].zw, TEMP[0].xyxy, IMM[0].zwzw
+2: D2F TEMP[2].x, TEMP[1].zwzw
+3: FSEQ TEMP[3].x, TEMP[2].xxxx, IMM[1].xxxx
+4: DABS TEMP[4].xy, TEMP[0].xyxy
+5: DNEG TEMP[5].xy, TEMP[4].xyxy
+6: DRCP TEMP[6].xy, TEMP[4].xyxy
+7: DSQRT TEMP[7].xy, TEMP[4].xyxy
+8: DFRAC TEMP[8].xy, TEMP[4].xyxy
+9: DRSQ TEMP[9].xy, TEMP[4].xyxy
+10: DTRUNC TEMP[10].xy, TEMP[4].xyxy
+11: DCEIL TEMP[11].xy, TEMP[4].xyxy
+12: DFLR TEMP[12].xy, TEMP[4].xyxy
+13: DROUND TEMP[13].xy, TEMP[4].xyxy
+14: DSSG TEMP[14].xy, TEMP[5].xyxy
+15: DDIV TEMP[15].xy, TEMP[4].xyxy, IMM[0].zwzw
+16: DMAX TEMP[16].xy, TEMP[4].xyxy, IMM[0].zwzw
+17: DMIN TEMP[17].xy, TEMP[4].xyxy, IMM[0].zwzw
+18: DMAD TEMP[18].xy, TEMP[4].xyxy, IMM[0].zwzw, IMM[0].xyxy
+19: DFMA TEMP[19].xy, TEMP[4].xyxy, IMM[0].zwzw, IMM[0].xyxy
+20: I2D TEMP[20].xy, IMM[4].xxxx
+21: U2D TEMP[21].xy, IMM[5].xxxx
+22: F2D TEMP[22].xy, IMM[1].xxxx
+23: D2I TEMP[23].x, TEMP[20].xyxy
+24: D2U TEMP[24].x, TEMP[21].xyxy
+25: DSEQ TEMP[25].x, TEMP[4].xyxy, TEMP[4].xyxy
+26: DSLT TEMP[26].x, TEMP[4].xyxy, IMM[0].zwzw
+27: DSNE TEMP[27].x, TEMP[4].xyxy, IMM[0].zwzw
+28: DSGE TEMP[28].x, TEMP[4].xyxy, IMM[0].zwzw
+29: DLDEXP TEMP[29].xy, TEMP[4].xyxy, IMM[4].xxxx
+30: DFRACEXP TEMP[29].zw, TEMP[30].x, TEMP[4].xyxy
+31: DDX TEMP[20].zw, TEMP[4].xyxy
+32: DDY TEMP[21].zw, TEMP[4].xyxy
+33: UCMP OUT[0], TEMP[3].xxxx, IMM[2], IMM[3]
+34: END`
+	_, vertexGLSL, err := translateTGSI(vertex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fragmentGLSL, err := translateTGSI(fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
+		if err == nil {
+			host.gl.deleteProgram(program)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTessellationTGSICompilesInDarwinHostContext(t *testing.T) {
+	const vertex = `VERT
+DCL OUT[0], POSITION
+IMM[0] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: END`
+	const control = `TESS_CTRL
+PROPERTY TCS_VERTICES_OUT 3
+DCL IN[][0], POSITION
+DCL OUT[][0], POSITION
+DCL OUT[][3], GENERIC[0]
+DCL OUT[1], TESSOUTER
+DCL OUT[2], TESSINNER
+DCL SV[0], INVOCATIONID
+DCL ADDR[0]
+IMM[0] FLT32 {1.0, 1.0, 1.0, 1.0}
+0: UARL ADDR[0].x, SV[0]
+1: MOV OUT[ADDR[0].x][0], IN[ADDR[0].x][0]
+2: MOV OUT[ADDR[0].x][3], IMM[0]
+3: MOV OUT[1], IMM[0]
+4: MOV OUT[2], IMM[0]
+5: BARRIER
+6: END`
+	const evaluation = `TESS_EVAL
+PROPERTY TES_PRIM_MODE 4
+PROPERTY TES_SPACING 2
+PROPERTY TES_VERTEX_ORDER_CW 0
+PROPERTY TES_POINT_MODE 0
+DCL IN[][0], POSITION
+DCL IN[][3], GENERIC[0]
+DCL SV[0], TESSCOORD
+DCL OUT[0], POSITION
+DCL TEMP[0]
+0: MUL TEMP[0], IN[0][0], SV[0].xxxx
+1: MAD TEMP[0], IN[1][0], SV[0].yyyy, TEMP[0]
+2: MAD OUT[0], IN[2][0], SV[0].zzzz, TEMP[0]
+3: END`
+	const fragment = `FRAG
+DCL OUT[0], COLOR
+IMM[0] FLT32 {1.0, 0.0, 0.0, 1.0}
+0: MOV OUT[0], IMM[0]
+1: END`
+
+	stages := []string{vertex, control, evaluation, fragment}
+	glsl := make([]string, len(stages))
+	for index, tgsi := range stages {
+		_, translated, err := translateTGSI(tgsi)
+		if err != nil {
+			t.Fatalf("translate stage %d: %v", index, err)
+		}
+		glsl[index] = translated
+	}
+	glsl[0] = linkTGSIInterfaces(glsl[0], glsl[1])
+	glsl[1] = linkTGSIInterfaces(glsl[1], glsl[2])
+	glsl[2] = linkTGSIInterfaces(glsl[2], glsl[3])
+	host, err := newDarwinHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.close()
+	if err := host.dispatch(func() error {
+		program, err := host.gl.compileProgramWithTessellationGeometryTransformFeedback(glsl[0], glsl[1], glsl[2], "", glsl[3], nil)
 		if err == nil {
 			host.gl.deleteProgram(program)
 		}
@@ -568,6 +992,7 @@ func TestGlmarkArithmeticTGSICompilesInDarwinHostContext(t *testing.T) {
 DCL OUT[0], COLOR
 DCL IN[0], POSITION
 DCL TEMP[0..7], ARRAY(1)
+DCL TEMP[8..11], ARRAY(2)
 DCL CONST[0..7]
 DCL ADDR[0]
 DCL SAMP[0..1]
@@ -635,8 +1060,19 @@ IMM[1] UINT32 {0, 1, 2, 3}
  57: CEIL TEMP[1], TEMP[0]
  58: IDIV TEMP[1], TEMP[1], IMM[1]
  59: IMIN TEMP[1], TEMP[1], IMM[1]
- 60: KILL
- 61: END`
+ 60: UMIN TEMP[1], TEMP[1], IMM[1]
+ 61: IABS TEMP[1], TEMP[1]
+ 62: ISSG TEMP[1], TEMP[1]
+ 63: TXD TEMP[1], TEMP[0], TEMP[0], TEMP[0], SAMP[1], 2D
+ 64: IMAX TEMP[1], TEMP[1], IMM[1]
+ 65: USGE TEMP[1], TEMP[1], IMM[1]
+ 66: USLT TEMP[1], TEMP[1], IMM[1]
+ 67: TG4 TEMP[1], TEMP[0], IMM[1].xxxx, SAMP[1], 2D
+ 68: TG4 TEMP[1], TEMP[0], IMM[1].xxxx, SAMP[1], 2D, IMM[1].xyxx
+ 69: MOV TEMP[ADDR[0].x+8](2), TEMP[0]
+ 70: MOV TEMP[1], TEMP[ADDR[0].x+8](2)
+ 71: KILL
+ 72: END`
 	_, fragmentGLSL, err := translateTGSI(fragment)
 	if err != nil {
 		t.Fatal(err)

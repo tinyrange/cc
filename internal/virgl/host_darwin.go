@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -27,6 +28,7 @@ const (
 	nsOpenGLPFAOpenGLProfile     = 99
 	nsOpenGLProfileVersion41Core = 0x4100
 	maxHostPrograms              = 128
+	emulatedVertexTableEntries   = 4096
 )
 
 type hostRequest struct {
@@ -41,6 +43,12 @@ type darwinHost struct {
 	once                    sync.Once
 	gl                      *hostGL
 	vao                     uint32
+	emulatedVertexIDBuffer  uint32
+	emulatedVertexTable     uint32
+	constantStagingBuffers  [5][16]uint32
+	constantBufferTextures  [5][16]uint32
+	retiredConstantBuffers  []uint32
+	zeroUniformBuffer       uint32
 	enabledVertexAttributes uint32
 	blitReadFBO             uint32
 	blitDrawFBO             uint32
@@ -92,6 +100,7 @@ type hostResource struct {
 	depth                 bool
 	stencil               bool
 	packedStencil         bool
+	emulatedIntegerMSAA   bool
 	references            int
 	samplerViewConfigured bool
 	appliedSamplerView    hostSamplerView
@@ -111,11 +120,14 @@ type hostFramebufferAttachment struct {
 	target  uint32
 	level   uint32
 	layer   uint32
+	layered bool
 }
 
 type hostSamplerView struct {
 	resourceID uint32
 	resource   *hostResource
+	texture    uint32
+	target     uint32
 	format     uint32
 	firstLevel uint32
 	lastLevel  uint32
@@ -158,26 +170,82 @@ type hostVertexBuffer struct {
 }
 
 type hostShader struct {
-	stage      uint32
-	source     string
-	generation uint64
+	stage                     uint32
+	tgsi                      string
+	source                    string
+	generation                uint64
+	streamOutputVaryings      []string
+	streamOutputBufferStrides [4]uint32
+	maxInterleavedWorkaround  bool
+	geometryOutputMode        uint32
+	tessEvaluationOutputMode  uint32
 }
 
 type hostShaderAssembly struct {
-	stage      uint32
-	numTokens  uint32
-	totalBytes uint32
-	nextOffset uint32
-	text       []byte
+	stage                     uint32
+	numTokens                 uint32
+	totalBytes                uint32
+	nextOffset                uint32
+	text                      []byte
+	streamOutputs             []tgsiStreamOutput
+	streamOutputBufferStrides [4]uint32
+}
+
+type hostStreamoutTarget struct {
+	resourceID uint32
+	resource   *hostResource
+	offset     uint32
+	size       uint32
+}
+
+const (
+	hostStreamoutNeedBegin uint8 = iota
+	hostStreamoutPaused
+)
+
+type hostStreamoutObject struct {
+	id                 uint32
+	handles            [4]uint32
+	state              uint8
+	writtenBytes       [4]uint32
+	appendOffsetsValid bool
+}
+
+type hostActiveStreamout struct {
+	maxInterleavedWorkaround bool
+	stagingBuffers           [2]uint32
+	target                   hostStreamoutTarget
+	vertexCapacity           uint32
+	object                   *hostStreamoutObject
+	persistent               bool
+	advanceBytes             [4]uint32
+	advanceOffsetsValid      bool
+}
+
+type hostQuery struct {
+	id         uint32
+	queryType  uint32
+	index      uint32
+	target     uint32
+	resultSize uint32
+	resource   *hostResource
+	offset     uint32
+	active     bool
+	ended      bool
 }
 
 type hostProgram struct {
 	id                    uint32
 	lastUsed              uint64
-	constants             [2][16]int32
+	constants             [5][16]int32
+	constantUniforms      [5][16]int32
+	constantSizes         [5][16]int32
+	constantTextures      [5][16]int32
 	winsysAdjustY         int32
-	samplers              [2][16]int32
-	explicitLODCrossovers [2][16]int32
+	samplers              [5][16]int32
+	explicitLODCrossovers [5][16]int32
+	samplerSampleCounts   [5][16]int32
+	samplerViewSwizzles   [5][16]int32
 }
 
 type hostUniformBuffer struct {
@@ -188,17 +256,23 @@ type hostUniformBuffer struct {
 }
 
 type hostProgramKey struct {
-	context                      *hostContext
-	vertexHandle, fragmentHandle uint32
-	vertexGeneration             uint64
-	fragmentGeneration           uint64
-	pointSpriteCoordinates       uint32
+	context                                                                               *hostContext
+	vertexHandle, fragmentHandle, geometryHandle, tessControlHandle, tessEvaluationHandle uint32
+	vertexGeneration, fragmentGeneration, geometryGeneration                              uint64
+	tessControlGeneration, tessEvaluationGeneration                                       uint64
+	pointSpriteCoordinates                                                                uint32
+	fragmentOutputClasses                                                                 [8]uint8
+	dualSourceBlend                                                                       bool
+	emulatedVertexSystemValue, emulatedVertexAttribute                                    uint8
+	signedVertexInputs, unsignedVertexInputs                                              uint16
+	disableStreamout                                                                      bool
 }
 
 type hostRasterizer struct {
 	state                  uint32
 	pointSize              float32
 	spriteCoordinateEnable uint32
+	clipPlaneEnable        uint8
 	offsetUnits            float32
 	offsetScale            float32
 }
@@ -216,39 +290,47 @@ type hostViewport struct {
 }
 
 type hostContext struct {
-	subcontexts          map[uint32]*hostContext
-	activeSubcontext     uint32
-	blendStates          map[uint32]hostBlendState
-	surfaces             map[uint32]hostSurface
-	samplerViews         map[uint32]hostSamplerView
-	samplerStates        map[uint32]hostSamplerState
-	depthStencilAlpha    map[uint32]hostDepthStencilAlpha
-	vertexElements       map[uint32][]hostVertexElement
-	rasterizers          map[uint32]hostRasterizer
-	shaders              map[uint32]hostShader
-	shaderAssemblies     map[uint32]*hostShaderAssembly
-	boundShaders         [6]uint32
-	boundVertexElements  uint32
-	boundBlend           uint32
-	boundDSA             uint32
-	boundRasterizer      uint32
-	colorSurfaces        [8]uint32
-	depthSurface         uint32
-	blendColor           [4]float32
-	stencilRef           [2]uint8
-	scissors             [16]hostScissor
-	viewport             hostViewport
-	viewportSet          bool
-	vertexBuffers        [16]hostVertexBuffer
-	indexBuffer          uint32
-	indexResource        *hostResource
-	indexSize            uint32
-	indexOffset          uint32
-	constants            [2][]float32
-	uniformBuffers       [2][16]hostUniformBuffer
-	boundSamplerViews    [6][16]uint32
-	boundSamplerStates   [6][16]uint32
-	nextShaderGeneration uint64
+	subcontexts           map[uint32]*hostContext
+	activeSubcontext      uint32
+	blendStates           map[uint32]hostBlendState
+	surfaces              map[uint32]hostSurface
+	samplerViews          map[uint32]hostSamplerView
+	samplerStates         map[uint32]hostSamplerState
+	depthStencilAlpha     map[uint32]hostDepthStencilAlpha
+	vertexElements        map[uint32][]hostVertexElement
+	rasterizers           map[uint32]hostRasterizer
+	shaders               map[uint32]hostShader
+	shaderAssemblies      map[uint32]*hostShaderAssembly
+	streamoutTargets      map[uint32]hostStreamoutTarget
+	streamoutObjects      map[[4]uint32]*hostStreamoutObject
+	currentStreamout      *hostStreamoutObject
+	queries               map[uint32]hostQuery
+	activeQueries         map[uint64]uint32
+	conditionalQuery      uint32
+	boundStreamoutTargets [4]uint32
+	boundShaders          [6]uint32
+	boundVertexElements   uint32
+	boundBlend            uint32
+	boundDSA              uint32
+	boundRasterizer       uint32
+	colorSurfaces         [8]uint32
+	depthSurface          uint32
+	blendColor            [4]float32
+	stencilRef            [2]uint8
+	scissors              [16]hostScissor
+	viewports             [16]hostViewport
+	viewportSet           uint16
+	vertexBuffers         [16]hostVertexBuffer
+	indexBuffer           uint32
+	indexResource         *hostResource
+	indexSize             uint32
+	indexOffset           uint32
+	constants             [5][]float32
+	uniformBuffers        [5][16]hostUniformBuffer
+	tessFactors           [6]float32
+	boundSamplerViews     [6][16]uint32
+	boundSamplerStates    [6][16]uint32
+	nextShaderGeneration  uint64
 }
 
 func NewHostRenderer() (virtio.GPURenderer, error) {
@@ -436,22 +518,57 @@ func (h *darwinHost) createResource(description virtio.GPUResource3D) error {
 			h.gl.genBuffers(1, &hostResource.buffer)
 			h.gl.bindBuffer(glArrayBuffer, hostResource.buffer)
 			h.gl.bufferData(glArrayBuffer, int(description.Width), 0, glStreamDraw)
-		case 2, 4, 7:
-			if description.Width > capsetMaxTexture2D || description.Height > capsetMaxTexture2D {
+		case 1, 2, 3, 4, 5, 6, 7, 8:
+			multisample := description.Samples != 0
+			hostResource.emulatedIntegerMSAA = multisample && isIntegerTextureFormat(description.Format)
+			if multisample && (description.Samples > 4 || (description.Target != 2 && description.Target != 7) || description.LastLevel != 0) {
+				return fmt.Errorf("VirGL multisample resource %d has unsupported target %d, sample count %d, or last level %d",
+					description.ID, description.Target, description.Samples, description.LastLevel)
+			}
+			maxTextureDimension := uint32(capsetMaxTexture2D)
+			if description.Target == 3 {
+				maxTextureDimension = capsetMaxTexture3D
+			}
+			if description.Width > maxTextureDimension || description.Height > maxTextureDimension ||
+				(description.Target == 3 && description.Depth > maxTextureDimension) {
 				return fmt.Errorf("VirGL texture resource %d dimensions %dx%d exceed %d",
-					description.ID, description.Width, description.Height, capsetMaxTexture2D)
+					description.ID, description.Width, description.Height, maxTextureDimension)
+			}
+			if description.Target == 1 && (description.Height != 1 || description.Depth != 1 || description.ArraySize != 1) {
+				return fmt.Errorf("VirGL 1D resource %d must have height, depth, and array size 1, got %d, %d, %d",
+					description.ID, description.Height, description.Depth, description.ArraySize)
 			}
 			if description.Target == 4 && (description.Width != description.Height ||
 				(description.ArraySize != 1 && description.ArraySize != 6)) {
 				return fmt.Errorf("VirGL cube resource %d must be square with one cube, got %dx%d array size %d",
 					description.ID, description.Width, description.Height, description.ArraySize)
 			}
-			if description.Target == 7 && (description.ArraySize == 0 || description.ArraySize > 256) {
+			if description.Target == 8 && (description.Width != description.Height || description.ArraySize == 0 ||
+				description.ArraySize > capsetMaxArrayLayers || description.ArraySize%6 != 0) {
+				return fmt.Errorf("VirGL cube-array resource %d must be square with a positive multiple-of-six layer count no greater than %d, got %dx%d array size %d",
+					description.ID, capsetMaxArrayLayers, description.Width, description.Height, description.ArraySize)
+			}
+			if description.Target == 7 && (description.ArraySize == 0 || description.ArraySize > capsetMaxArrayLayers) {
 				return fmt.Errorf("VirGL 2D array resource %d has invalid layer count %d", description.ID, description.ArraySize)
 			}
+			if description.Target == 6 && (description.Height != 1 || description.Depth != 1 ||
+				description.ArraySize == 0 || description.ArraySize > capsetMaxArrayLayers) {
+				return fmt.Errorf("VirGL 1D array resource %d has invalid height %d, depth %d, or layer count %d",
+					description.ID, description.Height, description.Depth, description.ArraySize)
+			}
+			if description.Target == 5 && (description.Depth != 1 || description.ArraySize != 1 || description.LastLevel != 0) {
+				return fmt.Errorf("VirGL rectangle resource %d must have depth and array size 1 and no mipmaps, got %d, %d, level %d",
+					description.ID, description.Depth, description.ArraySize, description.LastLevel)
+			}
+			if description.Target == 3 && description.ArraySize != 1 {
+				return fmt.Errorf("VirGL 3D resource %d must have array size 1, got %d", description.ID, description.ArraySize)
+			}
 			maxDimension := description.Width
-			if description.Height > maxDimension {
+			if description.Target != 6 && description.Height > maxDimension {
 				maxDimension = description.Height
+			}
+			if description.Target == 3 && description.Depth > maxDimension {
+				maxDimension = description.Depth
 			}
 			maxLevel := uint32(0)
 			for dimension := maxDimension; dimension > 1; dimension >>= 1 {
@@ -462,18 +579,54 @@ func (h *darwinHost) createResource(description virtio.GPUResource3D) error {
 					description.ID, description.LastLevel, maxLevel, description.Width, description.Height)
 			}
 			h.gl.genTextures(1, &hostResource.texture)
+			// Apple's rectangle path rejects otherwise valid integer textures at
+			// sampling time. Keep the VirGL RECT contract in the translated shader,
+			// but use ordinary 2D storage and normalize coordinates there.
 			hostResource.textureTarget = glTexture2D
-			if description.Target == 4 {
+			if description.Target == 1 {
+				hostResource.textureTarget = glTexture1D
+			} else if description.Target == 3 {
+				hostResource.textureTarget = glTexture3D
+			} else if description.Target == 4 {
 				hostResource.textureTarget = glTextureCubeMap
+			} else if description.Target == 6 {
+				hostResource.textureTarget = glTexture1DArray
 			} else if description.Target == 7 {
 				hostResource.textureTarget = glTexture2DArray
+			} else if description.Target == 8 {
+				hostResource.textureTarget = glTextureCubeMapArray
+			}
+			if hostResource.emulatedIntegerMSAA && description.Target == 2 {
+				hostResource.textureTarget = glTexture2DArray
+			} else if multisample && description.Target == 2 {
+				hostResource.textureTarget = glTexture2DMultisample
+			} else if multisample && description.Target == 7 && !hostResource.emulatedIntegerMSAA {
+				hostResource.textureTarget = glTexture2DMultisampleArray
 			}
 			h.gl.bindTexture(hostResource.textureTarget, hostResource.texture)
-			h.gl.texParameteri(hostResource.textureTarget, glTextureMinFilter, glLinear)
-			h.gl.texParameteri(hostResource.textureTarget, glTextureMagFilter, glLinear)
-			h.gl.texParameteri(hostResource.textureTarget, glTextureBaseLevel, 0)
-			h.gl.texParameteri(hostResource.textureTarget, glTextureMaxLevel, int32(description.LastLevel))
+			if !multisample {
+				h.gl.texParameteri(hostResource.textureTarget, glTextureMinFilter, glLinear)
+				h.gl.texParameteri(hostResource.textureTarget, glTextureMagFilter, glLinear)
+				h.gl.texParameteri(hostResource.textureTarget, glTextureBaseLevel, 0)
+				h.gl.texParameteri(hostResource.textureTarget, glTextureMaxLevel, int32(description.LastLevel))
+			}
 			allocateLevels := func(internalFormat int32, format, dataType uint32) {
+				if hostResource.emulatedIntegerMSAA {
+					layers := description.Samples
+					if description.Target == 7 {
+						layers *= description.ArraySize
+					}
+					h.gl.texImage3D(glTexture2DArray, 0, internalFormat, int32(description.Width), int32(description.Height), int32(layers), 0, format, dataType, 0)
+					return
+				}
+				if multisample {
+					if description.Target == 2 {
+						h.gl.texImage2DMultisample(glTexture2DMultisample, int32(description.Samples), uint32(internalFormat), int32(description.Width), int32(description.Height), true)
+					} else {
+						h.gl.texImage3DMultisample(glTexture2DMultisampleArray, int32(description.Samples), uint32(internalFormat), int32(description.Width), int32(description.Height), int32(description.ArraySize), true)
+					}
+					return
+				}
 				for level := uint32(0); level <= description.LastLevel; level++ {
 					width, height := description.Width>>level, description.Height>>level
 					if width == 0 {
@@ -482,43 +635,53 @@ func (h *darwinHost) createResource(description virtio.GPUResource3D) error {
 					if height == 0 {
 						height = 1
 					}
-					if description.Target == 4 {
+					depth := description.Depth >> level
+					if depth == 0 {
+						depth = 1
+					}
+					if description.Target == 1 {
+						h.gl.texImage1D(glTexture1D, int32(level), internalFormat, int32(width), 0, format, dataType, 0)
+					} else if description.Target == 3 {
+						h.gl.texImage3D(glTexture3D, int32(level), internalFormat, int32(width), int32(height), int32(depth), 0, format, dataType, 0)
+					} else if description.Target == 4 {
 						for face := uint32(0); face < 6; face++ {
 							h.gl.texImage2D(glTextureCubeMapPositiveX+face, int32(level), internalFormat, int32(width), int32(height), 0, format, dataType, 0)
 						}
+					} else if description.Target == 6 {
+						h.gl.texImage2D(glTexture1DArray, int32(level), internalFormat, int32(width), int32(description.ArraySize), 0, format, dataType, 0)
 					} else if description.Target == 7 {
 						h.gl.texImage3D(glTexture2DArray, int32(level), internalFormat, int32(width), int32(height), int32(description.ArraySize), 0, format, dataType, 0)
+					} else if description.Target == 8 {
+						h.gl.texImage3D(glTextureCubeMapArray, int32(level), internalFormat, int32(width), int32(height), int32(description.ArraySize), 0, format, dataType, 0)
 					} else {
 						h.gl.texImage2D(glTexture2D, int32(level), internalFormat, int32(width), int32(height), 0, format, dataType, 0)
 					}
 				}
 			}
-			switch description.Format {
-			case 16, 18, 21:
-				hostResource.depth = true
-				allocateLevels(glDepthComponent24, glDepthComponent, glUnsignedInt)
-			case 19:
-				hostResource.depth = true
-				hostResource.stencil = true
-				allocateLevels(glDepth24Stencil8, glDepthStencil, glUnsignedInt248)
-			case 20:
-				hostResource.stencil = true
-				// macOS's frozen OpenGL 4.1 profile cannot allocate the later
-				// GL_STENCIL_INDEX8 texture storage. Back a logical S8 Gallium
-				// resource with packed D24S8 and expose only its stencil aspect.
-				hostResource.packedStencil = true
-				allocateLevels(glDepth24Stencil8, glDepthStencil, glUnsignedInt248)
-			default:
-				allocateLevels(glRGBA8, textureTransferFormat(description.Format), glUnsignedByte)
-				if !hostResource.depth && !hostResource.stencil {
-					h.gl.genFramebuffers(1, &hostResource.framebuffer)
-					if description.Target == 2 {
-						h.framebufferBindingValid = false
-						h.gl.bindFramebuffer(glFramebuffer, hostResource.framebuffer)
-						h.gl.framebufferTexture(glFramebuffer, glColorAttachment0, glTexture2D, hostResource.texture, 0)
-						if status := h.gl.checkFramebuffer(glFramebuffer); status != glFramebufferComplete {
-							return fmt.Errorf("VirGL resource %d framebuffer status %#x", description.ID, status)
-						}
+			nativeFormat, ok := describeDarwinTextureFormat(description.Format)
+			if !ok {
+				return fmt.Errorf("VirGL resource %d uses unsupported Darwin texture format %d", description.ID, description.Format)
+			}
+			hostResource.depth = nativeFormat.depth
+			hostResource.stencil = nativeFormat.stencil
+			hostResource.packedStencil = nativeFormat.packedStencil
+			storageExternal, storageType := nativeFormat.external, nativeFormat.dataType
+			if nativeFormat.packedStencil {
+				storageExternal, storageType = glDepthStencil, glUnsignedInt248
+			}
+			allocateLevels(nativeFormat.internal, storageExternal, storageType)
+			if nativeFormat.render && !hostResource.depth && !hostResource.stencil {
+				h.gl.genFramebuffers(1, &hostResource.framebuffer)
+				if description.Target == 2 {
+					h.framebufferBindingValid = false
+					h.gl.bindFramebuffer(glFramebuffer, hostResource.framebuffer)
+					if hostResource.emulatedIntegerMSAA {
+						h.gl.framebufferTextureLayer(glFramebuffer, glColorAttachment0, hostResource.texture, 0, 0)
+					} else {
+						h.gl.framebufferTexture(glFramebuffer, glColorAttachment0, hostResource.textureTarget, hostResource.texture, 0)
+					}
+					if status := h.gl.checkFramebuffer(glFramebuffer); status != glFramebufferComplete {
+						return fmt.Errorf("VirGL resource %d framebuffer status %#x", description.ID, status)
 					}
 				}
 			}
@@ -602,14 +765,29 @@ func (h *darwinHost) uploadResource(hostResource *hostResource, description virt
 		copy(hostResource.bufferBytes[int(box.X):int(box.X+box.Width)], bytes)
 		h.markBufferDirty(hostResource, box.X, box.Width)
 	case hostResource.texture != 0:
+		if description.Samples != 0 {
+			return fmt.Errorf("direct upload to multisample VirGL resource %d is unsupported", description.ID)
+		}
 		box := transfer.Box
 		validLayerRange := box.Depth > 0
 		switch description.Target {
+		case 1:
+			validLayerRange = box.Depth == 1 && box.Z == 0 && box.Height == 1 && box.Y == 0
 		case 2:
 			validLayerRange = box.Depth == 1 && box.Z == 0
+		case 3:
+			levelDepth := description.Depth >> transfer.Level
+			if levelDepth == 0 {
+				levelDepth = 1
+			}
+			validLayerRange = box.Z <= levelDepth && box.Depth <= levelDepth-box.Z
 		case 4:
 			validLayerRange = box.Depth == 1 && box.Z < 6
-		case 7:
+		case 5:
+			validLayerRange = box.Depth == 1 && box.Z == 0
+		case 6:
+			validLayerRange = box.Y == 0 && box.Height == 1 && box.Z <= description.ArraySize && box.Depth <= description.ArraySize-box.Z
+		case 7, 8:
 			validLayerRange = box.Z <= description.ArraySize && box.Depth <= description.ArraySize-box.Z
 		}
 		if !validLayerRange {
@@ -669,16 +847,28 @@ func (h *darwinHost) uploadResource(hostResource *hostResource, description virt
 			bytes = packed
 		}
 		h.gl.bindTexture(hostResource.textureTarget, hostResource.texture)
-		format, dataType := textureTransferFormat(description.Format), uint32(glUnsignedByte)
-		if hostResource.depth {
-			format, dataType = glDepthComponent, glUnsignedInt
-			if description.Format == 16 {
-				dataType = glUnsignedShort
-			}
+		nativeFormat, ok := describeDarwinTextureFormat(description.Format)
+		if !ok {
+			return fmt.Errorf("unsupported Darwin texture transfer format %d", description.Format)
 		}
-		if hostResource.depth && hostResource.stencil {
-			format, dataType = glDepthStencil, glUnsignedInt248
-		} else if hostResource.stencil {
+		format, dataType := nativeFormat.external, nativeFormat.dataType
+		if description.Format == virglFormatZ24X8UNorm {
+			scaled := make([]byte, len(bytes))
+			for offset := 0; offset+4 <= len(bytes); offset += 4 {
+				value := uint64(binary.LittleEndian.Uint32(bytes[offset:]) & 0x00ffffff)
+				value = (value*math.MaxUint32 + 0x007fffff) / 0x00ffffff
+				binary.LittleEndian.PutUint32(scaled[offset:], uint32(value))
+			}
+			bytes = scaled
+		} else if description.Format == virglFormatZ24UNormS8UInt {
+			repacked := make([]byte, len(bytes))
+			for offset := 0; offset+4 <= len(bytes); offset += 4 {
+				value := binary.LittleEndian.Uint32(bytes[offset:])
+				binary.LittleEndian.PutUint32(repacked[offset:], value<<8|value>>24)
+			}
+			bytes = repacked
+		}
+		if hostResource.stencil && !hostResource.depth {
 			if hostResource.packedStencil {
 				packed := make([]byte, len(bytes)*4)
 				for index, value := range bytes {
@@ -694,7 +884,15 @@ func (h *darwinHost) uploadResource(hostResource *hostResource, description virt
 		if description.Target == 4 {
 			imageTarget = glTextureCubeMapPositiveX + box.Z
 		}
-		if description.Target == 7 {
+		if description.Target == 1 {
+			h.gl.texSubImage1D(imageTarget, int32(transfer.Level), int32(box.X), int32(box.Width), format, dataType, glPointer(bytes))
+		} else if description.Target == 3 {
+			h.gl.texSubImage3D(imageTarget, int32(transfer.Level), int32(box.X), int32(box.Y), int32(box.Z),
+				int32(box.Width), int32(box.Height), int32(box.Depth), format, dataType, glPointer(bytes))
+		} else if description.Target == 6 {
+			h.gl.texSubImage2D(imageTarget, int32(transfer.Level), int32(box.X), int32(box.Z),
+				int32(box.Width), int32(box.Depth), format, dataType, glPointer(bytes))
+		} else if description.Target == 7 || description.Target == 8 {
 			h.gl.texSubImage3D(imageTarget, int32(transfer.Level), int32(box.X), int32(box.Y), int32(box.Z),
 				int32(box.Width), int32(box.Height), int32(box.Depth), format, dataType, glPointer(bytes))
 		} else {
@@ -738,14 +936,29 @@ func (h *darwinHost) transferFromHost(resource *resource, transfer virtio.GPUTra
 			return nil
 
 		case hostResource.texture != 0:
+			if resource.description.Samples != 0 {
+				return fmt.Errorf("direct readback from multisample VirGL resource %d requires a resolve", resource.description.ID)
+			}
 			box := transfer.Box
 			validLayerRange := box.Depth > 0
 			switch resource.description.Target {
+			case 1:
+				validLayerRange = box.Depth == 1 && box.Z == 0 && box.Height == 1 && box.Y == 0
 			case 2:
 				validLayerRange = box.Depth == 1 && box.Z == 0
+			case 3:
+				levelDepth := resource.description.Depth >> transfer.Level
+				if levelDepth == 0 {
+					levelDepth = 1
+				}
+				validLayerRange = box.Z <= levelDepth && box.Depth <= levelDepth-box.Z
 			case 4:
 				validLayerRange = box.Depth == 1 && box.Z < 6
-			case 7:
+			case 5:
+				validLayerRange = box.Depth == 1 && box.Z == 0
+			case 6:
+				validLayerRange = box.Y == 0 && box.Height == 1 && box.Z <= resource.description.ArraySize && box.Depth <= resource.description.ArraySize-box.Z
+			case 7, 8:
 				validLayerRange = box.Z <= resource.description.ArraySize && box.Depth <= resource.description.ArraySize-box.Z
 			}
 			if !validLayerRange {
@@ -797,49 +1010,77 @@ func (h *darwinHost) transferFromHost(resource *resource, transfer virtio.GPUTra
 			packedLayer := rowBytes * uint64(box.Height)
 			packed := make([]byte, int(packedLayer)*int(box.Depth))
 			attachment := uint32(glColorAttachment0)
-			format, dataType := textureTransferFormat(resource.description.Format), uint32(glUnsignedByte)
+			nativeFormat, ok := describeDarwinTextureFormat(resource.description.Format)
+			if !ok {
+				return fmt.Errorf("unsupported Darwin texture readback format %d", resource.description.Format)
+			}
+			format, dataType := nativeFormat.external, nativeFormat.dataType
 			if hostResource.depth {
 				attachment = glDepthAttachment
-				format, dataType = glDepthComponent, glUnsignedInt
-				if resource.description.Format == 16 {
-					dataType = glUnsignedShort
-				}
 			}
 			if hostResource.depth && hostResource.stencil {
 				attachment = glDepthStencilAttachment
-				format, dataType = glDepthStencil, glUnsignedInt248
 			} else if hostResource.stencil {
 				if hostResource.packedStencil {
 					attachment = glDepthStencilAttachment
 				} else {
 					attachment = glStencilAttachment
 				}
-				format, dataType = glStencilIndex, glUnsignedByte
 			}
 
 			h.framebufferBindingValid = false
-			for layer := uint32(0); layer < box.Depth; layer++ {
-				h.gl.bindFramebuffer(glReadFramebuffer, h.blitReadFBO)
-				h.gl.framebufferTexture(glReadFramebuffer, glColorAttachment0, glTexture2D, 0, 0)
-				h.gl.framebufferTexture(glReadFramebuffer, glDepthAttachment, glTexture2D, 0, 0)
-				h.gl.framebufferTexture(glReadFramebuffer, glStencilAttachment, glTexture2D, 0, 0)
-				h.gl.framebufferTexture(glReadFramebuffer, glDepthStencilAttachment, glTexture2D, 0, 0)
-				if resource.description.Target == 7 {
-					h.gl.framebufferTextureLayer(glReadFramebuffer, attachment, hostResource.texture, int32(transfer.Level), int32(box.Z+layer))
-				} else {
-					imageTarget := hostResource.textureTarget
-					if resource.description.Target == 4 {
-						imageTarget = glTextureCubeMapPositiveX + box.Z
+			if resource.description.Format == virglFormatR9G9B9E5Float &&
+				(resource.description.Target == 2 || resource.description.Target == 5) {
+				full := make([]byte, int(levelWidth)*int(levelHeight)*4)
+				h.gl.bindTexture(hostResource.textureTarget, hostResource.texture)
+				h.drainGLErrors()
+				h.gl.getTexImage(hostResource.textureTarget, int32(transfer.Level), format, dataType, glPointer(full))
+				if glError := h.gl.getError(); glError != 0 {
+					return fmt.Errorf("VirGL shared-exponent texture readback GL error %#x", glError)
+				}
+				for row := uint32(0); row < box.Height; row++ {
+					source := (int(box.Y+row)*int(levelWidth) + int(box.X)) * 4
+					destination := int(row) * int(rowBytes)
+					copy(packed[destination:destination+int(rowBytes)], full[source:source+int(rowBytes)])
+				}
+			} else {
+				for layer := uint32(0); layer < box.Depth; layer++ {
+					h.gl.bindFramebuffer(glReadFramebuffer, h.blitReadFBO)
+					h.gl.framebufferTexture(glReadFramebuffer, glColorAttachment0, glTexture2D, 0, 0)
+					h.gl.framebufferTexture(glReadFramebuffer, glDepthAttachment, glTexture2D, 0, 0)
+					h.gl.framebufferTexture(glReadFramebuffer, glStencilAttachment, glTexture2D, 0, 0)
+					h.gl.framebufferTexture(glReadFramebuffer, glDepthStencilAttachment, glTexture2D, 0, 0)
+					if resource.description.Target == 1 {
+						h.gl.framebufferTexture1D(glReadFramebuffer, attachment, glTexture1D, hostResource.texture, int32(transfer.Level))
+					} else if resource.description.Target == 3 || resource.description.Target == 6 || resource.description.Target == 7 || resource.description.Target == 8 {
+						h.gl.framebufferTextureLayer(glReadFramebuffer, attachment, hostResource.texture, int32(transfer.Level), int32(box.Z+layer))
+					} else {
+						imageTarget := hostResource.textureTarget
+						if resource.description.Target == 4 {
+							imageTarget = glTextureCubeMapPositiveX + box.Z
+						}
+						h.gl.framebufferTexture(glReadFramebuffer, attachment, imageTarget, hostResource.texture, int32(transfer.Level))
 					}
-					h.gl.framebufferTexture(glReadFramebuffer, attachment, imageTarget, hostResource.texture, int32(transfer.Level))
+					if status := h.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
+						return fmt.Errorf("VirGL transfer source framebuffer status %#x", status)
+					}
+					h.gl.finish()
+					destination := uint64(layer) * packedLayer
+					h.gl.readPixels(int32(box.X), int32(box.Y), int32(box.Width), int32(box.Height),
+						format, dataType, glPointer(packed[int(destination):]))
 				}
-				if status := h.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
-					return fmt.Errorf("VirGL transfer source framebuffer status %#x", status)
+			}
+			if resource.description.Format == virglFormatZ24X8UNorm {
+				for offset := 0; offset+4 <= len(packed); offset += 4 {
+					value := uint64(binary.LittleEndian.Uint32(packed[offset:]))
+					value = (value*0x00ffffff + math.MaxUint32/2) / math.MaxUint32
+					binary.LittleEndian.PutUint32(packed[offset:], uint32(value))
 				}
-				h.gl.finish()
-				destination := uint64(layer) * packedLayer
-				h.gl.readPixels(int32(box.X), int32(box.Y), int32(box.Width), int32(box.Height),
-					format, dataType, glPointer(packed[int(destination):]))
+			} else if resource.description.Format == virglFormatZ24UNormS8UInt {
+				for offset := 0; offset+4 <= len(packed); offset += 4 {
+					value := binary.LittleEndian.Uint32(packed[offset:])
+					binary.LittleEndian.PutUint32(packed[offset:], value>>8|value<<24)
+				}
 			}
 			for layer := uint32(0); layer < box.Depth; layer++ {
 				for row := uint32(0); row < box.Height; row++ {
@@ -1050,6 +1291,10 @@ func newHostContext() *hostContext {
 		rasterizers:       make(map[uint32]hostRasterizer),
 		shaders:           make(map[uint32]hostShader),
 		shaderAssemblies:  make(map[uint32]*hostShaderAssembly),
+		streamoutTargets:  make(map[uint32]hostStreamoutTarget),
+		streamoutObjects:  make(map[[4]uint32]*hostStreamoutObject),
+		queries:           make(map[uint32]hostQuery),
+		activeQueries:     make(map[uint64]uint32),
 	}
 }
 
@@ -1121,6 +1366,7 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 				state:                  payload[1],
 				pointSize:              math.Float32frombits(payload[2]),
 				spriteCoordinateEnable: payload[3],
+				clipPlaneEnable:        uint8(payload[4] >> 24),
 				offsetUnits:            math.Float32frombits(payload[6]),
 				offsetScale:            math.Float32frombits(payload[7]),
 			}
@@ -1162,23 +1408,47 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			if resource == nil {
 				return fmt.Errorf("sampler view refers to unknown resource %d", payload[1])
 			}
+			format := payload[2] & 0x00ffffff
 			firstLayer, lastLayer := payload[3]&0xffff, payload[3]>>16
 			firstLevel, lastLevel := payload[4]&0xff, (payload[4]>>8)&0xff
-			if firstLevel > lastLevel || lastLevel > resource.description.LastLevel {
-				return fmt.Errorf("sampler view mip range %d..%d exceeds resource last level %d",
-					firstLevel, lastLevel, resource.description.LastLevel)
-			}
-			if err := validateTextureLayers(resource.description, firstLayer, lastLayer); err != nil {
-				return fmt.Errorf("sampler view %d: %w", handle, err)
+			viewTexture, viewTarget := uint32(0), uint32(0)
+			if resource.description.Target == 0 {
+				elementSize := textureFormatBytes(format)
+				firstElement, lastElement := payload[3], payload[4]
+				if elementSize == 0 || firstElement != 0 || firstElement > lastElement || lastElement == ^uint32(0) ||
+					uint64(lastElement+1)*elementSize != uint64(resource.description.Width) {
+					return fmt.Errorf("texture-buffer view %d range %d..%d does not cover %d bytes in format %d",
+						handle, firstElement, lastElement, resource.description.Width, format)
+				}
+				nativeFormat, ok := describeDarwinTextureFormat(format)
+				if !ok || nativeFormat.depth || nativeFormat.stencil {
+					return fmt.Errorf("texture-buffer view %d uses unsupported format %d", handle, format)
+				}
+				h.gl.genTextures(1, &viewTexture)
+				viewTarget = glTextureBuffer
+				h.gl.bindTexture(viewTarget, viewTexture)
+				h.gl.texBuffer(viewTarget, uint32(nativeFormat.internal), resource.buffer)
+				firstLayer, lastLayer, firstLevel, lastLevel = 0, 0, 0, 0
+			} else {
+				if firstLevel > lastLevel || lastLevel > resource.description.LastLevel {
+					return fmt.Errorf("sampler view mip range %d..%d exceeds resource last level %d",
+						firstLevel, lastLevel, resource.description.LastLevel)
+				}
+				if err := validateTextureLayers(resource.description, firstLayer, lastLayer); err != nil {
+					return fmt.Errorf("sampler view %d: %w", handle, err)
+				}
 			}
 			if previous, ok := context.samplerViews[handle]; ok {
+				h.deleteSamplerView(previous)
 				h.releaseResource(previous.resource)
 			}
 			h.retainResource(resource)
 			context.samplerViews[handle] = hostSamplerView{
 				resourceID: payload[1],
 				resource:   resource,
-				format:     payload[2] & 0x00ffffff,
+				texture:    viewTexture,
+				target:     viewTarget,
+				format:     format,
 				firstLevel: firstLevel,
 				lastLevel:  lastLevel,
 				firstLayer: firstLayer,
@@ -1237,6 +1507,53 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 				resourceID: payload[1], resource: resource, format: format, level: level,
 				firstLayer: firstLayer, lastLayer: lastLayer,
 			}
+		case 9: // VIRGL_OBJECT_QUERY
+			if len(payload) != 4 {
+				return errors.New("invalid query payload")
+			}
+			queryType, index := payload[1]&0xffff, payload[1]>>16
+			target, resultSize, err := hostQueryTarget(queryType)
+			if err != nil {
+				return err
+			}
+			resource := h.resources[payload[3]]
+			offset := payload[2]
+			if resource == nil || resource.buffer == 0 || offset%8 != 0 ||
+				offset > uint32(len(resource.bufferBytes)) || 16 > uint32(len(resource.bufferBytes))-offset {
+				return fmt.Errorf("query result range at %d is invalid for resource %d", offset, payload[3])
+			}
+			if previous, ok := context.queries[handle]; ok {
+				h.gl.deleteQueries(1, &previous.id)
+				h.releaseResource(previous.resource)
+			}
+			var id uint32
+			h.gl.genQueries(1, &id)
+			h.retainResource(resource)
+			context.queries[handle] = hostQuery{
+				id: id, queryType: queryType, index: index, target: target,
+				resultSize: resultSize, resource: resource, offset: offset,
+			}
+			h.writeHostQueryState(resource, offset, 0, resultSize, 0)
+		case 10: // VIRGL_OBJECT_STREAMOUT_TARGET
+			if len(payload) != 4 {
+				return errors.New("invalid streamout target payload")
+			}
+			resource := h.resources[payload[1]]
+			if resource == nil || resource.buffer == 0 {
+				return fmt.Errorf("streamout target refers to unknown buffer resource %d", payload[1])
+			}
+			offset, size := payload[2], payload[3]
+			if offset%4 != 0 || size == 0 || offset > uint32(len(resource.bufferBytes)) || size > uint32(len(resource.bufferBytes))-offset {
+				return fmt.Errorf("streamout target range %d..%d is invalid for %d-byte resource %d",
+					offset, uint64(offset)+uint64(size), len(resource.bufferBytes), payload[1])
+			}
+			if previous, ok := context.streamoutTargets[handle]; ok {
+				h.releaseResource(previous.resource)
+			}
+			h.retainResource(resource)
+			context.streamoutTargets[handle] = hostStreamoutTarget{
+				resourceID: payload[1], resource: resource, offset: offset, size: size,
+			}
 		default:
 			return fmt.Errorf("unsupported object type %d", command.Object)
 		}
@@ -1262,8 +1579,13 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			context.boundRasterizer = payload[0]
 			if payload[0] == 0 {
 				h.gl.disable(glCullFace)
-				h.gl.disable(glScissorTest)
+				for index := range context.scissors {
+					h.gl.disablei(glScissorTest, uint32(index))
+				}
 				h.gl.disable(glProgramPointSize)
+				h.gl.disable(glRasterizerDiscard)
+				h.gl.disable(glDepthClamp)
+				h.applyClipPlaneEnable(0)
 				h.gl.pointSize(1)
 				break
 			}
@@ -1318,6 +1640,7 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			delete(context.vertexElements, payload[0])
 		case 6:
 			if view, ok := context.samplerViews[payload[0]]; ok {
+				h.deleteSamplerView(view)
 				h.releaseResource(view.resource)
 			}
 			delete(context.samplerViews, payload[0])
@@ -1331,35 +1654,81 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 				h.releaseResource(surface.resource)
 			}
 			delete(context.surfaces, payload[0])
+		case 9:
+			query, ok := context.queries[payload[0]]
+			if !ok {
+				break
+			}
+			if query.active {
+				return fmt.Errorf("query %d is active", payload[0])
+			}
+			if context.conditionalQuery == payload[0] {
+				h.gl.endConditionalRender()
+				context.conditionalQuery = 0
+			}
+			h.gl.deleteQueries(1, &query.id)
+			h.releaseResource(query.resource)
+			delete(context.queries, payload[0])
+		case 10:
+			for key, object := range context.streamoutObjects {
+				for _, handle := range object.handles {
+					if handle != payload[0] {
+						continue
+					}
+					if context.currentStreamout == object {
+						h.gl.bindTransformFeedback(glTransformFeedback, 0)
+						context.currentStreamout = nil
+					}
+					h.gl.deleteTransformFeedbacks(1, &object.id)
+					delete(context.streamoutObjects, key)
+					break
+				}
+			}
+			if target, ok := context.streamoutTargets[payload[0]]; ok {
+				h.releaseResource(target.resource)
+			}
+			delete(context.streamoutTargets, payload[0])
+			for index, bound := range context.boundStreamoutTargets {
+				if bound == payload[0] {
+					context.boundStreamoutTargets[index] = 0
+				}
+			}
 		default:
 			return fmt.Errorf("unsupported object type %d", command.Object)
 		}
 	case 4: // VIRGL_CCMD_SET_VIEWPORT_STATE
-		if len(payload) < 7 {
-			return errors.New("truncated viewport")
+		if len(payload) < 7 || (len(payload)-1)%6 != 0 {
+			return errors.New("invalid viewport state")
 		}
-		scaleX := float64(math.Float32frombits(payload[1]))
-		scaleY := float64(math.Float32frombits(payload[2]))
-		scaleZ := float64(math.Float32frombits(payload[3]))
-		translateX := float64(math.Float32frombits(payload[4]))
-		translateY := float64(math.Float32frombits(payload[5]))
-		translateZ := float64(math.Float32frombits(payload[6]))
-		minX := math.Min(translateX-scaleX, translateX+scaleX)
-		minY := math.Min(translateY-scaleY, translateY+scaleY)
-		context.viewport = hostViewport{
-			x:       int32(math.Round(minX)),
-			y:       int32(math.Round(minY)),
-			width:   int32(math.Round(math.Abs(scaleX * 2))),
-			height:  int32(math.Round(math.Abs(scaleY * 2))),
-			adjustY: 1,
-			near:    translateZ - scaleZ,
-			far:     translateZ + scaleZ,
+		start, count := payload[0], (len(payload)-1)/6
+		if start >= uint32(len(context.viewports)) || int(start)+count > len(context.viewports) {
+			return errors.New("viewport slots are out of range")
 		}
-		if scaleY < 0 {
-			context.viewport.adjustY = -1
+		for index := 0; index < count; index++ {
+			base := 1 + index*6
+			scaleX := float64(math.Float32frombits(payload[base]))
+			scaleY := float64(math.Float32frombits(payload[base+1]))
+			scaleZ := float64(math.Float32frombits(payload[base+2]))
+			translateX := float64(math.Float32frombits(payload[base+3]))
+			translateY := float64(math.Float32frombits(payload[base+4]))
+			translateZ := float64(math.Float32frombits(payload[base+5]))
+			viewport := hostViewport{
+				x:       int32(math.Round(math.Min(translateX-scaleX, translateX+scaleX))),
+				y:       int32(math.Round(math.Min(translateY-scaleY, translateY+scaleY))),
+				width:   int32(math.Round(math.Abs(scaleX * 2))),
+				height:  int32(math.Round(math.Abs(scaleY * 2))),
+				adjustY: 1,
+				near:    translateZ - scaleZ,
+				far:     translateZ + scaleZ,
+			}
+			if scaleY < 0 {
+				viewport.adjustY = -1
+			}
+			slot := int(start) + index
+			context.viewports[slot] = viewport
+			context.viewportSet |= 1 << slot
+			h.applyViewportIndexed(uint32(slot), viewport)
 		}
-		context.viewportSet = true
-		h.applyViewport(context.viewport)
 	case 5: // VIRGL_CCMD_SET_FRAMEBUFFER_STATE
 		if len(payload) < 2 {
 			return errors.New("truncated framebuffer state")
@@ -1383,7 +1752,9 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 		context.depthSurface = payload[1]
 		return h.bindContextFramebuffer(context)
 	case 6: // VIRGL_CCMD_SET_VERTEX_BUFFERS
-		if len(payload) < 3 || len(payload)%3 != 0 {
+		// A zero-length command is the Gallium unbind-all representation used
+		// by draws whose vertex shader relies entirely on gl_VertexID.
+		if len(payload)%3 != 0 {
 			return errors.New("invalid vertex buffer state")
 		}
 		var bindings [16]hostVertexBuffer
@@ -1453,9 +1824,25 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 		scissorEnabled := context.boundRasterizer != 0 &&
 			context.rasterizers[context.boundRasterizer].state&(1<<14) != 0
 		if scissorEnabled {
-			h.gl.disable(glScissorTest)
+			for index := range context.scissors {
+				h.gl.disablei(glScissorTest, uint32(index))
+			}
 		}
-		h.gl.clear(mask)
+		emulatedSamples, err := h.contextEmulatedIntegerSamples(context)
+		if err != nil {
+			return err
+		}
+		if emulatedSamples == 0 {
+			h.gl.clear(mask)
+		} else {
+			for sample := uint32(0); sample < emulatedSamples; sample++ {
+				if err := h.attachContextEmulatedIntegerSample(context, sample); err != nil {
+					return err
+				}
+				h.gl.clear(mask)
+			}
+			h.framebufferBindingValid = false
+		}
 		if mask&glDepthBufferBit != 0 {
 			h.restoreDepthWriteMask(context)
 		}
@@ -1466,7 +1853,9 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			h.restoreColorMask(context)
 		}
 		if scissorEnabled {
-			h.gl.enable(glScissorTest)
+			for index := range context.scissors {
+				h.gl.enablei(glScissorTest, uint32(index))
+			}
 		}
 	case 8: // VIRGL_CCMD_DRAW_VBO
 		if len(payload) < 12 {
@@ -1537,7 +1926,13 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			return errors.New("truncated constant buffer")
 		}
 		stage := payload[0]
-		if stage > tgsiFragment {
+		if stage > tgsiTessEvaluation {
+			// Mesa clears constant-buffer slot zero for every Gallium shader
+			// stage during context initialization, including stages that the
+			// capset does not expose. An empty clear has no host state to apply.
+			if len(payload) == 2 {
+				break
+			}
 			return fmt.Errorf("constant buffer stage %d is unsupported", stage)
 		}
 		context.constants[stage] = make([]float32, len(payload)-2)
@@ -1577,16 +1972,18 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 				maxY: maxXY >> 16,
 			}
 		}
-		if start == 0 && context.boundRasterizer != 0 &&
-			context.rasterizers[context.boundRasterizer].state&(1<<14) != 0 {
-			h.applyScissor(context.scissors[0])
+		if context.boundRasterizer != 0 && context.rasterizers[context.boundRasterizer].state&(1<<14) != 0 {
+			for index := 0; index < count; index++ {
+				slot := uint32(int(start) + index)
+				h.applyScissorIndexed(slot, context.scissors[slot])
+			}
 		}
 	case 16: // VIRGL_CCMD_BLIT
 		return h.blit(context, payload)
 	case 17: // VIRGL_CCMD_RESOURCE_COPY_REGION
 		return h.copyResourceRegion(context, payload)
 	case 27: // VIRGL_CCMD_SET_UNIFORM_BUFFER
-		if len(payload) != 5 || payload[0] > tgsiFragment || payload[1] >= 16 {
+		if len(payload) != 5 || payload[0] > tgsiTessEvaluation || payload[1] >= 16 {
 			return errors.New("invalid uniform buffer binding")
 		}
 		stage, index := payload[0], payload[1]
@@ -1615,7 +2012,7 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			context.boundShaders[payload[1]] = 0
 			break
 		}
-		if payload[1] > tgsiFragment {
+		if payload[1] > tgsiTessEvaluation {
 			return fmt.Errorf("shader stage %d is unsupported", payload[1])
 		}
 		shader := context.shaders[payload[0]]
@@ -1639,9 +2036,190 @@ func (h *darwinHost) executeCommand(context *hostContext, command command) error
 			}
 			context.boundSamplerStates[stage][int(start)+index] = handle
 		}
-	case 22, 23, 24, 32:
-		// Empty index state, clip/sample state, and
-		// tessellation state do not require additional GL calls yet.
+	case 19: // VIRGL_CCMD_BEGIN_QUERY
+		if len(payload) != 1 {
+			return errors.New("invalid begin-query payload")
+		}
+		query, ok := context.queries[payload[0]]
+		if !ok || query.active || query.queryType == 2 {
+			return fmt.Errorf("query %d cannot begin", payload[0])
+		}
+		key := hostQueryActiveKey(query)
+		if active := context.activeQueries[key]; active != 0 {
+			return fmt.Errorf("query target %#x index %d is already active as %d", query.target, query.index, active)
+		}
+		if query.index != 0 {
+			h.gl.beginQueryIndexed(query.target, query.index, query.id)
+		} else {
+			h.gl.beginQuery(query.target, query.id)
+		}
+		query.active, query.ended = true, false
+		context.queries[payload[0]] = query
+		context.activeQueries[key] = payload[0]
+	case 20: // VIRGL_CCMD_END_QUERY
+		if len(payload) != 1 {
+			return errors.New("invalid end-query payload")
+		}
+		query, ok := context.queries[payload[0]]
+		if !ok {
+			return fmt.Errorf("unknown query %d", payload[0])
+		}
+		if query.queryType == 2 {
+			h.gl.queryCounter(query.id, glTimestamp)
+		} else {
+			key := hostQueryActiveKey(query)
+			if !query.active || context.activeQueries[key] != payload[0] {
+				return fmt.Errorf("query %d is not active", payload[0])
+			}
+			if query.index != 0 {
+				h.gl.endQueryIndexed(query.target, query.index)
+			} else {
+				h.gl.endQuery(query.target)
+			}
+			delete(context.activeQueries, key)
+			query.active = false
+		}
+		query.ended = true
+		context.queries[payload[0]] = query
+		h.writeHostQueryState(query.resource, query.offset, 2, query.resultSize, 0)
+	case 21: // VIRGL_CCMD_GET_QUERY_RESULT
+		if len(payload) != 2 || payload[1] > 1 {
+			return errors.New("invalid query-result payload")
+		}
+		query, ok := context.queries[payload[0]]
+		if !ok || !query.ended || query.active {
+			return fmt.Errorf("query %d has no completed result", payload[0])
+		}
+		// There is no asynchronous callback into a VirGL result resource. Read
+		// the ordered GL value here even for no-wait, then complete the shared
+		// state before the command fence is signaled.
+		var result uint64
+		if query.resultSize == 8 {
+			h.gl.getQueryObjectui64v(query.id, glQueryResult, &result)
+		} else {
+			var value uint32
+			h.gl.getQueryObjectuiv(query.id, glQueryResult, &value)
+			result = uint64(value)
+		}
+		h.writeHostQueryState(query.resource, query.offset, 1, query.resultSize, result)
+	case 24: // VIRGL_CCMD_SET_SAMPLE_MASK
+		if len(payload) != 1 {
+			return errors.New("invalid sample-mask payload")
+		}
+		h.gl.sampleMaski(0, payload[0])
+	case 26: // VIRGL_CCMD_SET_RENDER_CONDITION
+		if len(payload) != 3 || payload[1] > 1 || payload[2] > 3 {
+			return errors.New("invalid render-condition payload")
+		}
+		if context.conditionalQuery != 0 {
+			h.gl.endConditionalRender()
+			context.conditionalQuery = 0
+		}
+		if payload[0] == 0 {
+			break
+		}
+		query, ok := context.queries[payload[0]]
+		if !ok || !query.ended || query.active {
+			return fmt.Errorf("conditional query %d has no completed result", payload[0])
+		}
+		if payload[1] != 0 {
+			return errors.New("inverted render conditions are unsupported")
+		}
+		modes := [...]uint32{glQueryWait, glQueryNoWait, glQueryByRegionWait, glQueryByRegionNoWait}
+		h.gl.beginConditionalRender(query.id, modes[payload[2]])
+		context.conditionalQuery = payload[0]
+	case 25: // VIRGL_CCMD_SET_STREAMOUT_TARGETS
+		if len(payload) < 1 || len(payload)-1 > len(context.boundStreamoutTargets) {
+			return errors.New("invalid streamout target binding")
+		}
+		if payload[0]>>uint(len(payload)-1) != 0 {
+			return fmt.Errorf("streamout append mask %#x exceeds %d targets", payload[0], len(payload)-1)
+		}
+		var bindings [4]uint32
+		for index, handle := range payload[1:] {
+			if handle != 0 {
+				if _, ok := context.streamoutTargets[handle]; !ok {
+					return fmt.Errorf("unknown streamout target %d", handle)
+				}
+			}
+			bindings[index] = handle
+		}
+		context.boundStreamoutTargets = bindings
+		if bindings == [4]uint32{} {
+			// Unbinding targets is how Gallium represents a paused transform-
+			// feedback object. Apple GL loses the native write cursor across an
+			// object switch, so end exact vertex-point captures and resume them
+			// later through an explicitly advanced buffer range.
+			if context.currentStreamout != nil && context.currentStreamout.state == hostStreamoutPaused {
+				h.gl.endTransformFeedback()
+				context.currentStreamout.state = hostStreamoutNeedBegin
+			}
+			h.gl.bindTransformFeedback(glTransformFeedback, 0)
+			context.currentStreamout = nil
+			break
+		}
+		object := context.streamoutObjects[bindings]
+		if object == nil {
+			object = &hostStreamoutObject{handles: bindings, state: hostStreamoutNeedBegin, appendOffsetsValid: true}
+			h.gl.genTransformFeedbacks(1, &object.id)
+			h.gl.bindTransformFeedback(glTransformFeedback, object.id)
+			if err := h.bindStreamoutObjectTargets(context, object); err != nil {
+				return err
+			}
+			context.streamoutObjects[bindings] = object
+		} else {
+			h.gl.bindTransformFeedback(glTransformFeedback, object.id)
+			if object.state == hostStreamoutNeedBegin && object.appendOffsetsValid {
+				if err := h.bindStreamoutObjectTargets(context, object); err != nil {
+					return err
+				}
+			}
+		}
+		context.currentStreamout = object
+	case 52: // VIRGL_CCMD_LINK_SHADER
+		if len(payload) != len(context.boundShaders) {
+			return errors.New("invalid linked shader set")
+		}
+		for stage, handle := range payload {
+			if handle == 0 {
+				continue
+			}
+			shader, ok := context.shaders[handle]
+			if !ok {
+				return fmt.Errorf("linked shader stage %d refers to unknown shader %d", stage, handle)
+			}
+			if shader.stage != uint32(stage) {
+				return fmt.Errorf("linked shader %d is stage %d, not %d", handle, shader.stage, stage)
+			}
+			if stage > tgsiTessEvaluation {
+				return fmt.Errorf("linked shader stage %d is unsupported", stage)
+			}
+		}
+	case 33: // VIRGL_CCMD_SET_MIN_SAMPLES
+		if len(payload) != 1 {
+			return errors.New("invalid minimum-samples payload")
+		}
+		samples := uint32(1)
+		if handle := context.firstColorSurface(); handle != 0 {
+			if surface := context.surfaces[handle]; surface.resource != nil {
+				samples = max(1, surface.resource.description.Samples)
+			}
+		} else if surface := context.surfaces[context.depthSurface]; surface.resource != nil {
+			samples = max(1, surface.resource.description.Samples)
+		}
+		h.gl.minSampleShading(min(1, float32(payload[0])/float32(samples)))
+	case 32: // VIRGL_CCMD_SET_TESS_STATE
+		if len(payload) != len(context.tessFactors) {
+			return errors.New("invalid tessellation state")
+		}
+		for index, value := range payload {
+			context.tessFactors[index] = math.Float32frombits(value)
+		}
+		h.gl.patchParameterfv(glPatchDefaultOuterLevel, &context.tessFactors[0])
+		h.gl.patchParameterfv(glPatchDefaultInnerLevel, &context.tessFactors[4])
+	case 22, 23:
+		// Polygon stipple and clip-plane coefficients do not require additional
+		// calls for the currently advertised stages.
 	default:
 		return fmt.Errorf("command is not implemented")
 	}
@@ -1657,10 +2235,29 @@ func (c *hostContext) createShader(payload []uint32) error {
 		return errors.New("truncated shader")
 	}
 	handle, stage, offlen, numTokens, streamOutputs := payload[0], payload[1], payload[2], payload[3], payload[4]
+	shaderStart := 5
+	var outputs []tgsiStreamOutput
+	var strides [4]uint32
 	if streamOutputs != 0 {
-		return fmt.Errorf("shader stream outputs %d are unsupported", streamOutputs)
+		if streamOutputs > 64 || len(payload) < 9+int(streamOutputs)*2 {
+			return fmt.Errorf("shader stream output count %d is invalid", streamOutputs)
+		}
+		copy(strides[:], payload[5:9])
+		outputs = make([]tgsiStreamOutput, streamOutputs)
+		for index := range outputs {
+			packed := payload[9+index*2]
+			outputs[index] = tgsiStreamOutput{
+				registerIndex:  packed & 0xff,
+				startComponent: (packed >> 8) & 0x3,
+				numComponents:  (packed >> 10) & 0x7,
+				buffer:         (packed >> 13) & 0x7,
+				dstOffset:      packed >> 16,
+				stream:         payload[10+index*2] & 0x3,
+			}
+		}
+		shaderStart = 9 + int(streamOutputs)*2
 	}
-	chunk := shaderBytes(payload[5:])
+	chunk := shaderBytes(payload[shaderStart:])
 	if offlen&shaderContinuation == 0 {
 		totalBytes := offlen
 		if totalBytes == 0 || totalBytes > maxShaderBytes {
@@ -1671,11 +2268,13 @@ func (c *hostContext) createShader(payload []uint32) error {
 			return fmt.Errorf("shader first chunk has %d bytes, total is %d", len(chunk), totalBytes)
 		}
 		assembly := &hostShaderAssembly{
-			stage:      stage,
-			numTokens:  numTokens,
-			totalBytes: totalBytes,
-			nextOffset: uint32(len(chunk)),
-			text:       make([]byte, paddedBytes),
+			stage:                     stage,
+			numTokens:                 numTokens,
+			totalBytes:                totalBytes,
+			nextOffset:                uint32(len(chunk)),
+			text:                      make([]byte, paddedBytes),
+			streamOutputs:             outputs,
+			streamOutputBufferStrides: strides,
 		}
 		copy(assembly.text, chunk)
 		if assembly.nextOffset < paddedBytes {
@@ -1724,11 +2323,58 @@ func (c *hostContext) finishShader(handle uint32, assembly *hostShaderAssembly) 
 	if stage != assembly.stage {
 		return fmt.Errorf("shader payload type %d disagrees with TGSI stage %d", assembly.stage, stage)
 	}
+	source, varyings, maxInterleavedWorkaround, err := addTGSIStreamOutputs(text, source, assembly.streamOutputs, assembly.streamOutputBufferStrides)
+	if err != nil {
+		return fmt.Errorf("shader %d stream output: %w", handle, err)
+	}
 	c.nextShaderGeneration++
 	c.shaders[handle] = hostShader{
-		stage: stage, source: source, generation: c.nextShaderGeneration,
+		stage: stage, tgsi: text, source: source, generation: c.nextShaderGeneration,
+		streamOutputVaryings: varyings, streamOutputBufferStrides: assembly.streamOutputBufferStrides,
+		maxInterleavedWorkaround: maxInterleavedWorkaround,
+		geometryOutputMode:       geometryStreamoutMode(text),
+		tessEvaluationOutputMode: tessEvaluationStreamoutMode(text),
 	}
 	return nil
+}
+
+func geometryStreamoutMode(tgsi string) uint32 {
+	for _, line := range strings.Split(tgsi, "\n") {
+		switch strings.TrimSpace(line) {
+		case "PROPERTY GS_OUTPUT_PRIMITIVE POINTS":
+			return glPoints
+		case "PROPERTY GS_OUTPUT_PRIMITIVE LINE_STRIP":
+			return glLines
+		case "PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP":
+			return glTriangles
+		}
+	}
+	return 0
+}
+
+func tessEvaluationStreamoutMode(tgsi string) uint32 {
+	primitive := -1
+	pointMode := false
+	for _, line := range strings.Split(tgsi, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PROPERTY TES_PRIM_MODE ") {
+			primitive, _ = strconv.Atoi(strings.TrimPrefix(line, "PROPERTY TES_PRIM_MODE "))
+		}
+		if line == "PROPERTY TES_POINT_MODE 1" {
+			pointMode = true
+		}
+	}
+	if pointMode {
+		return glPoints
+	}
+	switch primitive {
+	case 1:
+		return glLines
+	case 4, 7:
+		return glTriangles
+	default:
+		return 0
+	}
 }
 
 func shaderBytes(words []uint32) []byte {
@@ -1748,9 +2394,11 @@ func validateTextureLayers(description virtio.GPUResource3D, first, last uint32)
 	}
 	limit := uint32(1)
 	switch description.Target {
+	case 3:
+		limit = description.Depth
 	case 4:
 		limit = 6
-	case 7:
+	case 6, 7, 8:
 		limit = description.ArraySize
 	}
 	if last >= limit {
@@ -1759,23 +2407,400 @@ func validateTextureLayers(description virtio.GPUResource3D, first, last uint32)
 	return nil
 }
 
-func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
+func (h *darwinHost) prepareVertexSystemEmulation(context *hostContext, elements []hostVertexElement,
+	start, count uint32, indexed bool, instanceCount uint32, indexBias int32) (hostVertexSystemEmulation, error) {
+	if len(elements) < 16 {
+		return hostVertexSystemEmulation{}, nil
+	}
+	vertex := context.shaders[context.boundShaders[tgsiVertex]].source
+	usesVertexID := strings.Contains(vertex, "gl_VertexID")
+	usesInstanceID := strings.Contains(vertex, "gl_InstanceID")
+	if !usesVertexID && !usesInstanceID {
+		return hostVertexSystemEmulation{}, nil
+	}
+	if usesVertexID && usesInstanceID {
+		return hostVertexSystemEmulation{}, errors.New("sixteen-attribute shaders using both vertex and instance IDs exceed the native host input limit")
+	}
+
+	emulation := hostVertexSystemEmulation{systemValue: emulatedVertexID}
+	wantDivisor := func(divisor uint32) bool { return divisor == 0 }
+	invocations := count
+	if usesInstanceID {
+		emulation.systemValue = emulatedInstanceID
+		wantDivisor = func(divisor uint32) bool { return divisor != 0 }
+		invocations = instanceCount
+	}
+	victim := -1
+	for index := len(elements) - 1; index >= 0; index-- {
+		element := elements[index]
+		constant := element.bufferIndex < uint32(len(context.vertexBuffers)) &&
+			context.vertexBuffers[element.bufferIndex].stride == 0
+		if wantDivisor(element.instanceDivisor) || constant {
+			victim = index
+			break
+		}
+	}
+	if victim < 0 {
+		return hostVertexSystemEmulation{}, errors.New("native vertex system-value emulation has no compatible attribute slot")
+	}
+	emulation.attribute = uint8(victim)
+	element := elements[victim]
+	if element.bufferIndex >= uint32(len(context.vertexBuffers)) {
+		return hostVertexSystemEmulation{}, fmt.Errorf("emulated vertex attribute uses invalid buffer index %d", element.bufferIndex)
+	}
+	binding := context.vertexBuffers[element.bufferIndex]
+	if binding.resource == nil {
+		return hostVertexSystemEmulation{}, fmt.Errorf("emulated vertex attribute refers to unknown buffer %d", binding.resourceID)
+	}
+
+	ids := make([]uint32, invocations)
+	if emulation.systemValue == emulatedVertexID {
+		if indexed {
+			if context.indexResource == nil {
+				return hostVertexSystemEmulation{}, fmt.Errorf("emulated vertex ID refers to unknown index buffer %d", context.indexBuffer)
+			}
+			for invocation := uint32(0); invocation < invocations; invocation++ {
+				offset := uint64(context.indexOffset) + uint64(invocation)*uint64(context.indexSize)
+				if offset+uint64(context.indexSize) > uint64(len(context.indexResource.bufferBytes)) {
+					return hostVertexSystemEmulation{}, errors.New("emulated vertex ID exceeds the index buffer")
+				}
+				bytes := context.indexResource.bufferBytes[offset:]
+				var index uint32
+				switch context.indexSize {
+				case 1:
+					index = uint32(bytes[0])
+				case 2:
+					index = uint32(binary.LittleEndian.Uint16(bytes))
+				case 4:
+					index = binary.LittleEndian.Uint32(bytes)
+				default:
+					return hostVertexSystemEmulation{}, fmt.Errorf("unsupported index size %d", context.indexSize)
+				}
+				adjusted := int64(index) + int64(indexBias)
+				if adjusted < 0 || adjusted > math.MaxUint32 {
+					return hostVertexSystemEmulation{}, fmt.Errorf("emulated vertex ID %d with bias %d is out of range", index, indexBias)
+				}
+				ids[invocation] = uint32(adjusted)
+			}
+		} else {
+			for invocation := range ids {
+				ids[invocation] = start + uint32(invocation)
+			}
+		}
+	} else {
+		for invocation := range ids {
+			ids[invocation] = uint32(invocation)
+		}
+	}
+
+	maxID := uint32(0)
+	for _, id := range ids {
+		maxID = max(maxID, id)
+	}
+	if maxID >= 1<<20 {
+		return hostVertexSystemEmulation{}, fmt.Errorf("native vertex system-value emulation ID %d exceeds its bounded staging buffer", maxID)
+	}
+	idWords := make([]uint32, (maxID+1)*2)
+	tableWords := make([]uint32, emulatedVertexTableEntries*4)
+	slots := make(map[uint32]uint32)
+	for _, id := range ids {
+		slot, ok := slots[id]
+		if !ok {
+			slot = uint32(len(slots))
+			if slot >= emulatedVertexTableEntries {
+				return hostVertexSystemEmulation{}, fmt.Errorf("native vertex system-value emulation needs more than %d unique values", emulatedVertexTableEntries)
+			}
+			fetch := id
+			if emulation.systemValue == emulatedInstanceID && binding.stride != 0 {
+				fetch = id / element.instanceDivisor
+			}
+			offset := binding.offset + element.offset
+			if binding.stride != 0 {
+				offset += fetch * binding.stride
+			}
+			value, err := vertexAttributeRawValue(binding.resource.bufferBytes, offset, element.format)
+			if err != nil {
+				return hostVertexSystemEmulation{}, fmt.Errorf("stage emulated vertex attribute %d: %w", victim, err)
+			}
+			for component := range value {
+				tableWords[slot*4+uint32(component)] = math.Float32bits(value[component])
+			}
+			slots[id] = slot
+		}
+		idWords[id*2] = id
+		idWords[id*2+1] = slot
+	}
+	if h.emulatedVertexIDBuffer == 0 {
+		h.gl.genBuffers(1, &h.emulatedVertexIDBuffer)
+		h.gl.genBuffers(1, &h.emulatedVertexTable)
+	}
+	h.gl.bindBuffer(glArrayBuffer, h.emulatedVertexIDBuffer)
+	h.gl.bufferData(glArrayBuffer, len(idWords)*4, glPointerUint32(idWords), glStreamDraw)
+	h.gl.bindBuffer(glUniformBuffer, h.emulatedVertexTable)
+	h.gl.bufferData(glUniformBuffer, len(tableWords)*4, glPointerUint32(tableWords), glStreamDraw)
+	return emulation, nil
+}
+
+func (h *darwinHost) applyDrawProgram(context *hostContext, program hostProgram, emulation hostVertexSystemEmulation) error {
+	if h.currentProgram != program.id {
+		h.gl.useProgram(program.id)
+		h.currentProgram = program.id
+	}
+	if emulation.systemValue != emulatedVertexSystemNone {
+		h.gl.bindBufferRange(glUniformBuffer, 0, h.emulatedVertexTable, 0, emulatedVertexTableEntries*16)
+	}
+	if program.winsysAdjustY >= 0 {
+		adjustY := float32(1)
+		if context.viewportSet&1 != 0 {
+			adjustY = context.viewports[0].adjustY
+		}
+		h.gl.uniform1f(program.winsysAdjustY, adjustY)
+	}
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for index, location := range program.constantUniforms[stage] {
+			if location < 0 {
+				continue
+			}
+			binding := context.uniformBuffers[stage][index]
+			if binding.resource != nil && binding.length >= 16 {
+				bytes := binding.resource.bufferBytes[binding.offset : binding.offset+binding.length]
+				h.gl.uniform4fv(location, int32(len(bytes)/16), (*float32)(unsafe.Pointer(&bytes[0])))
+				continue
+			}
+			if index == 0 && len(context.constants[stage]) >= 4 {
+				constants := context.constants[stage]
+				h.gl.uniform4fv(location, int32(len(constants)/4), &constants[0])
+			}
+		}
+	}
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for index, bindingPoint := range program.constants[stage] {
+			if bindingPoint < 0 {
+				continue
+			}
+			blockSize := int(program.constantSizes[stage][index])
+			if blockSize <= 0 {
+				return fmt.Errorf("stage %d constant buffer %d has invalid uniform-block size %d", stage, index, blockSize)
+			}
+			binding := context.uniformBuffers[stage][index]
+			if binding.resource != nil && int(binding.length) >= blockSize {
+				h.publishBuffer(binding.resource)
+				h.gl.bindBufferRange(glUniformBuffer, uint32(bindingPoint), binding.resource.buffer,
+					int(binding.offset), blockSize)
+				continue
+			}
+
+			var bytes []byte
+			if binding.resource != nil && binding.length != 0 {
+				bytes = make([]byte, blockSize)
+				copy(bytes, binding.resource.bufferBytes[binding.offset:binding.offset+binding.length])
+			} else if index == 0 && len(context.constants[stage]) != 0 {
+				bytes = make([]byte, blockSize)
+				for component, value := range context.constants[stage] {
+					if component*4 >= len(bytes) {
+						break
+					}
+					binary.LittleEndian.PutUint32(bytes[component*4:], math.Float32bits(value))
+				}
+			}
+			if bytes == nil {
+				if h.zeroUniformBuffer == 0 {
+					h.gl.genBuffers(1, &h.zeroUniformBuffer)
+					h.gl.bindBuffer(glUniformBuffer, h.zeroUniformBuffer)
+					h.gl.bufferData(glUniformBuffer, capsetMaxUniformBlockSize, 0, glStaticDraw)
+				}
+				h.gl.bindBufferRange(glUniformBuffer, uint32(bindingPoint), h.zeroUniformBuffer, 0, blockSize)
+				continue
+			}
+			staging := &h.constantStagingBuffers[stage][index]
+			if *staging == 0 {
+				h.gl.genBuffers(1, staging)
+			}
+			h.gl.bindBuffer(glUniformBuffer, *staging)
+			h.gl.bufferData(glUniformBuffer, len(bytes), glPointer(bytes), glStreamDraw)
+			h.gl.bindBufferRange(glUniformBuffer, uint32(bindingPoint), *staging, 0, len(bytes))
+		}
+	}
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for index, location := range program.constantTextures[stage] {
+			if location < 0 {
+				continue
+			}
+			binding := context.uniformBuffers[stage][index]
+			texture := &h.constantBufferTextures[stage][index]
+			if *texture == 0 {
+				h.gl.genTextures(1, texture)
+			}
+			textureUnit := uint32(64 + index)
+			h.gl.activeTexture(glTexture0 + textureUnit)
+			h.gl.bindTexture(glTextureBuffer, *texture)
+			staging := &h.constantStagingBuffers[stage][index]
+			data := make([]byte, capsetMaxUniformBlockSize)
+			if binding.resource != nil && binding.length != 0 {
+				copy(data, binding.resource.bufferBytes[binding.offset:binding.offset+binding.length])
+			}
+			var replacement uint32
+			h.gl.genBuffers(1, &replacement)
+			h.gl.bindBuffer(glTextureBuffer, replacement)
+			h.gl.bufferData(glTextureBuffer, len(data), glPointer(data), glStreamDraw)
+			h.gl.texBuffer(glTextureBuffer, glRGBA32UI, replacement)
+			if *staging != 0 {
+				h.retiredConstantBuffers = append(h.retiredConstantBuffers, *staging)
+			}
+			*staging = replacement
+			h.gl.uniform1i(location, int32(textureUnit))
+		}
+	}
+	// ARB_seamless_cube_map exposes one context-wide switch. VirGL carries
+	// Gallium's desired value in each sampler state, so restore the switch on
+	// every draw while walking the cube views that can observe it. As in the
+	// reference renderer, the last bound cube sampler is authoritative when a
+	// guest supplies conflicting states that native GL cannot represent.
+	seamlessCubeMap := false
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for slot, viewHandle := range context.boundSamplerViews[stage] {
+			if viewHandle == 0 {
+				continue
+			}
+			samplerLocation := program.samplers[stage][slot]
+			lodCrossoverLocation := program.explicitLODCrossovers[stage][slot]
+			sampleCountLocation := program.samplerSampleCounts[stage][slot]
+			viewSwizzleLocation := program.samplerViewSwizzles[stage][slot]
+			// Gallium may leave views bound after switching to a shader which
+			// does not use their sampler. Texture swizzles and mip ranges live on
+			// the shared native texture object, so applying such a stale view can
+			// overwrite the active view used by another shader stage.
+			if samplerLocation < 0 && lodCrossoverLocation < 0 && sampleCountLocation < 0 && viewSwizzleLocation < 0 {
+				continue
+			}
+			view := context.samplerViews[viewHandle]
+			texture := view.resource
+			textureID, textureTarget := uint32(0), uint32(0)
+			if texture != nil {
+				textureID, textureTarget = texture.texture, texture.textureTarget
+			}
+			if view.texture != 0 {
+				textureID, textureTarget = view.texture, view.target
+			}
+			if texture == nil || textureID == 0 {
+				return fmt.Errorf("sampler view %d has no texture", viewHandle)
+			}
+			if view.target == glTextureBuffer {
+				h.publishBuffer(texture)
+			}
+			textureUnit := uint32(stage*16 + slot)
+			h.gl.activeTexture(glTexture0 + textureUnit)
+			h.gl.bindTexture(textureTarget, textureID)
+			if !texture.samplerViewConfigured || texture.appliedSamplerView != view {
+				if err := h.applySamplerView(view); err != nil {
+					return fmt.Errorf("sampler view %d: %w", viewHandle, err)
+				}
+				texture.appliedSamplerView = view
+				texture.samplerViewConfigured = true
+			}
+			if stateHandle := context.boundSamplerStates[stage][slot]; stateHandle != 0 {
+				state := context.samplerStates[stateHandle]
+				h.gl.bindSampler(textureUnit, state.id)
+				if textureTarget == glTextureCubeMap {
+					seamlessCubeMap = state.state&(1<<19) != 0
+				}
+				if lodCrossoverLocation >= 0 {
+					h.gl.uniform1f(lodCrossoverLocation, explicitLODCrossover(view, state))
+				}
+			} else {
+				h.gl.bindSampler(textureUnit, 0)
+				if lodCrossoverLocation >= 0 {
+					h.gl.uniform1f(lodCrossoverLocation, 0)
+				}
+			}
+			if samplerLocation >= 0 {
+				h.gl.uniform1i(samplerLocation, int32(textureUnit))
+			}
+			if sampleCountLocation >= 0 {
+				h.gl.uniform1i(sampleCountLocation, int32(max(1, texture.description.Samples)))
+			}
+			if viewSwizzleLocation >= 0 {
+				swizzle := [4]int32{0, 1, 2, 3}
+				if texture.description.Samples != 0 {
+					for component, value := range view.swizzle {
+						if value == 3 && (view.format == virglFormatB8G8R8X8UNorm || view.format == virglFormatR8G8B8X8UNorm) {
+							value = 5
+						}
+						swizzle[component] = int32(value)
+					}
+				}
+				h.gl.uniform4iv(viewSwizzleLocation, 1, &swizzle[0])
+			}
+		}
+	}
+	if seamlessCubeMap {
+		h.gl.enable(glTextureCubeMapSeamless)
+	} else {
+		h.gl.disable(glTextureCubeMapSeamless)
+	}
+	return nil
+}
+
+func (h *darwinHost) draw(context *hostContext, payload []uint32) (err error) {
+	indirect := len(payload) == 20
+	if len(payload) < 4 || (len(payload) > 14 && !indirect) {
+		return fmt.Errorf("draw payload has %d words", len(payload))
+	}
 	start, count, mode, indexed := payload[0], payload[1], payload[2], payload[3] != 0
+	countFromStreamOutput := uint32(0)
+	// Gallium represents glDrawTransformFeedback* as an ordinary non-indexed
+	// draw whose count comes from a stream-output target. VirGL serializes that
+	// target's byte size in this field; the normal DRAW_VBO count is zero.
+	if !indexed && len(payload) > 11 && payload[11] != 0 {
+		countFromStreamOutput = payload[11]
+	}
 	instanceCount, startInstance := uint32(1), uint32(0)
+	indexBias := int32(0)
 	if len(payload) > 4 {
 		instanceCount = payload[4]
 	}
 	if len(payload) > 6 {
 		startInstance = payload[6]
 	}
-	if instanceCount == 0 {
+	if len(payload) > 5 {
+		indexBias = int32(payload[5])
+	}
+	if !indirect && instanceCount == 0 {
 		return nil
 	}
-	if instanceCount > math.MaxInt32 {
+	if !indirect && instanceCount > math.MaxInt32 {
 		return fmt.Errorf("instance count %d exceeds host GL", instanceCount)
 	}
-	if startInstance != 0 {
+	if !indirect && startInstance != 0 {
 		return fmt.Errorf("start instance %d is unsupported", startInstance)
+	}
+	var indirectBuffer *hostResource
+	var indirectOffset uintptr
+	if indirect {
+		if payload[17] != 1 {
+			return fmt.Errorf("indirect draw count %d requires multi-draw support", payload[17])
+		}
+		if payload[19] != 0 {
+			return errors.New("indirect draw-count buffers are unsupported")
+		}
+		indirectBuffer = h.resources[payload[14]]
+		if indirectBuffer == nil || indirectBuffer.buffer == 0 {
+			return fmt.Errorf("indirect draw refers to unknown buffer %d", payload[14])
+		}
+		commandSize := uint32(16)
+		if indexed {
+			commandSize = 20
+		}
+		if payload[15]&3 != 0 || payload[15] > indirectBuffer.description.Width ||
+			commandSize > indirectBuffer.description.Width-payload[15] {
+			return fmt.Errorf("indirect draw command range %d..%d exceeds buffer size %d",
+				payload[15], uint64(payload[15])+uint64(commandSize), indirectBuffer.description.Width)
+		}
+		baseInstanceOffset := payload[15] + commandSize - 4
+		if binary.LittleEndian.Uint32(indirectBuffer.bufferBytes[baseInstanceOffset:]) != 0 {
+			return errors.New("indirect draw base instance is unsupported")
+		}
+		indirectOffset = uintptr(payload[15])
 	}
 	if !context.hasColorSurface() && context.depthSurface == 0 {
 		return errors.New("draw has no framebuffer")
@@ -1787,9 +2812,31 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 		h.applyFrontFace(context, context.rasterizers[context.boundRasterizer].state)
 	}
 	elements := context.vertexElements[context.boundVertexElements]
+	if countFromStreamOutput != 0 {
+		start, count = 0, countFromStreamOutput
+		if capacity, ok := streamOutputVertexCapacity(context, elements); ok {
+			count = min(count, capacity)
+		}
+	}
 	h.gl.bindVertexArray(h.vao)
+	emulation, err := h.prepareVertexSystemEmulation(context, elements, start, count, indexed, instanceCount, indexBias)
+	if err != nil {
+		return err
+	}
 	var enabledAttributes uint32
 	for index, element := range elements {
+		if emulation.systemValue != emulatedVertexSystemNone && uint8(index) == emulation.attribute {
+			h.gl.bindBuffer(glArrayBuffer, h.emulatedVertexIDBuffer)
+			h.gl.vertexAttribPtr(uint32(index), 2, glFloat, false, 8, 0)
+			divisor := uint32(0)
+			if emulation.systemValue == emulatedInstanceID {
+				divisor = 1
+			}
+			h.gl.vertexAttribDivisor(uint32(index), divisor)
+			h.gl.enableVertexAttrib(uint32(index))
+			enabledAttributes |= 1 << uint(index)
+			continue
+		}
 		if element.bufferIndex >= uint32(len(context.vertexBuffers)) {
 			return fmt.Errorf("vertex element %d uses invalid buffer index %d", index, element.bufferIndex)
 		}
@@ -1797,6 +2844,30 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 		buffer := binding.resource
 		if buffer == nil || buffer.buffer == 0 {
 			return fmt.Errorf("vertex element %d refers to unknown buffer %d", index, binding.resourceID)
+		}
+		if components, dataType, signed, integer := integerVertexFormat(element.format); integer {
+			if binding.stride == 0 {
+				value, _, err := integerVertexAttributeValue(buffer.bufferBytes, binding.offset+element.offset, element.format)
+				if err != nil {
+					return fmt.Errorf("vertex element %d constant integer value: %w", index, err)
+				}
+				h.gl.disableVertexAttrib(uint32(index))
+				h.gl.vertexAttribDivisor(uint32(index), 0)
+				if signed {
+					h.gl.vertexAttribI4i(uint32(index), int32(value[0]), int32(value[1]), int32(value[2]), int32(value[3]))
+				} else {
+					h.gl.vertexAttribI4ui(uint32(index), value[0], value[1], value[2], value[3])
+				}
+				continue
+			}
+			h.publishBuffer(buffer)
+			h.gl.bindBuffer(glArrayBuffer, buffer.buffer)
+			h.gl.vertexAttribIPtr(uint32(index), components, dataType, int32(binding.stride),
+				uintptr(binding.offset+element.offset))
+			h.gl.vertexAttribDivisor(uint32(index), element.instanceDivisor)
+			h.gl.enableVertexAttrib(uint32(index))
+			enabledAttributes |= 1 << uint(index)
+			continue
 		}
 		components, dataType, normalized, ok := vertexFormat(element.format)
 		if !ok {
@@ -1840,75 +2911,12 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 			pointSpriteCoordinates = rasterizer.spriteCoordinateEnable
 		}
 	}
-	program, err := h.programFor(context, pointSpriteCoordinates)
+	program, err := h.programFor(context, pointSpriteCoordinates, emulation, false)
 	if err != nil {
 		return err
 	}
-	if h.currentProgram != program.id {
-		h.gl.useProgram(program.id)
-		h.currentProgram = program.id
-	}
-	if program.winsysAdjustY >= 0 {
-		adjustY := float32(1)
-		if context.viewportSet {
-			adjustY = context.viewport.adjustY
-		}
-		h.gl.uniform1f(program.winsysAdjustY, adjustY)
-	}
-	for stage := tgsiVertex; stage <= tgsiFragment; stage++ {
-		for index, location := range program.constants[stage] {
-			if location < 0 {
-				continue
-			}
-			binding := context.uniformBuffers[stage][index]
-			if binding.resource != nil && binding.length != 0 {
-				bytes := binding.resource.bufferBytes[binding.offset : binding.offset+binding.length]
-				h.gl.uniform4fv(location, int32(len(bytes)/16), (*float32)(unsafe.Pointer(&bytes[0])))
-				continue
-			}
-			if index == 0 && len(context.constants[stage]) != 0 {
-				constants := context.constants[stage]
-				h.gl.uniform4fv(location, int32(len(constants)/4), &constants[0])
-			}
-		}
-	}
-	for stage := tgsiVertex; stage <= tgsiFragment; stage++ {
-		for slot, viewHandle := range context.boundSamplerViews[stage] {
-			if viewHandle == 0 {
-				continue
-			}
-			view := context.samplerViews[viewHandle]
-			texture := view.resource
-			if texture == nil || texture.texture == 0 {
-				return fmt.Errorf("sampler view %d has no texture", viewHandle)
-			}
-			textureUnit := uint32(stage*16 + slot)
-			h.gl.activeTexture(glTexture0 + textureUnit)
-			h.gl.bindTexture(texture.textureTarget, texture.texture)
-			if !texture.samplerViewConfigured || texture.appliedSamplerView != view {
-				if err := h.applySamplerView(view); err != nil {
-					return fmt.Errorf("sampler view %d: %w", viewHandle, err)
-				}
-				texture.appliedSamplerView = view
-				texture.samplerViewConfigured = true
-			}
-			if stateHandle := context.boundSamplerStates[stage][slot]; stateHandle != 0 {
-				state := context.samplerStates[stateHandle]
-				h.gl.bindSampler(textureUnit, state.id)
-				if location := program.explicitLODCrossovers[stage][slot]; location >= 0 {
-					h.gl.uniform1f(location, explicitLODCrossover(view, state))
-				}
-			} else {
-				h.gl.bindSampler(textureUnit, 0)
-				if location := program.explicitLODCrossovers[stage][slot]; location >= 0 {
-					h.gl.uniform1f(location, 0)
-				}
-			}
-			location := program.samplers[stage][slot]
-			if location >= 0 {
-				h.gl.uniform1i(location, int32(textureUnit))
-			}
-		}
+	if err := h.applyDrawProgram(context, program, emulation); err != nil {
+		return err
 	}
 
 	var glMode uint32
@@ -1927,9 +2935,62 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 		glMode = glTriangleStrip
 	case 6:
 		glMode = glTriangleFan
+	case 10:
+		glMode = glLinesAdjacency
+	case 11:
+		glMode = glLineStripAdjacency
+	case 12:
+		glMode = glTrianglesAdjacency
+	case 13:
+		glMode = glTriangleStripAdjacency
+	case 14:
+		if len(payload) < 13 || payload[12] == 0 || payload[12] > 32 {
+			return fmt.Errorf("patch draw has invalid control-point count")
+		}
+		glMode = glPatches
+		h.gl.patchParameteri(glPatchVertices, int32(payload[12]))
 	default:
 		return fmt.Errorf("unsupported primitive mode %d", mode)
 	}
+	emulatedSamples, err := h.contextEmulatedIntegerSamples(context)
+	if err != nil {
+		return err
+	}
+	if emulatedSamples != 0 {
+		for _, handle := range context.boundStreamoutTargets {
+			if handle != 0 {
+				return errors.New("streamout with layered integer multisample rendering is not implemented")
+			}
+		}
+	}
+	inputVertices, inputVerticesExact := uint32(0), !indirect && glMode == glPoints && (!indexed || payload[7] == 0)
+	if inputVerticesExact {
+		vertices := uint64(count) * uint64(instanceCount)
+		if vertices > math.MaxUint32 {
+			return fmt.Errorf("streamout input vertex count %d exceeds host tracking", vertices)
+		}
+		inputVertices = uint32(vertices)
+	}
+	streamout, err := h.beginStreamout(context, glMode, inputVertices, inputVerticesExact)
+	if err != nil {
+		return err
+	}
+	streamoutEnded := false
+	if streamout != nil {
+		defer func() {
+			if streamoutEnded {
+				return
+			}
+			endErr := h.endStreamout(streamout)
+			if err == nil {
+				err = endErr
+			} else if endErr != nil {
+				err = errors.Join(err, endErr)
+			}
+		}()
+	}
+	var drawCall func()
+	primitiveRestart := false
 	if indexed {
 		buffer := context.indexResource
 		if buffer == nil || buffer.buffer == 0 {
@@ -1948,7 +3009,7 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 			return fmt.Errorf("unsupported index size %d", context.indexSize)
 		}
 		h.gl.bindBuffer(glElementArrayBuffer, buffer.buffer)
-		primitiveRestart := payload[7] != 0
+		primitiveRestart = payload[7] != 0
 		if primitiveRestart {
 			h.gl.enable(glPrimitiveRestart)
 			h.gl.primitiveRestartIndex(payload[8])
@@ -1958,29 +3019,304 @@ func (h *darwinHost) draw(context *hostContext, payload []uint32) error {
 		// the reference renderer; doing so selects unrelated indices from Mesa's
 		// shared streaming buffer as soon as a draw has a nonzero start.
 		offset := uintptr(context.indexOffset)
-		indexBias := int32(0)
-		if len(payload) > 5 {
-			indexBias = int32(payload[5])
-		}
-		if instanceCount > 1 && indexBias != 0 {
-			h.gl.drawElementsInstancedBaseVertex(glMode, int32(count), indexType, offset, int32(instanceCount), indexBias)
-		} else if instanceCount > 1 {
-			h.gl.drawElementsInstanced(glMode, int32(count), indexType, offset, int32(instanceCount))
-		} else if indexBias != 0 {
-			h.gl.drawElementsBaseVertex(glMode, int32(count), indexType, offset, indexBias)
-		} else {
-			h.gl.drawElements(glMode, int32(count), indexType, offset)
-		}
-		if primitiveRestart {
-			h.gl.disable(glPrimitiveRestart)
+		drawCall = func() {
+			if indirect {
+				h.gl.drawElementsIndirect(glMode, indexType, indirectOffset)
+			} else if instanceCount > 1 && indexBias != 0 {
+				h.gl.drawElementsInstancedBaseVertex(glMode, int32(count), indexType, offset, int32(instanceCount), indexBias)
+			} else if instanceCount > 1 {
+				h.gl.drawElementsInstanced(glMode, int32(count), indexType, offset, int32(instanceCount))
+			} else if indexBias != 0 {
+				h.gl.drawElementsBaseVertex(glMode, int32(count), indexType, offset, indexBias)
+			} else {
+				h.gl.drawElements(glMode, int32(count), indexType, offset)
+			}
 		}
 	} else {
-		if instanceCount > 1 {
-			h.gl.drawArraysInstanced(glMode, int32(start), int32(count), int32(instanceCount))
-		} else {
-			h.gl.drawArrays(glMode, int32(start), int32(count))
+		drawCall = func() {
+			if indirect {
+				h.gl.drawArraysIndirect(glMode, indirectOffset)
+			} else if instanceCount > 1 {
+				h.gl.drawArraysInstanced(glMode, int32(start), int32(count), int32(instanceCount))
+			} else {
+				h.gl.drawArrays(glMode, int32(start), int32(count))
+			}
 		}
 	}
+	if indirect {
+		h.publishBuffer(indirectBuffer)
+		h.gl.bindBuffer(glDrawIndirectBuffer, indirectBuffer.buffer)
+		defer h.gl.bindBuffer(glDrawIndirectBuffer, 0)
+	}
+	if emulatedSamples == 0 {
+		drawCall()
+		// Apple's software fallback captures point-emitting geometry produced by
+		// a patch draw, but drops its rasterization while transform feedback is
+		// active. Finish (or pause) capture and replay the side-effect-free GL
+		// 4.1 draw once for framebuffer/depth output. Transform-feedback writes
+		// still come only from the first draw.
+		geometry := context.shaders[context.boundShaders[tgsiGeometry]]
+		rasterizerDiscard := context.boundRasterizer != 0 &&
+			context.rasterizers[context.boundRasterizer].state&(1<<3) != 0
+		needsPointPatchRasterization := streamout != nil && glMode == glPatches &&
+			geometry.stage == tgsiGeometry && geometry.geometryOutputMode == glPoints &&
+			!rasterizerDiscard && (context.firstColorSurface() != 0 || context.depthSurface != 0)
+		if needsPointPatchRasterization {
+			// Pausing leaves Apple's EVAL_PROG transform-feedback fallback in a
+			// non-rasterizing state, so this path must fully end the capture.
+			streamout.persistent = false
+			if endErr := h.endStreamout(streamout); endErr != nil {
+				return endErr
+			}
+			streamoutEnded = true
+			rasterProgram, programErr := h.programFor(context, pointSpriteCoordinates, emulation, true)
+			if programErr != nil {
+				return programErr
+			}
+			if programErr := h.applyDrawProgram(context, rasterProgram, emulation); programErr != nil {
+				return programErr
+			}
+			drawCall()
+		}
+	} else {
+		for sample := uint32(0); sample < emulatedSamples; sample++ {
+			if err := h.attachContextEmulatedIntegerSample(context, sample); err != nil {
+				return err
+			}
+			drawCall()
+		}
+		h.framebufferBindingValid = false
+	}
+	if primitiveRestart {
+		h.gl.disable(glPrimitiveRestart)
+	}
+	for stage := range program.constantTextures {
+		for index, location := range program.constantTextures[stage] {
+			if location >= 0 {
+				h.gl.activeTexture(glTexture0 + uint32(64+index))
+				h.gl.bindTexture(glTextureBuffer, h.constantBufferTextures[stage][index])
+				h.gl.texBuffer(glTextureBuffer, glRGBA32UI, 0)
+				h.gl.bindTexture(glTextureBuffer, 0)
+				h.gl.bindBuffer(glTextureBuffer, 0)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func hostQueryActiveKey(query hostQuery) uint64 {
+	return uint64(query.target)<<32 | uint64(query.index)
+}
+
+func hostQueryTarget(queryType uint32) (uint32, uint32, error) {
+	switch queryType {
+	case 0:
+		return glSamplesPassed, 8, nil
+	case 1:
+		return glAnySamplesPassed, 4, nil
+	case 2:
+		return glTimestamp, 8, nil
+	case 4:
+		return glTimeElapsed, 8, nil
+	case 5:
+		return glPrimitivesGenerated, 4, nil
+	case 6:
+		return glTransformFeedbackPrimitivesWritten, 4, nil
+	case 11:
+		return glAnySamplesPassedConservative, 4, nil
+	default:
+		return 0, 0, fmt.Errorf("query type %d is unsupported", queryType)
+	}
+}
+
+func (h *darwinHost) writeHostQueryState(resource *hostResource, offset, state, resultSize uint32, result uint64) {
+	bytes := resource.bufferBytes[offset : offset+16]
+	binary.LittleEndian.PutUint32(bytes[0:4], state)
+	binary.LittleEndian.PutUint32(bytes[4:8], resultSize)
+	binary.LittleEndian.PutUint64(bytes[8:16], result)
+	h.markBufferDirty(resource, offset, 16)
+}
+
+func (c *hostContext) hasStreamoutTargets() bool {
+	for _, handle := range c.boundStreamoutTargets {
+		if handle != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *darwinHost) bindStreamoutObjectTargets(context *hostContext, object *hostStreamoutObject) error {
+	for index, handle := range object.handles {
+		if handle == 0 {
+			h.gl.bindBufferRange(glTransformFeedbackBuffer, uint32(index), 0, 0, 0)
+			continue
+		}
+		target, ok := context.streamoutTargets[handle]
+		if !ok || target.resource == nil || target.resource.buffer == 0 {
+			return fmt.Errorf("streamout object target %d is unavailable", handle)
+		}
+		written := object.writtenBytes[index]
+		if written >= target.size {
+			return fmt.Errorf("streamout target %d has no space after %d captured bytes", handle, written)
+		}
+		h.publishBuffer(target.resource)
+		h.gl.bindBufferRange(glTransformFeedbackBuffer, uint32(index), target.resource.buffer,
+			int(target.offset+written), int(target.size-written))
+	}
+	return nil
+}
+
+func (h *darwinHost) beginStreamout(context *hostContext, drawMode, inputVertices uint32, inputVerticesExact bool) (*hostActiveStreamout, error) {
+	if !context.hasStreamoutTargets() {
+		return nil, nil
+	}
+	shaderHandle := context.boundShaders[tgsiGeometry]
+	if shaderHandle == 0 {
+		shaderHandle = context.boundShaders[tgsiTessEvaluation]
+	}
+	if shaderHandle == 0 {
+		shaderHandle = context.boundShaders[tgsiVertex]
+	}
+	shader := context.shaders[shaderHandle]
+	if len(shader.streamOutputVaryings) == 0 {
+		return nil, fmt.Errorf("streamout targets are bound without outputs on final pre-fragment shader %d", shaderHandle)
+	}
+	if context.currentStreamout == nil {
+		return nil, errors.New("streamout targets have no native transform-feedback object")
+	}
+	active := &hostActiveStreamout{object: context.currentStreamout}
+	boundTargets := 0
+	for _, handle := range context.boundStreamoutTargets {
+		if handle != 0 {
+			boundTargets++
+		}
+	}
+	// Apple's multi-buffer transform-feedback path is reliable when each draw
+	// is ended. Exact point captures below preserve guest resume semantics by
+	// advancing every bound range before the next begin.
+	active.persistent = boundTargets == 1
+	active.advanceOffsetsValid = inputVerticesExact && shader.stage == tgsiVertex && drawMode == glPoints
+	if active.advanceOffsetsValid {
+		for index, stride := range shader.streamOutputBufferStrides {
+			advance := uint64(inputVertices) * uint64(stride) * 4
+			if advance > math.MaxUint32 {
+				return nil, fmt.Errorf("streamout target %d advances by %d bytes", index, advance)
+			}
+			active.advanceBytes[index] = uint32(advance)
+		}
+	}
+	if shader.maxInterleavedWorkaround {
+		if context.boundStreamoutTargets[0] == 0 || context.boundStreamoutTargets[1] != 0 ||
+			context.boundStreamoutTargets[2] != 0 || context.boundStreamoutTargets[3] != 0 {
+			return nil, errors.New("64-component interleaved streamout requires exactly one target")
+		}
+		target := context.streamoutTargets[context.boundStreamoutTargets[0]]
+		if target.resource == nil || target.resource.buffer == 0 {
+			return nil, errors.New("64-component interleaved streamout target is unavailable")
+		}
+		active.maxInterleavedWorkaround = true
+		active.target = target
+		active.vertexCapacity = target.size / (64 * 4)
+		if active.vertexCapacity == 0 {
+			return nil, fmt.Errorf("64-component interleaved streamout target has only %d bytes", target.size)
+		}
+		h.gl.genBuffers(2, &active.stagingBuffers[0])
+		h.gl.bindBuffer(glArrayBuffer, active.stagingBuffers[0])
+		h.gl.bufferData(glArrayBuffer, int(active.vertexCapacity*60*4), 0, glStreamDraw)
+		h.gl.bindBuffer(glArrayBuffer, active.stagingBuffers[1])
+		h.gl.bufferData(glArrayBuffer, int(active.vertexCapacity*4*4), 0, glStreamDraw)
+		h.gl.bindBufferRange(glTransformFeedbackBuffer, 0, active.stagingBuffers[0], 0, int(active.vertexCapacity*60*4))
+		h.gl.bindBufferRange(glTransformFeedbackBuffer, 1, active.stagingBuffers[1], 0, int(active.vertexCapacity*4*4))
+	} else {
+		for index, handle := range context.boundStreamoutTargets {
+			if handle == 0 {
+				if shader.streamOutputBufferStrides[index] != 0 {
+					return nil, fmt.Errorf("streamout shader buffer %d has no bound target", index)
+				}
+				continue
+			}
+			target, ok := context.streamoutTargets[handle]
+			if !ok || target.resource == nil || target.resource.buffer == 0 {
+				return nil, fmt.Errorf("bound streamout target %d is unavailable", handle)
+			}
+		}
+	}
+	mode := shader.geometryOutputMode
+	// GL_POINTS is zero, so a point-emitting geometry shader cannot use zero as
+	// an "unset" sentinel. Geometry TGSI has already been validated to carry a
+	// supported output primitive; only derive the capture primitive from the
+	// draw mode when the final pre-fragment stage is not geometry.
+	if shader.stage == tgsiTessEvaluation {
+		mode = shader.tessEvaluationOutputMode
+	} else if shader.stage != tgsiGeometry {
+		mode = uint32(glPoints)
+		switch drawMode {
+		case glPoints:
+			mode = glPoints
+		case glLines, glLineLoop, glLineStrip:
+			mode = glLines
+		case glTriangles, glTriangleStrip, glTriangleFan:
+			mode = glTriangles
+		default:
+			if active.maxInterleavedWorkaround {
+				h.gl.deleteBuffers(2, &active.stagingBuffers[0])
+			}
+			return nil, fmt.Errorf("primitive mode %#x cannot use streamout with shader %d stage %d",
+				drawMode, shaderHandle, shader.stage)
+		}
+	}
+	if active.object.state == hostStreamoutPaused && active.persistent && !active.maxInterleavedWorkaround {
+		h.gl.resumeTransformFeedback()
+	} else {
+		h.gl.beginTransformFeedback(mode)
+	}
+	return active, nil
+}
+
+func (h *darwinHost) endStreamout(active *hostActiveStreamout) error {
+	if active.maxInterleavedWorkaround || !active.persistent {
+		h.gl.endTransformFeedback()
+		active.object.state = hostStreamoutNeedBegin
+	} else {
+		h.gl.pauseTransformFeedback()
+		active.object.state = hostStreamoutPaused
+	}
+	if !active.maxInterleavedWorkaround {
+		if !active.advanceOffsetsValid {
+			active.object.appendOffsetsValid = false
+			return nil
+		}
+		if active.object.appendOffsetsValid {
+			for index, advance := range active.advanceBytes {
+				if advance > math.MaxUint32-active.object.writtenBytes[index] {
+					active.object.appendOffsetsValid = false
+					return fmt.Errorf("streamout target %d captured byte count overflow", index)
+				}
+				active.object.writtenBytes[index] += advance
+			}
+		}
+		return nil
+	}
+	defer h.gl.deleteBuffers(2, &active.stagingBuffers[0])
+	leading := make([]byte, int(active.vertexCapacity*60*4))
+	trailing := make([]byte, int(active.vertexCapacity*4*4))
+	h.gl.bindBuffer(glArrayBuffer, active.stagingBuffers[0])
+	h.gl.getBufferSubData(glArrayBuffer, 0, len(leading), glPointer(leading))
+	h.gl.bindBuffer(glArrayBuffer, active.stagingBuffers[1])
+	h.gl.getBufferSubData(glArrayBuffer, 0, len(trailing), glPointer(trailing))
+
+	interleavedBytes := int(active.vertexCapacity * 64 * 4)
+	interleaved := make([]byte, interleavedBytes)
+	for vertex := uint32(0); vertex < active.vertexCapacity; vertex++ {
+		copy(interleaved[int(vertex*64*4):int(vertex*64*4+60*4)], leading[int(vertex*60*4):int((vertex+1)*60*4)])
+		copy(interleaved[int(vertex*64*4+60*4):int((vertex+1)*64*4)], trailing[int(vertex*4*4):int((vertex+1)*4*4)])
+	}
+	start := int(active.target.offset)
+	copy(active.target.resource.bufferBytes[start:start+interleavedBytes], interleaved)
+	h.gl.bindBuffer(glArrayBuffer, active.target.resource.buffer)
+	h.gl.bufferSubData(glArrayBuffer, start, len(interleaved), glPointer(interleaved))
 	return nil
 }
 
@@ -1989,7 +3325,26 @@ func framebufferAttachmentForSurface(surface hostSurface) (hostFramebufferAttach
 		return hostFramebufferAttachment{}, errors.New("surface has no texture")
 	}
 	if surface.firstLayer != surface.lastLayer {
-		return hostFramebufferAttachment{}, fmt.Errorf("layered surface range %d..%d requires geometry-shader rendering", surface.firstLayer, surface.lastLayer)
+		layers := uint32(0)
+		switch surface.resource.description.Target {
+		case 3:
+			layers = surface.resource.description.Depth >> surface.level
+			if layers == 0 {
+				layers = 1
+			}
+		case 4:
+			layers = 6
+		case 6, 7, 8:
+			layers = surface.resource.description.ArraySize
+		}
+		if layers == 0 || surface.firstLayer != 0 || surface.lastLayer+1 != layers {
+			return hostFramebufferAttachment{}, fmt.Errorf("layered surface range %d..%d does not cover all %d texture layers",
+				surface.firstLayer, surface.lastLayer, layers)
+		}
+		return hostFramebufferAttachment{
+			texture: surface.resource.texture, target: surface.resource.description.Target,
+			level: surface.level, layered: true,
+		}, nil
 	}
 	return hostFramebufferAttachment{
 		texture: surface.resource.texture,
@@ -2004,28 +3359,111 @@ func (h *darwinHost) attachFramebufferSurface(target, attachment uint32, surface
 	if err != nil {
 		return err
 	}
+	if binding.layered {
+		if surface.resource.emulatedIntegerMSAA {
+			return errors.New("layered integer multisample framebuffer rendering is not implemented")
+		}
+		h.gl.framebufferTextureAll(target, attachment, surface.resource.texture, int32(binding.level))
+		return nil
+	}
 	return h.attachTextureLayer(target, attachment, surface.resource, binding.level, binding.layer)
 }
 
 func (h *darwinHost) attachTextureLayer(target, attachment uint32, resource *hostResource, level, layer uint32) error {
+	if resource.emulatedIntegerMSAA {
+		return h.attachEmulatedIntegerSample(target, attachment, resource, layer, 0)
+	}
 	switch resource.description.Target {
-	case 2:
+	case 1:
 		if layer != 0 {
-			return fmt.Errorf("2D texture layer %d is invalid", layer)
+			return fmt.Errorf("1D texture layer %d is invalid", layer)
 		}
-		h.gl.framebufferTexture(target, attachment, glTexture2D, resource.texture, int32(level))
+		h.gl.framebufferTexture1D(target, attachment, glTexture1D, resource.texture, int32(level))
+	case 2, 5:
+		if layer != 0 {
+			return fmt.Errorf("non-array texture layer %d is invalid", layer)
+		}
+		h.gl.framebufferTexture(target, attachment, resource.textureTarget, resource.texture, int32(level))
+	case 3:
+		levelDepth := resource.description.Depth >> level
+		if levelDepth == 0 {
+			levelDepth = 1
+		}
+		if layer >= levelDepth {
+			return fmt.Errorf("3D texture layer %d exceeds %d slices", layer, levelDepth)
+		}
+		h.gl.framebufferTextureLayer(target, attachment, resource.texture, int32(level), int32(layer))
 	case 4:
 		if layer >= 6 {
 			return fmt.Errorf("cube texture face %d is invalid", layer)
 		}
 		h.gl.framebufferTexture(target, attachment, glTextureCubeMapPositiveX+layer, resource.texture, int32(level))
-	case 7:
+	case 6, 7, 8:
 		if layer >= resource.description.ArraySize {
-			return fmt.Errorf("2D array texture layer %d exceeds %d layers", layer, resource.description.ArraySize)
+			return fmt.Errorf("array texture layer %d exceeds %d layers", layer, resource.description.ArraySize)
 		}
 		h.gl.framebufferTextureLayer(target, attachment, resource.texture, int32(level), int32(layer))
 	default:
 		return fmt.Errorf("framebuffer texture target %d is unsupported", resource.description.Target)
+	}
+	return nil
+}
+
+func (h *darwinHost) attachEmulatedIntegerSample(target, attachment uint32, resource *hostResource, layer, sample uint32) error {
+	if !resource.emulatedIntegerMSAA {
+		return errors.New("resource does not use layered integer multisample storage")
+	}
+	layers := uint32(1)
+	if resource.description.Target == 7 {
+		layers = resource.description.ArraySize
+	}
+	if layer >= layers {
+		return fmt.Errorf("integer multisample array layer %d exceeds %d layers", layer, layers)
+	}
+	if sample >= resource.description.Samples {
+		return fmt.Errorf("integer multisample sample %d exceeds %d samples", sample, resource.description.Samples)
+	}
+	nativeLayer := layer*resource.description.Samples + sample
+	h.gl.framebufferTextureLayer(target, attachment, resource.texture, 0, int32(nativeLayer))
+	return nil
+}
+
+func (h *darwinHost) contextEmulatedIntegerSamples(context *hostContext) (uint32, error) {
+	var samples uint32
+	for _, handle := range context.colorSurfaces {
+		if handle == 0 {
+			continue
+		}
+		surface := context.surfaces[handle]
+		if surface.resource == nil || !surface.resource.emulatedIntegerMSAA {
+			continue
+		}
+		if samples != 0 && samples != surface.resource.description.Samples {
+			return 0, errors.New("bound integer multisample surfaces use different sample counts")
+		}
+		samples = surface.resource.description.Samples
+	}
+	if samples != 0 && context.depthSurface != 0 {
+		return 0, errors.New("layered integer multisample color with a depth/stencil surface is not implemented")
+	}
+	return samples, nil
+}
+
+func (h *darwinHost) attachContextEmulatedIntegerSample(context *hostContext, sample uint32) error {
+	for index, handle := range context.colorSurfaces {
+		if handle == 0 {
+			continue
+		}
+		surface := context.surfaces[handle]
+		if surface.resource == nil || !surface.resource.emulatedIntegerMSAA {
+			continue
+		}
+		if err := h.attachEmulatedIntegerSample(glFramebuffer, glColorAttachment0+uint32(index), surface.resource, surface.firstLayer, sample); err != nil {
+			return err
+		}
+	}
+	if status := h.gl.checkFramebuffer(glFramebuffer); status != glFramebufferComplete {
+		return fmt.Errorf("VirGL integer multisample framebuffer status %#x", status)
 	}
 	return nil
 }
@@ -2210,9 +3648,14 @@ func (h *darwinHost) activateContext(context *hostContext) error {
 	}
 	if context.boundRasterizer == 0 {
 		h.gl.disable(glCullFace)
-		h.gl.disable(glScissorTest)
+		for index := range context.scissors {
+			h.gl.disablei(glScissorTest, uint32(index))
+		}
 		h.gl.disable(glProgramPointSize)
 		h.gl.disable(glPolygonOffsetFill)
+		h.gl.disable(glRasterizerDiscard)
+		h.gl.disable(glDepthClamp)
+		h.applyClipPlaneEnable(0)
 		h.gl.pointSize(1)
 	} else {
 		state, ok := context.rasterizers[context.boundRasterizer]
@@ -2234,16 +3677,18 @@ func (h *darwinHost) activateContext(context *hostContext) error {
 		h.applyDepthStencilAlpha(context, state)
 	}
 	h.gl.blendColor(context.blendColor[0], context.blendColor[1], context.blendColor[2], context.blendColor[3])
-	if context.viewportSet {
-		h.applyViewport(context.viewport)
+	for slots := context.viewportSet; slots != 0; {
+		index := uint32(bits.TrailingZeros16(slots))
+		h.applyViewportIndexed(index, context.viewports[index])
+		slots &^= 1 << index
 	}
 	h.activeContext = context
 	return nil
 }
 
-func (h *darwinHost) applyViewport(viewport hostViewport) {
-	h.gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height)
-	h.gl.depthRange(viewport.near, viewport.far)
+func (h *darwinHost) applyViewportIndexed(index uint32, viewport hostViewport) {
+	h.gl.viewportIndexedf(index, float32(viewport.x), float32(viewport.y), float32(viewport.width), float32(viewport.height))
+	h.gl.depthRangeIndexed(index, viewport.near, viewport.far)
 }
 
 func (h *darwinHost) restoreDepthWriteMask(context *hostContext) {
@@ -2269,18 +3714,47 @@ func (h *darwinHost) restoreStencilWriteMasks(context *hostContext) {
 	h.gl.stencilMaskSeparate(glBack, (back>>21)&0xff)
 }
 
-func (h *darwinHost) programFor(context *hostContext, pointSpriteCoordinates uint32) (hostProgram, error) {
+func (h *darwinHost) programFor(context *hostContext, pointSpriteCoordinates uint32, emulation hostVertexSystemEmulation, disableStreamout bool) (hostProgram, error) {
 	vertexHandle := context.boundShaders[tgsiVertex]
 	fragmentHandle := context.boundShaders[tgsiFragment]
+	geometryHandle := context.boundShaders[tgsiGeometry]
+	tessControlHandle := context.boundShaders[tgsiTessControl]
+	tessEvaluationHandle := context.boundShaders[tgsiTessEvaluation]
 	vertex := context.shaders[vertexHandle]
 	fragment := context.shaders[fragmentHandle]
+	geometry := context.shaders[geometryHandle]
+	tessControl := context.shaders[tessControlHandle]
+	tessEvaluation := context.shaders[tessEvaluationHandle]
 	if vertex.source == "" || fragment.source == "" {
 		return hostProgram{}, errors.New("draw has incomplete shader state")
 	}
+	if tessControl.source != "" && tessEvaluation.source == "" {
+		return hostProgram{}, errors.New("tessellation control shader requires an evaluation shader")
+	}
+	outputClasses := context.fragmentOutputClasses()
+	dualSource := context.usesDualSourceBlend()
+	var signedVertexInputs, unsignedVertexInputs uint16
+	for index, element := range context.vertexElements[context.boundVertexElements] {
+		_, _, signed, integer := integerVertexFormat(element.format)
+		if !integer || index >= 16 || (emulation.systemValue != emulatedVertexSystemNone && uint8(index) == emulation.attribute) {
+			continue
+		}
+		if signed {
+			signedVertexInputs |= 1 << index
+		} else {
+			unsignedVertexInputs |= 1 << index
+		}
+	}
 	key := hostProgramKey{
-		context: context, vertexHandle: vertexHandle, fragmentHandle: fragmentHandle,
-		vertexGeneration: vertex.generation, fragmentGeneration: fragment.generation,
-		pointSpriteCoordinates: pointSpriteCoordinates,
+		context: context, vertexHandle: vertexHandle, fragmentHandle: fragmentHandle, geometryHandle: geometryHandle,
+		tessControlHandle: tessControlHandle, tessEvaluationHandle: tessEvaluationHandle,
+		vertexGeneration: vertex.generation, fragmentGeneration: fragment.generation, geometryGeneration: geometry.generation,
+		tessControlGeneration: tessControl.generation, tessEvaluationGeneration: tessEvaluation.generation,
+		pointSpriteCoordinates: pointSpriteCoordinates, fragmentOutputClasses: outputClasses,
+		dualSourceBlend: dualSource, emulatedVertexSystemValue: emulation.systemValue,
+		emulatedVertexAttribute: emulation.attribute,
+		signedVertexInputs:      signedVertexInputs, unsignedVertexInputs: unsignedVertexInputs,
+		disableStreamout: disableStreamout,
 	}
 	if program, ok := h.programs[key]; ok {
 		h.programUseSequence++
@@ -2290,8 +3764,53 @@ func (h *darwinHost) programFor(context *hostContext, pointSpriteCoordinates uin
 	}
 	h.evictPrograms(maxHostPrograms - 1)
 	fragmentSource := pointSpriteFragmentSource(fragment.source, pointSpriteCoordinates)
-	vertexSource := linkTGSIInterfaces(vertex.source, fragmentSource)
-	id, err := h.gl.compileProgram(vertexSource, fragmentSource)
+	vertexSource := vertex.source
+	if geometry.source == "" && tessControl.source == "" && tessEvaluation.source == "" &&
+		!strings.Contains(vertex.tgsi, "DCL SAMP[") && uniformOnlyLargeFragmentTGSI(fragment.tgsi) {
+		if hoistedVertex, hoistedFragment, ok := hoistUniformFragmentSource(vertexSource, fragmentSource); ok {
+			vertexSource, fragmentSource = hoistedVertex, hoistedFragment
+		}
+	}
+	fragmentSource = typedFragmentOutputSource(fragmentSource, outputClasses, dualSource)
+	vertexSource = emulateVertexSystemValueSource(vertexSource, emulation)
+	vertexSource = typedVertexInputSource(vertexSource, signedVertexInputs, unsignedVertexInputs)
+	geometrySource := geometry.source
+	tessControlSource := tessControl.source
+	tessEvaluationSource := tessEvaluation.source
+	streamOutputVaryings := vertex.streamOutputVaryings
+	if tessEvaluationSource != "" {
+		vertexSource = strings.Replace(vertexSource, "    gl_Position.y *= uWinsysAdjustY;\n", "", 1)
+		if tessControlSource != "" {
+			vertexSource = linkTGSIInterfaces(vertexSource, tessControlSource)
+			tessControlSource = linkTGSIInterfaces(tessControlSource, tessEvaluationSource)
+		} else {
+			vertexSource = linkTGSIInterfaces(vertexSource, tessEvaluationSource)
+		}
+		streamOutputVaryings = tessEvaluation.streamOutputVaryings
+	}
+	if geometrySource != "" {
+		// The host framebuffer-origin adjustment belongs to the final
+		// pre-fragment stage. Applying it in the vertex shader would expose
+		// host coordinates through geometry inputs and transform feedback,
+		// then apply the adjustment a second time at EmitVertex.
+		vertexSource = strings.Replace(vertexSource, "    gl_Position.y *= uWinsysAdjustY;\n", "", 1)
+		if tessEvaluationSource != "" {
+			tessEvaluationSource = strings.Replace(tessEvaluationSource, "    gl_Position.y *= uWinsysAdjustY;\n", "", 1)
+			tessEvaluationSource = linkTGSIInterfaces(tessEvaluationSource, geometrySource)
+		} else {
+			vertexSource = linkTGSIInterfaces(vertexSource, geometrySource)
+		}
+		geometrySource = linkTGSIInterfaces(geometrySource, fragmentSource)
+		streamOutputVaryings = geometry.streamOutputVaryings
+	} else if tessEvaluationSource != "" {
+		tessEvaluationSource = linkTGSIInterfaces(tessEvaluationSource, fragmentSource)
+	} else {
+		vertexSource = linkTGSIInterfaces(vertexSource, fragmentSource)
+	}
+	if disableStreamout {
+		streamOutputVaryings = nil
+	}
+	id, err := h.gl.compileProgramWithTessellationGeometryTransformFeedback(vertexSource, tessControlSource, tessEvaluationSource, geometrySource, fragmentSource, streamOutputVaryings)
 	if err != nil {
 		return hostProgram{}, err
 	}
@@ -2301,21 +3820,102 @@ func (h *darwinHost) programFor(context *hostContext, pointSpriteCoordinates uin
 		lastUsed:      h.programUseSequence,
 		winsysAdjustY: uniformLocation(h.gl, id, "uWinsysAdjustY"),
 	}
-	for stage := tgsiVertex; stage <= tgsiFragment; stage++ {
+	for stage := range program.constants {
 		for buffer := range program.constants[stage] {
-			program.constants[stage][buffer] = uniformLocation(h.gl, id, tgsiConstantName(uint32(stage), buffer)+"[0]")
+			program.constants[stage][buffer] = -1
+			program.constantUniforms[stage][buffer] = -1
+			program.constantTextures[stage][buffer] = -1
+		}
+	}
+	constantBindingPoint := uint32(1) // binding zero is reserved for vertex-system emulation
+	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {
+		for buffer := range program.constants[stage] {
+			name := append([]byte(tgsiConstantBlockName(uint32(stage), buffer)), 0)
+			blockIndex := h.gl.getUniformBlockIndex(id, &name[0])
+			if blockIndex == ^uint32(0) {
+				program.constantUniforms[stage][buffer] = uniformLocation(h.gl, id, tgsiConstantName(uint32(stage), buffer)+"[0]")
+				if program.constantUniforms[stage][buffer] < 0 {
+					program.constantTextures[stage][buffer] = uniformLocation(h.gl, id, tgsiConstantTextureName(uint32(stage), buffer))
+				}
+				continue
+			}
+			var blockSize int32
+			h.gl.getActiveUniformBlockiv(id, blockIndex, glUniformBlockDataSize, &blockSize)
+			if blockSize <= 0 || blockSize > capsetMaxUniformBlockSize {
+				h.gl.deleteProgram(id)
+				return hostProgram{}, fmt.Errorf("VirGL constant block %s has invalid native size %d", name[:len(name)-1], blockSize)
+			}
+			h.gl.uniformBlockBinding(id, blockIndex, constantBindingPoint)
+			program.constants[stage][buffer] = int32(constantBindingPoint)
+			program.constantSizes[stage][buffer] = blockSize
+			constantBindingPoint++
 		}
 		for slot := range program.samplers[stage] {
 			program.samplers[stage][slot] = uniformLocation(h.gl, id, tgsiSamplerName(uint32(stage), slot))
 			program.explicitLODCrossovers[stage][slot] = uniformLocation(h.gl, id, tgsiSamplerLODCrossoverName(uint32(stage), slot))
+			program.samplerSampleCounts[stage][slot] = uniformLocation(h.gl, id, tgsiSamplerSampleCountName(uint32(stage), slot))
+			program.samplerViewSwizzles[stage][slot] = uniformLocation(h.gl, id, tgsiSamplerViewSwizzleName(uint32(stage), slot))
 		}
 	}
 	h.programs[key] = program
 	return program, nil
 }
 
+func (c *hostContext) fragmentOutputClasses() (classes [8]uint8) {
+	for index, handle := range c.colorSurfaces {
+		if handle == 0 {
+			continue
+		}
+		format := c.surfaces[handle].format
+		if isSignedIntegerTextureFormat(format) {
+			classes[index] = fragmentOutputSInt
+		} else if isIntegerTextureFormat(format) {
+			classes[index] = fragmentOutputUInt
+		}
+	}
+	return classes
+}
+
+func (c *hostContext) usesDualSourceBlend() bool {
+	if c.boundBlend == 0 {
+		return false
+	}
+	target := c.blendStates[c.boundBlend].renderTargets[0]
+	for _, factor := range [...]uint32{(target >> 4) & 0x1f, (target >> 9) & 0x1f, (target >> 17) & 0x1f, (target >> 22) & 0x1f} {
+		if factor == 9 || factor == 10 || factor == 0x19 || factor == 0x1a {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *darwinHost) applyRasterizer(context *hostContext, rasterizer hostRasterizer) {
 	state := rasterizer.state
+	// Gallium names this bit depth_clip: clipping is the ordinary enabled
+	// state, while clearing it requests ARB_depth_clamp behavior.
+	if state&(1<<1) != 0 {
+		h.gl.disable(glDepthClamp)
+	} else {
+		h.gl.enable(glDepthClamp)
+	}
+	if state&(1<<3) != 0 {
+		h.gl.enable(glRasterizerDiscard)
+	} else {
+		h.gl.disable(glRasterizerDiscard)
+	}
+	if state&(1<<25) != 0 {
+		h.gl.enable(glMultisample)
+		h.gl.enable(glSampleMask)
+	} else {
+		h.gl.disable(glMultisample)
+		h.gl.disable(glSampleMask)
+	}
+	if state&(1<<31) != 0 {
+		h.gl.enable(glSampleShading)
+	} else {
+		h.gl.disable(glSampleShading)
+	}
+	h.applyClipPlaneEnable(rasterizer.clipPlaneEnable)
 	switch (state >> 8) & 0x3 {
 	case 0:
 		h.gl.disable(glCullFace)
@@ -2331,10 +3931,14 @@ func (h *darwinHost) applyRasterizer(context *hostContext, rasterizer hostRaster
 	}
 	h.applyFrontFace(context, state)
 	if state&(1<<14) != 0 {
-		h.gl.enable(glScissorTest)
-		h.applyScissor(context.scissors[0])
+		for index := range context.scissors {
+			h.gl.enablei(glScissorTest, uint32(index))
+			h.applyScissorIndexed(uint32(index), context.scissors[index])
+		}
 	} else {
-		h.gl.disable(glScissorTest)
+		for index := range context.scissors {
+			h.gl.disablei(glScissorTest, uint32(index))
+		}
 	}
 	if state&(1<<24) != 0 {
 		h.gl.enable(glProgramPointSize)
@@ -2357,6 +3961,17 @@ func (h *darwinHost) applyRasterizer(context *hostContext, rasterizer hostRaster
 		h.gl.polygonOffset(rasterizer.offsetScale, rasterizer.offsetUnits)
 	} else {
 		h.gl.disable(glPolygonOffsetFill)
+	}
+}
+
+func (h *darwinHost) applyClipPlaneEnable(mask uint8) {
+	for index := uint32(0); index < 8; index++ {
+		capability := uint32(glClipDistance0 + index)
+		if mask&(1<<index) != 0 {
+			h.gl.enable(capability)
+		} else {
+			h.gl.disable(capability)
+		}
 	}
 }
 
@@ -2511,10 +4126,21 @@ func explicitLODCrossover(view hostSamplerView, state hostSamplerState) float32 
 }
 
 func (h *darwinHost) applySamplerView(view hostSamplerView) error {
-	if view.resource == nil || view.resource.textureTarget == 0 {
+	if view.resource == nil {
+		return errors.New("sampler view has no resource")
+	}
+	if view.target == glTextureBuffer {
+		return nil
+	}
+	if view.resource.textureTarget == 0 {
 		return errors.New("sampler view has no texture target")
 	}
 	target := view.resource.textureTarget
+	if view.resource.description.Samples != 0 {
+		// Apple's GL 4.1 driver ignores multisample texture swizzle state.
+		// Multisample TGSI fetches apply the view swizzle in translated GLSL.
+		return nil
+	}
 	h.gl.texParameteri(target, glTextureBaseLevel, int32(view.firstLevel))
 	h.gl.texParameteri(target, glTextureMaxLevel, int32(view.lastLevel))
 	swizzles := [...]int32{glRed, glGreen, glBlue, glAlpha, glZero, glOne}
@@ -2540,6 +4166,10 @@ func (h *darwinHost) applyDefaultBlend() {
 	h.gl.disable(glBlend)
 	h.gl.disable(glDither)
 	h.gl.colorMask(true, true, true, true)
+	for index := uint32(0); index < 8; index++ {
+		h.gl.disablei(glBlend, index)
+		h.gl.colorMaski(index, true, true, true, true)
+	}
 }
 
 func (h *darwinHost) applyBlend(state hostBlendState) error {
@@ -2547,13 +4177,6 @@ func (h *darwinHost) applyBlend(state hostBlendState) error {
 		h.gl.enable(glDither)
 	} else {
 		h.gl.disable(glDither)
-	}
-	target := state.renderTargets[0]
-	mask := (target >> 27) & 0xf
-	h.gl.colorMask(mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
-	if target&1 == 0 {
-		h.gl.disable(glBlend)
-		return nil
 	}
 	factor := func(value uint32) (uint32, bool) {
 		switch value {
@@ -2606,33 +4229,65 @@ func (h *darwinHost) applyBlend(state hostBlendState) error {
 		}
 		return equations[value], true
 	}
-	rgbSource, ok := factor((target >> 4) & 0x1f)
-	if !ok {
-		return fmt.Errorf("unsupported RGB source blend factor %d", (target>>4)&0x1f)
+	independent := state.state&1 != 0
+	applyTarget := func(index uint32, target uint32) error {
+		mask := (target >> 27) & 0xf
+		if independent {
+			h.gl.colorMaski(index, mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
+		} else {
+			h.gl.colorMask(mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
+		}
+		if target&1 == 0 {
+			if independent {
+				h.gl.disablei(glBlend, index)
+			} else {
+				h.gl.disable(glBlend)
+			}
+			return nil
+		}
+		rgbSource, ok := factor((target >> 4) & 0x1f)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported RGB source blend factor %d", index, (target>>4)&0x1f)
+		}
+		rgbDestination, ok := factor((target >> 9) & 0x1f)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported RGB destination blend factor %d", index, (target>>9)&0x1f)
+		}
+		alphaSource, ok := factor((target >> 17) & 0x1f)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported alpha source blend factor %d", index, (target>>17)&0x1f)
+		}
+		alphaDestination, ok := factor((target >> 22) & 0x1f)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported alpha destination blend factor %d", index, (target>>22)&0x1f)
+		}
+		rgbEquation, ok := equation((target >> 1) & 7)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported RGB blend equation %d", index, (target>>1)&7)
+		}
+		alphaEquation, ok := equation((target >> 14) & 7)
+		if !ok {
+			return fmt.Errorf("target %d has unsupported alpha blend equation %d", index, (target>>14)&7)
+		}
+		if independent {
+			h.gl.blendFuncSeparatei(index, rgbSource, rgbDestination, alphaSource, alphaDestination)
+			h.gl.blendEquationSeparatei(index, rgbEquation, alphaEquation)
+			h.gl.enablei(glBlend, index)
+		} else {
+			h.gl.blendFuncSeparate(rgbSource, rgbDestination, alphaSource, alphaDestination)
+			h.gl.blendEquationSeparate(rgbEquation, alphaEquation)
+			h.gl.enable(glBlend)
+		}
+		return nil
 	}
-	rgbDestination, ok := factor((target >> 9) & 0x1f)
-	if !ok {
-		return fmt.Errorf("unsupported RGB destination blend factor %d", (target>>9)&0x1f)
+	if !independent {
+		return applyTarget(0, state.renderTargets[0])
 	}
-	alphaSource, ok := factor((target >> 17) & 0x1f)
-	if !ok {
-		return fmt.Errorf("unsupported alpha source blend factor %d", (target>>17)&0x1f)
+	for index, target := range state.renderTargets {
+		if err := applyTarget(uint32(index), target); err != nil {
+			return err
+		}
 	}
-	alphaDestination, ok := factor((target >> 22) & 0x1f)
-	if !ok {
-		return fmt.Errorf("unsupported alpha destination blend factor %d", (target>>22)&0x1f)
-	}
-	rgbEquation, ok := equation((target >> 1) & 7)
-	if !ok {
-		return fmt.Errorf("unsupported RGB blend equation %d", (target>>1)&7)
-	}
-	alphaEquation, ok := equation((target >> 14) & 7)
-	if !ok {
-		return fmt.Errorf("unsupported alpha blend equation %d", (target>>14)&7)
-	}
-	h.gl.blendFuncSeparate(rgbSource, rgbDestination, alphaSource, alphaDestination)
-	h.gl.blendEquationSeparate(rgbEquation, alphaEquation)
-	h.gl.enable(glBlend)
 	return nil
 }
 
@@ -2641,12 +4296,24 @@ func (h *darwinHost) restoreColorMask(context *hostContext) {
 		h.gl.colorMask(true, true, true, true)
 		return
 	}
-	target := context.blendStates[context.boundBlend].renderTargets[0]
-	mask := (target >> 27) & 0xf
-	h.gl.colorMask(mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
+	state := context.blendStates[context.boundBlend]
+	if state.state&1 == 0 {
+		target := state.renderTargets[0]
+		mask := (target >> 27) & 0xf
+		h.gl.colorMask(mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
+		return
+	}
+	for index, target := range state.renderTargets {
+		mask := (target >> 27) & 0xf
+		h.gl.colorMaski(uint32(index), mask&1 != 0, mask&2 != 0, mask&4 != 0, mask&8 != 0)
+	}
 }
 
 func (h *darwinHost) applyScissor(scissor hostScissor) {
+	h.applyScissorIndexed(0, scissor)
+}
+
+func (h *darwinHost) applyScissorIndexed(index uint32, scissor hostScissor) {
 	width, height := int32(scissor.maxX-scissor.minX), int32(scissor.maxY-scissor.minY)
 	if scissor.maxX < scissor.minX {
 		width = 0
@@ -2654,16 +4321,20 @@ func (h *darwinHost) applyScissor(scissor hostScissor) {
 	if scissor.maxY < scissor.minY {
 		height = 0
 	}
-	h.gl.scissor(int32(scissor.minX), int32(scissor.minY), width, height)
+	h.gl.scissorIndexed(index, int32(scissor.minX), int32(scissor.minY), width, height)
 }
 
 func (h *darwinHost) restoreScissor(context *hostContext) {
 	if context.boundRasterizer != 0 && context.rasterizers[context.boundRasterizer].state&(1<<14) != 0 {
-		h.gl.enable(glScissorTest)
-		h.applyScissor(context.scissors[0])
+		for index := range context.scissors {
+			h.gl.enablei(glScissorTest, uint32(index))
+			h.applyScissorIndexed(uint32(index), context.scissors[index])
+		}
 		return
 	}
-	h.gl.disable(glScissorTest)
+	for index := range context.scissors {
+		h.gl.disablei(glScissorTest, uint32(index))
+	}
 }
 
 func (h *darwinHost) blit(context *hostContext, payload []uint32) error {
@@ -2683,11 +4354,15 @@ func (h *darwinHost) blit(context *hostContext, payload []uint32) error {
 	dstZ, srcZ := payload[8], payload[17]
 	validLayer := func(resource *hostResource, layer uint32) bool {
 		switch resource.description.Target {
-		case 2:
+		case 1:
 			return layer == 0
+		case 2, 5:
+			return layer == 0
+		case 3:
+			return layer < resource.description.Depth
 		case 4:
 			return layer < 6
-		case 7:
+		case 6, 7, 8:
 			return layer < resource.description.ArraySize
 		default:
 			return false
@@ -2700,20 +4375,6 @@ func (h *darwinHost) blit(context *hostContext, payload []uint32) error {
 		return fmt.Errorf("texture blit layers source %d target %d and destination %d target %d are invalid",
 			srcZ, src.description.Target, dstZ, dst.description.Target)
 	}
-	h.gl.bindFramebuffer(glReadFramebuffer, h.blitReadFBO)
-	if err := h.attachTextureLayer(glReadFramebuffer, glColorAttachment0, src, srcLevel, srcZ); err != nil {
-		return err
-	}
-	if status := h.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
-		return fmt.Errorf("VirGL blit source framebuffer status %#x", status)
-	}
-	h.gl.bindFramebuffer(glDrawFramebuffer, h.blitDrawFBO)
-	if err := h.attachTextureLayer(glDrawFramebuffer, glColorAttachment0, dst, dstLevel, dstZ); err != nil {
-		return err
-	}
-	if status := h.gl.checkFramebuffer(glDrawFramebuffer); status != glFramebufferComplete {
-		return fmt.Errorf("VirGL blit destination framebuffer status %#x", status)
-	}
 	mask := uint32(0)
 	if payload[0]&0xf != 0 {
 		mask |= glColorBufferBit
@@ -2723,6 +4384,69 @@ func (h *darwinHost) blit(context *hostContext, payload []uint32) error {
 	}
 	if payload[0]&0x20 != 0 {
 		mask |= glStencilBufferBit
+	}
+	attachment := uint32(glColorAttachment0)
+	if src.depth {
+		attachment = glDepthAttachment
+		if src.stencil {
+			attachment = glDepthStencilAttachment
+		}
+	} else if src.stencil {
+		attachment = glStencilAttachment
+		if src.packedStencil {
+			attachment = glDepthStencilAttachment
+		}
+	}
+	if src.depth != dst.depth || src.stencil != dst.stencil {
+		return errors.New("blit requires matching source and destination aspects")
+	}
+	if handled, err := h.blitSharedExponentToRGBA32F(context, dst, src, payload); handled {
+		return err
+	}
+	// Apple's GL-on-Metal driver can corrupt the color texture formerly
+	// attached to a reused temporary draw FBO when the next operation replaces
+	// it with a packed depth/stencil attachment and performs a scissored blit.
+	// Keep each VirGL blit's attachment lifetime independent. Resource-transfer
+	// and copy paths retain the shared temporary FBOs because they do not switch
+	// a draw FBO directly between color and packed depth/stencil operations.
+	var blitFBOs [2]uint32
+	h.gl.genFramebuffers(2, &blitFBOs[0])
+	defer h.gl.deleteFramebuffers(2, &blitFBOs[0])
+	readFBO, drawFBO := blitFBOs[0], blitFBOs[1]
+	clearAttachments := func(target uint32) {
+		h.gl.framebufferTexture(target, glColorAttachment0, glTexture2D, 0, 0)
+		h.gl.framebufferTexture(target, glDepthAttachment, glTexture2D, 0, 0)
+		h.gl.framebufferTexture(target, glStencilAttachment, glTexture2D, 0, 0)
+		h.gl.framebufferTexture(target, glDepthStencilAttachment, glTexture2D, 0, 0)
+	}
+	h.gl.bindFramebuffer(glReadFramebuffer, readFBO)
+	clearAttachments(glReadFramebuffer)
+	if err := h.attachTextureLayer(glReadFramebuffer, attachment, src, srcLevel, srcZ); err != nil {
+		return err
+	}
+	if attachment == glColorAttachment0 {
+		h.gl.readBuffer(glColorAttachment0)
+	} else {
+		h.gl.readBuffer(glNone)
+	}
+	if status := h.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
+		return fmt.Errorf("VirGL blit source framebuffer status %#x (resource %d format %#x target %d level %d layer %d flags %#x; destination %d format %#x target %d level %d layer %d flags %#x; control %#x source box %d,%d %dx%d destination box %d,%d %dx%d)",
+			status, payload[12], src.description.Format, src.description.Target, srcLevel, srcZ, src.description.Flags,
+			payload[3], dst.description.Format, dst.description.Target, dstLevel, dstZ, dst.description.Flags,
+			payload[0], payload[15], payload[16], payload[18], payload[19], payload[6], payload[7], payload[9], payload[10])
+	}
+	h.gl.bindFramebuffer(glDrawFramebuffer, drawFBO)
+	clearAttachments(glDrawFramebuffer)
+	if err := h.attachTextureLayer(glDrawFramebuffer, attachment, dst, dstLevel, dstZ); err != nil {
+		return err
+	}
+	if attachment == glColorAttachment0 {
+		h.gl.drawBuffer(glColorAttachment0)
+	} else {
+		h.gl.drawBuffer(glNone)
+	}
+	if status := h.gl.checkFramebuffer(glDrawFramebuffer); status != glFramebufferComplete {
+		return fmt.Errorf("VirGL blit destination framebuffer status %#x", status)
 	}
 	filter := uint32(glNearest)
 	if (payload[0]>>8)&3 != 0 {
@@ -2749,6 +4473,93 @@ func (h *darwinHost) blit(context *hostContext, payload []uint32) error {
 	)
 	h.restoreScissor(context)
 	return h.bindContextFramebuffer(context)
+}
+
+// blitSharedExponentToRGBA32F handles Mesa's staging conversion for
+// glGetTexImage(GL_RGB9_E5). Apple's OpenGL 4.1 driver can sample and transfer
+// RGB9_E5 textures, but reports GL_FRAMEBUFFER_UNSUPPORTED when a 2D image or
+// 3D slice is attached to a read framebuffer. Mesa implements the format
+// conversion as a VirGL blit into RGBA32F, so perform that exact conversion
+// through the texture transfer API when the framebuffer path is unavailable.
+func (h *darwinHost) blitSharedExponentToRGBA32F(context *hostContext, dst, src *hostResource, payload []uint32) (bool, error) {
+	if src.description.Format != virglFormatR9G9B9E5Float ||
+		dst.description.Format != virglFormatR32G32B32A32Float {
+		return false, nil
+	}
+	if payload[0] != 0xf || src.depth || src.stencil || dst.depth || dst.stencil ||
+		(src.description.Target != 2 && src.description.Target != 3 && src.description.Target != 5) ||
+		(dst.description.Target != 2 && dst.description.Target != 5) ||
+		(src.textureTarget != glTexture2D && src.textureTarget != glTexture3D) || dst.textureTarget != glTexture2D ||
+		src.description.Samples != 0 || dst.description.Samples != 0 ||
+		payload[8] != 0 ||
+		src.description.Flags&1 != dst.description.Flags&1 {
+		return false, nil
+	}
+
+	srcWidth, srcHeight := int64(payload[18]), int64(payload[19])
+	dstWidth, dstHeight := int64(payload[9]), int64(payload[10])
+	if srcWidth != dstWidth || srcHeight != dstHeight || srcWidth == 0 || srcHeight == 0 ||
+		srcWidth > math.MaxInt32 || srcHeight > math.MaxInt32 {
+		return false, nil
+	}
+	levelDimension := func(value, level uint32) int64 {
+		result := value >> level
+		if result == 0 {
+			result = 1
+		}
+		return int64(result)
+	}
+	srcLevel, dstLevel := payload[13], payload[4]
+	srcLevelWidth, srcLevelHeight := levelDimension(src.description.Width, srcLevel), levelDimension(src.description.Height, srcLevel)
+	dstLevelWidth, dstLevelHeight := levelDimension(dst.description.Width, dstLevel), levelDimension(dst.description.Height, dstLevel)
+	srcX, srcY, srcZ := int64(payload[15]), int64(payload[16]), int64(payload[17])
+	dstX, dstY := int64(payload[6]), int64(payload[7])
+	if srcX > srcLevelWidth || srcWidth > srcLevelWidth-srcX ||
+		srcY > srcLevelHeight || srcHeight > srcLevelHeight-srcY ||
+		dstX > dstLevelWidth || dstWidth > dstLevelWidth-dstX ||
+		dstY > dstLevelHeight || dstHeight > dstLevelHeight-dstY {
+		return true, errors.New("shared-exponent texture blit is out of bounds")
+	}
+
+	srcLevelDepth := int64(1)
+	if src.description.Target == 3 {
+		srcLevelDepth = levelDimension(src.description.Depth, srcLevel)
+	}
+	full := make([]byte, int(srcLevelWidth*srcLevelHeight*srcLevelDepth*3*4))
+	h.gl.bindTexture(src.textureTarget, src.texture)
+	h.drainGLErrors()
+	h.gl.getTexImage(src.textureTarget, int32(srcLevel), glRGB, glFloat, glPointer(full))
+	if glError := h.gl.getError(); glError != 0 {
+		return true, fmt.Errorf("VirGL shared-exponent blit readback GL error %#x (resource %d target %d native target %#x level %d slice %d level size %dx%dx%d source box %d,%d %dx%d)",
+			glError, src.description.ID, src.description.Target, src.textureTarget, srcLevel, srcZ,
+			srcLevelWidth, srcLevelHeight, srcLevelDepth, srcX, srcY, srcWidth, srcHeight)
+	}
+	rowBytes := int(srcWidth * 3 * 4)
+	region := make([]byte, rowBytes*int(srcHeight))
+	for row := int64(0); row < srcHeight; row++ {
+		source := int(((srcZ*srcLevelHeight+srcY+row)*srcLevelWidth + srcX) * 3 * 4)
+		copy(region[int(row)*rowBytes:], full[source:source+rowBytes])
+	}
+
+	h.gl.bindTexture(dst.textureTarget, dst.texture)
+	h.drainGLErrors()
+	h.gl.texSubImage2D(dst.textureTarget, int32(dstLevel), int32(dstX), int32(dstY),
+		int32(dstWidth), int32(dstHeight), glRGB, glFloat, glPointer(region))
+	if glError := h.gl.getError(); glError != 0 {
+		return true, fmt.Errorf("VirGL shared-exponent blit upload GL error %#x", glError)
+	}
+	return true, h.bindContextFramebuffer(context)
+}
+
+// OpenGL error flags are context-global and survive until queried. Localized
+// checks around driver workarounds must not attribute an older command's flag
+// to the transfer they are about to validate.
+func (h *darwinHost) drainGLErrors() {
+	for range 16 {
+		if h.gl.getError() == 0 {
+			return
+		}
+	}
 }
 
 func virglBlitY(resource *hostResource, level uint32, y, height int32) (int32, int32) {
@@ -2803,9 +4614,11 @@ func (h *darwinHost) copyResourceRegion(context *hostContext, payload []uint32) 
 		switch resource.description.Target {
 		case 2:
 			return 1
+		case 3:
+			return resource.description.Depth
 		case 4:
 			return 6
-		case 7:
+		case 7, 8:
 			return resource.description.ArraySize
 		default:
 			return 0
@@ -2902,12 +4715,158 @@ func virglCopyY(resource *hostResource, level uint32, y, height int32) (int32, i
 	return resourceHeight - y - height, resourceHeight - y
 }
 
-func textureTransferFormat(format uint32) uint32 {
+type darwinTextureFormatDescription struct {
+	internal      int32
+	external      uint32
+	dataType      uint32
+	render        bool
+	depth         bool
+	stencil       bool
+	packedStencil bool
+}
+
+func describeDarwinTextureFormat(format uint32) (darwinTextureFormatDescription, bool) {
+	color := func(internal int32, external, dataType uint32) (darwinTextureFormatDescription, bool) {
+		return darwinTextureFormatDescription{internal: internal, external: external, dataType: dataType, render: true}, true
+	}
 	switch format {
-	case 1, 2:
-		return glBGRA
+	case virglFormatB8G8R8A8UNorm, virglFormatB8G8R8X8UNorm:
+		return color(glRGBA8, glBGRA, glUnsignedByte)
+	case virglFormatR8G8B8A8UNorm, virglFormatX8B8G8R8UNorm, virglFormatR8G8B8X8UNorm:
+		return color(glRGBA8, glRGBA, glUnsignedByte)
+	case virglFormatA8B8G8R8UNorm:
+		return color(glRGBA8, glRGBA, glUnsignedInt8888)
+	case virglFormatR8UNorm:
+		return color(glR8, glRed, glUnsignedByte)
+	case virglFormatR8G8UNorm:
+		return color(glRG8, glRG, glUnsignedByte)
+	case virglFormatR8G8B8UNorm:
+		return color(glRGB8, glRGB, glUnsignedByte)
+	case virglFormatR16UNorm:
+		return color(glR16, glRed, glUnsignedShort)
+	case virglFormatR16G16UNorm:
+		return color(glRG16, glRG, glUnsignedShort)
+	case virglFormatR16G16B16UNorm:
+		return color(glRGB16, glRGB, glUnsignedShort)
+	case virglFormatR16G16B16A16UNorm:
+		return color(glRGBA16, glRGBA, glUnsignedShort)
+	case virglFormatR8SNorm:
+		return color(glR8SNorm, glRed, glByte)
+	case virglFormatR8G8SNorm:
+		return color(glRG8SNorm, glRG, glByte)
+	case virglFormatR8G8B8SNorm:
+		return color(glRGB8SNorm, glRGB, glByte)
+	case virglFormatR8G8B8A8SNorm:
+		return color(glRGBA8SNorm, glRGBA, glByte)
+	case virglFormatR16SNorm:
+		return color(glR16SNorm, glRed, glShort)
+	case virglFormatR16G16SNorm:
+		return color(glRG16SNorm, glRG, glShort)
+	case virglFormatR16G16B16SNorm:
+		return color(glRGB16SNorm, glRGB, glShort)
+	case virglFormatR16G16B16A16SNorm:
+		return color(glRGBA16SNorm, glRGBA, glShort)
+	case virglFormatR8UInt:
+		return color(glR8UI, glRedInteger, glUnsignedByte)
+	case virglFormatR8G8UInt:
+		return color(glRG8UI, glRGInteger, glUnsignedByte)
+	case virglFormatR8G8B8UInt:
+		return color(glRGB8UI, glRGBInteger, glUnsignedByte)
+	case virglFormatR8G8B8A8UInt:
+		return color(glRGBA8UI, glRGBAInteger, glUnsignedByte)
+	case virglFormatR8SInt:
+		return color(glR8I, glRedInteger, glByte)
+	case virglFormatR8G8SInt:
+		return color(glRG8I, glRGInteger, glByte)
+	case virglFormatR8G8B8SInt:
+		return color(glRGB8I, glRGBInteger, glByte)
+	case virglFormatR8G8B8A8SInt:
+		return color(glRGBA8I, glRGBAInteger, glByte)
+	case virglFormatR16UInt:
+		return color(glR16UI, glRedInteger, glUnsignedShort)
+	case virglFormatR16G16UInt:
+		return color(glRG16UI, glRGInteger, glUnsignedShort)
+	case virglFormatR16G16B16UInt:
+		return color(glRGB16UI, glRGBInteger, glUnsignedShort)
+	case virglFormatR16G16B16A16UInt:
+		return color(glRGBA16UI, glRGBAInteger, glUnsignedShort)
+	case virglFormatR16SInt:
+		return color(glR16I, glRedInteger, glShort)
+	case virglFormatR16G16SInt:
+		return color(glRG16I, glRGInteger, glShort)
+	case virglFormatR16G16B16SInt:
+		return color(glRGB16I, glRGBInteger, glShort)
+	case virglFormatR16G16B16A16SInt:
+		return color(glRGBA16I, glRGBAInteger, glShort)
+	case virglFormatR16Float:
+		return color(glR16F, glRed, glHalfFloat)
+	case virglFormatR16G16Float:
+		return color(glRG16F, glRG, glHalfFloat)
+	case virglFormatR16G16B16Float:
+		return color(glRGB16F, glRGB, glHalfFloat)
+	case virglFormatR16G16B16A16Float:
+		return color(glRGBA16F, glRGBA, glHalfFloat)
+	case virglFormatR32Float:
+		return color(glR32F, glRed, glFloat)
+	case virglFormatR32G32Float:
+		return color(glRG32F, glRG, glFloat)
+	case virglFormatR32G32B32Float:
+		return color(glRGB32F, glRGB, glFloat)
+	case virglFormatR32G32B32A32Float:
+		return color(glRGBA32F, glRGBA, glFloat)
+	case virglFormatR32G32B32A32UInt:
+		return color(glRGBA32UI, glRGBAInteger, glUnsignedInt)
+	case virglFormatR32G32B32A32SInt:
+		return color(glRGBA32I, glRGBAInteger, glInt)
+	case virglFormatR32UInt:
+		return color(glR32UI, glRedInteger, glUnsignedInt)
+	case virglFormatR32G32UInt:
+		return color(glRG32UI, glRGInteger, glUnsignedInt)
+	case virglFormatR32G32B32UInt:
+		return color(glRGB32UI, glRGBInteger, glUnsignedInt)
+	case virglFormatR32SInt:
+		return color(glR32I, glRedInteger, glInt)
+	case virglFormatR32G32SInt:
+		return color(glRG32I, glRGInteger, glInt)
+	case virglFormatR32G32B32SInt:
+		return color(glRGB32I, glRGBInteger, glInt)
+	case virglFormatR8G8B8SRGB:
+		return color(glSRGB8, glRGB, glUnsignedByte)
+	case virglFormatR8G8B8A8SRGB:
+		return color(glSRGB8Alpha8, glRGBA, glUnsignedByte)
+	case virglFormatA8B8G8R8SRGB:
+		return color(glSRGB8Alpha8, glRGBA, glUnsignedInt8888)
+	case virglFormatB8G8R8A8SRGB:
+		return color(glSRGB8Alpha8, glBGRA, glUnsignedByte)
+	case virglFormatR10G10B10A2UNorm:
+		return color(glRGB10A2, glRGBA, glUnsignedInt2101010Rev)
+	case virglFormatB10G10R10A2UNorm:
+		return color(glRGB10A2, glBGRA, glUnsignedInt2101010Rev)
+	case virglFormatR10G10B10A2UInt:
+		return color(glRGB10A2UI, glRGBAInteger, glUnsignedInt2101010Rev)
+	case virglFormatB10G10R10A2UInt:
+		return color(glRGB10A2UI, glBGRAInteger, glUnsignedInt2101010Rev)
+	case virglFormatR11G11B10Float:
+		return color(glR11FG11FB10F, glRGB, glUnsignedInt10F11F11FRev)
+	case virglFormatR9G9B9E5Float:
+		return darwinTextureFormatDescription{internal: glRGB9E5, external: glRGB, dataType: glUnsignedInt5999Rev}, true
+	case virglFormatZ16UNorm:
+		return darwinTextureFormatDescription{internal: glDepthComponent16, external: glDepthComponent, dataType: glUnsignedShort, depth: true}, true
+	case virglFormatZ32Float:
+		return darwinTextureFormatDescription{internal: glDepthComponent32F, external: glDepthComponent, dataType: glFloat, depth: true}, true
+	case virglFormatZ24UNormS8UInt:
+		return darwinTextureFormatDescription{internal: glDepth24Stencil8, external: glDepthStencil, dataType: glUnsignedInt248, depth: true, stencil: true}, true
+	case virglFormatZ32FloatS8X24UInt:
+		return darwinTextureFormatDescription{internal: glDepth32FStencil8, external: glDepthStencil, dataType: glFloat32UnsignedInt248Rev, depth: true, stencil: true}, true
+	case virglFormatZ24X8UNorm:
+		return darwinTextureFormatDescription{internal: glDepthComponent24, external: glDepthComponent, dataType: glUnsignedInt, depth: true}, true
+	case virglFormatS8UInt:
+		// macOS's frozen OpenGL 4.1 profile cannot allocate the later
+		// GL_STENCIL_INDEX8 texture storage. Back a logical S8 VirGL resource
+		// with packed D24S8 and expose only its stencil aspect.
+		return darwinTextureFormatDescription{internal: glDepth24Stencil8, external: glStencilIndex, dataType: glUnsignedByte, stencil: true, packedStencil: true}, true
 	default:
-		return glRGBA
+		return darwinTextureFormatDescription{}, false
 	}
 }
 
@@ -2933,9 +4892,132 @@ func vertexFormat(format uint32) (components int32, dataType uint32, normalized 
 		return int32(format - 81), glByte, false, true
 	case format >= 87 && format <= 90:
 		return int32(format - 86), glFixed, false, true
+	case format >= virglFormatR32UInt && format <= virglFormatR32G32B32A32UInt:
+		// TGSI has one typeless 32-bit register file. Integer vertex values,
+		// including the paired words Mesa uses for 64-bit attributes, must reach
+		// the translated vec4 inputs without numeric conversion so the shader's
+		// floatBitsToUint operation recovers the original words.
+		return int32(format - virglFormatR32UInt + 1), glFloat, false, true
+	case format >= virglFormatR32SInt && format <= virglFormatR32G32B32A32SInt:
+		return int32(format - virglFormatR32SInt + 1), glFloat, false, true
 	default:
 		return 0, 0, false, false
 	}
+}
+
+func integerVertexFormat(format uint32) (components int32, dataType uint32, signed bool, ok bool) {
+	switch {
+	case format >= virglFormatR8UInt && format <= virglFormatR8G8B8A8UInt:
+		return int32(format - virglFormatR8UInt + 1), glUnsignedByte, false, true
+	case format >= virglFormatR8SInt && format <= virglFormatR8G8B8A8SInt:
+		return int32(format - virglFormatR8SInt + 1), glByte, true, true
+	case format >= virglFormatR16UInt && format <= virglFormatR16G16B16A16UInt:
+		return int32(format - virglFormatR16UInt + 1), glUnsignedShort, false, true
+	case format >= virglFormatR16SInt && format <= virglFormatR16G16B16A16SInt:
+		return int32(format - virglFormatR16SInt + 1), glShort, true, true
+	case format >= virglFormatR32UInt && format <= virglFormatR32G32B32A32UInt:
+		return int32(format - virglFormatR32UInt + 1), glUnsignedInt, false, true
+	case format >= virglFormatR32SInt && format <= virglFormatR32G32B32A32SInt:
+		return int32(format - virglFormatR32SInt + 1), glInt, true, true
+	default:
+		return 0, 0, false, false
+	}
+}
+
+func vertexFormatByteSize(format uint32) (uint32, bool) {
+	components, dataType, _, ok := integerVertexFormat(format)
+	if !ok {
+		components, dataType, _, ok = vertexFormat(format)
+	}
+	if !ok {
+		return 0, false
+	}
+	componentBytes := uint32(4)
+	switch dataType {
+	case glByte, glUnsignedByte:
+		componentBytes = 1
+	case glShort, glUnsignedShort:
+		componentBytes = 2
+	}
+	return uint32(components) * componentBytes, true
+}
+
+func streamOutputVertexCapacity(context *hostContext, elements []hostVertexElement) (uint32, bool) {
+	capacity, found := uint32(math.MaxUint32), false
+	for _, element := range elements {
+		if element.bufferIndex >= uint32(len(context.vertexBuffers)) || element.instanceDivisor != 0 {
+			continue
+		}
+		binding := context.vertexBuffers[element.bufferIndex]
+		if binding.resource == nil || binding.stride == 0 {
+			continue
+		}
+		size, ok := vertexFormatByteSize(element.format)
+		if !ok {
+			continue
+		}
+		offset := uint64(binding.offset) + uint64(element.offset)
+		length := uint64(len(binding.resource.bufferBytes))
+		var available uint32
+		if offset+uint64(size) <= length {
+			available = 1 + uint32((length-offset-uint64(size))/uint64(binding.stride))
+		}
+		capacity, found = min(capacity, available), true
+	}
+	return capacity, found
+}
+
+func integerVertexAttributeValue(data []byte, offset, format uint32) ([4]uint32, bool, error) {
+	components, dataType, signed, ok := integerVertexFormat(format)
+	if !ok {
+		return [4]uint32{}, false, nil
+	}
+	componentBytes := uint32(1)
+	if dataType == glUnsignedShort || dataType == glShort {
+		componentBytes = 2
+	} else if dataType == glUnsignedInt || dataType == glInt {
+		componentBytes = 4
+	}
+	end := uint64(offset) + uint64(components)*uint64(componentBytes)
+	if end > uint64(len(data)) {
+		return [4]uint32{}, true, fmt.Errorf("range %d..%d exceeds %d-byte buffer", offset, end, len(data))
+	}
+	value := [4]uint32{0, 0, 0, 1}
+	for component := uint32(0); component < uint32(components); component++ {
+		start := offset + component*componentBytes
+		switch componentBytes {
+		case 1:
+			if signed {
+				value[component] = uint32(int32(int8(data[start])))
+			} else {
+				value[component] = uint32(data[start])
+			}
+		case 2:
+			raw := binary.LittleEndian.Uint16(data[start:])
+			if signed {
+				value[component] = uint32(int32(int16(raw)))
+			} else {
+				value[component] = uint32(raw)
+			}
+		case 4:
+			value[component] = binary.LittleEndian.Uint32(data[start:])
+		}
+	}
+	return value, true, nil
+}
+
+func vertexAttributeRawValue(data []byte, offset, format uint32) ([4]float32, error) {
+	integer, ok, err := integerVertexAttributeValue(data, offset, format)
+	if err != nil {
+		return [4]float32{}, err
+	}
+	if ok {
+		return [4]float32{
+			math.Float32frombits(integer[0]), math.Float32frombits(integer[1]),
+			math.Float32frombits(integer[2]), math.Float32frombits(integer[3]),
+		}, nil
+	}
+	return constantVertexAttribute(data, offset, format)
 }
 
 func constantVertexAttribute(data []byte, offset, format uint32) ([4]float32, error) {
@@ -3040,15 +5122,40 @@ func (h *darwinHost) releaseResource(resource *hostResource) {
 	delete(h.allResources, resource)
 }
 
+func (h *darwinHost) deleteSamplerView(view hostSamplerView) {
+	if view.texture != 0 {
+		h.gl.deleteTextures(1, &view.texture)
+	}
+}
+
 func (h *darwinHost) releaseContextResources(context *hostContext) {
 	for _, subcontext := range context.subcontexts {
 		h.releaseContextResources(subcontext)
+	}
+	if context.conditionalQuery != 0 {
+		h.gl.endConditionalRender()
+		context.conditionalQuery = 0
+	}
+	if context.currentStreamout != nil {
+		h.gl.bindTransformFeedback(glTransformFeedback, 0)
+		context.currentStreamout = nil
+	}
+	for _, object := range context.streamoutObjects {
+		h.gl.deleteTransformFeedbacks(1, &object.id)
 	}
 	for _, surface := range context.surfaces {
 		h.releaseResource(surface.resource)
 	}
 	for _, view := range context.samplerViews {
+		h.deleteSamplerView(view)
 		h.releaseResource(view.resource)
+	}
+	for _, target := range context.streamoutTargets {
+		h.releaseResource(target.resource)
+	}
+	for _, query := range context.queries {
+		h.gl.deleteQueries(1, &query.id)
+		h.releaseResource(query.resource)
 	}
 	for _, state := range context.samplerStates {
 		h.gl.deleteSamplers(1, &state.id)
@@ -3078,7 +5185,8 @@ func (h *darwinHost) deleteContextPrograms(context *hostContext) {
 
 func (h *darwinHost) deleteProgramsForShader(context *hostContext, handle uint32) {
 	for key, program := range h.programs {
-		if key.context == context && (key.vertexHandle == handle || key.fragmentHandle == handle) {
+		if key.context == context && (key.vertexHandle == handle || key.fragmentHandle == handle || key.geometryHandle == handle ||
+			key.tessControlHandle == handle || key.tessEvaluationHandle == handle) {
 			h.deleteProgram(key, program)
 		}
 	}
@@ -3134,6 +5242,32 @@ func (h *darwinHost) releaseGLObjects() {
 	}
 	if h.vao != 0 {
 		h.gl.deleteVertexArrays(1, &h.vao)
+	}
+	if h.emulatedVertexIDBuffer != 0 {
+		h.gl.deleteBuffers(1, &h.emulatedVertexIDBuffer)
+	}
+	if h.emulatedVertexTable != 0 {
+		h.gl.deleteBuffers(1, &h.emulatedVertexTable)
+	}
+	for stage := range h.constantStagingBuffers {
+		for buffer := range h.constantStagingBuffers[stage] {
+			if h.constantStagingBuffers[stage][buffer] != 0 {
+				h.gl.deleteBuffers(1, &h.constantStagingBuffers[stage][buffer])
+			}
+		}
+	}
+	for stage := range h.constantBufferTextures {
+		for buffer := range h.constantBufferTextures[stage] {
+			if h.constantBufferTextures[stage][buffer] != 0 {
+				h.gl.deleteTextures(1, &h.constantBufferTextures[stage][buffer])
+			}
+		}
+	}
+	for index := range h.retiredConstantBuffers {
+		h.gl.deleteBuffers(1, &h.retiredConstantBuffers[index])
+	}
+	if h.zeroUniformBuffer != 0 {
+		h.gl.deleteBuffers(1, &h.zeroUniformBuffer)
 	}
 	if h.blitReadFBO != 0 {
 		h.gl.deleteFramebuffers(1, &h.blitReadFBO)
