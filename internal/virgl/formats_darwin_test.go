@@ -12,10 +12,7 @@ import (
 )
 
 func TestModernTextureFormatsRoundTripNativeStorage(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	float32Bytes := func(values ...float32) []byte {
@@ -112,10 +109,7 @@ func TestModernTextureFormatsRoundTripNativeStorage(t *testing.T) {
 }
 
 func TestIntegerMultisampleFormatsUseLayeredNativeStorage(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	formats := []uint32{
@@ -162,10 +156,7 @@ func TestIntegerMultisampleFormatsUseLayeredNativeStorage(t *testing.T) {
 }
 
 func TestSharedExponentTextureUploadsToSamplerNativeStorage(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -194,10 +185,7 @@ func TestSharedExponentTextureUploadsToSamplerNativeStorage(t *testing.T) {
 }
 
 func TestSharedExponent2DReadbackPreservesPackedSubrectangle(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -238,10 +226,7 @@ func TestSharedExponent2DReadbackPreservesPackedSubrectangle(t *testing.T) {
 }
 
 func TestDepth32FloatPreservesNativePrecision(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -271,10 +256,7 @@ func TestDepth32FloatPreservesNativePrecision(t *testing.T) {
 }
 
 func TestDepth24X8UsesGuestScaledIntegerRepresentation(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -321,10 +303,7 @@ func TestDepth24X8UsesGuestScaledIntegerRepresentation(t *testing.T) {
 }
 
 func TestDepth24Stencil8ReordersGuestPackedChannels(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -376,10 +355,7 @@ func TestDepth24Stencil8ReordersGuestPackedChannels(t *testing.T) {
 }
 
 func TestDepth32FloatStencil8RoundTripsNativeStorage(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{

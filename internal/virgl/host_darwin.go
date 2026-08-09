@@ -20,6 +20,8 @@ import (
 	"j5.nz/cc/internal/virtio"
 )
 
+var errDarwinAcceleratedOpenGLUnavailable = errors.New("create accelerated VirGL pixel format")
+
 const (
 	nsOpenGLPFAAccelerated       = 73
 	nsOpenGLPFAColorSize         = 8
@@ -420,7 +422,7 @@ func (h *darwinHost) contextLoop(shareContext, sharePixelFormat uintptr, ready c
 		format = objc.ID(objc.GetClass("NSOpenGLPixelFormat")).Send(alloc)
 		format = format.Send(initWithAttributes, unsafe.Pointer(&attributes[0]))
 		if format == 0 {
-			ready <- errors.New("create accelerated VirGL pixel format")
+			ready <- errDarwinAcceleratedOpenGLUnavailable
 			return
 		}
 		defer format.Send(release)

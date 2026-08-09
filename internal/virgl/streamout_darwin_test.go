@@ -13,10 +13,7 @@ import (
 )
 
 func TestStreamoutCapturesGuestVertexOutputs(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -132,10 +129,7 @@ void main() { color = vec4(0.0); }`,
 }
 
 func TestStreamoutCapturesEmittedGeometryOutputs(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -263,10 +257,7 @@ void main() { color = vec4(0.0); }`}
 }
 
 func TestStreamoutCapturesPointGeometryFromPatchDraw(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -400,10 +391,7 @@ void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }`}
 }
 
 func TestStreamoutCapturesTessEvaluationOutputFromPatchDraw(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -498,10 +486,7 @@ void main() { color = vec4(1); }`}
 }
 
 func TestStreamoutCapturesMultipleGeometryStreams(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -629,10 +614,7 @@ void main() { color = vec4(0.0); }`}
 }
 
 func TestStreamoutCapturesMaximumInterleavedVertexOutputs(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const (
@@ -759,10 +741,7 @@ void main() { color = vec4(0.0); }`,
 }
 
 func TestEmptyVertexBufferStateClearsAllBindings(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1

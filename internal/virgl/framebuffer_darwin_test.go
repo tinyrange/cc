@@ -44,10 +44,7 @@ func TestOpenArenaVertexFormats(t *testing.T) {
 }
 
 func TestFixedPointVertexFormatRendersThroughDarwinHost(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	output := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
@@ -107,10 +104,7 @@ void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 }
 
 func TestVertexElementPreservesInstanceDivisor(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -136,10 +130,7 @@ func TestVertexElementPreservesInstanceDivisor(t *testing.T) {
 }
 
 func TestDestroyObjectDoesNotDeleteOtherObjectTypesWithSameHandle(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -196,10 +187,7 @@ func TestProgramCacheEvictsLeastRecentlyUsedProgram(t *testing.T) {
 }
 
 func TestSurfaceKeepsResourceAliveAfterGuestUnref(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -245,10 +233,7 @@ func TestSurfaceKeepsResourceAliveAfterGuestUnref(t *testing.T) {
 }
 
 func TestUnrefCommitsQueuedBufferTransferForRetainedBinding(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -292,10 +277,7 @@ func TestUnrefCommitsQueuedBufferTransferForRetainedBinding(t *testing.T) {
 }
 
 func TestSparseVertexBufferSlotsRenderMixedAttributes(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -385,10 +367,7 @@ void main() { color = varyingColor; }`}
 }
 
 func TestSubcontextsKeepIndependentFramebufferState(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -446,10 +425,7 @@ func TestSubcontextsKeepIndependentFramebufferState(t *testing.T) {
 }
 
 func TestClearTargetsBoundVirGLFramebufferAfterBlit(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -520,10 +496,7 @@ func TestClearTargetsBoundVirGLFramebufferAfterBlit(t *testing.T) {
 }
 
 func TestBlitConvertsSharedExponentTextureToRGBA32F(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -599,10 +572,7 @@ func TestBlitConvertsSharedExponentTextureToRGBA32F(t *testing.T) {
 }
 
 func TestBlitConvertsSharedExponent3DTextureSliceToRGBA32F(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -671,10 +641,7 @@ func TestBlitConvertsSharedExponent3DTextureSliceToRGBA32F(t *testing.T) {
 }
 
 func TestBlitPreservesSingleChannelTextureData(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -726,10 +693,7 @@ func TestBlitPreservesSingleChannelTextureData(t *testing.T) {
 }
 
 func TestBlitInterpretsA8B8G8R8PackedOrdering(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -789,10 +753,7 @@ func TestBlitInterpretsA8B8G8R8PackedOrdering(t *testing.T) {
 }
 
 func TestScissoredBlitPreservesDestinationOutsideRectangle(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -864,10 +825,7 @@ func TestScissoredBlitPreservesDestinationOutsideRectangle(t *testing.T) {
 }
 
 func TestSampleShadingStateUsesBoundFramebufferSampleCount(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -908,10 +866,7 @@ func TestSampleShadingStateUsesBoundFramebufferSampleCount(t *testing.T) {
 }
 
 func TestFramebufferClearUpdatesEveryColorTarget(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -949,10 +904,7 @@ func TestFramebufferClearUpdatesEveryColorTarget(t *testing.T) {
 }
 
 func TestArrayTextureLayersCanBeRenderedAndReadBack(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -998,10 +950,7 @@ func TestArrayTextureLayersCanBeRenderedAndReadBack(t *testing.T) {
 }
 
 func TestUniformBufferSuppliesFragmentConstants(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1086,10 +1035,7 @@ DCL OUT[0], COLOR
 }
 
 func TestLargeUniformOnlyFragmentShaderProducesIntegerResult(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -1180,10 +1126,7 @@ void main() {
 }
 
 func TestEmptyConstantBufferClearForUnadvertisedStageIsAccepted(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1196,10 +1139,7 @@ func TestEmptyConstantBufferClearForUnadvertisedStageIsAccepted(t *testing.T) {
 }
 
 func TestExplicitShaderLinkValidatesTheCompleteStageSet(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1218,10 +1158,7 @@ func TestExplicitShaderLinkValidatesTheCompleteStageSet(t *testing.T) {
 }
 
 func TestClearIgnoresBoundDepthWriteMask(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1274,10 +1211,7 @@ func TestClearIgnoresBoundDepthWriteMask(t *testing.T) {
 }
 
 func TestClearIgnoresBoundStencilWriteMask(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1323,10 +1257,7 @@ func TestClearIgnoresBoundStencilWriteMask(t *testing.T) {
 }
 
 func TestLogicalStencil8ControlsAColorDraw(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1413,10 +1344,7 @@ void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }`}
 }
 
 func TestBlendAndScissorAffectRenderedPixels(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1527,10 +1455,7 @@ void main() { result = vec4(%g, %g, %g, %g); }`, red, green, blue, alpha)
 }
 
 func TestRasterizerWindingAccountsForHostFramebufferOrigin(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1592,10 +1517,7 @@ void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 }
 
 func TestDrawDisablesRetiredVertexAttributes(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1690,10 +1612,7 @@ void main() { color = vec4(1.0, varyingCoordinate.x * 0.0, 0.0, 1.0); }`}
 }
 
 func TestZeroStrideVertexBufferSuppliesAConstantAttribute(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1771,10 +1690,7 @@ void main() { color = vec4(value.x, 0.0, 0.0, 1.0); }`}
 }
 
 func TestPointSpriteCoordinateModeControlsVerticalOrigin(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1848,10 +1764,7 @@ void main() { color = vec4(0.0, gl_PointCoord.y, 0.0, 1.0); }`}
 }
 
 func TestRasterizerDepthClipBitControlsDepthClamping(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1886,6 +1799,7 @@ out vec4 result;
 void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 	var program uint32
 	if err := host.dispatch(func() error {
+		var err error
 		program, err = host.gl.compileProgram(vertex, fragment)
 		return err
 	}); err != nil {
@@ -1926,10 +1840,7 @@ void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 }
 
 func TestRasterizerClipPlaneMaskControlsShaderClipDistance(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -1965,6 +1876,7 @@ out vec4 result;
 void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 	var program uint32
 	if err := host.dispatch(func() error {
+		var err error
 		program, err = host.gl.compileProgram(vertex, fragment)
 		return err
 	}); err != nil {
@@ -2005,10 +1917,7 @@ void main() { result = vec4(1.0, 0.0, 0.0, 1.0); }`
 }
 
 func TestTranslatedClipDistancesReachFragmentShader(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2218,10 +2127,7 @@ DCL TEMP[21..24]
 	}
 	vertex = linkTGSIInterfaces(vertex, fragment)
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	color := virtio.GPUResource3D{ID: 1, Target: 2, Format: virglFormatR8G8B8A8UNorm, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
 	if err := host.createResource(color); err != nil {
@@ -2255,10 +2161,7 @@ DCL TEMP[21..24]
 }
 
 func TestIndexedDrawAppliesBaseVertex(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2347,10 +2250,7 @@ func TestIndirectDrawRendersArraysAndElements(t *testing.T) {
 		{name: "elements", indexed: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			host, err := newDarwinHost()
-			if err != nil {
-				t.Fatal(err)
-			}
+			host := newDarwinTestHost(t)
 			defer host.close()
 
 			const contextID = 1
@@ -2471,10 +2371,7 @@ func TestTextureBufferRGB32FormatsRender(t *testing.T) {
 		{name: "sint", format: virglFormatR32G32B32SInt, returnType: "SINT", conversion: "1: I2F TEMP[0], TEMP[0]\n", data: wordBytes(1, 0, 0)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			host, err := newDarwinHost()
-			if err != nil {
-				t.Fatal(err)
-			}
+			host := newDarwinTestHost(t)
 			defer host.close()
 
 			const contextID = 1
@@ -2557,10 +2454,7 @@ void main() { gl_Position = vec4(position, 0.0, 1.0); }`}
 }
 
 func TestCubeArraySamplesDistinctCubes(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2661,10 +2555,7 @@ IMM[0] FLT32 {1.0, 0.0, 0.0, %g}
 }
 
 func TestSamplerViewAndStateAffectRenderedPixels(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2764,10 +2655,7 @@ void main() {
 }
 
 func TestUnusedSamplerViewDoesNotOverrideActiveStage(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2846,10 +2734,7 @@ void main() {
 }
 
 func TestOneDimensionalTextureUploadsAndSamples(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -2920,10 +2805,7 @@ void main() { result = texture(source, 0.75); }`
 }
 
 func TestOneDimensionalArrayTextureLayerReadback(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -2954,10 +2836,7 @@ func TestOneDimensionalArrayTextureLayerReadback(t *testing.T) {
 }
 
 func TestRectangleTextureReadback(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -2985,10 +2864,7 @@ func TestRectangleTextureReadback(t *testing.T) {
 }
 
 func TestThreeDimensionalTextureSliceReadback(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -3016,10 +2892,7 @@ func TestThreeDimensionalTextureSliceReadback(t *testing.T) {
 }
 
 func TestMultisampleTextureRendersAndResolves(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	multisample := virtio.GPUResource3D{
@@ -3063,10 +2936,7 @@ func TestMultisampleTextureRendersAndResolves(t *testing.T) {
 }
 
 func TestMultisampleSamplerViewSwizzleAffectsTexelFetch(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3144,10 +3014,7 @@ void main() {
 }
 
 func TestDepth24TransferPreservesMaximumForSwizzledFetch(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3227,10 +3094,7 @@ void main() {
 }
 
 func TestIntegerMultisampleDrawPopulatesEverySample(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3290,10 +3154,7 @@ void main() { fragmentColor0 = uintBitsToFloat(uvec4(7, 8, 9, 10));
 }
 
 func TestIndependentSamplerStatesCanShareOneTexture(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3379,10 +3240,7 @@ void main() {
 }
 
 func TestGalliumMipFilterNoneDoesNotSelectMipLevels(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3474,10 +3332,7 @@ void main() {
 }
 
 func TestCubeMapTransfersAndSamplingRenderEveryFace(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3612,10 +3467,7 @@ void main() {
 }
 
 func TestSamplerStateSeamlessCubeBitFiltersAcrossFaces(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3705,10 +3557,7 @@ void main() { result = texture(fragmentSampler0, vec3(1.0, 0.0, 1.0)); }`}
 }
 
 func TestIntegerFragmentOutputRendersRawRegisterBits(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3759,10 +3608,7 @@ void main() { fragmentColor0 = uintBitsToFloat(uvec4(1u, 2u, 3u, 4u)); }`}
 }
 
 func TestIntegerFragmentOutputPreservesSpilledSubnormalRegisterBits(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3817,10 +3663,7 @@ void main() {
 }
 
 func TestFP64TGSIArithmeticAndRoundEvenRenderExpectedResult(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3888,10 +3731,7 @@ void main() {
 }
 
 func TestLargeFragmentFP64EqualityRendersExpectedResult(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -3954,10 +3794,7 @@ void main() {
 }
 
 func TestTessellationTGSIRendersPatch(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -4046,10 +3883,7 @@ void main() { color = vec4(1, 0, 0, 1); }`}
 }
 
 func TestViewportArrayRoutesGeometryPrimitive(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -4129,10 +3963,7 @@ void main() { color = vec4(1, 0, 0, 1); }`}
 }
 
 func TestDualSourceBlendUsesSecondFragmentColor(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -4191,10 +4022,7 @@ void main() {
 }
 
 func TestBufferTransfersHonorInlineAndBackingOffsets(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{ID: 1, Target: 0, Format: 64, Width: 16}
@@ -4253,10 +4081,7 @@ func TestBufferTransfersHonorInlineAndBackingOffsets(t *testing.T) {
 }
 
 func TestZeroStridePartialTextureTransferUsesFullMipWidth(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	description := virtio.GPUResource3D{
@@ -4301,10 +4126,7 @@ func TestZeroStridePartialTextureTransferUsesFullMipWidth(t *testing.T) {
 }
 
 func TestTransferFromHostReturnsTextureRowsToGuestBacking(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	renderer := NewRenderer(host)
 	defer renderer.Close()
 
@@ -4353,10 +4175,7 @@ func TestTransferFromHostReturnsTextureRowsToGuestBacking(t *testing.T) {
 }
 
 func TestBlitTargetsRequestedMipLevels(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -4413,10 +4232,7 @@ func TestBlitTargetsRequestedMipLevels(t *testing.T) {
 }
 
 func TestBlitPopulatesRequestedCubeFaceAndMipLevel(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -4472,10 +4288,7 @@ func TestBlitPopulatesRequestedCubeFaceAndMipLevel(t *testing.T) {
 }
 
 func TestResourceCopyRegionPopulatesRequestedMipLevel(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -4526,10 +4339,7 @@ func TestResourceCopyRegionPopulatesRequestedMipLevel(t *testing.T) {
 }
 
 func TestResourceCopyRegionCopiesMultipleArrayLayers(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1

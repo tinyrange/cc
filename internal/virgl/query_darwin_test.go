@@ -11,10 +11,7 @@ import (
 )
 
 func TestTimestampQueryCompletesGuestResultState(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -54,10 +51,7 @@ func TestTimestampQueryCompletesGuestResultState(t *testing.T) {
 }
 
 func TestQueryRejectsOutOfBoundsGuestResultRange(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1
@@ -68,7 +62,7 @@ func TestQueryRejectsOutOfBoundsGuestResultRange(t *testing.T) {
 	if err := host.createResource(result); err != nil {
 		t.Fatal(err)
 	}
-	err = host.execute(contextID, []command{{
+	err := host.execute(contextID, []command{{
 		Opcode: 1, Object: 9, Payload: []uint32{7, 1, 8, result.ID},
 	}}, nil)
 	if err == nil {
@@ -77,10 +71,7 @@ func TestQueryRejectsOutOfBoundsGuestResultRange(t *testing.T) {
 }
 
 func TestOcclusionQueryCanControlConditionalRendering(t *testing.T) {
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 
 	const contextID = 1

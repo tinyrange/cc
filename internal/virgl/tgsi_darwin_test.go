@@ -25,10 +25,7 @@ func TestNativeHostEmulatesVertexIDAtSixteenAttributeLimit(t *testing.T) {
 	}
 	vertex.WriteString("; gl_Position = vec4(0.0); }\n")
 	const fragment = "#version 410 core\nvoid main() { discard; }\n"
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		source := emulateVertexSystemValueSource(vertex.String(), hostVertexSystemEmulation{
@@ -160,10 +157,7 @@ DCL TEMP[0..3]
 		t.Fatalf("translated all-color-buffer shader does not replicate color zero:\n%s", fragmentGLSL)
 	}
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -228,10 +222,7 @@ DCL OUT[0], COLOR
 	vertexGLSL = linkTGSIInterfaces(vertexGLSL, geometryGLSL)
 	geometryGLSL = linkTGSIInterfaces(geometryGLSL, fragmentGLSL)
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgramWithGeometryTransformFeedback(vertexGLSL, geometryGLSL, fragmentGLSL, nil)
@@ -273,10 +264,7 @@ DCL TEMP[0]
 		t.Fatal(err)
 	}
 	vertexGLSL = linkTGSIInterfaces(vertexGLSL, fragmentGLSL)
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -321,10 +309,7 @@ IMM[0] FLT32 {1.0, 0.0, 0.0, 0.5}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -366,10 +351,7 @@ IMM[0] FLT32 {0.25, 0.5, 0.75, 1.0}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -409,10 +391,7 @@ DCL TEMP[0]
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -453,10 +432,7 @@ IMM[0] INT32 {0, 0, 0, 0}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -497,10 +473,7 @@ IMM[1] FLT32 {0.5, 0.0, 0.0, 0.0}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -571,10 +544,7 @@ IMM[5] UINT32 {3, 0, 0, 0}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -642,10 +612,7 @@ IMM[0] FLT32 {1.0, 0.0, 0.0, 1.0}
 	glsl[0] = linkTGSIInterfaces(glsl[0], glsl[1])
 	glsl[1] = linkTGSIInterfaces(glsl[1], glsl[2])
 	glsl[2] = linkTGSIInterfaces(glsl[2], glsl[3])
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgramWithTessellationGeometryTransformFeedback(glsl[0], glsl[1], glsl[2], "", glsl[3], nil)
@@ -685,10 +652,7 @@ IMM[0] FLT32 {0.25, 0.75, 1.0, 0.5}
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -727,10 +691,7 @@ DCL OUT[0], COLOR
 	}
 	vertexGLSL = linkTGSIInterfaces(vertexGLSL, fragmentGLSL)
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	const contextID = 1
 	if err := host.createContext(contextID); err != nil {
@@ -850,10 +811,7 @@ DCL OUT[0], COLOR
 		t.Fatalf("fragment shader does not consume point coordinates as a builtin:\n%s", fragmentGLSL)
 	}
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
@@ -885,10 +843,7 @@ void main() {
 		t.Fatal("unselected generic input was removed")
 	}
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	vertex := `#version 150
 out vec4 varying_generic_9;
@@ -939,10 +894,7 @@ IMM[2] FLT32 {0.0, 0.0, 1.0, 1.0}
 	}
 	vertexGLSL = linkTGSIInterfaces(vertexGLSL, fragmentGLSL)
 
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	output := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
 	positions := virtio.GPUResource3D{ID: 2, Target: 0, Width: 24}
@@ -1082,10 +1034,7 @@ void main() {
 	vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
 	gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
 }`
-	host, err := newDarwinHost()
-	if err != nil {
-		t.Fatal(err)
-	}
+	host := newDarwinTestHost(t)
 	defer host.close()
 	if err := host.dispatch(func() error {
 		program, err := host.gl.compileProgram(vertexGLSL, fragmentGLSL)
