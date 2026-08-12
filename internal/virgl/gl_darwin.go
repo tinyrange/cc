@@ -101,12 +101,14 @@ const (
 	glUnsignedInt8888                    = 0x8035
 	glUnsignedInt248                     = 0x84fa
 	glUnsignedInt2101010Rev              = 0x8368
+	glInt2101010Rev                      = 0x8d9f
 	glUnsignedInt10F11F11FRev            = 0x8c3b
 	glUnsignedInt5999Rev                 = 0x8c3e
 	glHalfFloat                          = 0x140b
 	glFloat                              = 0x1406
 	glFixed                              = 0x140c
 	glFramebuffer                        = 0x8d40
+	glFramebufferSRGB                    = 0x8db9
 	glReadFramebuffer                    = 0x8ca8
 	glDrawFramebuffer                    = 0x8ca9
 	glColorAttachment0                   = 0x8ce0
@@ -193,6 +195,7 @@ const (
 	glDecrementWrap                      = 0x8508
 	glInvert                             = 0x150a
 	glStencilIndex                       = 0x1901
+	glColor                              = 0x1800
 	glUnpackAlignment                    = 0x0cf5
 	glPackAlignment                      = 0x0d05
 	glTextureMinFilter                   = 0x2801
@@ -205,6 +208,7 @@ const (
 	glTextureBorderColor                 = 0x1004
 	glTextureCompareMode                 = 0x884c
 	glTextureCompareFunc                 = 0x884d
+	glTextureMaxAnisotropyExt            = 0x84fe
 	glCompareRefToTexture                = 0x884e
 	glNone                               = 0
 	glLinear                             = 0x2601
@@ -294,6 +298,7 @@ type hostGL struct {
 	samplerParameteri               func(uint32, uint32, int32)
 	samplerParameterf               func(uint32, uint32, float32)
 	samplerParameterfv              func(uint32, uint32, *float32)
+	getSamplerParameterfv           func(uint32, uint32, *float32)
 	pixelStorei                     func(uint32, int32)
 	genBuffers                      func(int32, *uint32)
 	deleteBuffers                   func(int32, *uint32)
@@ -408,6 +413,9 @@ type hostGL struct {
 	primitiveRestartIndex           func(uint32)
 	polygonOffset                   func(float32, float32)
 	readPixels                      func(int32, int32, int32, int32, uint32, uint32, uintptr)
+	clearBufferfv                   func(uint32, int32, *float32)
+	clearBufferiv                   func(uint32, int32, *int32)
+	clearBufferuiv                  func(uint32, int32, *uint32)
 	drawBuffer                      func(uint32)
 	drawBuffers                     func(int32, *uint32)
 	readBuffer                      func(uint32)
@@ -453,6 +461,7 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.samplerParameteri, "glSamplerParameteri")
 	register(&gl.samplerParameterf, "glSamplerParameterf")
 	register(&gl.samplerParameterfv, "glSamplerParameterfv")
+	register(&gl.getSamplerParameterfv, "glGetSamplerParameterfv")
 	register(&gl.pixelStorei, "glPixelStorei")
 	register(&gl.genBuffers, "glGenBuffers")
 	register(&gl.deleteBuffers, "glDeleteBuffers")
@@ -567,6 +576,9 @@ func loadHostGL() (*hostGL, error) {
 	register(&gl.primitiveRestartIndex, "glPrimitiveRestartIndex")
 	register(&gl.polygonOffset, "glPolygonOffset")
 	register(&gl.readPixels, "glReadPixels")
+	register(&gl.clearBufferfv, "glClearBufferfv")
+	register(&gl.clearBufferiv, "glClearBufferiv")
+	register(&gl.clearBufferuiv, "glClearBufferuiv")
 	register(&gl.drawBuffer, "glDrawBuffer")
 	register(&gl.drawBuffers, "glDrawBuffers")
 	register(&gl.readBuffer, "glReadBuffer")

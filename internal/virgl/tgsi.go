@@ -124,6 +124,7 @@ type tgsiShader struct {
 	fragmentColor0WritesAll bool
 	usesDoubleRoundEven     bool
 	usesDoubleEquality      bool
+	usesCubeGradientFix     bool
 }
 
 var (
@@ -148,6 +149,7 @@ var (
 	tgsiAddressPattern              = regexp.MustCompile(`^ADDR\[(\d+)\](?:\.([xyzw]+))?$`)
 	tgsiControlLabel                = regexp.MustCompile(`(?:^|\s+):\d+$`)
 	tgsiSamplerPattern              = regexp.MustCompile(`^SAMP\[(\d+)\]$`)
+	tgsiIndirectSamplerPattern      = regexp.MustCompile(`^SAMP\[ADDR\[(\d+)\]\.([xyzw])([+-]\d+)?\]$`)
 )
 
 func translateTGSI(source string) (uint32, string, error) {
@@ -721,7 +723,7 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 	twoSourceTexture := opcode == "TEX2" || opcode == "TXB2" || opcode == "TXL2"
 	gradientTexture := opcode == "TXD"
 	gatherTexture := opcode == "TG4"
-	if opcode == "TEX" || opcode == "TXP" || opcode == "TXB" || opcode == "TXL" || opcode == "TXF" || opcode == "LODQ" || twoSourceTexture || gradientTexture || gatherTexture {
+	if opcode == "TEX" || opcode == "TXP" || opcode == "TXB" || opcode == "TXL" || opcode == "TXF" || opcode == "TXQ" || opcode == "LODQ" || twoSourceTexture || gradientTexture || gatherTexture {
 		targetIndex, samplerIndexOperand := 3, 2
 		if twoSourceTexture {
 			targetIndex, samplerIndexOperand = 4, 3
@@ -735,17 +737,23 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 			target = normalizeTGSISamplerTarget(operands[targetIndex])
 		}
 		operandCountOK := len(operands) == targetIndex+1
+		hasTextureOffset := !gatherTexture && len(operands) == targetIndex+2
+		if hasTextureOffset {
+			operandCountOK = true
+		}
 		if gatherTexture && len(operands) == targetIndex+2 {
 			operandCountOK = true
 		}
 		if !operandCountOK ||
 			!supportedTGSISamplerTarget(target) ||
-			(twoSourceTexture && target != "CUBE_ARRAY") ||
-			(target == "BUFFER" && opcode != "TXF") ||
-			(opcode == "TXP" && (target == "3D" || target == "CUBE" || target == "CUBE_ARRAY" || target == "1D_ARRAY" || target == "2D_ARRAY")) ||
+			(target == "BUFFER" && opcode != "TXF" && opcode != "TXQ") ||
+			(opcode == "TXP" && (target == "CUBE" || target == "CUBE_ARRAY" || target == "1D_ARRAY" || target == "2D_ARRAY")) ||
 			((opcode == "TXP" || opcode == "TXB" || opcode == "TXL") && (target == "RECT" || target == "CUBE_ARRAY")) ||
 			(opcode == "LODQ" && (target == "RECT" || target == "2D_MSAA" || target == "2D_ARRAY_MSAA")) ||
-			(opcode != "TXF" && (target == "2D_MSAA" || target == "2D_ARRAY_MSAA")) ||
+			(hasTextureOffset && (opcode == "TXQ" || opcode == "LODQ" || target == "BUFFER" ||
+				target == "CUBE" || target == "CUBE_ARRAY" || target == "SHADOWCUBE" || target == "SHADOWCUBE_ARRAY" ||
+				target == "2D_MSAA" || target == "2D_ARRAY_MSAA")) ||
+			(opcode != "TXF" && opcode != "TXQ" && (target == "2D_MSAA" || target == "2D_ARRAY_MSAA")) ||
 			(opcode == "TXF" && (strings.HasPrefix(target, "SHADOW") || target == "CUBE" || target == "CUBE_ARRAY")) ||
 			(gatherTexture && (!tgsiGatherTarget(target) || (len(operands) == targetIndex+2 &&
 				(target == "CUBE" || target == "CUBE_ARRAY" || target == "SHADOWCUBE" || target == "SHADOWCUBE_ARRAY")))) {
@@ -777,6 +785,13 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 				return "", err
 			}
 		}
+		textureOffset := ""
+		if hasTextureOffset {
+			textureOffset, _, err = s.register(operands[targetIndex+1], false)
+			if err != nil {
+				return "", err
+			}
+		}
 		gatherComponent := ""
 		gatherOffset := ""
 		if gatherTexture {
@@ -793,7 +808,36 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		}
 		sampler := tgsiSamplerPattern.FindStringSubmatch(operands[samplerIndexOperand])
 		if sampler == nil {
-			return "", fmt.Errorf("invalid texture sampler %q", operands[samplerIndexOperand])
+			indirect := tgsiIndirectSamplerPattern.FindStringSubmatch(operands[samplerIndexOperand])
+			if indirect == nil {
+				return "", fmt.Errorf("invalid texture sampler %q", operands[samplerIndexOperand])
+			}
+			addressIndex, _ := strconv.Atoi(indirect[1])
+			if addressIndex > s.maxAddress {
+				return "", fmt.Errorf("address register %d is not declared", addressIndex)
+			}
+			lastSampler := max(s.maxSampler, s.maxSamplerView)
+			if lastSampler < 0 {
+				return "", errors.New("indirect texture sampler has no declared samplers")
+			}
+			index := fmt.Sprintf("address[%d].%s%s", addressIndex, indirect[2], indirect[3])
+			staticOpcode := opcode
+			if saturate {
+				staticOpcode += "_SAT"
+			}
+			var statement strings.Builder
+			fmt.Fprintf(&statement, "{\nswitch (%s) {\n", index)
+			for samplerIndex := 0; samplerIndex <= lastSampler; samplerIndex++ {
+				staticOperands := append([]string(nil), operands...)
+				staticOperands[samplerIndexOperand] = fmt.Sprintf("SAMP[%d]", samplerIndex)
+				translated, err := s.translateInstruction(staticOpcode, staticOperands)
+				if err != nil {
+					return "", err
+				}
+				fmt.Fprintf(&statement, "case %d:\n%s\nbreak;\n", samplerIndex, translated)
+			}
+			statement.WriteString("default:\nbreak;\n}\n}")
+			return statement.String(), nil
 		}
 		samplerIndex, _ := strconv.Atoi(sampler[1])
 		samplerName := tgsiSamplerName(s.stage, samplerIndex)
@@ -806,168 +850,322 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		multisample2D := target == "2D_MSAA" || view.target == "2D_MSAA"
 		multisampleArray := target == "2D_ARRAY_MSAA" || view.target == "2D_ARRAY_MSAA"
 		integerView := view.returnType == "UINT" || view.returnType == "SINT"
-		rectangle := target == "RECT" || view.target == "RECT"
+		rectangle := target == "RECT" || view.target == "RECT" || target == "SHADOWRECT" || view.target == "SHADOWRECT"
 		shadowTarget := target
 		if strings.HasPrefix(view.target, "SHADOW") {
 			shadowTarget = view.target
 		}
 		shadow := strings.HasPrefix(shadowTarget, "SHADOW")
+		shadow2D := shadowTarget == "SHADOW2D" || shadowTarget == "SHADOWRECT"
+		shadow2DArray := shadowTarget == "SHADOW2D_ARRAY"
+		shadowCube := shadowTarget == "SHADOWCUBE"
+		shadowCubeArray := shadowTarget == "SHADOWCUBE_ARRAY"
 		cube := target == "CUBE" || view.target == "CUBE"
 		cubeArray := target == "CUBE_ARRAY" || view.target == "CUBE_ARRAY"
-		array := target == "2D_ARRAY" || view.target == "2D_ARRAY"
-		switch opcode {
-		case "TEX", "TEX2":
-			if cubeArray {
-				expression = fmt.Sprintf("texture(%s, %s)", samplerName, coordinate)
-			} else if oneD {
-				expression = fmt.Sprintf("texture(%s, (%s).x)", samplerName, coordinate)
-			} else if rectangle {
-				expression = fmt.Sprintf("texture(%s, (%s).xy / vec2(textureSize(%s, 0)))", samplerName, coordinate, samplerName)
-			} else if shadow {
-				expression = fmt.Sprintf("vec4(texture(%s, (%s).xyz))", samplerName, coordinate)
-			} else if oneDArray {
-				expression = fmt.Sprintf("texture(%s, (%s).xy)", samplerName, coordinate)
-			} else if threeD || cube || array {
-				expression = fmt.Sprintf("texture(%s, (%s).xyz)", samplerName, coordinate)
-			} else {
-				expression = fmt.Sprintf("texture(%s, (%s).xy)", samplerName, coordinate)
-			}
-		case "TXP":
+		array := target == "2D_ARRAY" || view.target == "2D_ARRAY" || target == "SHADOW2D_ARRAY" || view.target == "SHADOW2D_ARRAY"
+		if textureOffset != "" {
+			offsetBits := "floatBitsToInt(" + textureOffset + ")"
+			offsetArgument := "ivec2((" + offsetBits + ").xy)"
 			if oneD {
-				expression = fmt.Sprintf("textureProj(%s, vec2((%s).x, (%s).w))", samplerName, coordinate, coordinate)
-			} else if rectangle {
-				expression = fmt.Sprintf("texture(%s, ((%s).xy / (%s).w) / vec2(textureSize(%s, 0)))", samplerName, coordinate, coordinate, samplerName)
-			} else if shadow {
-				expression = fmt.Sprintf("vec4(textureProj(%s, %s))", samplerName, coordinate)
-			} else {
-				expression = fmt.Sprintf("textureProj(%s, vec3((%s).xy, (%s).w))", samplerName, coordinate, coordinate)
+				offsetArgument = "int((" + offsetBits + ").x)"
+			} else if threeD {
+				offsetArgument = "ivec3((" + offsetBits + ").xyz)"
 			}
-		case "TXB":
-			if oneD {
-				expression = fmt.Sprintf("texture(%s, (%s).x, (%s).w)", samplerName, coordinate, coordinate)
-			} else if rectangle {
-				expression = fmt.Sprintf("texture(%s, (%s).xy / vec2(textureSize(%s, 0)), (%s).w)", samplerName, coordinate, samplerName, coordinate)
-			} else if shadow {
-				expression = fmt.Sprintf("vec4(texture(%s, (%s).xyz, (%s).w))", samplerName, coordinate, coordinate)
-			} else if oneDArray {
-				expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).w)", samplerName, coordinate, coordinate)
-			} else if threeD || cube || array {
-				expression = fmt.Sprintf("texture(%s, (%s).xyz, (%s).w)", samplerName, coordinate, coordinate)
-			} else {
-				expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).w)", samplerName, coordinate, coordinate)
+			coordinateArgument := fmt.Sprintf("(%s).xy", coordinate)
+			switch {
+			case oneD:
+				coordinateArgument = fmt.Sprintf("(%s).x", coordinate)
+			case rectangle:
+				coordinateArgument = fmt.Sprintf("(%s).xy / vec2(textureSize(%s, 0))", coordinate, samplerName)
+			case shadow2DArray:
+				coordinateArgument = coordinate
+			case shadow:
+				coordinateArgument = fmt.Sprintf("(%s).xyz", coordinate)
+			case oneDArray:
+				coordinateArgument = fmt.Sprintf("(%s).xy", coordinate)
+			case threeD || array:
+				coordinateArgument = fmt.Sprintf("(%s).xyz", coordinate)
 			}
-		case "TXB2":
-			expression = fmt.Sprintf("texture(%s, %s, (%s).x)", samplerName, coordinate, extra)
-		case "TXL":
-			lod := fmt.Sprintf("(%s).w", coordinate)
-			crossover := tgsiSamplerLODCrossoverName(s.stage, samplerIndex)
-			lod = fmt.Sprintf("(%s - (%s <= %s ? %s : 0.0))", lod, lod, crossover, crossover)
-			if oneD {
-				expression = fmt.Sprintf("textureLod(%s, (%s).x, %s)", samplerName, coordinate, lod)
-			} else if rectangle {
-				expression = fmt.Sprintf("textureLod(%s, (%s).xy / vec2(textureSize(%s, 0)), 0.0)", samplerName, coordinate, samplerName)
-			} else if shadow {
-				expression = fmt.Sprintf("vec4(textureLod(%s, (%s).xyz, %s))", samplerName, coordinate, lod)
-			} else if oneDArray {
-				expression = fmt.Sprintf("textureLod(%s, (%s).xy, %s)", samplerName, coordinate, lod)
-			} else if threeD || cube || array {
-				expression = fmt.Sprintf("textureLod(%s, (%s).xyz, %s)", samplerName, coordinate, lod)
-			} else {
-				expression = fmt.Sprintf("textureLod(%s, (%s).xy, %s)", samplerName, coordinate, lod)
-			}
-		case "TXL2":
-			expression = fmt.Sprintf("textureLod(%s, %s, (%s).x)", samplerName, coordinate, extra)
-		case "TXD":
-			if oneD {
-				expression = fmt.Sprintf("textureGrad(%s, (%s).x, (%s).x, (%s).x)", samplerName, coordinate, gradientX, gradientY)
-			} else if rectangle {
-				expression = fmt.Sprintf("textureGrad(%s, (%s).xy / vec2(textureSize(%s, 0)), (%s).xy / vec2(textureSize(%s, 0)), (%s).xy / vec2(textureSize(%s, 0)))", samplerName, coordinate, samplerName, gradientX, samplerName, gradientY, samplerName)
-			} else if shadow {
-				expression = fmt.Sprintf("vec4(textureGrad(%s, (%s).xyz, (%s).xy, (%s).xy))", samplerName, coordinate, gradientX, gradientY)
-			} else if oneDArray {
-				expression = fmt.Sprintf("textureGrad(%s, (%s).xy, (%s).x, (%s).x)", samplerName, coordinate, gradientX, gradientY)
-			} else if threeD || cube || cubeArray {
-				expression = fmt.Sprintf("textureGrad(%s, %s, (%s).xyz, (%s).xyz)", samplerName, coordinate, gradientX, gradientY)
-			} else if array {
-				expression = fmt.Sprintf("textureGrad(%s, (%s).xyz, (%s).xy, (%s).xy)", samplerName, coordinate, gradientX, gradientY)
-			} else {
-				expression = fmt.Sprintf("textureGrad(%s, (%s).xy, (%s).xy, (%s).xy)", samplerName, coordinate, gradientX, gradientY)
-			}
-		case "TG4":
-			component := "floatBitsToInt(" + gatherComponent + ").x"
-			coordinateOffset := ""
-			if gatherOffset != "" {
-				// Apple's GLSL compiler incorrectly requires textureGatherOffset's
-				// offset to be constant. Shifting the normalized base coordinate by
-				// an integer number of level-zero texels is the same gather footprint
-				// and preserves Gallium's permitted dynamic-offset behavior.
-				coordinateOffset = " + vec2(floatBitsToInt(" + gatherOffset + ").xy) / vec2(textureSize(" + samplerName + ", 0).xy)"
-			}
-			switch shadowTarget {
-			case "SHADOW2D", "SHADOWRECT":
-				coordinates := fmt.Sprintf("(%s).xy", coordinate)
-				if shadowTarget == "SHADOWRECT" {
-					coordinates += fmt.Sprintf(" / vec2(textureSize(%s, 0))", samplerName)
+			switch opcode {
+			case "TEX", "TEX2":
+				expression = fmt.Sprintf("textureOffset(%s, %s, %s)", samplerName, coordinateArgument, offsetArgument)
+			case "TXP":
+				projectiveCoordinate := fmt.Sprintf("vec3((%s).xy, (%s).w)", coordinate, coordinate)
+				if oneD {
+					projectiveCoordinate = fmt.Sprintf("vec2((%s).x, (%s).w)", coordinate, coordinate)
+				} else if rectangle {
+					projectiveCoordinate = fmt.Sprintf("vec3((%s).xy / vec2(textureSize(%s, 0)), (%s).w)", coordinate, samplerName, coordinate)
+				} else if shadow || threeD {
+					projectiveCoordinate = coordinate
 				}
-				expression = fmt.Sprintf("textureGather(%s, %s%s, (%s).z)", samplerName, coordinates, coordinateOffset, coordinate)
-			case "SHADOW2D_ARRAY":
-				expression = fmt.Sprintf("textureGather(%s, vec3((%s).xy%s, (%s).z), (%s).w)", samplerName, coordinate, coordinateOffset, coordinate, coordinate)
-			case "SHADOWCUBE":
-				expression = fmt.Sprintf("textureGather(%s, (%s).xyz, (%s).w)", samplerName, coordinate, coordinate)
-			case "SHADOWCUBE_ARRAY":
-				expression = fmt.Sprintf("textureGather(%s, %s, (%s).x)", samplerName, coordinate, gatherComponent)
-			default:
-				if rectangle {
-					expression = fmt.Sprintf("textureGather(%s, (%s).xy / vec2(textureSize(%s, 0))%s, %s)", samplerName, coordinate, samplerName, coordinateOffset, component)
-				} else if cubeArray {
-					expression = fmt.Sprintf("textureGather(%s, %s, %s)", samplerName, coordinate, component)
-				} else if cube {
-					expression = fmt.Sprintf("textureGather(%s, (%s).xyz, %s)", samplerName, coordinate, component)
-				} else if array {
-					expression = fmt.Sprintf("textureGather(%s, vec3((%s).xy%s, (%s).z), %s)", samplerName, coordinate, coordinateOffset, coordinate, component)
+				expression = fmt.Sprintf("textureProjOffset(%s, %s, %s)", samplerName, projectiveCoordinate, offsetArgument)
+			case "TXB":
+				expression = fmt.Sprintf("textureOffset(%s, %s, %s, (%s).w)", samplerName, coordinateArgument, offsetArgument, coordinate)
+			case "TXB2":
+				expression = fmt.Sprintf("textureOffset(%s, %s, %s, (%s).x)", samplerName, coordinateArgument, offsetArgument, extra)
+			case "TXL", "TXL2":
+				lod := fmt.Sprintf("(%s).w", coordinate)
+				if opcode == "TXL2" {
+					lod = fmt.Sprintf("(%s).x", extra)
 				} else {
-					expression = fmt.Sprintf("textureGather(%s, (%s).xy%s, %s)", samplerName, coordinate, coordinateOffset, component)
+					crossover := tgsiSamplerLODCrossoverName(s.stage, samplerIndex)
+					lod = fmt.Sprintf("(%s - (%s <= %s ? %s : 0.0))", lod, lod, crossover, crossover)
 				}
+				expression = fmt.Sprintf("textureLodOffset(%s, %s, %s, %s)", samplerName, coordinateArgument, lod, offsetArgument)
+			case "TXD":
+				gradientXArgument := fmt.Sprintf("(%s).xy", gradientX)
+				gradientYArgument := fmt.Sprintf("(%s).xy", gradientY)
+				if oneD {
+					gradientXArgument = fmt.Sprintf("(%s).x", gradientX)
+					gradientYArgument = fmt.Sprintf("(%s).x", gradientY)
+				} else if threeD {
+					gradientXArgument = fmt.Sprintf("(%s).xyz", gradientX)
+					gradientYArgument = fmt.Sprintf("(%s).xyz", gradientY)
+				} else if rectangle {
+					gradientXArgument = fmt.Sprintf("(%s).xy / vec2(textureSize(%s, 0))", gradientX, samplerName)
+					gradientYArgument = fmt.Sprintf("(%s).xy / vec2(textureSize(%s, 0))", gradientY, samplerName)
+				}
+				expression = fmt.Sprintf("textureGradOffset(%s, %s, %s, %s, %s)", samplerName, coordinateArgument, gradientXArgument, gradientYArgument, offsetArgument)
+			case "TXF":
+				integerCoordinate := fmt.Sprintf("floatBitsToInt(%s)", coordinate)
+				fetchCoordinate := fmt.Sprintf("(%s).xy", integerCoordinate)
+				if oneD {
+					fetchCoordinate = fmt.Sprintf("(%s).x", integerCoordinate)
+				} else if threeD || array {
+					fetchCoordinate = fmt.Sprintf("(%s).xyz", integerCoordinate)
+				}
+				expression = fmt.Sprintf("texelFetchOffset(%s, %s, (%s).w, %s)", samplerName, fetchCoordinate, integerCoordinate, offsetArgument)
+			default:
+				return "", fmt.Errorf("opcode %s cannot use a texture offset", opcode)
 			}
-		case "TXF":
-			integerCoordinate := fmt.Sprintf("floatBitsToInt(%s)", coordinate)
-			if buffer {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).x)", samplerName, integerCoordinate)
-			} else if oneD {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).x, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
-			} else if rectangle {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xy, 0)", samplerName, integerCoordinate)
-			} else if multisampleArray && integerView {
-				expression = fmt.Sprintf("texelFetch(%s, ivec3((%s).xy, (%s).z * %s + (%s).w), 0)", samplerName, integerCoordinate, integerCoordinate, tgsiSamplerSampleCountName(s.stage, samplerIndex), integerCoordinate)
-			} else if multisample2D && integerView {
-				expression = fmt.Sprintf("texelFetch(%s, ivec3((%s).xy, (%s).w), 0)", samplerName, integerCoordinate, integerCoordinate)
-			} else if multisampleArray {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xyz, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
-			} else if multisample2D {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
-			} else if oneDArray {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
-			} else if threeD || array {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xyz, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
-			} else {
-				expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+			if shadow {
+				expression = "vec4(" + expression + ")"
 			}
-		case "LODQ":
-			var queryCoordinate string
-			if oneD {
-				queryCoordinate = fmt.Sprintf("(%s).x", coordinate)
-			} else if threeD || cube || cubeArray {
-				queryCoordinate = fmt.Sprintf("(%s).xyz", coordinate)
-			} else {
-				queryCoordinate = fmt.Sprintf("(%s).xy", coordinate)
+		} else {
+			switch opcode {
+			case "TXQ":
+				lod := fmt.Sprintf("floatBitsToInt(%s).x", coordinate)
+				size := fmt.Sprintf("textureSize(%s, %s)", samplerName, lod)
+				if buffer || rectangle || multisample2D || multisampleArray {
+					size = fmt.Sprintf("textureSize(%s)", samplerName)
+				}
+				levels := tgsiSamplerLevelCountName(s.stage, samplerIndex)
+				switch {
+				case buffer || oneD:
+					expression = fmt.Sprintf("intBitsToFloat(ivec4(%s, 0, 0, %s))", size, levels)
+				case oneDArray:
+					expression = fmt.Sprintf("intBitsToFloat(ivec4(%s, 0, %s))", size, levels)
+				case threeD || array || cubeArray || multisampleArray:
+					expression = fmt.Sprintf("intBitsToFloat(ivec4(%s, %s))", size, levels)
+				default:
+					expression = fmt.Sprintf("intBitsToFloat(ivec4(%s, 0, %s))", size, levels)
+				}
+			case "TEX", "TEX2":
+				if cubeArray {
+					expression = fmt.Sprintf("texture(%s, %s)", samplerName, coordinate)
+				} else if oneD {
+					expression = fmt.Sprintf("texture(%s, (%s).x)", samplerName, coordinate)
+				} else if rectangle {
+					expression = fmt.Sprintf("texture(%s, (%s).xy / vec2(textureSize(%s, 0)))", samplerName, coordinate, samplerName)
+				} else if shadowCubeArray {
+					expression = fmt.Sprintf("vec4(texture(%s, %s, (%s).x))", samplerName, coordinate, extra)
+				} else if shadow2DArray || shadowCube {
+					expression = fmt.Sprintf("vec4(texture(%s, %s))", samplerName, coordinate)
+				} else if shadow {
+					expression = fmt.Sprintf("vec4(texture(%s, (%s).xyz))", samplerName, coordinate)
+				} else if oneDArray {
+					expression = fmt.Sprintf("texture(%s, (%s).xy)", samplerName, coordinate)
+				} else if threeD || cube || array {
+					expression = fmt.Sprintf("texture(%s, (%s).xyz)", samplerName, coordinate)
+				} else {
+					expression = fmt.Sprintf("texture(%s, (%s).xy)", samplerName, coordinate)
+				}
+			case "TXP":
+				if oneD {
+					expression = fmt.Sprintf("textureProj(%s, vec2((%s).x, (%s).w))", samplerName, coordinate, coordinate)
+				} else if rectangle {
+					expression = fmt.Sprintf("texture(%s, ((%s).xy / (%s).w) / vec2(textureSize(%s, 0)))", samplerName, coordinate, coordinate, samplerName)
+				} else if shadow {
+					expression = fmt.Sprintf("vec4(textureProj(%s, %s))", samplerName, coordinate)
+				} else if threeD {
+					expression = fmt.Sprintf("textureProj(%s, %s)", samplerName, coordinate)
+				} else {
+					expression = fmt.Sprintf("textureProj(%s, vec3((%s).xy, (%s).w))", samplerName, coordinate, coordinate)
+				}
+			case "TXB":
+				if oneD {
+					expression = fmt.Sprintf("texture(%s, (%s).x, (%s).w)", samplerName, coordinate, coordinate)
+				} else if rectangle {
+					expression = fmt.Sprintf("texture(%s, (%s).xy / vec2(textureSize(%s, 0)), (%s).w)", samplerName, coordinate, samplerName, coordinate)
+				} else if shadow2DArray || shadowCube {
+					expression = fmt.Sprintf("vec4(texture(%s, %s, (%s).w))", samplerName, coordinate, coordinate)
+				} else if shadow {
+					expression = fmt.Sprintf("vec4(texture(%s, (%s).xyz, (%s).w))", samplerName, coordinate, coordinate)
+				} else if oneDArray {
+					expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).w)", samplerName, coordinate, coordinate)
+				} else if threeD || cube || array {
+					expression = fmt.Sprintf("texture(%s, (%s).xyz, (%s).w)", samplerName, coordinate, coordinate)
+				} else {
+					expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).w)", samplerName, coordinate, coordinate)
+				}
+			case "TXB2":
+				if shadowCubeArray {
+					expression = fmt.Sprintf("vec4(texture(%s, %s, (%s).x, (%s).y))", samplerName, coordinate, extra, extra)
+				} else if cubeArray {
+					expression = fmt.Sprintf("texture(%s, %s, (%s).x)", samplerName, coordinate, extra)
+				} else if shadow2DArray || shadowCube {
+					expression = fmt.Sprintf("vec4(texture(%s, %s, (%s).x))", samplerName, coordinate, extra)
+				} else if shadow2D {
+					expression = fmt.Sprintf("vec4(texture(%s, (%s).xyz, (%s).x))", samplerName, coordinate, extra)
+				} else if oneD {
+					expression = fmt.Sprintf("texture(%s, (%s).x, (%s).x)", samplerName, coordinate, extra)
+				} else if oneDArray {
+					expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).x)", samplerName, coordinate, extra)
+				} else if threeD || cube || array {
+					expression = fmt.Sprintf("texture(%s, (%s).xyz, (%s).x)", samplerName, coordinate, extra)
+				} else {
+					expression = fmt.Sprintf("texture(%s, (%s).xy, (%s).x)", samplerName, coordinate, extra)
+				}
+			case "TXL":
+				lod := fmt.Sprintf("(%s).w", coordinate)
+				crossover := tgsiSamplerLODCrossoverName(s.stage, samplerIndex)
+				lod = fmt.Sprintf("(%s - (%s <= %s ? %s : 0.0))", lod, lod, crossover, crossover)
+				if oneD {
+					expression = fmt.Sprintf("textureLod(%s, (%s).x, %s)", samplerName, coordinate, lod)
+				} else if rectangle {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xy / vec2(textureSize(%s, 0)), 0.0)", samplerName, coordinate, samplerName)
+				} else if shadow2DArray || shadowCube {
+					expression = fmt.Sprintf("vec4(textureLod(%s, %s, %s))", samplerName, coordinate, lod)
+				} else if shadow {
+					expression = fmt.Sprintf("vec4(textureLod(%s, (%s).xyz, %s))", samplerName, coordinate, lod)
+				} else if oneDArray {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xy, %s)", samplerName, coordinate, lod)
+				} else if threeD || cube || array {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xyz, %s)", samplerName, coordinate, lod)
+				} else {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xy, %s)", samplerName, coordinate, lod)
+				}
+			case "TXL2":
+				if shadowCubeArray {
+					expression = fmt.Sprintf("vec4(textureLod(%s, %s, (%s).x, (%s).y))", samplerName, coordinate, extra, extra)
+				} else if cubeArray {
+					expression = fmt.Sprintf("textureLod(%s, %s, (%s).x)", samplerName, coordinate, extra)
+				} else if shadow2DArray || shadowCube {
+					expression = fmt.Sprintf("vec4(textureLod(%s, %s, (%s).x))", samplerName, coordinate, extra)
+				} else if shadow2D {
+					expression = fmt.Sprintf("vec4(textureLod(%s, (%s).xyz, (%s).x))", samplerName, coordinate, extra)
+				} else if oneD {
+					expression = fmt.Sprintf("textureLod(%s, (%s).x, (%s).x)", samplerName, coordinate, extra)
+				} else if oneDArray {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xy, (%s).x)", samplerName, coordinate, extra)
+				} else if threeD || cube || array {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xyz, (%s).x)", samplerName, coordinate, extra)
+				} else {
+					expression = fmt.Sprintf("textureLod(%s, (%s).xy, (%s).x)", samplerName, coordinate, extra)
+				}
+			case "TXD":
+				if oneD {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).x, (%s).x, (%s).x)", samplerName, coordinate, gradientX, gradientY)
+				} else if rectangle {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).xy / vec2(textureSize(%s, 0)), (%s).xy / vec2(textureSize(%s, 0)), (%s).xy / vec2(textureSize(%s, 0)))", samplerName, coordinate, samplerName, gradientX, samplerName, gradientY, samplerName)
+				} else if shadow2DArray {
+					expression = fmt.Sprintf("vec4(textureGrad(%s, %s, (%s).xy, (%s).xy))", samplerName, coordinate, gradientX, gradientY)
+				} else if shadowCube {
+					expression = fmt.Sprintf("vec4(textureGrad(%s, %s, (%s).xyz, (%s).xyz))", samplerName, coordinate, gradientX, gradientY)
+				} else if shadow {
+					expression = fmt.Sprintf("vec4(textureGrad(%s, (%s).xyz, (%s).xy, (%s).xy))", samplerName, coordinate, gradientX, gradientY)
+				} else if oneDArray {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).xy, (%s).x, (%s).x)", samplerName, coordinate, gradientX, gradientY)
+				} else if cube {
+					s.usesCubeGradientFix = true
+					expression = fmt.Sprintf("(tgsiCubePositiveZ((%[2]s).xyz) ? textureLod(%[1]s, (%[2]s).xyz, tgsiCubeGradientLOD((%[2]s).xyz, (%[3]s).xyz, (%[4]s).xyz, vec2(textureSize(%[1]s, 0)))) : textureGrad(%[1]s, (%[2]s).xyz, (%[3]s).xyz, (%[4]s).xyz))", samplerName, coordinate, gradientX, gradientY)
+				} else if threeD {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).xyz, (%s).xyz, (%s).xyz)", samplerName, coordinate, gradientX, gradientY)
+				} else if cubeArray {
+					expression = fmt.Sprintf("textureGrad(%s, %s, (%s).xyz, (%s).xyz)", samplerName, coordinate, gradientX, gradientY)
+				} else if array {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).xyz, (%s).xy, (%s).xy)", samplerName, coordinate, gradientX, gradientY)
+				} else {
+					expression = fmt.Sprintf("textureGrad(%s, (%s).xy, (%s).xy, (%s).xy)", samplerName, coordinate, gradientX, gradientY)
+				}
+			case "TG4":
+				component := "floatBitsToInt(" + gatherComponent + ").x"
+				coordinateOffset := ""
+				if gatherOffset != "" {
+					// Apple's GLSL compiler incorrectly requires textureGatherOffset's
+					// offset to be constant. Shifting the normalized base coordinate by
+					// an integer number of level-zero texels is the same gather footprint
+					// and preserves Gallium's permitted dynamic-offset behavior.
+					coordinateOffset = " + vec2(floatBitsToInt(" + gatherOffset + ").xy) / vec2(textureSize(" + samplerName + ", 0).xy)"
+				}
+				switch shadowTarget {
+				case "SHADOW2D", "SHADOWRECT":
+					coordinates := fmt.Sprintf("(%s).xy", coordinate)
+					if shadowTarget == "SHADOWRECT" {
+						coordinates += fmt.Sprintf(" / vec2(textureSize(%s, 0))", samplerName)
+					}
+					expression = fmt.Sprintf("textureGather(%s, %s%s, (%s).z)", samplerName, coordinates, coordinateOffset, coordinate)
+				case "SHADOW2D_ARRAY":
+					expression = fmt.Sprintf("textureGather(%s, vec3((%s).xy%s, (%s).z), (%s).w)", samplerName, coordinate, coordinateOffset, coordinate, coordinate)
+				case "SHADOWCUBE":
+					expression = fmt.Sprintf("textureGather(%s, (%s).xyz, (%s).w)", samplerName, coordinate, coordinate)
+				case "SHADOWCUBE_ARRAY":
+					expression = fmt.Sprintf("textureGather(%s, %s, (%s).x)", samplerName, coordinate, gatherComponent)
+				default:
+					if rectangle {
+						expression = fmt.Sprintf("textureGather(%s, (%s).xy / vec2(textureSize(%s, 0))%s, %s)", samplerName, coordinate, samplerName, coordinateOffset, component)
+					} else if cubeArray {
+						expression = fmt.Sprintf("textureGather(%s, %s, %s)", samplerName, coordinate, component)
+					} else if cube {
+						expression = fmt.Sprintf("textureGather(%s, (%s).xyz, %s)", samplerName, coordinate, component)
+					} else if array {
+						expression = fmt.Sprintf("textureGather(%s, vec3((%s).xy%s, (%s).z), %s)", samplerName, coordinate, coordinateOffset, coordinate, component)
+					} else {
+						expression = fmt.Sprintf("textureGather(%s, (%s).xy%s, %s)", samplerName, coordinate, coordinateOffset, component)
+					}
+				}
+			case "TXF":
+				integerCoordinate := fmt.Sprintf("floatBitsToInt(%s)", coordinate)
+				if buffer {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).x)", samplerName, integerCoordinate)
+				} else if oneD {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).x, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				} else if rectangle {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xy, 0)", samplerName, integerCoordinate)
+				} else if multisampleArray && integerView {
+					expression = fmt.Sprintf("texelFetch(%s, ivec3((%s).xy, (%s).z * %s + (%s).w), 0)", samplerName, integerCoordinate, integerCoordinate, tgsiSamplerSampleCountName(s.stage, samplerIndex), integerCoordinate)
+				} else if multisample2D && integerView {
+					expression = fmt.Sprintf("texelFetch(%s, ivec3((%s).xy, (%s).w), 0)", samplerName, integerCoordinate, integerCoordinate)
+				} else if multisampleArray {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xyz, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				} else if multisample2D {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				} else if oneDArray {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				} else if threeD || array {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xyz, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				} else {
+					expression = fmt.Sprintf("texelFetch(%s, (%s).xy, (%s).w)", samplerName, integerCoordinate, integerCoordinate)
+				}
+			case "LODQ":
+				var queryCoordinate string
+				if oneD {
+					queryCoordinate = fmt.Sprintf("(%s).x", coordinate)
+				} else if threeD || cube || cubeArray {
+					queryCoordinate = fmt.Sprintf("(%s).xyz", coordinate)
+				} else {
+					queryCoordinate = fmt.Sprintf("(%s).xy", coordinate)
+				}
+				expression = fmt.Sprintf("vec4(textureQueryLod(%s, %s), 0.0, 0.0)", samplerName, queryCoordinate)
 			}
-			expression = fmt.Sprintf("vec4(textureQueryLod(%s, %s), 0.0, 0.0)", samplerName, queryCoordinate)
 		}
-		if multisample2D || multisampleArray {
+		if opcode != "TXQ" && (multisample2D || multisampleArray) {
 			expression = fmt.Sprintf("tgsiSamplerViewSwizzle(%s, %s)", expression,
 				tgsiSamplerViewSwizzleName(s.stage, samplerIndex))
 		}
-		if view.returnType == "UINT" {
+		if opcode == "TXQ" {
+			// TXQ returns signed integer resource dimensions as raw TGSI register bits.
+		} else if view.returnType == "UINT" {
 			expression = "uintBitsToFloat(" + expression + ")"
 		} else if view.returnType == "SINT" {
 			expression = "intBitsToFloat(" + expression + ")"
@@ -981,12 +1179,14 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		return destination + " = " + expression + ";", nil
 	}
 	arities := map[string]int{
-		"MOV": 2, "RSQ": 2, "RCP": 2, "FLR": 2, "FRC": 2, "CEIL": 2, "TRUNC": 2, "EX2": 2, "LG2": 2, "SIN": 2, "COS": 2, "DDX": 2, "DDY": 2, "SSG": 2, "ISSG": 2, "IABS": 2, "NOT": 2, "INEG": 2,
+		"MOV": 2, "RSQ": 2, "RCP": 2, "FLR": 2, "FRC": 2, "CEIL": 2, "TRUNC": 2, "ROUND": 2, "EX2": 2, "LG2": 2, "SIN": 2, "COS": 2, "DDX": 2, "DDY": 2, "SSG": 2, "ISSG": 2, "IABS": 2, "NOT": 2, "INEG": 2,
 		"F2I": 2, "F2U": 2, "I2F": 2, "U2F": 2,
 		"ADD": 3, "MUL": 3, "DIV": 3, "DP2": 3, "DP3": 3, "DP4": 3, "MAX": 3, "MIN": 3,
-		"POW": 3, "FSLT": 3, "FSGE": 3, "SGE": 3, "FSEQ": 3, "FSNE": 3, "ISGE": 3, "ISLT": 3, "USEQ": 3, "USNE": 3, "USGE": 3, "USLT": 3, "UMAX": 3, "UMIN": 3,
-		"AND": 3, "OR": 3, "XOR": 3, "UADD": 3, "UMUL": 3, "IDIV": 3, "IMIN": 3, "IMAX": 3, "SHL": 3, "USHR": 3, "ISHR": 3,
+		"POW": 3, "FSLT": 3, "FSGE": 3, "SLT": 3, "SGE": 3, "FSEQ": 3, "FSNE": 3, "ISGE": 3, "ISLT": 3, "USEQ": 3, "USNE": 3, "USGE": 3, "USLT": 3, "UMAX": 3, "UMIN": 3,
+		"AND": 3, "OR": 3, "XOR": 3, "UADD": 3, "UMUL": 3, "UDIV": 3, "UMOD": 3, "IDIV": 3, "IMIN": 3, "IMAX": 3, "SHL": 3, "USHR": 3, "ISHR": 3,
+		"IBFE": 4, "UBFE": 4,
 		"MAD": 4, "LRP": 4, "UCMP": 4,
+		"BFI": 5,
 	}
 	arity, ok := arities[opcode]
 	if !ok {
@@ -1023,6 +1223,8 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "ceil(" + sources[0] + ")"
 	case "TRUNC":
 		expression = "trunc(" + sources[0] + ")"
+	case "ROUND":
+		expression = "roundEven(" + sources[0] + ")"
 	case "EX2":
 		expression = "vec4(exp2((" + sources[0] + ").x))"
 	case "LG2":
@@ -1075,12 +1277,21 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "intBitsToFloat(-ivec4(lessThan(" + sources[0] + ", " + sources[1] + ")))"
 	case "FSGE":
 		expression = "intBitsToFloat(-ivec4(greaterThanEqual(" + sources[0] + ", " + sources[1] + ")))"
+	case "SLT":
+		expression = "vec4(lessThan(" + sources[0] + ", " + sources[1] + "))"
 	case "SGE":
 		expression = "vec4(greaterThanEqual(" + sources[0] + ", " + sources[1] + "))"
 	case "FSEQ":
 		expression = "intBitsToFloat(-ivec4(equal(" + sources[0] + ", " + sources[1] + ")))"
 	case "FSNE":
-		expression = "intBitsToFloat(-ivec4(notEqual(" + sources[0] + ", " + sources[1] + ")))"
+		if sources[0] == sources[1] {
+			// Mesa lowers isnan(value) to FSNE value, value. Apple's GLSL
+			// optimizer folds the translated self-comparison to false despite
+			// IEEE NaN semantics, while the dedicated builtin remains correct.
+			expression = "intBitsToFloat(-ivec4(isnan(" + sources[0] + ")))"
+		} else {
+			expression = "intBitsToFloat(-ivec4(notEqual(" + sources[0] + ", " + sources[1] + ")))"
+		}
 	case "ISGE":
 		expression = "intBitsToFloat(-ivec4(greaterThanEqual(" +
 			"floatBitsToInt(" + sources[0] + "), floatBitsToInt(" + sources[1] + "))))"
@@ -1113,6 +1324,10 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") + floatBitsToUint(" + sources[1] + "))"
 	case "UMUL":
 		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") * floatBitsToUint(" + sources[1] + "))"
+	case "UDIV":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") / floatBitsToUint(" + sources[1] + "))"
+	case "UMOD":
+		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") % floatBitsToUint(" + sources[1] + "))"
 	case "IDIV":
 		expression = "intBitsToFloat(floatBitsToInt(" + sources[0] + ") / floatBitsToInt(" + sources[1] + "))"
 	case "IMIN":
@@ -1125,6 +1340,12 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 		expression = "uintBitsToFloat(floatBitsToUint(" + sources[0] + ") >> floatBitsToUint(" + sources[1] + "))"
 	case "ISHR":
 		expression = "intBitsToFloat(floatBitsToInt(" + sources[0] + ") >> floatBitsToInt(" + sources[1] + "))"
+	case "IBFE":
+		expression = "intBitsToFloat(bitfieldExtract(floatBitsToInt(" + sources[0] + "), " +
+			"(floatBitsToInt(" + sources[1] + ")).x, (floatBitsToInt(" + sources[2] + ")).x))"
+	case "UBFE":
+		expression = "uintBitsToFloat(bitfieldExtract(floatBitsToUint(" + sources[0] + "), " +
+			"(floatBitsToInt(" + sources[1] + ")).x, (floatBitsToInt(" + sources[2] + ")).x))"
 	case "MAD":
 		expression = "((" + sources[0] + " * " + sources[1] + ") + " + sources[2] + ")"
 	case "LRP":
@@ -1132,6 +1353,10 @@ func (s *tgsiShader) translateInstruction(opcode string, operands []string) (str
 	case "UCMP":
 		expression = "mix(" + sources[2] + ", " + sources[1] +
 			", notEqual(floatBitsToUint(" + sources[0] + "), uvec4(0)))"
+	case "BFI":
+		expression = "uintBitsToFloat(bitfieldInsert(floatBitsToUint(" + sources[0] + "), " +
+			"floatBitsToUint(" + sources[1] + "), (floatBitsToInt(" + sources[2] + ")).x, " +
+			"(floatBitsToInt(" + sources[3] + ")).x))"
 	}
 	if saturate {
 		expression = "clamp(" + expression + ", 0.0, 1.0)"
@@ -1829,8 +2054,13 @@ func (s *tgsiShader) outputName(index int) string {
 			return fmt.Sprintf("clipDistance%d", clipIndex)
 		}
 	}
-	if s.stage == tgsiFragment && strings.HasPrefix(declaration.semantic, "COLOR") {
-		return fmt.Sprintf("fragmentColor%d", index)
+	if s.stage == tgsiFragment && declaration.semantic == "POSITION" {
+		return "fragmentPosition"
+	}
+	if s.stage == tgsiFragment {
+		if colorIndex, ok := fragmentColorSemanticIndex(declaration.semantic); ok {
+			return fmt.Sprintf("fragmentColor%d", colorIndex)
+		}
 	}
 	if s.stage == tgsiFragment && declaration.semantic == "SAMPLEMASK" {
 		return "fragmentSampleMask"
@@ -1913,6 +2143,18 @@ func clipDistanceSemanticIndex(semantic string) (int, bool) {
 	}
 	index, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(semantic, "CLIPDIST["), "]"))
 	return index, err == nil && index >= 0 && index < 2
+}
+
+func fragmentColorSemanticIndex(semantic string) (int, bool) {
+	semantic = strings.TrimSpace(semantic)
+	if semantic == "COLOR" {
+		return 0, true
+	}
+	if !strings.HasPrefix(semantic, "COLOR[") || !strings.HasSuffix(semantic, "]") {
+		return 0, false
+	}
+	index, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(semantic, "COLOR["), "]"))
+	return index, err == nil && index >= 0 && index < 8
 }
 
 func declarationRank(declarations map[int]tgsiDeclaration, index int, _ bool) int {
@@ -2455,17 +2697,31 @@ func (s *tgsiShader) glsl() (string, error) {
 			fmt.Fprintf(&source, "vec4 %s;\n", s.outputName(index))
 			continue
 		}
-		if s.stage == tgsiFragment && strings.HasPrefix(declaration.semantic, "COLOR") {
-			fmt.Fprintf(&source, "layout(location = %d) out vec4 %s;\n", index, s.outputName(index))
-		} else if s.stage == tgsiFragment && declaration.semantic == "SAMPLEMASK" {
+		if s.stage == tgsiFragment {
+			if colorIndex, ok := fragmentColorSemanticIndex(declaration.semantic); ok {
+				fmt.Fprintf(&source, "layout(location = %d) out vec4 %s;\n", colorIndex, s.outputName(index))
+				continue
+			}
+			if declaration.semantic == "POSITION" {
+				fmt.Fprintf(&source, "vec4 %s;\n", s.outputName(index))
+				continue
+			}
+		}
+		if s.stage == tgsiFragment && declaration.semantic == "SAMPLEMASK" {
 			fmt.Fprintf(&source, "vec4 %s;\n", s.outputName(index))
 		} else {
 			fmt.Fprintf(&source, "out vec4 %s;\n", s.outputName(index))
 		}
 	}
 	if s.stage == tgsiFragment && s.fragmentColor0WritesAll {
-		color0, ok := s.outputs[0]
-		if !ok || !strings.HasPrefix(color0.semantic, "COLOR") {
+		color0Found := false
+		for _, declaration := range s.outputs {
+			if index, ok := fragmentColorSemanticIndex(declaration.semantic); ok && index == 0 {
+				color0Found = true
+				break
+			}
+		}
+		if !color0Found {
 			return "", errors.New("FS_COLOR0_WRITES_ALL_CBUFS requires color output zero")
 		}
 		for index := 1; index < 8; index++ {
@@ -2488,6 +2744,25 @@ func (s *tgsiShader) glsl() (string, error) {
 	bool rightNaN = (right.y & 0x7ff00000u) == 0x7ff00000u && ((right.y & 0xfffffu) != 0u || right.x != 0u);
 	bool bothZero = left.x == 0u && (left.y & 0x7fffffffu) == 0u && right.x == 0u && (right.y & 0x7fffffffu) == 0u;
 	return !leftNaN && !rightNaN && (all(equal(left, right)) || bothZero);
+}
+`)
+	}
+	if s.usesCubeGradientFix {
+		source.WriteString(`bool tgsiCubePositiveZ(vec3 coordinate) {
+	return coordinate.z > 0.0 && coordinate.z >= abs(coordinate.x) && coordinate.z >= abs(coordinate.y);
+}
+
+float tgsiCubeGradientLOD(vec3 coordinate, vec3 gradientX, vec3 gradientY, vec2 size) {
+	float major = coordinate.z;
+	float scale = 0.5 / (major * major);
+	vec2 projectedX = vec2(
+		gradientX.x * major - coordinate.x * gradientX.z,
+		-gradientX.y * major + coordinate.y * gradientX.z) * scale;
+	vec2 projectedY = vec2(
+		gradientY.x * major - coordinate.x * gradientY.z,
+		-gradientY.y * major + coordinate.y * gradientY.z) * scale;
+	float footprint = max(length(projectedX * size), length(projectedY * size));
+	return log2(max(footprint, 1.0 / 65536.0));
 }
 `)
 	}
@@ -2585,6 +2860,7 @@ func (s *tgsiShader) glsl() (string, error) {
 		fmt.Fprintf(&source, "uniform %s %s;\n", samplerType, tgsiSamplerName(s.stage, index))
 		fmt.Fprintf(&source, "uniform float %s;\n", tgsiSamplerLODCrossoverName(s.stage, index))
 		fmt.Fprintf(&source, "uniform int %s;\n", tgsiSamplerSampleCountName(s.stage, index))
+		fmt.Fprintf(&source, "uniform int %s;\n", tgsiSamplerLevelCountName(s.stage, index))
 		if view.target == "2D_MSAA" || view.target == "2D_ARRAY_MSAA" {
 			fmt.Fprintf(&source, "uniform ivec4 %s;\n", tgsiSamplerViewSwizzleName(s.stage, index))
 		}
@@ -2662,8 +2938,13 @@ func (s *tgsiShader) glsl() (string, error) {
 	}
 	if s.stage == tgsiFragment {
 		for index := 0; index <= maxDeclarationIndex(s.outputs); index++ {
-			if declaration, ok := s.outputs[index]; ok && declaration.semantic == "SAMPLEMASK" {
-				fmt.Fprintf(&source, "    gl_SampleMask[0] = floatBitsToInt(%s).x;\n", s.outputName(index))
+			if declaration, ok := s.outputs[index]; ok {
+				switch declaration.semantic {
+				case "POSITION":
+					fmt.Fprintf(&source, "    gl_FragDepth = %s.z;\n", s.outputName(index))
+				case "SAMPLEMASK":
+					fmt.Fprintf(&source, "    gl_SampleMask[0] = floatBitsToInt(%s).x;\n", s.outputName(index))
+				}
 			}
 		}
 	}
@@ -2771,6 +3052,10 @@ func tgsiSamplerLODCrossoverName(stage uint32, index int) string {
 
 func tgsiSamplerSampleCountName(stage uint32, index int) string {
 	return tgsiSamplerName(stage, index) + "SampleCount"
+}
+
+func tgsiSamplerLevelCountName(stage uint32, index int) string {
+	return tgsiSamplerName(stage, index) + "LevelCount"
 }
 
 func tgsiSamplerViewSwizzleName(stage uint32, index int) string {

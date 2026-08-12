@@ -95,6 +95,7 @@ type RunRequest struct {
 	NetDevice              *virtio.Net
 	DisplayWidth           uint32
 	DisplayHeight          uint32
+	Accelerated3D          bool
 	OpenGLShareContext     uintptr
 	OpenGLSharePixelFormat uintptr
 	SnapshotDir            string

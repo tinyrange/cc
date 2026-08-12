@@ -13,6 +13,89 @@ func TestTranslateTGSIRejectsUnsupportedOpcode(t *testing.T) {
 	}
 }
 
+func TestTranslateTGSIRoundInstruction(t *testing.T) {
+	const shader = `FRAG
+DCL OUT[0], COLOR
+DCL TEMP[0]
+IMM[0] FLT32 {0.5, 1.5, 2.5, -1.5}
+0: ROUND TEMP[0], IMM[0]
+1: MOV OUT[0], TEMP[0]
+2: END`
+	_, _, err := translateTGSI(shader)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTranslateTGSIBitfieldInstructions(t *testing.T) {
+	const shader = `FRAG
+DCL OUT[0], COLOR
+DCL TEMP[0..2]
+IMM[0] UINT32 {305419896, 2271560481, 8, 12}
+0: IBFE TEMP[0], IMM[0].xxxx, IMM[0].zzzz, IMM[0].wwww
+1: UBFE TEMP[1], IMM[0].yyyy, IMM[0].zzzz, IMM[0].wwww
+2: BFI TEMP[2], IMM[0].xxxx, IMM[0].yyyy, IMM[0].zzzz, IMM[0].wwww
+3: MOV OUT[0], TEMP[2]
+4: END`
+	_, glsl, err := translateTGSI(shader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"intBitsToFloat(bitfieldExtract(floatBitsToInt(immediate0.xxxx)",
+		"uintBitsToFloat(bitfieldExtract(floatBitsToUint(immediate0.yyyy)",
+		"uintBitsToFloat(bitfieldInsert(floatBitsToUint(immediate0.xxxx), floatBitsToUint(immediate0.yyyy)",
+	} {
+		if !strings.Contains(glsl, expected) {
+			t.Fatalf("translated bitfield shader lacks %q:\n%s", expected, glsl)
+		}
+	}
+}
+
+func TestTranslateTGSIUsesIsnanForFloatSelfComparison(t *testing.T) {
+	const shader = `VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL TEMP[0..1]
+0: FSNE TEMP[0], IN[0], IN[0]
+1: FSNE TEMP[1], IN[0], TEMP[0]
+2: MOV OUT[0], TEMP[0]
+3: END`
+	_, glsl, err := translateTGSI(shader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"intBitsToFloat(-ivec4(isnan(attribute0)))",
+		"intBitsToFloat(-ivec4(notEqual(attribute0, temporary[0])))",
+	} {
+		if !strings.Contains(glsl, expected) {
+			t.Fatalf("translated float comparison shader lacks %q:\n%s", expected, glsl)
+		}
+	}
+}
+
+func TestTranslateTGSIIndirectSamplerInstruction(t *testing.T) {
+	const shader = `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0..1]
+DCL SVIEW[0..1], 2D, FLOAT
+DCL TEMP[0]
+DCL ADDR[0]
+0: TEX TEMP[0], TEMP[0], SAMP[ADDR[0].x], 2D
+1: MOV OUT[0], TEMP[0]
+2: END`
+	_, glsl, err := translateTGSI(shader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sampler := range []string{"fragmentSampler0", "fragmentSampler1"} {
+		if !strings.Contains(glsl, "texture("+sampler) {
+			t.Fatalf("translated indirect sampler shader does not sample %s:\n%s", sampler, glsl)
+		}
+	}
+}
+
 func TestTranslateTGSIDoubleArithmeticUsesPackedRegisterPairs(t *testing.T) {
 	const shader = `FRAG
 DCL OUT[0], COLOR
@@ -169,6 +252,31 @@ DCL CONST[0]
 		assignment := fmt.Sprintf("fragmentColor%d = fragmentColor0;", index)
 		if !strings.Contains(glsl, declaration) || !strings.Contains(glsl, assignment) {
 			t.Fatalf("replicated color output %d is incomplete:\n%s", index, glsl)
+		}
+	}
+}
+
+func TestTranslateTGSIMapsFragmentDepthBeforeColorZero(t *testing.T) {
+	const shader = `FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL OUT[0], POSITION
+DCL OUT[1], COLOR
+IMM[0] FLT32 {1.0, 0.0, 0.0, 0.0}
+0: MOV OUT[0].z, IMM[0].x
+1: MOV OUT[1], IMM[0]
+2: END`
+	_, glsl, err := translateTGSI(shader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"layout(location = 0) out vec4 fragmentColor0;",
+		"fragmentPosition.z = (immediate0.xxxx).z;",
+		"gl_FragDepth = fragmentPosition.z;",
+		"fragmentColor7 = fragmentColor0;",
+	} {
+		if !strings.Contains(glsl, expected) {
+			t.Fatalf("translated depth-writing fragment shader lacks %q:\n%s", expected, glsl)
 		}
 	}
 }

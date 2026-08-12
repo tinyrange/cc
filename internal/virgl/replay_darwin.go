@@ -31,7 +31,8 @@ func ReplayCaptureResource(capturePath, outputPath string, frame int, resourceID
 }
 
 // ReplayCaptureResourceLevel renders one mip level of a specific active
-// texture resource at a capture checkpoint.
+// texture resource at a capture checkpoint. Frame zero renders the resource's
+// final contents even when a headless capture has no scanout checkpoints.
 func ReplayCaptureResourceLevel(capturePath, outputPath string, frame int, resourceID, level uint32) (int, error) {
 	if resourceID == 0 {
 		return 0, errors.New("VirGL replay resource ID must be nonzero")
@@ -40,13 +41,14 @@ func ReplayCaptureResourceLevel(capturePath, outputPath string, frame int, resou
 }
 
 // ReplayCaptureResourceDraw renders a resource immediately after a selected
-// draw in one captured frame. Draw numbers start at one within the frame.
+// draw in one captured frame. Draw numbers start at one within the frame;
+// frame zero selects a global draw from a headless capture.
 func ReplayCaptureResourceDraw(capturePath, outputPath string, frame int, resourceID uint32, draw int) (int, error) {
 	if resourceID == 0 {
 		return 0, errors.New("VirGL replay resource ID must be nonzero")
 	}
-	if frame <= 0 || draw <= 0 {
-		return 0, errors.New("VirGL replay frame and draw must be positive")
+	if frame < 0 || draw <= 0 {
+		return 0, errors.New("VirGL replay frame must be nonnegative and draw must be positive")
 	}
 	return replayCapture(capturePath, outputPath, frame, resourceID, 0, draw, 0, nil, nil)
 }
@@ -368,6 +370,11 @@ func replayCapture(capturePath, outputPath string, frame int, resourceID, resour
 			traceFrame := traceOutput != nil && (frame == 0 || checkpoint == frame-1)
 			if (selectedDraw != 0 || traceFrame) && (frame == 0 || checkpoint == frame-1) {
 				for _, item := range commands {
+					if traceFrame && ((item.Opcode == 1 && item.Object == 1) ||
+						(item.Opcode == 2 && item.Object == 1) || item.Opcode == 5 || item.Opcode == 7) {
+						fmt.Fprintf(traceOutput, "command context=%d subcontext=%d opcode=%d object=%d payload=%#x\n",
+							contextID, host.contexts[contextID].activeSubcontext, item.Opcode, item.Object, item.Payload)
+					}
 					if err := host.execute(contextID, []command{item}, resources); err != nil {
 						return 0, err
 					}
@@ -477,16 +484,36 @@ func replayCapture(capturePath, outputPath string, frame int, resourceID, resour
 		}
 	}
 	if selectedResource == nil {
-		if projectiveOutput != nil {
-			return checkpoint, nil
+		if resourceID != 0 && frame == 0 {
+			selectedResource = resources[resourceID]
+			if selectedResource == nil {
+				return 0, fmt.Errorf("VirGL replay refers to unknown final resource %d", resourceID)
+			}
+			if resourceLevel > selectedResource.description.LastLevel {
+				return 0, fmt.Errorf("VirGL resource %d mip level %d exceeds last level %d",
+					resourceID, resourceLevel, selectedResource.description.LastLevel)
+			}
+			width := selectedResource.description.Width >> resourceLevel
+			height := selectedResource.description.Height >> resourceLevel
+			if width == 0 {
+				width = 1
+			}
+			if height == 0 {
+				height = 1
+			}
+			selectedRect = image.Rect(0, 0, int(width), int(height))
+		} else {
+			if projectiveOutput != nil {
+				return checkpoint, nil
+			}
+			if traceOutput != nil && frame == 0 {
+				return checkpoint, nil
+			}
+			if selectedDraw != 0 {
+				return 0, fmt.Errorf("VirGL frame %d has %d draws, requested %d", frame, draw, selectedDraw)
+			}
+			return 0, fmt.Errorf("VirGL capture has %d checkpoints, requested %d", checkpoint, frame)
 		}
-		if traceOutput != nil && frame == 0 {
-			return checkpoint, nil
-		}
-		if selectedDraw != 0 {
-			return 0, fmt.Errorf("VirGL frame %d has %d draws, requested %d", frame, draw, selectedDraw)
-		}
-		return 0, fmt.Errorf("VirGL capture has %d checkpoints, requested %d", checkpoint, frame)
 	}
 	if projectiveOutput != nil {
 		return checkpoint, nil
@@ -597,10 +624,13 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 			depthFormat = surface.resource.description.Format
 		}
 	}
-	stateKey := fmt.Sprintf("%p/%d/%v/%v", context, context.boundVertexElements, context.boundShaders, slots)
-	fmt.Fprintf(output, "draw=%d context=%d subcontext=%d framebuffers=%v framebuffer_resource=%d framebuffer_format=%d depth_surface=%d depth_resource=%d depth_format=%d resource=%d fragment_slots=%v vertex_elements=%d shaders=%v rasterizer=%d dsa=%d\n",
+	stateKey := fmt.Sprintf("%p/%d/%v/%v/%v/%v", context, context.boundVertexElements,
+		context.boundShaders, slots, context.boundSamplerViews[tgsiFragment],
+		context.boundSamplerStates[tgsiFragment])
+	fmt.Fprintf(output, "draw=%d context=%d subcontext=%d framebuffers=%v framebuffer_resource=%d framebuffer_format=%d depth_surface=%d depth_resource=%d depth_format=%d resource=%d fragment_slots=%v fragment_views=%v fragment_samplers=%v vertex_elements=%d shaders=%v rasterizer=%d dsa=%d\n",
 		draw, contextID, root.activeSubcontext, context.colorSurfaces, colorResource,
 		colorFormat, context.depthSurface, depthResource, depthFormat, resourceID, slots,
+		context.boundSamplerViews[tgsiFragment], context.boundSamplerStates[tgsiFragment],
 		context.boundVertexElements, context.boundShaders, context.boundRasterizer, context.boundDSA)
 	fmt.Fprintf(output, "  draw_payload=%v index_resource=%d index_size=%d index_offset=%d\n",
 		command.Payload, context.indexBuffer, context.indexSize, context.indexOffset)
@@ -609,9 +639,10 @@ func traceResourceDraw(output io.Writer, host *darwinHost, contextID uint32, dra
 	fmt.Fprintf(output, "  rasterizer_state=%#x point_size=%g sprite_coordinates=%#x dsa_state=%#x stencil=%#x/%#x stencil_ref=%v\n",
 		rasterizer.state, rasterizer.pointSize, rasterizer.spriteCoordinateEnable,
 		dsa.state, dsa.stencil[0], dsa.stencil[1], context.stencilRef)
-	fmt.Fprintf(output, "  viewport_set=%#x viewport0=%+v scissor0=%+v blend=%d blend_target0=%#x\n",
+	blend := context.blendStates[context.boundBlend]
+	fmt.Fprintf(output, "  viewport_set=%#x viewport0=%+v scissor0=%+v blend=%d blend_state=%#x blend_targets=%#x\n",
 		context.viewportSet, context.viewports[0], context.scissors[0], context.boundBlend,
-		context.blendStates[context.boundBlend].renderTargets[0])
+		blend.state, blend.renderTargets)
 	fmt.Fprintf(output, "  vertex_constants=%v fragment_constants=%v\n",
 		context.constants[tgsiVertex], context.constants[tgsiFragment])
 	for stage := tgsiVertex; stage <= tgsiTessEvaluation; stage++ {

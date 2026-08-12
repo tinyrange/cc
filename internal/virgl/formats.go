@@ -40,6 +40,7 @@ const (
 	virglFormatR8G8B8SRGB        uint32 = 97
 	virglFormatA8B8G8R8SRGB      uint32 = 98
 	virglFormatB8G8R8A8SRGB      uint32 = 100
+	virglFormatB8G8R8X8SRGB      uint32 = 101
 	virglFormatR8G8B8A8SRGB      uint32 = 104
 	virglFormatA8B8G8R8UNorm     uint32 = 121
 	virglFormatR11G11B10Float    uint32 = 124
@@ -47,6 +48,7 @@ const (
 	virglFormatZ32FloatS8X24UInt uint32 = 126
 	virglFormatB10G10R10A2UNorm  uint32 = 131
 	virglFormatR8G8B8X8UNorm     uint32 = 134
+	virglFormatR8G8B8X8SRGB      uint32 = 230
 	virglFormatR32G32B32A32UInt  uint32 = 196
 	virglFormatR8UInt            uint32 = 177
 	virglFormatR8G8UInt          uint32 = 178
@@ -121,7 +123,9 @@ var textureFormatDescriptions = []textureFormatDescription{
 	{virglFormatR8G8B8SRGB, 3, true, true, false, true},
 	{virglFormatA8B8G8R8SRGB, 4, true, true, false, true},
 	{virglFormatB8G8R8A8SRGB, 4, true, true, false, true},
+	{virglFormatB8G8R8X8SRGB, 4, true, true, false, true},
 	{virglFormatR8G8B8A8SRGB, 4, true, true, false, true},
+	{virglFormatR8G8B8X8SRGB, 4, true, true, false, true},
 	{virglFormatA8B8G8R8UNorm, 4, true, true, false, true},
 	{virglFormatR11G11B10Float, 4, true, true, false, true},
 	{virglFormatR9G9B9E5Float, 4, true, false, false, false},

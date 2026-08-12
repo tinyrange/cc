@@ -21,12 +21,21 @@ func TestOpenArenaVertexFormats(t *testing.T) {
 		dataType   uint32
 		normalized bool
 	}{
+		{name: "R10G10B10A2_UNORM", format: 8, components: 4, dataType: glUnsignedInt2101010Rev, normalized: true},
+		{name: "R10G10B10A2_USCALED", format: 123, components: 4, dataType: glUnsignedInt2101010Rev, normalized: false},
+		{name: "R10G10B10A2_SSCALED", format: 172, components: 4, dataType: glInt2101010Rev, normalized: false},
+		{name: "R10G10B10A2_SNORM", format: 173, components: 4, dataType: glInt2101010Rev, normalized: true},
 		{name: "R16G16B16A16_UNORM", format: 51, components: 4, dataType: glUnsignedShort, normalized: true},
+		{name: "R32G32B32_UNORM", format: 34, components: 3, dataType: glUnsignedInt, normalized: true},
+		{name: "R32G32B32_USCALED", format: 38, components: 3, dataType: glUnsignedInt, normalized: false},
+		{name: "R32G32B32_SNORM", format: 42, components: 3, dataType: glInt, normalized: true},
+		{name: "R32G32B32_SSCALED", format: 46, components: 3, dataType: glInt, normalized: false},
 		{name: "R16G16_SSCALED", format: 61, components: 2, dataType: glShort, normalized: false},
 		{name: "R8G8B8A8_USCALED", format: 72, components: 4, dataType: glUnsignedByte, normalized: false},
 		{name: "R8G8B8A8_SNORM", format: 77, components: 4, dataType: glByte, normalized: true},
 		{name: "R8G8B8A8_SSCALED", format: 85, components: 4, dataType: glByte, normalized: false},
 		{name: "R32G32_FIXED", format: 88, components: 2, dataType: glFixed, normalized: false},
+		{name: "R16G16B16_FLOAT", format: 93, components: 3, dataType: glHalfFloat, normalized: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			components, dataType, normalized, ok := vertexFormat(test.format)
@@ -692,6 +701,60 @@ func TestBlitPreservesSingleChannelTextureData(t *testing.T) {
 	}
 }
 
+func TestBlitConvertsBetweenLinearAndSRGBFramebuffers(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		sourceFormat, destFormat uint32
+		want                     byte
+	}{
+		{name: "encode", sourceFormat: virglFormatR8G8B8A8UNorm, destFormat: virglFormatR8G8B8A8SRGB, want: 137},
+		{name: "decode", sourceFormat: virglFormatR8G8B8A8SRGB, destFormat: virglFormatR8G8B8A8UNorm, want: 13},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host := newDarwinTestHost(t)
+			defer host.close()
+			if err := host.createContext(1); err != nil {
+				t.Fatal(err)
+			}
+			source := virtio.GPUResource3D{ID: 1, Target: 2, Format: test.sourceFormat, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+			destination := virtio.GPUResource3D{ID: 2, Target: 2, Format: test.destFormat, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+			if err := host.createResource(source); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.createResource(destination); err != nil {
+				t.Fatal(err)
+			}
+			if err := host.transferToHost(&resource{description: source, data: []byte{64, 64, 64, 255}}, virtio.GPUTransfer3D{
+				ResourceID: source.ID, Stride: 4,
+				Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 1},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			blit := make([]uint32, 21)
+			blit[0] = 0xf
+			blit[3], blit[5] = destination.ID, destination.Format
+			blit[9], blit[10], blit[11] = 1, 1, 1
+			blit[12], blit[14] = source.ID, source.Format
+			blit[18], blit[19], blit[20] = 1, 1, 1
+			if err := host.execute(1, []command{{Opcode: 16, Payload: blit}}, nil); err != nil {
+				t.Fatal(err)
+			}
+			readback := &resource{description: destination, data: make([]byte, 4)}
+			if err := host.transferFromHost(readback, virtio.GPUTransfer3D{
+				ResourceID: destination.ID, Stride: 4,
+				Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 1},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for channel := 0; channel < 3; channel++ {
+				if difference := int(readback.data[channel]) - int(test.want); difference < -1 || difference > 1 {
+					t.Fatalf("blit pixel = %v, want RGB near %d", readback.data, test.want)
+				}
+			}
+		})
+	}
+}
+
 func TestBlitInterpretsA8B8G8R8PackedOrdering(t *testing.T) {
 	host := newDarwinTestHost(t)
 	defer host.close()
@@ -865,6 +928,47 @@ func TestSampleShadingStateUsesBoundFramebufferSampleCount(t *testing.T) {
 	}
 }
 
+func TestFramebufferClearTemporarilyDisablesRasterizerDiscard(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	color := virtio.GPUResource3D{ID: 1, Target: 2, Format: 1, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	if err := host.createResource(color); err != nil {
+		t.Fatal(err)
+	}
+	clear := func(red, green, blue float32) command {
+		return command{Opcode: 7, Payload: []uint32{
+			0x4,
+			math.Float32bits(red),
+			math.Float32bits(green),
+			math.Float32bits(blue),
+			math.Float32bits(1),
+		}}
+	}
+	if err := host.execute(contextID, []command{
+		{Opcode: 1, Object: 8, Payload: []uint32{11, color.ID}},
+		{Opcode: 5, Payload: []uint32{1, 0, 11}},
+		clear(0, 0, 1),
+		{Opcode: 1, Object: 2, Payload: []uint32{12, 1 << 3, math.Float32bits(1), 0, 0, 0, 0, 0, 0}},
+		{Opcode: 2, Object: 2, Payload: []uint32{12}},
+		clear(1, 0, 0),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	pixels, _, err := host.readScanout(&resource{description: color}, image.Rect(0, 0, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pixels, []byte{0, 0, 255, 255}; string(got) != string(want) {
+		t.Fatalf("clear with stale rasterizer discard BGRA = %v, want %v", got, want)
+	}
+}
+
 func TestFramebufferClearUpdatesEveryColorTarget(t *testing.T) {
 	host := newDarwinTestHost(t)
 	defer host.close()
@@ -885,7 +989,7 @@ func TestFramebufferClearUpdatesEveryColorTarget(t *testing.T) {
 		{Opcode: 1, Object: 8, Payload: []uint32{12, second.ID}},
 		{Opcode: 5, Payload: []uint32{2, 0, 11, 12}},
 		{Opcode: 7, Payload: []uint32{
-			0x4, math.Float32bits(1), math.Float32bits(0.25), math.Float32bits(0.5), math.Float32bits(1),
+			0xc, math.Float32bits(1), math.Float32bits(0.25), math.Float32bits(0.5), math.Float32bits(1),
 		}},
 	}, nil); err != nil {
 		t.Fatal(err)
@@ -899,6 +1003,48 @@ func TestFramebufferClearUpdatesEveryColorTarget(t *testing.T) {
 		}
 		if string(pixels) != string(want) {
 			t.Fatalf("color target %d BGRA = %v, want %v", description.ID, pixels, want)
+		}
+	}
+}
+
+func TestFramebufferClearUpdatesOnlySelectedColorTarget(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	first := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	second := virtio.GPUResource3D{ID: 2, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	for _, description := range []virtio.GPUResource3D{first, second} {
+		if err := host.createResource(description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := host.execute(contextID, []command{
+		{Opcode: 1, Object: 8, Payload: []uint32{11, first.ID}},
+		{Opcode: 1, Object: 8, Payload: []uint32{12, second.ID}},
+		{Opcode: 5, Payload: []uint32{2, 0, 11, 12}},
+		{Opcode: 7, Payload: []uint32{0xc, 0, 0, math.Float32bits(1), math.Float32bits(1)}},
+		{Opcode: 7, Payload: []uint32{0x8, math.Float32bits(1), 0, 0, math.Float32bits(1)}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		description virtio.GPUResource3D
+		want        []byte
+	}{
+		{description: first, want: []byte{255, 0, 0, 255}},
+		{description: second, want: []byte{0, 0, 255, 255}},
+	} {
+		pixels, _, err := host.readScanout(&resource{description: test.description}, image.Rect(0, 0, 1, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(pixels) != string(test.want) {
+			t.Fatalf("color target %d BGRA = %v, want %v", test.description.ID, pixels, test.want)
 		}
 	}
 }
@@ -1135,6 +1281,31 @@ func TestEmptyConstantBufferClearForUnadvertisedStageIsAccepted(t *testing.T) {
 	}
 	if err := host.execute(contextID, []command{{Opcode: 12, Payload: []uint32{2, 0}}}, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConstantBuffersAreTrackedByProtocolIndex(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	value := math.Float32bits(640)
+	commands := []command{
+		{Opcode: 12, Payload: []uint32{tgsiVertex, 0, value}},
+		{Opcode: 12, Payload: []uint32{tgsiVertex, 1}},
+	}
+	if err := host.execute(contextID, commands, nil); err != nil {
+		t.Fatal(err)
+	}
+	context := host.contexts[contextID]
+	if got := context.constants[tgsiVertex][0]; len(got) != 1 || got[0] != 640 {
+		t.Fatalf("vertex constant buffer 0 = %v, want [640]", got)
+	}
+	if got := context.constants[tgsiVertex][1]; len(got) != 0 {
+		t.Fatalf("vertex constant buffer 1 = %v, want empty", got)
 	}
 }
 
@@ -1451,6 +1622,36 @@ void main() { result = vec4(%g, %g, %g, %g); }`, red, green, blue, alpha)
 		if difference := int(pixels[4+channel]) - int(wantRight[channel]); difference < -1 || difference > 1 {
 			t.Fatalf("scissored right pixel BGRA = %v, want approximately %v", pixels[4:8], wantRight)
 		}
+	}
+}
+
+func TestIncompleteFramebufferDrawDoesNotAbortFollowingCommands(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	color := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	if err := host.createResource(color); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.execute(contextID, []command{
+		{Opcode: 8, Payload: []uint32{0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}},
+		{Opcode: 1, Object: 8, Payload: []uint32{11, color.ID, color.Format, 0, 0}},
+		{Opcode: 5, Payload: []uint32{1, 0, 11}},
+		{Opcode: 7, Payload: []uint32{1 << 2, math.Float32bits(1), 0, 0, math.Float32bits(1)}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	pixels, _, err := host.readScanout(&resource{description: color}, image.Rect(0, 0, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pixels, []byte{0, 0, 255, 255}; string(got) != string(want) {
+		t.Fatalf("post-error clear BGRA = %v, want %v", got, want)
 	}
 }
 
@@ -1994,6 +2195,64 @@ DCL OUT[0], COLOR
 			if difference := int(pixel[component]) - int(want[component]); difference < -1 || difference > 1 {
 				t.Fatalf("clip mask %#x fragment pixel = %v, want approximately %v\nvertex:\n%s\nfragment:\n%s", clipMask, pixel, want, vertex, fragment)
 			}
+		}
+	}
+}
+
+func TestSRGBFramebufferEncodesFragmentColor(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	color := virtio.GPUResource3D{
+		ID: 1, Target: 2, Format: virglFormatR8G8B8A8SRGB,
+		Width: 1, Height: 1, Depth: 1, ArraySize: 1,
+	}
+	if err := host.createResource(color); err != nil {
+		t.Fatal(err)
+	}
+	context := host.contexts[contextID]
+	context.surfaces[11] = hostSurface{
+		resourceID: color.ID,
+		resource:   host.resources[color.ID],
+		format:     color.Format,
+	}
+	context.colorSurfaces[0] = 11
+
+	const vertex = `#version 410 core
+void main() {
+	vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+	gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}`
+	const fragment = `#version 410 core
+layout(location = 0) out vec4 fragmentColor0;
+void main() { fragmentColor0 = vec4(0.25, 0.25, 0.25, 1.0); }`
+
+	var pixel [4]byte
+	if err := host.dispatch(func() error {
+		if err := host.bindContextFramebuffer(context); err != nil {
+			return err
+		}
+		program, err := host.gl.compileProgram(vertex, fragment)
+		if err != nil {
+			return err
+		}
+		defer host.gl.deleteProgram(program)
+		host.gl.viewport(0, 0, 1, 1)
+		host.gl.useProgram(program)
+		host.gl.bindVertexArray(host.vao)
+		host.gl.drawArrays(glTriangles, 0, 3)
+		host.gl.readPixels(0, 0, 1, 1, glRGBA, glUnsignedByte, glPointer(pixel[:]))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for channel := 0; channel < 3; channel++ {
+		if pixel[channel] < 135 || pixel[channel] > 139 {
+			t.Fatalf("sRGB framebuffer pixel = %v, want encoded RGB near 137", pixel)
 		}
 	}
 }
@@ -2654,6 +2913,98 @@ void main() {
 	}
 }
 
+func TestTextureSizeQueryRendersDimensionsAndAccessibleLevels(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	color := virtio.GPUResource3D{ID: 1, Target: 2, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	positions := virtio.GPUResource3D{ID: 2, Target: 0, Width: 24}
+	texture := virtio.GPUResource3D{ID: 3, Target: 2, Format: 67, Width: 4, Height: 2, Depth: 1, ArraySize: 1, LastLevel: 2}
+	for _, description := range []virtio.GPUResource3D{color, positions, texture} {
+		if err := host.createResource(description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	positionWords := []uint32{
+		math.Float32bits(-1), math.Float32bits(-1),
+		math.Float32bits(3), math.Float32bits(-1),
+		math.Float32bits(-1), math.Float32bits(3),
+	}
+	positionBytes := make([]byte, len(positionWords)*4)
+	for index, word := range positionWords {
+		binary.LittleEndian.PutUint32(positionBytes[index*4:], word)
+	}
+	if err := host.transferToHost(&resource{description: positions, data: positionBytes}, virtio.GPUTransfer3D{
+		ResourceID: positions.ID,
+		Box:        virtio.GPUBox{Width: positions.Width, Height: 1, Depth: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	identitySwizzle := uint32(0 | (1 << 3) | (2 << 6) | (3 << 9))
+	if err := host.execute(contextID, []command{{
+		Opcode: 1, Object: 6,
+		Payload: []uint32{30, texture.ID, texture.Format, 0, texture.LastLevel << 8, identitySwizzle},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	fragmentTGSI := `FRAG
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0..1]
+IMM[0] INT32 {0, 0, 0, 0}
+IMM[1] FLT32 {0.25, 0.5, 0.33333334, 0.0}
+IMM[2] FLT32 {0.0, 0.0, 0.0, 1.0}
+0: TXQ TEMP[0], IMM[0], SAMP[0], 2D
+1: I2F TEMP[1], TEMP[0]
+2: MUL OUT[0].xy, TEMP[1], IMM[1]
+3: MUL OUT[0].z, TEMP[1].wwww, IMM[1].zzzz
+4: MOV OUT[0].w, IMM[2].wwww
+5: END
+`
+	_, fragmentGLSL, err := translateTGSI(fragmentTGSI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := host.contexts[contextID]
+	context.surfaces[11] = hostSurface{resourceID: color.ID, resource: host.resources[color.ID]}
+	context.colorSurfaces[0] = 11
+	context.vertexElements[12] = []hostVertexElement{{bufferIndex: 0, format: 29}}
+	context.boundVertexElements = 12
+	context.vertexBuffers[0] = hostVertexBuffer{stride: 8, resourceID: positions.ID, resource: host.resources[positions.ID]}
+	context.shaders[20] = hostShader{stage: tgsiVertex, source: `#version 410 core
+layout(location = 0) in vec2 position;
+void main() { gl_Position = vec4(position, 0.0, 1.0); }`}
+	context.shaders[21] = hostShader{stage: tgsiFragment, source: fragmentGLSL}
+	context.boundShaders[tgsiVertex] = 20
+	context.boundShaders[tgsiFragment] = 21
+	context.boundSamplerViews[tgsiFragment][0] = 30
+
+	if err := host.dispatch(func() error {
+		if err := host.bindContextFramebuffer(context); err != nil {
+			return err
+		}
+		host.gl.viewport(0, 0, 1, 1)
+		host.gl.clearColor(0, 0, 0, 1)
+		host.gl.clear(glColorBufferBit)
+		return host.draw(context, []uint32{0, 3, 4, 0})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pixels, _, err := host.readScanout(&resource{description: color}, image.Rect(0, 0, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{255, 255, 255, 255}; string(pixels) != string(want) {
+		t.Fatalf("texture query result BGRA = %v, want %v", pixels, want)
+	}
+}
+
 func TestUnusedSamplerViewDoesNotOverrideActiveStage(t *testing.T) {
 	host := newDarwinTestHost(t)
 	defer host.close()
@@ -3236,6 +3587,43 @@ void main() {
 	}
 	if got, want := pixels, []byte{0, 0, 255, 255, 255, 0, 0, 255}; string(got) != string(want) {
 		t.Fatalf("independent sampler pixels BGRA = %v, want %v", got, want)
+	}
+}
+
+func TestSamplerStateAppliesMaximumAnisotropy(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	statePayload := func(handle, anisotropy uint32) []uint32 {
+		return []uint32{handle, anisotropy << 20, 0, 0, math.Float32bits(1000), 0, 0, 0, 0}
+	}
+	if err := host.execute(contextID, []command{
+		{Opcode: 1, Object: 7, Payload: statePayload(10, 0)},
+		{Opcode: 1, Object: 7, Payload: statePayload(11, 16)},
+		{Opcode: 1, Object: 7, Payload: statePayload(12, 31)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := host.dispatch(func() error {
+		for _, test := range []struct {
+			handle uint32
+			want   float32
+		}{{10, 1}, {11, 16}, {12, capsetMaxAnisotropy}} {
+			var got float32
+			host.gl.getSamplerParameterfv(host.contexts[contextID].samplerStates[test.handle].id,
+				glTextureMaxAnisotropyExt, &got)
+			if got != test.want {
+				return fmt.Errorf("sampler %d anisotropy = %v, want %v", test.handle, got, test.want)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -4111,14 +4499,14 @@ func TestZeroStridePartialTextureTransferUsesFullMipWidth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// readScanout returns BGRA rows from the top of the image. Both transferred
-	// rows must retain their own colors instead of consuming the padding between
-	// full-width rows.
+	// readScanout returns BGRA rows in guest scanout order, with GL y=0 first.
+	// Both transferred rows must retain their own colors instead of consuming
+	// the padding between full-width rows.
 	got := append([]byte(nil), pixels[4:12]...)
 	got = append(got, pixels[20:28]...)
 	want := []byte{
-		255, 0, 0, 255, 255, 255, 255, 255,
 		0, 0, 255, 255, 0, 255, 0, 255,
+		255, 0, 0, 255, 255, 255, 255, 255,
 	}
 	if string(got) != string(want) {
 		t.Fatalf("zero-stride partial texture pixels BGRA = %v, want %v", got, want)
@@ -4382,5 +4770,246 @@ func TestResourceCopyRegionCopiesMultipleArrayLayers(t *testing.T) {
 	}
 	if string(readback.data) != string(want) {
 		t.Fatalf("copied array texture layers = %v, want %v", readback.data, want)
+	}
+}
+
+func TestBlitCopiesMultipleArrayLayers(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	src := virtio.GPUResource3D{ID: 1, Target: 7, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 2}
+	dst := virtio.GPUResource3D{ID: 2, Target: 7, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 2}
+	for _, description := range []virtio.GPUResource3D{src, dst} {
+		if err := host.createResource(description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []byte{19, 83, 211, 255, 7, 131, 41, 255}
+	if err := host.transferToHost(&resource{description: src, data: want}, virtio.GPUTransfer3D{
+		ResourceID: src.ID, Stride: 4, LayerStride: 4,
+		Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blit := make([]uint32, 21)
+	blit[0] = 0xf
+	blit[3], blit[5] = dst.ID, dst.Format
+	blit[9], blit[10], blit[11] = 1, 1, 2
+	blit[12], blit[14] = src.ID, src.Format
+	blit[18], blit[19], blit[20] = 1, 1, 2
+	if err := host.execute(contextID, []command{{Opcode: 16, Payload: blit}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	readback := &resource{description: dst, data: make([]byte, len(want))}
+	if err := host.transferFromHost(readback, virtio.GPUTransfer3D{
+		ResourceID: dst.ID, Stride: 4, LayerStride: 4,
+		Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if string(readback.data) != string(want) {
+		t.Fatalf("blitted array texture layers = %v, want %v", readback.data, want)
+	}
+}
+
+func TestBlitScalesArrayLayerRanges(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+
+	const contextID = 1
+	if err := host.createContext(contextID); err != nil {
+		t.Fatal(err)
+	}
+	src := virtio.GPUResource3D{ID: 1, Target: 7, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 2}
+	dst := virtio.GPUResource3D{ID: 2, Target: 7, Format: 67, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	for _, description := range []virtio.GPUResource3D{src, dst} {
+		if err := host.createResource(description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourcePixels := []byte{255, 0, 0, 255, 0, 255, 0, 255}
+	if err := host.transferToHost(&resource{description: src, data: sourcePixels}, virtio.GPUTransfer3D{
+		ResourceID: src.ID, Stride: 4, LayerStride: 4,
+		Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blit := make([]uint32, 21)
+	blit[0] = 0xf
+	blit[3], blit[5] = dst.ID, dst.Format
+	blit[9], blit[10], blit[11] = 1, 1, 1
+	blit[12], blit[14] = src.ID, src.Format
+	blit[18], blit[19], blit[20] = 1, 1, 2
+	if err := host.execute(contextID, []command{{Opcode: 16, Payload: blit}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	readback := &resource{description: dst, data: make([]byte, 4)}
+	if err := host.transferFromHost(readback, virtio.GPUTransfer3D{
+		ResourceID: dst.ID, Stride: 4, LayerStride: 4,
+		Box: virtio.GPUBox{Width: 1, Height: 1, Depth: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := readback.data, sourcePixels[4:]; string(got) != string(want) {
+		t.Fatalf("scaled array texture layer = %v, want %v", got, want)
+	}
+}
+
+func TestResourceCopyRegionCopiesSharedExponentTextures(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		target    uint32
+		depth     uint32
+		arraySize uint32
+		srcLayer  uint32
+	}{
+		{name: "2D", target: 2, depth: 1, arraySize: 1},
+		{name: "cube", target: 4, depth: 1, arraySize: 1, srcLayer: 1},
+		{name: "3D", target: 3, depth: 2, arraySize: 1, srcLayer: 1},
+		{name: "2D-array", target: 7, depth: 1, arraySize: 2, srcLayer: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host := newDarwinTestHost(t)
+			defer host.close()
+
+			const contextID = 1
+			if err := host.createContext(contextID); err != nil {
+				t.Fatal(err)
+			}
+			src := virtio.GPUResource3D{
+				ID: 1, Target: test.target, Format: virglFormatR9G9B9E5Float,
+				Width: 3, Height: 3, Depth: test.depth, ArraySize: test.arraySize,
+			}
+			dst := src
+			dst.ID = 2
+			for _, description := range []virtio.GPUResource3D{src, dst} {
+				if err := host.createResource(description); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			want := make([]byte, 2*2*4)
+			for index := range 4 {
+				binary.LittleEndian.PutUint32(want[index*4:], 15<<27|uint32(index+3)<<18|uint32(index+2)<<9|uint32(index+1))
+			}
+			if err := host.dispatch(func() error {
+				resource := host.resources[src.ID]
+				host.gl.bindTexture(resource.textureTarget, resource.texture)
+				switch test.target {
+				case 3, 7:
+					host.gl.texSubImage3D(resource.textureTarget, 0, 1, 0, int32(test.srcLayer), 2, 2, 1,
+						glRGB, glUnsignedInt5999Rev, glPointer(want))
+				case 4:
+					host.gl.texSubImage2D(glTextureCubeMapPositiveX+test.srcLayer, 0, 1, 0, 2, 2,
+						glRGB, glUnsignedInt5999Rev, glPointer(want))
+				default:
+					host.gl.texSubImage2D(resource.textureTarget, 0, 1, 0, 2, 2,
+						glRGB, glUnsignedInt5999Rev, glPointer(want))
+				}
+				if glError := host.gl.getError(); glError != 0 {
+					return fmt.Errorf("source upload GL error %#x", glError)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			copyRegion := []uint32{
+				dst.ID, 0, 0, 0, 0,
+				src.ID, 0, 1, 0, test.srcLayer,
+				2, 2, 1,
+			}
+			if err := host.execute(contextID, []command{{Opcode: 17, Payload: copyRegion}}, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			got := make([]byte, 3*3*4)
+			if err := host.dispatch(func() error {
+				resource := host.resources[dst.ID]
+				host.gl.bindTexture(resource.textureTarget, resource.texture)
+				imageTarget := resource.textureTarget
+				if test.target == 4 {
+					imageTarget = glTextureCubeMapPositiveX
+				}
+				host.gl.getTexImage(imageTarget, 0, glRGB, glUnsignedInt5999Rev, glPointer(got))
+				if glError := host.gl.getError(); glError != 0 {
+					return fmt.Errorf("destination readback GL error %#x", glError)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for row := range 2 {
+				if actual := got[row*3*4 : row*3*4+2*4]; string(actual) != string(want[row*2*4:(row+1)*2*4]) {
+					t.Fatalf("copied row %d = %x, want %x", row, actual, want[row*2*4:(row+1)*2*4])
+				}
+			}
+		})
+	}
+}
+
+func TestPartialNativeScanoutPublishesCompleteFrame(t *testing.T) {
+	host := newDarwinTestHost(t)
+	defer host.close()
+	host.sharedPresentation = true
+
+	description := virtio.GPUResource3D{
+		ID: 1, Target: 2, Format: 67,
+		Width: 4, Height: 2, Depth: 1, ArraySize: 1,
+	}
+	if err := host.createResource(description); err != nil {
+		t.Fatal(err)
+	}
+	pixels := []byte{
+		1, 2, 3, 255, 11, 12, 13, 255, 21, 22, 23, 255, 31, 32, 33, 255,
+		41, 42, 43, 255, 51, 52, 53, 255, 61, 62, 63, 255, 71, 72, 73, 255,
+	}
+	if err := host.dispatch(func() error {
+		resource := host.resources[description.ID]
+		host.gl.bindTexture(glTexture2D, resource.texture)
+		host.gl.texSubImage2D(glTexture2D, 0, 0, 0, 4, 2, glRGBA, glUnsignedByte, glPointer(pixels))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	damage := image.Rect(1, 0, 3, 1)
+	frame, available, err := host.nativeScanout(&resource{description: description}, damage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("native frame is unavailable")
+	}
+	defer frame.ReleaseFrame(0)
+	if frame.Width != 4 || frame.Height != 2 {
+		t.Fatalf("native frame size = %dx%d, want 4x2", frame.Width, frame.Height)
+	}
+	if frame.Damage != damage {
+		t.Fatalf("native frame damage = %v, want %v", frame.Damage, damage)
+	}
+
+	got := make([]byte, len(pixels))
+	if err := host.dispatch(func() error {
+		host.gl.bindFramebuffer(glReadFramebuffer, host.blitReadFBO)
+		host.gl.framebufferTexture(glReadFramebuffer, glColorAttachment0, glTexture2D, frame.Texture, 0)
+		if status := host.gl.checkFramebuffer(glReadFramebuffer); status != glFramebufferComplete {
+			return fmt.Errorf("native frame framebuffer status %#x", status)
+		}
+		host.gl.finish()
+		host.gl.readPixels(0, 0, 4, 2, glRGBA, glUnsignedByte, glPointer(got))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), pixels[16:]...), pixels[:16]...)
+	if string(got) != string(want) {
+		t.Fatalf("native frame pixels = %v, want complete vertically flipped frame %v", got, want)
 	}
 }

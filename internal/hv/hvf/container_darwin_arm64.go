@@ -1286,12 +1286,15 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			vm.Close()
 			return nil, fmt.Errorf("create display: %w", err)
 		}
-		renderer, err := virgl.NewHostRendererWithShareGroup(req.OpenGLShareContext, req.OpenGLSharePixelFormat)
-		if err != nil {
-			vm.Close()
-			return nil, fmt.Errorf("create VirGL renderer: %w", err)
+		gpu := virtio.NewGPU(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer)
+		if req.Accelerated3D {
+			renderer, err := virgl.NewHostRendererWithShareGroup(req.OpenGLShareContext, req.OpenGLSharePixelFormat)
+			if err != nil {
+				vm.Close()
+				return nil, fmt.Errorf("create experimental VirGL renderer: %w", err)
+			}
+			gpu = virtio.NewGPUWithRenderer(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer, renderer)
 		}
-		gpu := virtio.NewGPUWithRenderer(arm64vm.GPUBase, arm64vm.GPUSize, arm64vm.GPUIRQ, framebuffer, renderer)
 		displayGPU = gpu
 		keyboard := virtio.NewKeyboardInput(arm64vm.KeyboardBase, arm64vm.KeyboardSize, arm64vm.KeyboardIRQ)
 		pointer := virtio.NewAbsolutePointerInput(arm64vm.PointerBase, arm64vm.PointerSize, arm64vm.PointerIRQ, req.DisplayWidth, req.DisplayHeight)

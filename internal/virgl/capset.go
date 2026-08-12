@@ -18,6 +18,7 @@ const (
 	capsetMaxArrayLayers      = 2048
 	capsetMaxTextureBuffer    = 64 * 1024
 	capsetMaxUniformBlockSize = 64 * 1024
+	capsetMaxAnisotropy       = 16
 )
 
 func buildCapsetV1() []byte {
@@ -57,7 +58,14 @@ func buildCapsetV1() []byte {
 			setFormat(depthStencilMaskOffset, description.format)
 		}
 	}
-	for _, format := range []uint32{28, 29, 30, 31, 64, 65, 66, 67, 87, 88, 89, 90} {
+	for _, format := range []uint32{
+		8, 123, 172, 173,
+		28, 29, 30, 31,
+		32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+		48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+		64, 65, 66, 67, 69, 70, 71, 72, 74, 75, 76, 77, 82, 83, 84, 85,
+		87, 88, 89, 90, 91, 92, 93, 94,
+	} {
 		setFormat(vertexBufferMaskOffset, format)
 	}
 	for format := virglFormatR8UInt; format <= virglFormatR32G32B32A32SInt; format++ {
@@ -142,6 +150,8 @@ func buildCapsetV2() []byte {
 	put(maxVertexOutputsOffset, 16)
 	put(maxVertexAttribsOffset, 16)
 	put(maxShaderPatchOffset, 16)
+	put(capsetV2LimitsStart+56, ^uint32(7)) // minimum program texel offset: -8
+	put(capsetV2LimitsStart+60, 7)          // maximum program texel offset
 	put(capsetV2LimitsStart+64, ^uint32(7)) // minimum texture gather offset: -8
 	put(capsetV2LimitsStart+68, 7)          // maximum texture gather offset
 	put(maxTexture2DSizeOffset, capsetMaxTexture2D)
@@ -164,7 +174,7 @@ func buildCapsetV2() []byte {
 		}
 	}
 	copy(data[rendererOffset:rendererOffset+64], []byte("vmsh Darwin VirGL"))
-	putFloat(maxAnisotropyOffset, 1)
+	putFloat(maxAnisotropyOffset, capsetMaxAnisotropy)
 	put(maxShaderSamplersOffset, 16)
 	for _, description := range textureFormatDescriptions {
 		if description.render {

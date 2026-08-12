@@ -20,13 +20,12 @@ func TestStreamoutCapturesGuestVertexOutputs(t *testing.T) {
 	if err := host.createContext(contextID); err != nil {
 		t.Fatal(err)
 	}
-	positions := virtio.GPUResource3D{ID: 1, Target: 0, Width: 48}
+	positions := virtio.GPUResource3D{ID: 1, Target: 0, Width: 96}
 	captures := [4]virtio.GPUResource3D{}
 	for index := range captures {
-		captures[index] = virtio.GPUResource3D{ID: uint32(index + 2), Target: 0, Width: 12}
+		captures[index] = virtio.GPUResource3D{ID: uint32(index + 2), Target: 0, Width: 24}
 	}
-	color := virtio.GPUResource3D{ID: 6, Target: 2, Format: virglFormatR8G8B8A8UNorm, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
-	resources := []virtio.GPUResource3D{positions, color}
+	resources := []virtio.GPUResource3D{positions}
 	resources = append(resources, captures[:]...)
 	for _, description := range resources {
 		if err := host.createResource(description); err != nil {
@@ -34,7 +33,14 @@ func TestStreamoutCapturesGuestVertexOutputs(t *testing.T) {
 		}
 	}
 	want := make([]byte, positions.Width)
-	values := []float32{-1, -0.5, 0.25, 0.75, 1, 0, -0.25, 0.5, 0.125, -0.75, 0.625, -0.375}
+	values := []float32{
+		-1, -0.5, 0.25, 0.75,
+		1, 0, -0.25, 0.5,
+		0.125, -0.75, 0.625, -0.375,
+		0.875, -0.625, 0.375, -0.125,
+		-0.875, 0.625, -0.375, 0.125,
+		0.5, -1, 1, -0.5,
+	}
 	for index, value := range values {
 		binary.LittleEndian.PutUint32(want[index*4:], math.Float32bits(value))
 	}
@@ -85,8 +91,6 @@ void main() { color = vec4(0.0); }`,
 		{Opcode: 1, Object: 5, Payload: []uint32{30, 0, 0, 0, virglFormatR32G32B32A32Float}},
 		{Opcode: 2, Object: 5, Payload: []uint32{30}},
 		{Opcode: 6, Payload: []uint32{16, 0, positions.ID}},
-		{Opcode: 1, Object: 8, Payload: []uint32{35, color.ID}},
-		{Opcode: 5, Payload: []uint32{1, 0, 35}},
 		{Opcode: 1, Object: 10, Payload: []uint32{40, captures[0].ID, 0, captures[0].Width}},
 		{Opcode: 1, Object: 10, Payload: []uint32{41, captures[1].ID, 0, captures[1].Width}},
 		{Opcode: 1, Object: 10, Payload: []uint32{42, captures[2].ID, 0, captures[2].Width}},
@@ -94,7 +98,11 @@ void main() { color = vec4(0.0); }`,
 		{Opcode: 25, Payload: []uint32{0, 40, 41, 42, 43}},
 		{Opcode: 1, Object: 2, Payload: []uint32{50, 1 << 3, math.Float32bits(1), 0, 0, 0, 0, 0, 0}},
 		{Opcode: 2, Object: 2, Payload: []uint32{50}},
-		{Opcode: 8, Payload: []uint32{0, 3, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0}},
+		{Opcode: 8, Payload: []uint32{0, 2, 1, 0, 1, 0, 0, 0, 0, 0, 2, 0}},
+		{Opcode: 8, Payload: []uint32{2, 2, 1, 0, 1, 0, 0, 0, 0, 0, 2, 0}},
+		{Opcode: 25, Payload: []uint32{0}},
+		{Opcode: 25, Payload: []uint32{0xf, 40, 41, 42, 43}},
+		{Opcode: 8, Payload: []uint32{4, 2, 1, 0, 1, 0, 0, 0, 0, 0, 2, 0}},
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +127,7 @@ void main() { color = vec4(0.0); }`,
 			t.Fatal(err)
 		}
 		expected := make([]byte, capture.Width)
-		for vertex := 0; vertex < 3; vertex++ {
+		for vertex := 0; vertex < 6; vertex++ {
 			binary.LittleEndian.PutUint32(expected[vertex*4:], math.Float32bits(values[vertex*4+component]))
 		}
 		if string(readback.data) != string(expected) {

@@ -38,7 +38,8 @@ func TestCapsetAdvertisesOnlyImplementedModernTextureFormats(t *testing.T) {
 		virglFormatR16SNorm, virglFormatR16G16SNorm, virglFormatR16G16B16SNorm, virglFormatR16G16B16A16SNorm,
 		virglFormatR16Float, virglFormatR16G16Float, virglFormatR16G16B16A16Float,
 		virglFormatR32Float, virglFormatR32G32Float, virglFormatR32G32B32A32Float,
-		virglFormatA8B8G8R8SRGB, virglFormatB8G8R8A8SRGB, virglFormatR8G8B8A8SRGB,
+		virglFormatA8B8G8R8SRGB, virglFormatB8G8R8A8SRGB, virglFormatB8G8R8X8SRGB,
+		virglFormatR8G8B8A8SRGB, virglFormatR8G8B8X8SRGB,
 		virglFormatR10G10B10A2UNorm, virglFormatB10G10R10A2UNorm,
 		virglFormatR11G11B10Float,
 		virglFormatR32G32B32A32UInt, virglFormatR32G32B32A32SInt,
@@ -97,6 +98,24 @@ func TestCapsetAdvertisesImplementedArrayTexturesAndMultipleRenderTargets(t *tes
 	}
 }
 
+func TestCapsetAdvertisesImplementedVertexFormats(t *testing.T) {
+	capset := buildCapsetV1()
+	const vertexBufferOffset = 4 + 64*3
+	for _, format := range []uint32{
+		8, 123, 172, 173,
+		28, 29, 30, 31,
+		32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+		48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+		64, 65, 66, 67, 69, 70, 71, 72, 74, 75, 76, 77, 82, 83, 84, 85,
+		87, 88, 89, 90, 91, 92, 93, 94,
+	} {
+		word := binary.LittleEndian.Uint32(capset[vertexBufferOffset+int(format/32)*4:])
+		if word&(1<<(format%32)) == 0 {
+			t.Fatalf("implemented vertex format %d is absent", format)
+		}
+	}
+}
+
 func TestCapsetV2AdvertisesNativeMultisampleFormats(t *testing.T) {
 	capset := buildCapsetV2()
 	const multisampleFormatsOffset = capsetV2LimitsStart + 460
@@ -115,12 +134,17 @@ func TestCapsetV2AdvertisesNativeMultisampleFormats(t *testing.T) {
 	}
 }
 
-func TestCapsetV2AdvertisesCoreTextureGatherOffsetRange(t *testing.T) {
+func TestCapsetV2AdvertisesCoreTextureOffsetRanges(t *testing.T) {
 	capset := buildCapsetV2()
-	minOffset := int32(binary.LittleEndian.Uint32(capset[capsetV2LimitsStart+64:]))
-	maxOffset := int32(binary.LittleEndian.Uint32(capset[capsetV2LimitsStart+68:]))
-	if minOffset != -8 || maxOffset != 7 {
-		t.Fatalf("texture gather offset range = %d..%d, want -8..7", minOffset, maxOffset)
+	for name, offset := range map[string]int{
+		"program texel":  56,
+		"texture gather": 64,
+	} {
+		minOffset := int32(binary.LittleEndian.Uint32(capset[capsetV2LimitsStart+offset:]))
+		maxOffset := int32(binary.LittleEndian.Uint32(capset[capsetV2LimitsStart+offset+4:]))
+		if minOffset != -8 || maxOffset != 7 {
+			t.Fatalf("%s offset range = %d..%d, want -8..7", name, minOffset, maxOffset)
+		}
 	}
 }
 
@@ -191,8 +215,8 @@ func TestCapsetV2PublishesBoundedUniformBufferLimits(t *testing.T) {
 	if got := string(capset[rendererOffset : rendererOffset+17]); got != "vmsh Darwin VirGL" {
 		t.Fatalf("capset v2 renderer = %q", got)
 	}
-	if got := math.Float32frombits(binary.LittleEndian.Uint32(capset[maxAnisotropyOffset:])); got != 1 {
-		t.Fatalf("capset v2 max anisotropy = %v, want 1", got)
+	if got := math.Float32frombits(binary.LittleEndian.Uint32(capset[maxAnisotropyOffset:])); got != capsetMaxAnisotropy {
+		t.Fatalf("capset v2 max anisotropy = %v, want %v", got, capsetMaxAnisotropy)
 	}
 }
 

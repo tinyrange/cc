@@ -127,6 +127,7 @@ func (h *captureHost) destroyContext(id uint32) error {
 
 func (h *captureHost) createResource(description virtio.GPUResource3D) error {
 	if err := h.next.createResource(description); err != nil {
+		fmt.Fprintf(os.Stderr, "VirGL capture rejected resource %+v: %v\n", description, err)
 		return err
 	}
 	return h.writeRecord(captureCreateResource, words(
@@ -351,6 +352,8 @@ func SummarizeCapture(path string, output io.Writer) error {
 	dsa := make(map[uint32]int)
 	vertexFormats := make(map[uint32]int)
 	resourceFormats := make(map[uint32]int)
+	samplerViewFormats := make(map[uint32]int)
+	surfaceFormats := make(map[uint32]int)
 	resourceFormatIDs := make(map[uint32][]uint32)
 	scanouts := make(map[uint32]int)
 	resourceSizes := make(map[uint32][3]uint32)
@@ -471,6 +474,14 @@ func SummarizeCapture(path string, output io.Writer) error {
 							count.instanceDivisors++
 						}
 					}
+				case command.Opcode == 1 && command.Object == 6 && len(command.Payload) == 6:
+					samplerViewFormats[command.Payload[2]&0x00ffffff]++
+				case command.Opcode == 1 && command.Object == 8:
+					if len(command.Payload) == 5 {
+						surfaceFormats[command.Payload[2]]++
+					} else if len(command.Payload) == 2 {
+						surfaceFormats[resourceFormatByID[command.Payload[1]]]++
+					}
 				case command.Opcode == 8 && len(command.Payload) >= 12:
 					count.draws++
 					modes[command.Payload[2]]++
@@ -544,6 +555,8 @@ func SummarizeCapture(path string, output io.Writer) error {
 	printUint32Counts(output, "dsa", dsa)
 	printUint32Counts(output, "vertex_formats", vertexFormats)
 	printUint32Counts(output, "resource_formats", resourceFormats)
+	printUint32Counts(output, "sampler_view_formats", samplerViewFormats)
+	printUint32Counts(output, "surface_formats", surfaceFormats)
 	formats := make([]uint32, 0, len(resourceFormatIDs))
 	for format := range resourceFormatIDs {
 		formats = append(formats, format)
@@ -555,9 +568,25 @@ func SummarizeCapture(path string, output io.Writer) error {
 			fmt.Fprintf(output, "resource_format_%#x_ids=%v\n", format, ids)
 		}
 	}
+	for _, id := range sortedUint32KeysFromSizes(resourceSizes) {
+		dimensions := resourceSizes[id]
+		if dimensions[0] != 0 && dimensions[1] >= 1024 && dimensions[2] >= 768 {
+			fmt.Fprintf(output, "active_large_texture=%d target=%#x format=%#x size=%dx%d\n",
+				id, dimensions[0], resourceFormatByID[id], dimensions[1], dimensions[2])
+		}
+	}
 	printUint32Counts(output, "scanouts", scanouts)
 	printUint32Counts(output, "final_scanout_sized_textures", matchingScanoutResources)
 	return nil
+}
+
+func sortedUint32KeysFromSizes(values map[uint32][3]uint32) []uint32 {
+	keys := make([]uint32, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
 }
 
 func printUint32Counts(output io.Writer, label string, counts map[uint32]int) {

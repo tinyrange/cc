@@ -592,11 +592,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	runReq.Mounts = append(runReq.Mounts, persistentMounts...)
 	runReq.Mounts = append(runReq.Mounts, hostMountsFromContext(ctx)...)
 	runReq.Env = append([]string(nil), req.Env...)
-	runReq.DisplayWidth = displayWidthDarwin(req.Display)
-	runReq.DisplayHeight = displayHeightDarwin(req.Display)
-	if runReq.DisplayWidth != 0 && runReq.DisplayHeight != 0 && b.openGLShareGroup != nil {
-		runReq.OpenGLShareContext, runReq.OpenGLSharePixelFormat = b.openGLShareGroup()
-	}
+	b.configureDisplayRequest(&runReq, req.Display)
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	applyStartupSnapshotOptions(&runReq, req.SnapshotDir, req.RestoreSnapshot)
@@ -621,7 +617,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		} else {
 			shares = nil
 		}
-		return vmruntime.RunRequest{
+		runReq := vmruntime.RunRequest{
 			Kernel:            append([]byte(nil), bundle.Kernel...),
 			KernelRelease:     bundle.KernelRelease,
 			ModuleSymvers:     append([]byte(nil), bundle.ModuleSymvers...),
@@ -641,12 +637,12 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			Persistent:        true,
 			Network:           network.guestInitConfig(),
 			NetDevice:         networkDeviceDarwin(network),
-			DisplayWidth:      displayWidthDarwin(req.Display),
-			DisplayHeight:     displayHeightDarwin(req.Display),
 			SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 			RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 			UnixTime:          time.Now().Unix(),
-		}, ctx.Err()
+		}
+		b.configureDisplayRequest(&runReq, req.Display)
+		return runReq, ctx.Err()
 	}
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
@@ -710,7 +706,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			return vmruntime.RunRequest{}, err
 		}
 	}
-	return vmruntime.RunRequest{
+	runReq := vmruntime.RunRequest{
 		Kernel:            kernel,
 		KernelRelease:     kernelMetadata.Release,
 		ModuleSymvers:     kernelMetadata.ModuleSymvers,
@@ -731,12 +727,12 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Persistent:        true,
 		Network:           network.guestInitConfig(),
 		NetDevice:         networkDeviceDarwin(network),
-		DisplayWidth:      displayWidthDarwin(req.Display),
-		DisplayHeight:     displayHeightDarwin(req.Display),
 		SnapshotDir:       strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot:   strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:          time.Now().Unix(),
-	}, ctx.Err()
+	}
+	b.configureDisplayRequest(&runReq, req.Display)
+	return runReq, ctx.Err()
 }
 
 func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req client.StartInstanceRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
@@ -777,7 +773,7 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 			return vmruntime.RunRequest{}, err
 		}
 	}
-	return vmruntime.RunRequest{
+	runReq := vmruntime.RunRequest{
 		Image:           image,
 		InitSystem:      req.InitSystem,
 		Env:             append([]string(nil), req.Env...),
@@ -792,12 +788,24 @@ func (b *runtimeBackend) buildBlankRestoreRequest(ctx context.Context, req clien
 		Persistent:      true,
 		Network:         network.guestInitConfig(),
 		NetDevice:       networkDeviceDarwin(network),
-		DisplayWidth:    displayWidthDarwin(req.Display),
-		DisplayHeight:   displayHeightDarwin(req.Display),
 		SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
 		RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
 		UnixTime:        time.Now().Unix(),
-	}, ctx.Err()
+	}
+	b.configureDisplayRequest(&runReq, req.Display)
+	return runReq, ctx.Err()
+}
+
+func (b *runtimeBackend) configureDisplayRequest(runReq *vmruntime.RunRequest, display *client.DisplayConfig) {
+	runReq.DisplayWidth = displayWidthDarwin(display)
+	runReq.DisplayHeight = displayHeightDarwin(display)
+	if display == nil || !display.Accelerated3D || runReq.DisplayWidth == 0 || runReq.DisplayHeight == 0 {
+		return
+	}
+	runReq.Accelerated3D = true
+	if b.openGLShareGroup != nil {
+		runReq.OpenGLShareContext, runReq.OpenGLSharePixelFormat = b.openGLShareGroup()
+	}
 }
 
 func applyStartupSnapshotOptions(req *vmruntime.RunRequest, snapshotDir, restoreSnapshot string) {
