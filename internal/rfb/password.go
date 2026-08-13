@@ -38,17 +38,10 @@ func (s PasswordSecurity) Handshake(conn io.ReadWriter) error {
 	if _, err := io.ReadFull(conn, response); err != nil {
 		return err
 	}
-	key := make([]byte, 8)
-	for index, value := range password {
-		key[index] = reverseByte(value)
-	}
-	cipher, err := des.NewCipher(key)
+	expected, err := passwordChallengeResponse(string(s), challenge)
 	if err != nil {
 		return err
 	}
-	expected := make([]byte, len(challenge))
-	cipher.Encrypt(expected[:8], challenge[:8])
-	cipher.Encrypt(expected[8:], challenge[8:])
 	if subtle.ConstantTimeCompare(response, expected) != 1 {
 		if err := binary.Write(conn, binary.BigEndian, uint32(1)); err != nil {
 			return err
@@ -61,6 +54,30 @@ func (s PasswordSecurity) Handshake(conn io.ReadWriter) error {
 		return fmt.Errorf("VNC authentication failed")
 	}
 	return binary.Write(conn, binary.BigEndian, uint32(0))
+}
+
+func passwordChallengeResponse(password string, challenge []byte) ([]byte, error) {
+	if len(password) == 0 {
+		return nil, fmt.Errorf("VNC password is empty")
+	}
+	if len(password) > 8 {
+		return nil, fmt.Errorf("VNC passwords are limited to 8 bytes")
+	}
+	if len(challenge) != 16 {
+		return nil, fmt.Errorf("VNC challenge is %d bytes, want 16", len(challenge))
+	}
+	key := make([]byte, 8)
+	for index, value := range []byte(password) {
+		key[index] = reverseByte(value)
+	}
+	cipher, err := des.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	response := make([]byte, len(challenge))
+	cipher.Encrypt(response[:8], challenge[:8])
+	cipher.Encrypt(response[8:], challenge[8:])
+	return response, nil
 }
 
 func reverseByte(value byte) byte {

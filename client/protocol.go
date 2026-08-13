@@ -465,10 +465,11 @@ type CapabilitiesResponse struct {
 }
 
 type DisplayConfig struct {
-	Width       uint32 `json:"width,omitempty"`
-	Height      uint32 `json:"height,omitempty"`
-	VNCListen   string `json:"vnc_listen,omitempty"`
-	VNCPassword string `json:"vnc_password,omitempty"`
+	Width         uint32 `json:"width,omitempty"`
+	Height        uint32 `json:"height,omitempty"`
+	VNCListen     string `json:"vnc_listen,omitempty"`
+	VNCPassword   string `json:"vnc_password,omitempty"`
+	Accelerated3D bool   `json:"accelerated_3d,omitempty"`
 }
 
 type DisplayState struct {
