@@ -1,9 +1,0 @@
-/bin/
-/.venv/
-/.pytest_cache/
-/.ipynb_checkpoints/
-/notebooks/.ipynb_checkpoints/
-**/__pycache__/
-*.pyc
-*.pyo
-.DS_Store

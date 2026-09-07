@@ -20,19 +20,8 @@
 /tools/__pycache__
 /tools/*.pyc
 /tools/*.pyo
-/pyneurodesk/.git
-/pyneurodesk/.venv
-/pyneurodesk/.pytest_cache
-/pyneurodesk/.ipynb_checkpoints
-/pyneurodesk/notebooks/.ipynb_checkpoints
-/pyneurodesk/**/__pycache__
-/pyneurodesk/**/*.pyc
-/pyneurodesk/**/*.pyo
-/pyneurodesk/.DS_Store
-/pyneurodesk/dist
-/pyneurodesk/src/pyneurodesk/bin/ccvm
-/pyneurodesk/src/pyneurodesk/bin/ccvm.exe
 
 *.simg
 !fixtures/alpine.simg
 !fixtures/alpine-arm64.simg
+/frontends/vmsh/build/

@@ -1,0 +1,74 @@
+name: Release experimental vmsh
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag
+        required: true
+      publish:
+        description: Publish a GitHub release
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: linux, arch: amd64, runner: ubuntu-24.04}
+          - {os: linux, arch: arm64, runner: ubuntu-24.04}
+          - {os: windows, arch: amd64, runner: ubuntu-24.04, ext: .exe}
+          - {os: windows, arch: arm64, runner: ubuntu-24.04, ext: .exe}
+          - {os: darwin, arch: arm64, runner: macos-15}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            frontends/vmsh/go.sum
+      - run: go run ./internal/cmd/build-guestinit -arch "${{ matrix.arch }}"
+      - name: Build vmsh
+        working-directory: frontends/vmsh
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+          EXE: ${{ matrix.ext }}
+        run: |
+          mkdir -p ../../dist
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+            -ldflags "-X j5.nz/cc/frontends/vmsh/internal/version.Release=${VERSION} -X j5.nz/cc/frontends/vmsh/internal/version.Commit=${GITHUB_SHA} -X j5.nz/cc/frontends/vmsh/internal/version.Dirty=false" \
+            -o "../../dist/vmsh_${VERSION}_${GOOS}_${GOARCH}${EXE}" ./cmd/vmsh
+      - name: Sign development macOS binary
+        if: matrix.os == 'darwin'
+        run: codesign --force --sign - --entitlements tools/entitlements.xml dist/vmsh_*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/vmsh_*
+  publish:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum vmsh_* > checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmsh-checksums
+          path: dist/checksums.txt
+      - uses: softprops/action-gh-release@v2
+        if: inputs.publish
+        with:
+          tag_name: ${{ inputs.version }}
+          generate_release_notes: true
+          files: dist/*
