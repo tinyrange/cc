@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="${VMSH_REPO:-tinyrange/vmsh}"
+repo="${VMSH_REPO:-tinyrange/cc}"
 version="${VMSH_VERSION:-latest}"
 
 say() {
