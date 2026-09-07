@@ -12,6 +12,31 @@ devices, or running a privileged helper daemon.
 This repository is published at
 [github.com/tinyrange/cc](https://github.com/tinyrange/cc).
 
+The production desktop apps, SquadVM and NeurodeskAppX, live in the independent
+[CrumbleCracker](https://github.com/tinyrange/vmsh) codebase. This
+repository retains the experimental runtime, complete daemon and worker system,
+and command-line frontends. There is no automatic synchronization between the
+codebases. The old Python frontend has been removed; a future production Python
+API will be designed separately.
+
+## Interactive vmsh
+
+The interactive shell is maintained in [`frontends/vmsh`](frontends/vmsh).
+Build it against this checkout:
+
+```sh
+go run ./internal/cmd/build-guestinit
+cd frontends/vmsh
+go build -o ../../build/vmsh ./cmd/vmsh
+../../build/vmsh
+```
+
+Inside the shell, select `@alpine`, run ordinary commands, and use `@host` to
+return to the host. The vmsh binary includes its daemon entry point; a separate
+ccvm executable is optional. The manual `Release experimental vmsh` workflow
+builds shell artifacts and can publish them to this repository; `@upgrade` uses
+those releases. Its macOS artifacts are ad-hoc signed development binaries.
+
 ## Status
 
 Supported host backends:
@@ -201,27 +226,6 @@ VM and exec requests and through `GET /vm` for listing. Reported
 `max_instances` is a daemon concurrency limit, not a guarantee that the host has
 enough free memory or CPU for that many guests.
 
-## Python Client
-
-The Python package lives in `pyneurodesk/` and is published as `neurodesk`. It
-can start or connect to the daemon, import Neurodesk containers from CVMFS, and
-expose container commands through Python or shell wrappers.
-
-```sh
-pip install neurodesk
-```
-
-Example:
-
-```python
-import neurodesk as nd
-
-nm = nd.container("niimath")
-print(nm.run("niimath", "-help"))
-```
-
-See [pyneurodesk/README.md](pyneurodesk/README.md) for Python-specific usage.
-
 ## Worker control transport
 
 Sidecar worker control uses an owner-only Unix socket where the platform
@@ -291,5 +295,5 @@ plaintext deprecation window before v1.
 - `internal/oci`: OCI, SIMG/SIF, and CVMFS image import
 - `internal/cvmfs`: minimal remote CVMFS catalog and file client
 - `docs/design`: accepted plans for cross-cutting runtime features
-- `pyneurodesk`: Python client and shell integration
+- `frontends/vmsh`: interactive host, VM, and SSH shell
 - `PLAN.md`: linux/amd64 support plan and milestone notes

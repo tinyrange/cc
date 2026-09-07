@@ -112,6 +112,8 @@ jobs:
         run: go test -race -short ./internal/ccvmd ./internal/netstack ./internal/virtio ./internal/vm/... -count=1 -timeout 15m
 
   kvm-test:
+    # Keep full VM/rootfs runs available without extending every commit check.
+    if: github.event_name == 'workflow_dispatch'
     name: KVM and rootfs tests (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -190,3 +192,23 @@ jobs:
           fi
           go test -p 1 "${run_args[@]}" ${TEST_PACKAGES} -count=1 -timeout 40m
           echo "KVM/rootfs shard '${{ matrix.name }}' took $((SECONDS - start))s"
+
+  vmsh:
+    name: Interactive vmsh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            frontends/vmsh/go.sum
+      - run: go run ./internal/cmd/build-guestinit
+      - name: Test interactive shell
+        working-directory: frontends/vmsh
+        run: go test -short ./... -count=1 -timeout 3m
+      - name: Build interactive shell
+        working-directory: frontends/vmsh
+        run: go build -o ../../build/vmsh ./cmd/vmsh

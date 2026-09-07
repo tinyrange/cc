@@ -5,7 +5,6 @@ set -x
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
-PYNEURODESK_BIN_DIR="${ROOT_DIR}/pyneurodesk/src/pyneurodesk/bin"
 GUESTINIT_ARM64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-arm64"
 GUESTINIT_AMD64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-amd64"
 TARGET_GOOS="${CCX3_TARGET_GOOS:-$(go env GOOS)}"
@@ -15,11 +14,10 @@ if [[ "${TARGET_GOOS}" == "windows" ]]; then
   TARGET_SUFFIX=".exe"
 fi
 CCVM_OUTPUT="${BUILD_DIR}/ccvm-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}"
-PYNEURODESK_CCVM_OUTPUT="${PYNEURODESK_BIN_DIR}/ccvm${TARGET_SUFFIX}"
 
 export CGO_ENABLED=0
 
-mkdir -p "${BUILD_DIR}" "${PYNEURODESK_BIN_DIR}"
+mkdir -p "${BUILD_DIR}"
 
 GOOS=linux GOARCH=arm64 go build -o "${BUILD_DIR}/init-linux-arm64" ./internal/cmd/init
 install -m 644 "${BUILD_DIR}/init-linux-arm64" "${GUESTINIT_ARM64_EMBED_PATH}"
@@ -36,9 +34,9 @@ GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${CCVM_OUTPUT}" ./c
 GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/cc-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}" ./cmd/cc
 GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/glass-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}" ./cmd/glass
 
-install -m 755 "${CCVM_OUTPUT}" "${PYNEURODESK_CCVM_OUTPUT}"
+(cd "${ROOT_DIR}/frontends/vmsh" && GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -o "${BUILD_DIR}/vmsh-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}" ./cmd/vmsh)
 
 if [[ "${TARGET_GOOS}" == "darwin" && "$(uname -s)" == "Darwin" ]]; then
   codesign -f -s - --entitlements "${ROOT_DIR}/tools/entitlements.xml" "${CCVM_OUTPUT}"
-  codesign -f -s - --entitlements "${ROOT_DIR}/tools/entitlements.xml" "${PYNEURODESK_CCVM_OUTPUT}"
+  codesign -f -s - --entitlements "${ROOT_DIR}/tools/entitlements.xml" "${BUILD_DIR}/vmsh-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}"
 fi
