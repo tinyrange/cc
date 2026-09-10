@@ -104,3 +104,46 @@ func TestARM64Restore(t *testing.T) {
 		t.Fatalf("SPSR=%#x: %v", saved, err)
 	}
 }
+
+func TestARM64PSCIPowerDiscovery(t *testing.T) {
+	if os.Getenv("CC_HVF_TEST") != "1" {
+		t.Skip("requires hypervisor-entitled test executable")
+	}
+	vm, err := NewARM64(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vm.Close()
+	for _, call := range []struct {
+		function, argument, want uint64
+		terminal                 bool
+	}{
+		{0x84000000, 0, 0x10001, false},
+		{0x80000000, 0, 0x10001, false},
+		{0x8400000a, 0x80000000, 0, false},
+		{0x8400000a, 0x84000008, 0, false},
+		{0x8400000a, 0x84000009, 0, false},
+		{0x8400000a, 0xc4000001, 0xffffffff, false},
+		{0x8400000a, 0xffffffff, 0xffffffff, false},
+		{0x80000001, 0x80000000, 0, false},
+		{0x80000001, 0x80000001, 0, false},
+		{0x80000001, 0x80008000, 0xffffffff, false},
+		{0x84000008, 0, 0x84000008, true},
+		{0x84000009, 0, 0x84000009, true},
+	} {
+		if err := vm.SetRegister(0, call.function); err != nil {
+			t.Fatal(err)
+		}
+		if err := vm.SetRegister(1, call.argument); err != nil {
+			t.Fatal(err)
+		}
+		terminal, err := vm.HandlePSCI()
+		if err != nil || terminal != call.terminal {
+			t.Fatalf("call %#x/%#x: terminal %v err %v", call.function, call.argument, terminal, err)
+		}
+		result, err := vm.Register(0)
+		if err != nil || result != call.want {
+			t.Fatalf("call %#x/%#x: result %#x want %#x err %v", call.function, call.argument, result, call.want, err)
+		}
+	}
+}

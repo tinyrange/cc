@@ -24,6 +24,12 @@ another goroutine. Device interrupts can produce `ExitCanceled`; callers should
 resume these when their own context is still live. Exception metadata is valid
 only for `ExitException`. `Counter` reports HVF's virtual-counter clock and Hz.
 
+`HandlePSCI` services PSCI 1.1 and SMCCC 1.1 discovery over HVC. Feature queries
+report supported calls; unsupported suspend modes and architecture services
+return NOT_SUPPORTED. Its boolean result identifies a terminal SYSTEM_OFF or
+SYSTEM_RESET request. The caller must stop execution rather than resume past
+that request; adapters can expose `ExitShutdown` and `ExitReset` to their users.
+
 `NewNVMePCI` binds caller-owned random-access storage to an ECAM bus and one
 32-bit memory BAR. Interrupt numbers are architectural GIC IDs. The caller must
 provide matching firmware declarations and dispatch the returned MMIO device.

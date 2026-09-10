@@ -44,6 +44,9 @@ const (
 	ExitException
 	ExitVirtualTimer
 	ExitUnknown
+	// Terminal platform requests, synthesized by an execution adapter.
+	ExitShutdown
+	ExitReset
 )
 
 const (
