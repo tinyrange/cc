@@ -170,12 +170,13 @@ const (
 )
 
 var (
-	loadOnce      sync.Once
-	loadErr       error
-	vmLifecycleMu sync.Mutex
-	activeVM      atomic.Pointer[VM]
-	hvLib         uintptr
-	sysLib        uintptr
+	loadOnce         sync.Once
+	loadErr          error
+	vmLifecycleMu    sync.Mutex
+	activeVM         atomic.Pointer[VM]
+	hvLib            uintptr
+	sysLib           uintptr
+	machAbsoluteTime func() uint64
 
 	hvVMConfigCreate          func() VMConfig
 	hvVMConfigGetEL2Supported func(el2Supported *bool) Return
@@ -274,6 +275,7 @@ func load() error {
 		registerOptionalLibFunc(&taskSelfTrap, sysLib, "task_self_trap")
 
 		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
+		purego.RegisterLibFunc(&machAbsoluteTime, sysLib, "mach_absolute_time")
 	})
 	return loadErr
 }
@@ -1648,6 +1650,36 @@ func (v *VM) HandleSystemInstructionForVCPU(index int, syndrome uint64) (bool, e
 			return handled, err
 		}
 	default:
+		// Debug-exception trapping also routes the architectural breakpoint
+		// and watchpoint registers through the host. Preserve guest setup in
+		// the actual VCPU so these retain their architectural behavior.
+		reg := info.SysReg()
+		if reg&0xff00 == 0x8000 && reg&7 >= 4 {
+			if info.Read {
+				value, err := v.GetSysRegForVCPU(index, reg)
+				if err != nil {
+					return false, err
+				}
+				if info.Rt != hvRegXZR {
+					if err := v.SetRegForVCPU(index, info.Rt, value); err != nil {
+						return false, err
+					}
+				}
+			} else {
+				var value uint64
+				if info.Rt != hvRegXZR {
+					var err error
+					value, err = v.GetRegForVCPU(index, info.Rt)
+					if err != nil {
+						return false, err
+					}
+				}
+				if err := v.SetSysRegForVCPU(index, reg, value); err != nil {
+					return false, err
+				}
+			}
+			return true, v.AdvanceProgramCounterForVCPU(index)
+		}
 		return false, nil
 	}
 

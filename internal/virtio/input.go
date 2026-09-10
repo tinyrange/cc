@@ -34,9 +34,13 @@ const (
 	inputRelHWheelHiRes = 0x0c
 	inputAbsX           = 0
 	inputAbsY           = 1
-	inputBtnLeft        = 0x110
-	inputBtnRight       = 0x111
-	inputBtnMiddle      = 0x112
+	// Match the positive 16-bit physical axis range used by the Windows
+	// VirtIO HID mouse. Keeping logical and physical ranges equal also avoids
+	// signed HID scaling across bit 15 at the midpoint of a 0xffff range.
+	inputAbsMaximum = 0x7fff
+	inputBtnLeft    = 0x110
+	inputBtnRight   = 0x111
+	inputBtnMiddle  = 0x112
 )
 
 type InputKind uint8
@@ -109,6 +113,22 @@ func (i *Input) IRQAsserted() bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.irqHigh
+}
+
+// Stats is a bounded observation of the guest's input transport state.
+func (i *Input) Stats() map[string]uint64 {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	ready := uint64(0)
+	if i.queues[0].ready {
+		ready = 1
+	}
+	return map[string]uint64{
+		"status": uint64(i.status), "event_queue_ready": ready,
+		"event_queue_size": uint64(i.queues[0].size),
+		"used_events":      uint64(i.queues[0].usedIdx), "pending_events": uint64(len(i.pending)),
+		"interrupt_status": uint64(i.interruptStatus),
+	}
 }
 
 func (i *Input) Contains(addr uint64, size int) bool {
@@ -380,7 +400,7 @@ func scaleAbsolutePosition(position, extent uint32) uint32 {
 	if position >= extent {
 		position = extent - 1
 	}
-	return position * 0xffff / (extent - 1)
+	return position * inputAbsMaximum / (extent - 1)
 }
 
 func (i *Input) SetDimensions(width, height uint32) {
@@ -493,7 +513,7 @@ func (i *Input) configBytesLocked() []byte {
 	case inputConfigABSInfo:
 		if i.Kind == InputAbsolutePointer && (i.configSubsel == inputAbsX || i.configSubsel == inputAbsY) {
 			data = make([]byte, 20)
-			binary.LittleEndian.PutUint32(data[4:8], 0xffff)
+			binary.LittleEndian.PutUint32(data[4:8], inputAbsMaximum)
 		}
 	}
 	if len(data) > 128 {

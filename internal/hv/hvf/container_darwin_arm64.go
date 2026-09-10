@@ -2366,6 +2366,8 @@ func handleContainerHVC(vm *VM, vcpuIndex int) (bool, error) {
 		psciSystemOff       = 0x84000008
 		psciSystemReset     = 0x84000009
 		psciFeatures        = 0x8400000a
+		smcccVersion        = 0x80000000
+		smcccArchFeatures   = 0x80000001
 		psciSuccess         = 0
 		psciNotSupported    = 0xffffffff
 		psciInvalidParams   = 0xfffffffe
@@ -2377,11 +2379,30 @@ func handleContainerHVC(vm *VM, vcpuIndex int) (bool, error) {
 	var ret uint64
 	switch x0 {
 	case psciVersion:
-		ret = 0x00010000
+		ret = 0x00010001
+	case smcccVersion:
+		ret = 0x00010001
+	case smcccArchFeatures:
+		function, err := vm.GetRegForVCPU(vcpuIndex, hvRegX1)
+		if err != nil {
+			return false, err
+		}
+		ret = psciNotSupported
+		if function == smcccVersion || function == smcccArchFeatures {
+			ret = psciSuccess
+		}
 	case psciMigrateInfoType:
 		ret = psciTosNotPresent
 	case psciFeatures:
 		ret = psciNotSupported
+		function, err := vm.GetRegForVCPU(vcpuIndex, hvRegX1)
+		if err != nil {
+			return false, err
+		}
+		switch function {
+		case psciVersion, psciCpuOff, psciCpuOn, psciCpuOn64, psciAffinityInfo, psciAffinityInfo64, psciMigrateInfoType, psciSystemOff, psciSystemReset, psciFeatures, smcccVersion:
+			ret = psciSuccess
+		}
 	case psciCpuSuspend:
 		ret = psciNotSupported
 	case psciCpuOff:

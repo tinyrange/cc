@@ -142,3 +142,19 @@ func trimZero(data []byte) []byte {
 	}
 	return data
 }
+
+func TestPCIAddressBytesAndProbe(t *testing.T) {
+	d := newHVFNVMePCIDevice(1, 0x21000000, 46, nil)
+	h := newHVFPCIHost(d)
+	h.writeConfig(0x8010, 4, 0xffffffff)
+	if got := h.readConfig(0x8010, 4); got != 0xffffc000 {
+		t.Fatalf("probe: %#x", got)
+	}
+	h.writeConfig(0x8010, 4, 0x21ffc000)
+	if got := h.readConfig(0x8010, 4); got != 0x21ffc000 {
+		t.Fatalf("address containing ff: %#x", got)
+	}
+	if d.MMIOBAR != 0x21ffc000 {
+		t.Fatalf("mapped BAR: %#x", d.MMIOBAR)
+	}
+}

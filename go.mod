@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/creack/pty v1.1.24
 	github.com/ebitengine/purego v0.10.0
+	github.com/tinyrange/gowin v0.0.0-20260809233042-3f02e7d42a2d
 )
 
 require (
