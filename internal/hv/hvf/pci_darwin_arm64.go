@@ -44,7 +44,9 @@ type hvfPCIDevice struct {
 		ReadMMIO(offset uint64, size int) (uint64, error)
 		WriteMMIO(offset uint64, size int, value uint64) error
 	}
+	configure     func([]byte)
 	barProbeValue bool
+	barValue      uint32
 }
 
 func newHVFPCIHost(devices ...*hvfPCIDevice) *hvfPCIHost {
@@ -75,6 +77,7 @@ func newHVFNVMePCIDevice(dev uint8, mmioBase uint64, irq uint8, ctrl *nvme.Contr
 		IRQPin:      1,
 		MMIOBAR:     mmioBase,
 		MMIOSize:    nvme.MMIOSize,
+		barValue:    uint32(mmioBase),
 		mmio:        ctrl,
 	}
 }
@@ -177,6 +180,9 @@ func (h *hvfPCIHost) writeConfig(offset uint64, size int, value uint64) {
 	for i := 0; i < size; i++ {
 		dev.writeConfigByte(uint16(int(reg)+i), byte(value>>(8*i)))
 	}
+	if reg < 0x14 && int(reg)+size > 0x10 && !dev.barProbeValue {
+		dev.MMIOBAR = uint64(dev.barValue) & ^(dev.MMIOSize - 1)
+	}
 }
 
 func (h *hvfPCIHost) deviceAt(bus, device, function uint8) *hvfPCIDevice {
@@ -218,6 +224,9 @@ func (d *hvfPCIDevice) buildConfig(cfg []byte) {
 	binary.LittleEndian.PutUint16(cfg[0x2e:0x30], d.SubsystemID)
 	cfg[0x3c] = d.IRQLine
 	cfg[0x3d] = d.IRQPin
+	if d.configure != nil {
+		d.configure(cfg)
+	}
 }
 
 func (d *hvfPCIDevice) deviceTreeNode() fdt.Node {
@@ -238,21 +247,9 @@ func (d *hvfPCIDevice) writeConfigByte(offset uint16, value byte) {
 	case 0x05:
 		d.Command = (d.Command & 0x00ff) | uint16(value)<<8
 	case 0x10, 0x11, 0x12, 0x13:
-		if value == 0xff {
-			d.barProbeValue = true
-			return
-		}
-		d.barProbeValue = false
-		switch offset {
-		case 0x10:
-			d.MMIOBAR = (d.MMIOBAR & 0xffffffffffffff00) | uint64(value&0xf0)
-		case 0x11:
-			d.MMIOBAR = (d.MMIOBAR & 0xffffffffffff00ff) | uint64(value)<<8
-		case 0x12:
-			d.MMIOBAR = (d.MMIOBAR & 0xffffffffff00ffff) | uint64(value)<<16
-		case 0x13:
-			d.MMIOBAR = (d.MMIOBAR & 0xffffffff00ffffff) | uint64(value)<<24
-		}
+		shift := (offset - 0x10) * 8
+		d.barValue = d.barValue&^(0xff<<shift) | uint32(value)<<shift
+		d.barProbeValue = d.barValue&0xfffffff0 == 0xfffffff0
 	case 0x3c:
 		d.IRQLine = value
 	}
