@@ -89,6 +89,13 @@ jobs:
         # an allocation advisory. Neither is a correctness failure.
         run: staticcheck -checks='SA*,-SA1019,-SA6002' ./...
 
+      - name: Enable KVM for native x86 tests
+        if: matrix.name == 'linux-amd64'
+        run: |
+          sudo chown "$(id -u):$(id -g)" /dev/kvm
+          sudo chmod 660 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
       - name: Run tests
         run: go test -short ./... -count=1 -timeout 30m
 
