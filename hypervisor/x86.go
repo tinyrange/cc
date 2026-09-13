@@ -2,6 +2,7 @@ package hypervisor
 
 import (
 	"context"
+
 	"j5.nz/cc/hypervisor/x86state"
 )
 
@@ -33,6 +34,10 @@ const (
 // The PC interrupt controllers and interval timer are provided by the backend.
 // Firmware, disk and display device semantics belong to the caller.
 type X86 interface {
+	// SupportedCPUID returns an owned table of accelerator-supported leaves.
+	SupportedCPUID() ([]x86state.CPUIDEntry, error)
+	// SetCPUID installs the machine's feature policy before the first Run.
+	SetCPUID([]x86state.CPUIDEntry) error
 	MapRAM(base, size uint64) ([]byte, error)
 	MapRAMRegions(size uint64, regions []RAMRegion) ([]byte, error)
 	Registers() (x86state.Registers, error)
