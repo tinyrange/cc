@@ -69,6 +69,10 @@ const (
 
 const ia32MiscEnableDefault = (1 << 0) | (1 << 3) | (1 << 11) | (1 << 12) | (1 << 16) | (1 << 18) | (1 << 23)
 
+// ioctl arguments may point into Go objects. Preserve those objects across
+// stack growth and the blocking system call, including through the retry layer.
+//
+//go:uintptrescapes
 func ioctl(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	v1, _, err := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(request), arg)
 	if err != 0 {
@@ -77,6 +81,7 @@ func ioctl(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	return v1, nil
 }
 
+//go:uintptrescapes
 func ioctlWithRetry(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	for {
 		v1, err := ioctl(fd, request, arg)
