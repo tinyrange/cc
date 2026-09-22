@@ -156,4 +156,71 @@ func TestX86RealModeInterrupt(t *testing.T) {
 			break
 		}
 	}
+	// A stream of handled exits must remain cancellable. Handler errors and
+	// unhandled exits return the exact exit without running another instruction.
+	copy(ram[0x7c00:], []byte{0xe6, 0xf2, 0xeb, 0xfc}) // out f2,al; loop
+	reset := func() {
+		t.Helper()
+		r.Rip = 0x7c00
+		if err := cpu.SetRegisters(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reset()
+	failure := errors.New("device failure")
+	calls := 0
+	for {
+		ex, err := cpu.RunUntil(ctx, func(ex X86Exit) (bool, error) {
+			calls++
+			return false, failure
+		})
+		if ex.Reason == 0 && err == nil {
+			continue
+		}
+		if !errors.Is(err, failure) || calls != 1 || ex.Port != 0xf2 {
+			t.Fatalf("handler error: %+v %v calls=%d", ex, err, calls)
+		}
+		break
+	}
+	if err := cpu.CompleteIO(); err != nil {
+		t.Fatal(err)
+	}
+	reset()
+	stream, cancelStream := context.WithCancel(ctx)
+	calls = 0
+	for {
+		_, err := cpu.RunUntil(stream, func(ex X86Exit) (bool, error) {
+			if ex.Reason != X86ExitIO || ex.Port != 0xf2 {
+				t.Fatalf("stream exit: %+v", ex)
+			}
+			calls++
+			if calls == 10 {
+				cancelStream()
+			}
+			return true, cpu.CompleteIO()
+		})
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, context.Canceled) || calls != 10 {
+			t.Fatalf("cancel handled stream: %v calls=%d", err, calls)
+		}
+		break
+	}
+	cancelStream()
+	reset()
+	for {
+		ex, err := cpu.RunUntil(ctx, func(X86Exit) (bool, error) { return false, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ex.Reason == 0 {
+			continue
+		}
+		if ex.Reason != X86ExitIO || ex.Port != 0xf2 {
+			t.Fatalf("unhandled exit after cancellation: %+v", ex)
+		}
+		break
+	}
+
 }
