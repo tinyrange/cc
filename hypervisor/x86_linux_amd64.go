@@ -86,6 +86,9 @@ func (n *nativeX86) MapRAM(base, size uint64) ([]byte, error) {
 }
 func (n *nativeX86) Cancel() error { n.RequestImmediateExit(); return nil }
 func (n *nativeX86) Run(ctx context.Context) (X86Exit, error) {
+	return n.RunUntil(ctx, nil)
+}
+func (n *nativeX86) RunUntil(ctx context.Context, handle func(X86Exit) (bool, error)) (X86Exit, error) {
 	if err := ctx.Err(); err != nil {
 		return X86Exit{}, err
 	}
@@ -107,29 +110,37 @@ func (n *nativeX86) Run(ctx context.Context) (X86Exit, error) {
 			<-joined
 		}
 	}()
-	if err := ctx.Err(); err != nil {
-		return X86Exit{}, err
-	}
-	var ex kvm.Exit
-	err := n.RunVCPUInterruptible(0, &ex)
-	if errors.Is(err, unix.EINTR) {
-		return X86Exit{}, ctx.Err()
-	}
-	if err != nil {
-		return X86Exit{}, err
-	}
-	ret := X86Exit{Reason: uint32(ex.Reason)}
-	if ex.Reason == kvm.ExitUnknown {
-		return X86Exit{}, fmt.Errorf("unknown KVM hardware exit")
-	}
-	if ex.Reason == kvm.ExitIO {
-		ret.Port, ret.Size, ret.Count, ret.Write, ret.Data = ex.IO.Port, ex.IO.Size, ex.IO.Count, ex.IO.Write, ex.IO.Data
-	} else if ex.Reason == kvm.ExitMMIO {
-		if ex.MMIO.Len == 0 || ex.MMIO.Len > 8 {
-			return X86Exit{}, fmt.Errorf("invalid KVM MMIO width %d", ex.MMIO.Len)
+	for {
+		if err := ctx.Err(); err != nil {
+			return X86Exit{}, err
 		}
-		ret.Address, ret.Size, ret.Write = ex.MMIO.Addr, uint8(ex.MMIO.Len), ex.MMIO.Write
-		ret.Data = append([]byte(nil), ex.MMIO.Data[:ex.MMIO.Len]...)
+		var ex kvm.Exit
+		err := n.RunVCPUInterruptible(0, &ex)
+		if errors.Is(err, unix.EINTR) {
+			return X86Exit{}, ctx.Err()
+		}
+		if err != nil {
+			return X86Exit{}, err
+		}
+		ret := X86Exit{Reason: uint32(ex.Reason)}
+		if ex.Reason == kvm.ExitUnknown {
+			return X86Exit{}, fmt.Errorf("unknown KVM hardware exit")
+		}
+		if ex.Reason == kvm.ExitIO {
+			ret.Port, ret.Size, ret.Count, ret.Write, ret.Data = ex.IO.Port, ex.IO.Size, ex.IO.Count, ex.IO.Write, ex.IO.Data
+		} else if ex.Reason == kvm.ExitMMIO {
+			if ex.MMIO.Len == 0 || ex.MMIO.Len > 8 {
+				return X86Exit{}, fmt.Errorf("invalid KVM MMIO width %d", ex.MMIO.Len)
+			}
+			ret.Address, ret.Size, ret.Write = ex.MMIO.Addr, uint8(ex.MMIO.Len), ex.MMIO.Write
+			ret.Data = append([]byte(nil), ex.MMIO.Data[:ex.MMIO.Len]...)
+		}
+		if handle == nil {
+			return ret, nil
+		}
+		handled, err := handle(ret)
+		if err != nil || !handled {
+			return ret, err
+		}
 	}
-	return ret, nil
 }

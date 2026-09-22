@@ -6,8 +6,9 @@ import (
 	"j5.nz/cc/hypervisor/x86state"
 )
 
-// X86Exit exposes architectural exits. IO.Data is borrowed until the next Run;
-// fill it for input instructions. CompleteMMIORead completes MMIO reads.
+// X86Exit exposes architectural exits. IO.Data is borrowed until execution
+// resumes (including after a RunUntil handler returns true); fill it for input
+// instructions. CompleteMMIORead completes MMIO reads.
 type X86Exit struct {
 	Reason  uint32
 	Port    uint16
@@ -30,7 +31,7 @@ const (
 	X86ExitShutdown uint32 = 8
 )
 
-// X86 owns its RAM and one CPU. All methods except Cancel must be serialized.
+// X86 owns its RAM and one CPU. All methods except Cancel and SetIRQ must be serialized.
 // The PC interrupt controllers and interval timer are provided by the backend.
 // Firmware, disk and display device semantics belong to the caller.
 type X86 interface {
@@ -45,10 +46,18 @@ type X86 interface {
 	SetRegisters(x86state.Registers) error
 	SetSystemRegisters(x86state.SystemRegisters) error
 	Run(context.Context) (X86Exit, error)
+	// RunUntil services handled exits within one native execution call. The
+	// caller supplies a context deadline when an execution bound is required.
+	// The handler runs synchronously on the owning CPU thread. Returning false
+	// leaves the exit to the caller; an error or context cancellation stops the
+	// call. Every guest instruction still executes through the accelerator.
+	RunUntil(context.Context, func(X86Exit) (bool, error)) (X86Exit, error)
 	// CompleteIO commits a pending IO/MMIO operation without executing the
 	// next instruction. Call before inspecting or changing CPU state after IO.
 	CompleteIO() error
 	CompleteMMIORead(value uint64, size uint32)
+	// SetIRQ may run concurrently with Run/RunUntil. The caller must join
+	// pending IRQ delivery before Close.
 	SetIRQ(line uint32, level bool) error
 	InterruptState() (map[string]uint64, error)
 	Cancel() error
