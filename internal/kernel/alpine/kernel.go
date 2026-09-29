@@ -816,8 +816,10 @@ func copyWithProgress(dst io.Writer, src io.Reader, total int64, artifact string
 			eta = float64(total-downloaded) / rate
 		}
 		report(client.ProgressEvent{
-			Status:             status,
-			Artifact:           artifact,
+			Status:   status,
+			Artifact: artifact,
+			// Package transfer completion is not completion of the whole operation.
+			Blob:               artifact,
 			Progress:           progress,
 			BytesDownloaded:    downloaded,
 			BytesTotal:         total,

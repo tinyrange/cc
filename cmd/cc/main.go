@@ -838,20 +838,30 @@ func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error
 
 	args := []string{"-cache-dir", cacheDir}
 	proc := exec.Command(ccvmPath, args...)
-	proc.Stderr = os.Stderr
+	// The daemon outlives cc. Inheriting a captured stderr pipe keeps callers
+	// waiting for EOF after cc exits (and can SIGPIPE the daemon later).
+	logPath := filepath.Join(cacheDir, "ccvm.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open ccvm log %s: %w", logPath, err)
+	}
+	defer logFile.Close()
+	proc.Stderr = logFile
 
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", ccvmPath, err)
 	}
+	defer stdout.Close()
 	if err := proc.Start(); err != nil {
-		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", ccvmPath, cacheDir, err)
+		return nil, fmt.Errorf("start ccvm daemon %s with cache %s (log %s): %w", ccvmPath, cacheDir, logPath, err)
 	}
 
 	var hello client.ServerHello
 	if err := json.NewDecoder(stdout).Decode(&hello); err != nil {
+		_ = proc.Process.Kill()
 		_ = proc.Wait()
-		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", ccvmPath, err)
+		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s (log %s): %w", ccvmPath, logPath, err)
 	}
 	if err := validateServerHello(hello, cacheDir); err != nil {
 		_ = proc.Process.Kill()
@@ -871,6 +881,8 @@ func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error
 		_ = proc.Wait()
 		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
+	// Reap the daemon if it exits while this client is still alive.
+	go func() { _ = proc.Wait() }()
 	return api, nil
 }
 

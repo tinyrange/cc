@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"j5.nz/cc/client"
 )
 
 func TestAPKChecksumUsesControlGzipStream(t *testing.T) {
@@ -99,8 +101,26 @@ func TestEnsureDownloadedRecoversFromRepositoryIndexPackageRace(t *testing.T) {
 	manager := NewManager(t.TempDir())
 	manager.mirror = server.URL
 	manager.httpClient = server.Client()
-	if err := manager.ensureDownloaded(context.Background(), nil); err != nil {
+	var events []client.ProgressEvent
+	if err := manager.EnsureWithProgress(context.Background(), func(event client.ProgressEvent) {
+		events = append(events, event)
+	}); err != nil {
 		t.Fatalf("ensure downloaded: %v", err)
+	}
+	completedPackages := 0
+	for _, event := range events {
+		if event.Status == "downloaded" {
+			completedPackages++
+			if event.Blob == "" {
+				t.Fatalf("package completion would prematurely terminate client stream: %+v", event)
+			}
+		}
+	}
+	if completedPackages != 3 {
+		t.Fatalf("completed package transfers = %d, want 3 (including retry)", completedPackages)
+	}
+	if err := manager.Ensure(context.Background()); err != nil {
+		t.Fatalf("immediate cached ensure: %v", err)
 	}
 	metadata, err := manager.ReadKernelMetadata()
 	if err != nil {
