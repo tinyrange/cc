@@ -1591,7 +1591,11 @@ func newMuxWithRoutes(srvState *server, watchdog *watchdogController, shutdown f
 			}
 			if err := srvState.kernel.EnsureWithProgress(r.Context(), report); err != nil {
 				_ = writeProgressEvent(w, client.ProgressEvent{Status: "error", Error: err.Error()})
+				return
 			}
+			// Signal success only after verification, extraction, metadata publication,
+			// and clearing the manager's downloading state, including cache hits.
+			_ = writeProgressEvent(w, client.ProgressEvent{Status: "downloaded", Artifact: "kernel"})
 			return
 		}
 		if err := srvState.kernel.Ensure(r.Context()); err != nil {
@@ -2805,9 +2809,8 @@ func bootProgressMessage(prefix string, event client.ProgressEvent) string {
 
 func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error {
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	if _, ok := w.(http.Flusher); ok {
-		w.WriteHeader(http.StatusOK)
-	}
+	// Encode commits status 200 on the first write; subsequent events must not
+	// call WriteHeader again.
 	if err := json.NewEncoder(w).Encode(event); err != nil {
 		return err
 	}

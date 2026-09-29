@@ -137,8 +137,10 @@ go build -o "$tmp/glass" ./cmd/glass
 
 ## CLI Usage
 
-`cc` starts `ccvm` automatically when needed. If the binaries are not installed
-next to each other, pass the daemon path explicitly:
+`cc` starts `ccvm` automatically when needed. Auto-started daemon diagnostics
+are appended to `ccvm.log` in the selected cache directory (set with
+`-cache-dir`), rather than keeping the caller's stderr open after `cc` exits.
+If the binaries are not installed next to each other, pass the daemon path explicitly:
 
 ```sh
 cc -ccvm ./ccvm doctor
