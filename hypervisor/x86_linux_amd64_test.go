@@ -12,6 +12,42 @@ import (
 	"j5.nz/cc/hypervisor/x86state"
 )
 
+func TestX86LegacyTimerReplacement(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Skip("KVM unavailable")
+	}
+	cpu, err := NewX86(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cpu.Close()
+	legacy, ok := cpu.(interface{ SetLegacyTimerReplacement(bool) error })
+	if !ok {
+		t.Fatal("missing legacy timer control")
+	}
+	before, err := cpu.InterruptState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []bool{true, false} {
+		if err := legacy.SetLegacyTimerReplacement(enabled); err != nil {
+			t.Fatal(err)
+		}
+		state, err := cpu.InterruptState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (state["pit.flags"]&1 != 0) != enabled {
+			t.Fatalf("PIT flags %x", state["pit.flags"])
+		}
+		for _, name := range []string{"pit0.count", "pit0.mode", "pit0.gate", "pit1.count", "pit1.mode", "pit2.count", "pit2.mode", "pit2.gate"} {
+			if state[name] != before[name] {
+				t.Fatalf("modified %s", name)
+			}
+		}
+	}
+}
+
 func TestX86RealModeInterrupt(t *testing.T) {
 	if _, err := os.Stat("/dev/kvm"); err != nil {
 		t.Skip("KVM unavailable")
@@ -223,4 +259,49 @@ func TestX86RealModeInterrupt(t *testing.T) {
 		break
 	}
 
+}
+
+func TestX86GuestTimingObservations(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Skip("KVM unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cpu, err := NewX86(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cpu.Close()
+	clock, ok := cpu.(interface {
+		TSCFrequency() (uint64, error)
+		ReadMSR(uint32) (uint64, error)
+	})
+	if !ok {
+		t.Fatal("native x86 lacks read-only timing observations")
+	}
+	before, err := cpu.Registers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hz, err := clock.TSCFrequency()
+	if err != nil || hz == 0 || hz%1000 != 0 {
+		t.Fatalf("guest TSC Hz: %d %v", hz, err)
+	}
+	// KVM initializes PERF_STATUS for the virtual processor. XNU uses its
+	// multiplier (including the half-ratio bit), not the host marketing clock.
+	perf, err := clock.ReadMSR(0x198)
+	ratio := ((perf>>40)&31)*2 + ((perf >> 46) & 1)
+	if err != nil || ratio == 0 {
+		t.Fatalf("guest PERF_STATUS: %#x %v", perf, err)
+	}
+	if _, err := clock.ReadMSR(0xffffffff); err == nil {
+		t.Fatal("unsupported MSR observation must report failure")
+	}
+	regs, err := cpu.Registers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regs != before {
+		t.Fatal("observation started guest execution")
+	}
 }

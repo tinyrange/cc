@@ -46,6 +46,7 @@ func (v *VM) InterruptState() (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
+	result["pit.flags"] = uint64(pit.Flags)
 	for i, c := range pit.Channels {
 		result[fmt.Sprintf("pit%d.count", i)] = uint64(c.Count)
 		result[fmt.Sprintf("pit%d.mode", i)] = uint64(c.Mode)
