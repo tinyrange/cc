@@ -111,7 +111,11 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			closeVirtioFSDevices(fsdevs)
 		}
 	}()
-	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+	initOverride := sandboxInitFromContext(ctx)
+	initBin := initOverride.payload
+	if len(initBin) == 0 {
+		initBin, err = guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
@@ -120,6 +124,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		workDir = "/"
 	}
 	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
+	initCfg.Protocol = initOverride.protocol
 	initCfg.InitSystem = req.InitSystem
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))

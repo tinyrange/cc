@@ -8,6 +8,9 @@ import (
 
 func TestBuildForArchReturnsEmbeddedPayloadCopy(t *testing.T) {
 	payload := embeddedPayload("arm64")
+	if len(payload) == 0 {
+		t.Skip("source-only build: payload absent")
+	}
 	got, err := BuildForArch(context.Background(), t.TempDir(), "arm64")
 	if err != nil {
 		t.Fatalf("load embedded guest init: %v", err)

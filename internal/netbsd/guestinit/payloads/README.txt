@@ -1,0 +1,1 @@
+Generated cc guest init payloads live here. Run cc's tools/build.sh or go run ./internal/cmd/build-guestinit before producing a cc runtime that uses default init payloads. SA2's tools/build-peer.sh generates only its custom Linux-amd64 override, not these files. Missing binaries fail closed; this placeholder permits source-only compilation.

@@ -66,23 +66,25 @@ func ResolveExecRequest(req client.ExecRequest, resolver Resolver) (client.ExecR
 		skipResolve = true
 	}
 	return client.ExecRequest{
-		ID:            req.ID,
-		Kind:          req.Kind,
-		Command:       command,
-		Env:           env,
-		RootDir:       rootDir,
-		Path:          req.Path,
-		Directory:     req.Directory,
-		ReplaceEnv:    req.ReplaceEnv,
-		SkipResolve:   skipResolve,
-		WorkDir:       workDir,
-		User:          user,
-		Stdin:         append([]byte(nil), req.Stdin...),
-		TTY:           req.TTY,
-		ControlFD:     req.ControlFD,
-		Cols:          req.Cols,
-		Rows:          req.Rows,
-		ArchiveLimits: req.ArchiveLimits,
+		ProcessMode:     req.ProcessMode,
+		SandboxProtocol: req.SandboxProtocol,
+		ID:              req.ID,
+		Kind:            req.Kind,
+		Command:         command,
+		Env:             env,
+		RootDir:         rootDir,
+		Path:            req.Path,
+		Directory:       req.Directory,
+		ReplaceEnv:      req.ReplaceEnv,
+		SkipResolve:     skipResolve,
+		WorkDir:         workDir,
+		User:            user,
+		Stdin:           append([]byte(nil), req.Stdin...),
+		TTY:             req.TTY,
+		ControlFD:       req.ControlFD,
+		Cols:            req.Cols,
+		Rows:            req.Rows,
+		ArchiveLimits:   req.ArchiveLimits,
 	}, nil
 }
 
@@ -116,15 +118,17 @@ func ControlRequest(req client.ExecRequest, defaultWorkDir string) client.ExecRe
 		workDir = defaultWorkDir
 	}
 	return client.ExecRequest{
-		ID:            req.ID,
-		Kind:          req.Kind,
-		RootDir:       req.RootDir,
-		Path:          req.Path,
-		Directory:     req.Directory,
-		WorkDir:       workDir,
-		User:          req.User,
-		Stdin:         append([]byte(nil), req.Stdin...),
-		ArchiveLimits: req.ArchiveLimits,
+		ProcessMode:     req.ProcessMode,
+		SandboxProtocol: req.SandboxProtocol,
+		ID:              req.ID,
+		Kind:            req.Kind,
+		RootDir:         req.RootDir,
+		Path:            req.Path,
+		Directory:       req.Directory,
+		WorkDir:         workDir,
+		User:            req.User,
+		Stdin:           append([]byte(nil), req.Stdin...),
+		ArchiveLimits:   req.ArchiveLimits,
 	}
 }
 

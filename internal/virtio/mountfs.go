@@ -678,10 +678,10 @@ func (m *mountedFS) restoreNodePath(nodePath string) error {
 	childID, _, errno := m.Lookup(parentID, name)
 	if errno != 0 {
 		childID, _, errno = m.Mkdir(parentID, name, 0o755, 0, 0)
-		if errno != 0 && errno != -linuxabi.EEXIST {
+		if errno != 0 && !fsErrnoIs(errno, linuxabi.EEXIST) {
 			return fmt.Errorf("restore mountedfs node %q: lookup errno %d", nodePath, errno)
 		}
-		if errno == -linuxabi.EEXIST {
+		if fsErrnoIs(errno, linuxabi.EEXIST) {
 			childID, _, errno = m.Lookup(parentID, name)
 			if errno != 0 {
 				return fmt.Errorf("restore mountedfs node %q: lookup after mkdir errno %d", nodePath, errno)
@@ -877,7 +877,7 @@ func (m *mountedFS) OpenDir(nodeID uint64, flags uint32) (uint64, int32) {
 		}
 		return m.storeHandle(node.path, backend, backendNodeID, fh, true, entries), 0
 	}
-	if errno != -linuxENOENT || !m.isSyntheticPath(node.path) {
+	if !fsErrnoIs(errno, linuxENOENT) || !m.isSyntheticPath(node.path) {
 		return 0, errno
 	}
 	entries, errno := m.snapshotDirEntries(node, nil, 0, 0)

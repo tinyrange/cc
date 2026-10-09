@@ -15,26 +15,31 @@ import (
 
 func TestExecRequestCopiesFields(t *testing.T) {
 	req := ExecRequest("7", client.ExecRequest{
-		Command:     []string{"/bin/sh", "-c", "echo hi"},
-		Env:         []string{"A=B"},
-		RootDir:     "/mnt",
-		Path:        "/tmp/file",
-		Directory:   true,
-		ReplaceEnv:  true,
-		SkipResolve: true,
-		WorkDir:     "/work",
-		User:        "1000:1000",
-		Stdin:       []byte("input"),
-		TTY:         true,
-		ControlFD:   true,
-		Cols:        80,
-		Rows:        24,
+		ProcessMode:     "single",
+		SandboxProtocol: 1,
+		Command:         []string{"/bin/sh", "-c", "echo hi"},
+		Env:             []string{"A=B"},
+		RootDir:         "/mnt",
+		Path:            "/tmp/file",
+		Directory:       true,
+		ReplaceEnv:      true,
+		SkipResolve:     true,
+		WorkDir:         "/work",
+		User:            "1000:1000",
+		Stdin:           []byte("input"),
+		TTY:             true,
+		ControlFD:       true,
+		Cols:            80,
+		Rows:            24,
 	})
 	if req.Kind != "exec" || req.ID != "7" || req.Command[0] != "/bin/sh" || req.Env[0] != "A=B" {
 		t.Fatalf("unexpected request: %+v", req)
 	}
 	if !req.Directory || !req.TTY || !req.ControlFD || req.Cols != 80 || req.Rows != 24 {
 		t.Fatalf("missing flags: %+v", req)
+	}
+	if req.ProcessMode != "single" || req.SandboxProtocol != 1 {
+		t.Fatalf("missing sandbox protocol fields: %+v", req)
 	}
 	if !req.ReplaceEnv || !req.SkipResolve {
 		t.Fatalf("missing resolver flags: %+v", req)

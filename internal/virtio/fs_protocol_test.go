@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"reflect"
 	"testing"
 )
 
@@ -202,6 +203,154 @@ func BenchmarkDecodeFUSERequest(b *testing.B) {
 	for b.Loop() {
 		if _, err := decodeFUSERequest(raw); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// RPC backends conventionally return positive errno. The wire must never expose
+// a positive out_header.error: VFS can interpret it as success without an inode.
+type positiveErrnoFSBackend struct{ inertFSBackend }
+
+func (positiveErrnoFSBackend) Lookup(uint64, string) (uint64, FuseAttr, int32) {
+	return 0, FuseAttr{}, linuxENOENT
+}
+func (positiveErrnoFSBackend) Create(uint64, string, uint32, uint32, uint32, uint32) (uint64, uint64, FuseAttr, int32) {
+	return 0, 0, FuseAttr{}, linuxEACCES
+}
+
+func TestFUSEDispatcherNormalizesPositiveBackendErrno(t *testing.T) {
+	device := NewFS(0, 0, 0, "errno", positiveErrnoFSBackend{})
+	for _, tc := range []struct {
+		opcode uint32
+		size   int
+		want   int32
+	}{
+		{fuseLookup, 0, -linuxENOENT}, {fuseCreate, 16, -linuxEACCES},
+	} {
+		raw := make([]byte, fuseInHeaderSize+tc.size+5)
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(len(raw)))
+		binary.LittleEndian.PutUint32(raw[4:8], tc.opcode)
+		binary.LittleEndian.PutUint64(raw[8:16], 77)
+		binary.LittleEndian.PutUint64(raw[16:24], 1)
+		copy(raw[fuseInHeaderSize+tc.size:], "live")
+		result, err := device.dispatcher.Dispatch(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := result.reply.Bytes()
+		if got := int32(binary.LittleEndian.Uint32(wire[4:8])); got != tc.want {
+			t.Fatalf("opcode %d error=%d, want %d", tc.opcode, got, tc.want)
+		}
+		if len(wire) != fuseOutHeaderSize {
+			t.Fatalf("error reply included success payload: %x", wire)
+		}
+	}
+	for _, errno := range []int32{linuxEACCES, -linuxEACCES} {
+		wire := fuseReply(78, errno, []byte("must not appear in error reply")).Bytes()
+		if len(wire) != fuseOutHeaderSize || int32(binary.LittleEndian.Uint32(wire[4:8])) != -linuxEACCES {
+			t.Fatalf("malformed error reply: %x", wire)
+		}
+	}
+}
+
+type disappearingReadDirFSBackend struct {
+	inertFSBackend
+	missingErrno int32
+	calls        []uint64
+}
+
+func disappearingReadDirEntry(node, cookie uint64, name string) []byte {
+	entry := make([]byte, align8(fuseDirentBaseSize+len(name)))
+	binary.LittleEndian.PutUint64(entry[0:8], node)
+	binary.LittleEndian.PutUint64(entry[8:16], cookie)
+	binary.LittleEndian.PutUint32(entry[16:20], uint32(len(name)))
+	binary.LittleEndian.PutUint32(entry[20:24], 8)
+	copy(entry[24:], name)
+	return entry
+}
+
+func (b *disappearingReadDirFSBackend) ReadDir(_, _ uint64, off uint64, _ uint32) ([]byte, int32) {
+	b.calls = append(b.calls, off)
+	switch off {
+	case 0:
+		return disappearingReadDirEntry(2, 7, "gone-page"), 0
+	case 7:
+		page := disappearingReadDirEntry(3, 19, "gone-entry")
+		return append(page, disappearingReadDirEntry(4, 42, "alive-a")...), 0
+	case 42:
+		return disappearingReadDirEntry(5, 61, "alive-b"), 0
+	case 61:
+		return nil, 0
+	default:
+		return nil, -linuxEINVAL
+	}
+}
+func (b *disappearingReadDirFSBackend) GetAttr(node uint64) (FuseAttr, int32) {
+	if node == 2 || node == 3 {
+		return FuseAttr{}, b.missingErrno
+	}
+	return FuseAttr{Ino: node, Mode: 0100644, NLink: 1}, 0
+}
+
+func TestReadDirPlusSkipsVanishedEntriesWithEitherErrnoSign(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		errno int32
+	}{{"positive", linuxENOENT}, {"negative", -linuxENOENT}} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &disappearingReadDirFSBackend{missingErrno: tc.errno}
+			device := NewFS(0, 0, 0, "vanishing", backend)
+			off := uint64(0)
+			for i, name := range []string{"alive-a", "alive-b", ""} {
+				req := make([]byte, fuseInHeaderSize+24)
+				binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+				binary.LittleEndian.PutUint32(req[4:8], fuseReadDirPlus)
+				binary.LittleEndian.PutUint64(req[8:16], uint64(i+1))
+				binary.LittleEndian.PutUint64(req[16:24], 1)
+				binary.LittleEndian.PutUint64(req[40:48], 9)
+				binary.LittleEndian.PutUint64(req[48:56], off)
+				binary.LittleEndian.PutUint32(req[56:60], 4096)
+				reply, err := dispatchFUSEForTest(device, req)
+				if err != nil || reply.errno != 0 {
+					t.Fatalf("page %d: error=%v errno=%d", i, err, reply.errno)
+				}
+				if name == "" {
+					if len(reply.extra) != 0 {
+						t.Fatal("expected real EOF")
+					}
+					continue
+				}
+				if len(reply.extra) < fuseDirentPlusBaseSize {
+					t.Fatalf("false EOF after vanished entry at cookie %d", off)
+				}
+				data := reply.extra[fuseEntryOutSize:]
+				n := int(binary.LittleEndian.Uint32(data[16:20]))
+				if len(data) < 24+n || string(data[24:24+n]) != name {
+					t.Fatalf("wrong surviving entry: %x", data)
+				}
+				if len(reply.extra) != align8(fuseDirentPlusBaseSize+n) {
+					t.Fatal("vanished entry leaked into result")
+				}
+				node := uint64(i + 4)
+				if binary.LittleEndian.Uint64(reply.extra[0:8]) != node || binary.LittleEndian.Uint64(reply.extra[40:48]) != node || binary.LittleEndian.Uint64(data[0:8]) != node {
+					t.Fatal("surviving node identity changed")
+				}
+				off = binary.LittleEndian.Uint64(data[8:16])
+			}
+			if !reflect.DeepEqual(backend.calls, []uint64{0, 7, 42, 61}) {
+				t.Fatalf("directory cookies skipped or reset: %v", backend.calls)
+			}
+		})
+	}
+}
+
+func TestReadDirPlusDoesNotHideOtherBackendErrors(t *testing.T) {
+	for _, errno := range []int32{linuxEIO, -linuxEIO} {
+		backend := &disappearingReadDirFSBackend{missingErrno: errno}
+		device := NewFS(0, 0, 0, "io-error", backend)
+		data, got := device.dispatcher.(*fuseServer).readDirPlus(1, 9, 0, 4096)
+		if got != errno || len(data) != 0 {
+			t.Fatalf("non-ENOENT error became EOF/success: errno=%d data=%x", got, data)
 		}
 	}
 }

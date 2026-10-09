@@ -21,13 +21,13 @@ func main() {
 	builds := []struct {
 		goos, goarch, pkg, output string
 	}{
-		{"linux", "arm64", "./internal/cmd/init", "internal/guestinit/guest-init-linux-arm64"},
-		{"linux", "amd64", "./internal/cmd/init", "internal/guestinit/guest-init-linux-amd64"},
+		{"linux", "arm64", "./internal/cmd/init", "internal/guestinit/payloads/guest-init-linux-arm64"},
+		{"linux", "amd64", "./internal/cmd/init", "internal/guestinit/payloads/guest-init-linux-amd64"},
 	}
 	for _, goos := range []string{"freebsd", "netbsd", "openbsd"} {
 		builds = append(builds, struct {
 			goos, goarch, pkg, output string
-		}{goos, *arch, "./internal/cmd/" + goos + "-init", "internal/" + goos + "/guestinit/guest-init-" + goos + "-" + *arch})
+		}{goos, *arch, "./internal/cmd/" + goos + "-init", "internal/" + goos + "/guestinit/payloads/guest-init-" + goos + "-" + *arch})
 	}
 
 	for _, build := range builds {
@@ -44,7 +44,7 @@ func buildPayload(goos, goarch, pkg, output string) error {
 	}
 	tmp := output + ".tmp"
 	_ = os.Remove(tmp)
-	cmd := exec.Command("go", "build", "-trimpath", "-o", tmp, pkg)
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-ldflags=-buildid=", "-o", tmp, pkg)
 	cmd.Env = append(withoutGoTarget(os.Environ()), "CGO_ENABLED=0", "GOOS="+goos, "GOARCH="+goarch)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

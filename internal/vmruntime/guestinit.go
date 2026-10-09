@@ -10,6 +10,7 @@ import (
 )
 
 type GuestInitConfig struct {
+	Protocol           int                 `json:"protocol,omitempty"`
 	Command            []string            `json:"command"`
 	Env                []string            `json:"env"`
 	WorkDir            string              `json:"workdir"`
@@ -143,6 +144,9 @@ func GuestShareConfigs(shares []DirectoryShare) []GuestInitShare {
 }
 
 func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestInitConfig) ([]byte, error) {
+	if config.Protocol != 0 && config.Protocol != 1 {
+		return nil, fmt.Errorf("unsupported guest init protocol %d", config.Protocol)
+	}
 	if len(config.RootFSImage) > 0 {
 		if strings.TrimSpace(config.RootFSImageType) == "" {
 			config.RootFSImageType = "ext4"

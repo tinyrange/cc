@@ -734,3 +734,56 @@ func readSnapshotFile(t *testing.T, root imagefs.Directory, guestPath string) st
 	}
 	return string(data)
 }
+
+type signedErrnoMountBackend struct {
+	inertFSBackend
+	sign     int32
+	appeared bool
+}
+
+func (b *signedErrnoMountBackend) GetAttr(node uint64) (FuseAttr, int32) {
+	return FuseAttr{Ino: node, Mode: 0040755, NLink: 2}, 0
+}
+func (b *signedErrnoMountBackend) Lookup(_ uint64, name string) (uint64, FuseAttr, int32) {
+	if name == "restored" && b.appeared {
+		attr, _ := b.GetAttr(2)
+		return 2, attr, 0
+	}
+	return 0, FuseAttr{}, b.sign * linuxENOENT
+}
+func (b *signedErrnoMountBackend) Mkdir(uint64, string, uint32, uint32, uint32) (uint64, FuseAttr, int32) {
+	// A competing creator made this directory after the restore's initial Lookup.
+	b.appeared = true
+	return 0, FuseAttr{}, b.sign * linuxEEXIST
+}
+
+func TestMountedFSInternalErrnoDecisionsAcceptEitherSign(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sign int32
+	}{{"positive", 1}, {"negative", -1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := &signedErrnoMountBackend{sign: tc.sign}
+			mounted := NewMountedFS(root, []ShareMount{{GuestPath: "/synthetic/share", Backend: inertFSBackend{}}}).(*mountedFS)
+			node, _, errno := mounted.Lookup(1, "synthetic")
+			if errno != 0 {
+				t.Fatalf("synthetic lookup: %d", errno)
+			}
+			fh, errno := mounted.OpenDir(node, 0)
+			if errno != 0 {
+				t.Fatalf("synthetic directory fallback rejected signed ENOENT: %d", errno)
+			}
+			data, errno := mounted.ReadDir(node, fh, 0, 4096)
+			if errno != 0 || len(data) == 0 {
+				t.Fatalf("synthetic directory listing: %x %d", data, errno)
+			}
+			mounted.ReleaseDir(node, fh)
+			if err := mounted.RestoreNodePaths([]string{"/restored"}); err != nil {
+				t.Fatalf("restore rejected concurrent signed EEXIST: %v", err)
+			}
+			if mounted.nodeIDForPath("/restored") == 0 {
+				t.Fatal("restore did not bind raced directory")
+			}
+		})
+	}
+}

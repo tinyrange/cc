@@ -1602,6 +1602,13 @@ func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageNa
 		return manifest{}, "", err
 	}
 
+	// A registry response header is not proof that the body matches a pinned
+	// request. Verify the requested digest even when that header is absent.
+	if strings.HasPrefix(tag, "sha256:") {
+		if err := verifyManifestSHA256(body, tag); err != nil {
+			return manifest{}, "", err
+		}
+	}
 	if isManifestMediaType(mediaType) {
 		var mani manifest
 		if err := json.Unmarshal(body, &mani); err != nil {
@@ -1623,6 +1630,9 @@ func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageNa
 					"application/vnd.oci.image.manifest.v1+json",
 				})
 				if err != nil {
+					return manifest{}, "", err
+				}
+				if err := verifyManifestSHA256(body, entry.Digest); err != nil {
 					return manifest{}, "", err
 				}
 				var mani manifest
@@ -2761,14 +2771,25 @@ func ParseImageRef(imageRef string) (registry string, image string, tag string, 
 	if strings.TrimSpace(imageRef) == "" {
 		return "", "", "", fmt.Errorf("image source is required")
 	}
-	image = imageRef
+	// Split the digest before looking for a tag: the digest's algorithm colon
+	// is not a tag separator. With name:tag@digest, the digest is authoritative
+	// and the optional tag must not remain part of the repository name.
+	image, digest, pinned := strings.Cut(imageRef, "@")
 	tag = "latest"
+	if pinned {
+		if image == "" || digest == "" || strings.Contains(digest, "@") {
+			return "", "", "", fmt.Errorf("invalid image digest reference %q", imageRef)
+		}
+		tag = digest
+	}
 
-	lastSlash := strings.LastIndex(imageRef, "/")
-	lastColon := strings.LastIndex(imageRef, ":")
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
 	if lastColon > lastSlash {
-		image = imageRef[:lastColon]
-		tag = imageRef[lastColon+1:]
+		if !pinned {
+			tag = image[lastColon+1:]
+		}
+		image = image[:lastColon]
 	}
 
 	firstSlash := strings.Index(image, "/")

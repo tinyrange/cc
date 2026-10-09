@@ -2,11 +2,11 @@
 
 package guestinit
 
-import _ "embed"
+import "embed"
 
-//go:embed guest-init-netbsd-arm64
-var guestInitNetBSD []byte
+//go:embed payloads
+var payloadFiles embed.FS
 
 func init() {
-	embeddedPayloads["arm64"] = guestInitNetBSD
+	embeddedPayloads["arm64"], _ = payloadFiles.ReadFile("payloads/guest-init-netbsd-arm64")
 }
