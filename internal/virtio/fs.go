@@ -1551,7 +1551,20 @@ type fsReply struct {
 	ok     bool
 }
 
+// fsErrnoIs accepts either backend convention before FUSE wire normalization.
+// code is a positive Linux errno.
+func fsErrnoIs(errno, code int32) bool { return errno == code || errno == -code }
+
 func fuseReply(unique uint64, errno int32, extra []byte) fsReply {
+	// FUSE's out_header.error is zero or a negative Linux errno. Direct/RPC
+	// backends may report positive errno values; never let those become positive
+	// VFS return values (e.g. an apparently successful atomic_open with no inode).
+	if errno > 0 {
+		errno = -errno
+	}
+	if errno != 0 {
+		extra = nil
+	}
 	return fsReply{unique: unique, errno: errno, extra: extra, ok: true}
 }
 
@@ -1613,7 +1626,7 @@ func (s *fuseServer) readDirPlus(nodeID uint64, fh uint64, off uint64, maxBytes 
 			childID := binary.LittleEndian.Uint64(entries[cursor : cursor+8])
 			attr, attrErrno := s.backend.GetAttr(childID)
 			cursor += direntBytes
-			if attrErrno == -linuxENOENT {
+			if fsErrnoIs(attrErrno, linuxENOENT) {
 				continue
 			}
 			if attrErrno != 0 {

@@ -123,6 +123,14 @@ func ParseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 		if err != nil {
 			return client.ExecEvent{}, false, false, nil
 		}
+		var lifecycle struct {
+			Version int    `json:"version"`
+			Kind    string `json:"kind"`
+			Error   string `json:"error,omitempty"`
+		}
+		if json.Unmarshal(data, &lifecycle) == nil && lifecycle.Version == 1 && (lifecycle.Kind == "started" || lifecycle.Kind == "launch_error") {
+			return client.ExecEvent{Kind: lifecycle.Kind, Error: lifecycle.Error}, false, true, nil
+		}
 		return client.ExecEvent{Kind: "control", Output: string(data), Data: data}, false, true, nil
 	case strings.HasPrefix(line, exitPrefix):
 		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))

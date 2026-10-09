@@ -617,24 +617,36 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
-	Kind          string         `json:"kind,omitempty"`
-	ID            string         `json:"id,omitempty"`
-	Image         string         `json:"image,omitempty"`
-	Command       []string       `json:"command"`
-	Env           []string       `json:"env,omitempty"`
-	RootDir       string         `json:"root_dir,omitempty"`
-	Path          string         `json:"path,omitempty"`
-	Directory     bool           `json:"directory,omitempty"`
-	ReplaceEnv    bool           `json:"replace_env,omitempty"`
-	SkipResolve   bool           `json:"skip_resolve,omitempty"`
-	WorkDir       string         `json:"workdir,omitempty"`
-	User          string         `json:"user,omitempty"`
-	Stdin         []byte         `json:"stdin,omitempty"`
-	TTY           bool           `json:"tty,omitempty"`
-	ControlFD     bool           `json:"control_fd,omitempty"`
-	Cols          int            `json:"cols,omitempty"`
-	Rows          int            `json:"rows,omitempty"`
-	ArchiveLimits *ArchiveLimits `json:"archive_limits,omitempty"`
+	// ProcessMode is single (signal only the direct PID; descendants may survive),
+	// group (signal the process group and tracked descendants), or empty (legacy
+	// family). Linux guestinit also terminates group/family descendants after
+	// the direct process exits: cgroups track forks and setsid. PID 1 fails
+	// launch if cgroup preparation fails; outside PID 1, unavailable cgroups
+	// use best-effort ancestry tracking that can miss rapid reparenting. Final
+	// stdout/stderr/control/PTY draining is bounded to 50ms after cleanup in
+	// all modes; remaining output may be discarded. Exit status is the direct
+	// process's, not a descendant's. This does not bound a blocked transport writer.
+	ProcessMode string `json:"process_mode,omitempty"`
+	// SandboxProtocol must be 1 when ProcessMode is nonempty; zero preserves cc requests.
+	SandboxProtocol int            `json:"sandbox_protocol,omitempty"`
+	Kind            string         `json:"kind,omitempty"`
+	ID              string         `json:"id,omitempty"`
+	Image           string         `json:"image,omitempty"`
+	Command         []string       `json:"command"`
+	Env             []string       `json:"env,omitempty"`
+	RootDir         string         `json:"root_dir,omitempty"`
+	Path            string         `json:"path,omitempty"`
+	Directory       bool           `json:"directory,omitempty"`
+	ReplaceEnv      bool           `json:"replace_env,omitempty"`
+	SkipResolve     bool           `json:"skip_resolve,omitempty"`
+	WorkDir         string         `json:"workdir,omitempty"`
+	User            string         `json:"user,omitempty"`
+	Stdin           []byte         `json:"stdin,omitempty"`
+	TTY             bool           `json:"tty,omitempty"`
+	ControlFD       bool           `json:"control_fd,omitempty"`
+	Cols            int            `json:"cols,omitempty"`
+	Rows            int            `json:"rows,omitempty"`
+	ArchiveLimits   *ArchiveLimits `json:"archive_limits,omitempty"`
 }
 
 // ArchiveLimits bounds the expanded work performed by an fs_extract request.

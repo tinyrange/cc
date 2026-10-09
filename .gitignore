@@ -9,6 +9,10 @@
 /.tmp-kickpoll-debug
 /.tmp-vsh-vim-bench
 /.tmp-virtiofs-exit-sweep
+/internal/guestinit/payloads/guest-init-*
+/internal/freebsd/guestinit/payloads/guest-init-*
+/internal/netbsd/guestinit/payloads/guest-init-*
+/internal/openbsd/guestinit/payloads/guest-init-*
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
 /internal/freebsd/guestinit/guest-init-freebsd-arm64

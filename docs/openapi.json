@@ -1458,6 +1458,16 @@
         "type": "object",
         "required": ["command"],
         "properties": {
+          "process_mode": {
+            "type": "string",
+            "enum": ["", "single", "group"],
+            "description": "Empty or omitted retains legacy process-family containment. single signals only the direct PID and preserves descendants on exit; group signals and cleans up the process group. Nonempty modes require sandbox_protocol 1."
+          },
+          "sandbox_protocol": {
+            "type": "integer",
+            "enum": [0, 1],
+            "description": "Zero or omitted preserves legacy cc requests. Version 1 must match the guest init protocol and is required for a nonempty process_mode."
+          },
           "kind": { "type": "string" },
           "id": { "type": "string" },
           "image": { "type": "string" },

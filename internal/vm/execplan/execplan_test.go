@@ -1,13 +1,17 @@
 package execplan
 
 import (
+	"bytes"
+	"encoding/json"
 	"io/fs"
 	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
+	managedagent "j5.nz/cc/internal/managed/agent"
 	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/managed/protocol"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -232,4 +236,31 @@ type staticCapabilityProvider struct {
 
 func (p staticCapabilityProvider) ManagedCapabilities() managedguest.Capabilities {
 	return p.caps
+}
+
+func TestSandboxModeSurvivesResolutionAndManagedWire(t *testing.T) {
+	for _, mode := range []string{"single", "group", ""} {
+		for _, skip := range []bool{false, true} {
+			req := client.ExecRequest{Command: []string{"tool"}, ProcessMode: mode, SandboxProtocol: 1, SkipResolve: skip}
+			got, err := ResolveExecRequest(req, Resolver{Root: testResolverRoot(t), BaseEnv: []string{"PATH=/bin"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire bytes.Buffer
+			if err := managedagent.Send(&wire, managedagent.ExecRequest("sandbox", got)); err != nil {
+				t.Fatal(err)
+			}
+			var decoded protocol.ManagedExecRequest
+			if err := json.Unmarshal(bytes.TrimSpace(wire.Bytes()), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.ProcessMode != mode || decoded.SandboxProtocol != 1 {
+				t.Fatalf("normalization lost cancellation semantics: skip=%v mode=%q wire=%s", skip, mode, wire.String())
+			}
+		}
+		control := ControlRequest(client.ExecRequest{Kind: "fs_write", ProcessMode: mode, SandboxProtocol: 1}, "/")
+		if control.ProcessMode != mode || control.SandboxProtocol != 1 {
+			t.Fatalf("control normalization lost protocol: %+v", control)
+		}
+	}
 }
