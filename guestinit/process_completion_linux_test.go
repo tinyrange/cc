@@ -30,8 +30,14 @@ func TestManagedExecEscapedHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "escaped stderr")
 		ctl := os.NewFile(3, "control")
 		fmt.Fprintln(ctl, `{"escaped":true}`)
-		if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		// Publish setsid proof atomically before the parent may exit. The
+		// process can legitimately be reaped before the test reads this file.
+		proof := []byte(fmt.Sprintf("%d %d", os.Getpid(), syscall.Getpgrp()))
+		if err := os.WriteFile(path+".ready", proof, 0600); err != nil {
 			os.Exit(91)
+		}
+		if err := os.Rename(path+".ready", path); err != nil {
+			os.Exit(94)
 		}
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
@@ -48,7 +54,14 @@ func TestManagedExecEscapedHelper(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		os.Exit(93)
 	}
-	if role != "fast" {
+	if role == "fast" {
+		for {
+			if _, err := os.Stat(path); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+	} else {
 		for {
 			if _, err := os.Stat(path + ".release"); err == nil {
 				break
@@ -100,10 +113,15 @@ func TestManagedExecEscapedCompletion(t *testing.T) {
 						t.Error("worker did not stop after test cleanup")
 					}
 				}()
+				pgid := 0
 				deadline := time.Now().Add(4 * time.Second)
 				for time.Now().Before(deadline) {
 					data, _ := os.ReadFile(path)
-					child, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+					fields := strings.Fields(string(data))
+					if len(fields) == 2 {
+						child, _ = strconv.Atoi(fields[0])
+						pgid, _ = strconv.Atoi(fields[1])
+					}
 					managed.stdinMu.Lock()
 					started := managed.process != nil
 					managed.stdinMu.Unlock()
@@ -115,9 +133,8 @@ func TestManagedExecEscapedCompletion(t *testing.T) {
 				if child <= 0 {
 					t.Fatal("escaped descendant did not start")
 				}
-				pgid, err := syscall.Getpgid(child)
-				if err != nil || pgid != child {
-					t.Fatalf("descendant did not setsid: pgid=%d err=%v", pgid, err)
+				if pgid != child {
+					t.Fatalf("descendant did not setsid: pid=%d pgid=%d", child, pgid)
 				}
 				if action == "tty" {
 					if err := managed.resize(100, 30); err != nil {
