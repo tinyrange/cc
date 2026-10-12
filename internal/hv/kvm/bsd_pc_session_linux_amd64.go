@@ -99,6 +99,9 @@ func startBSDPCManagedSession(ctx context.Context, cfg bsdPCSessionConfig, onEve
 	uart := newAMD64UART(kvmVM, serialWriter)
 
 	pci := attachBSDPCDevices(kvmVM, cfg.Root, cfg.ExtraBlocks, cfg.NetDevice, cfg.NetPCIDev, cfg.NetIOBase, cfg.NetIRQ)
+	if cfg.GuestName == "FreeBSD" {
+		pci.devices = append(pci.devices, NewISABridgePCIDevice(31))
+	}
 
 	if err := cfg.Prepare(kvmVM, mem); err != nil {
 		cleanupStartup()
