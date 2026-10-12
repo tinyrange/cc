@@ -69,6 +69,7 @@ func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 		netIndex := len(pciDevices) + 1
 		pciDevices = append(pciDevices, NewVirtioNetPCIDevice(uint8(netIndex), uint16(0x1000+netIndex*0x100), uint8(10+netIndex), netdev))
 	}
+	pciDevices = append(pciDevices, NewISABridgePCIDevice(31))
 	if len(pciDevices) > 0 {
 		pci = NewPCIBus(pciDevices...)
 	}
@@ -98,11 +99,18 @@ func bootFreeBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 
 	var exit Exit
 	for step := 0; ; step++ {
+		if serialOut.Len() >= 1<<20 {
+			return serialOut.String()[:1<<20], fmt.Errorf("BSD serial output exceeds 1 MiB")
+		}
 		if err := ctx.Err(); err != nil {
 			if done(serialOut.String()) {
 				return serialOut.String(), nil
 			}
-			return serialOut.String(), err
+			regs, regsErr := vm.Registers()
+			system, systemErr := vm.SystemRegisters()
+			var stack [128]byte
+			stackErr := vm.ReadVirtualInto(regs.Rsp, stack[:])
+			return serialOut.String(), fmt.Errorf("%w; FreeBSD stopped pc=%#x rsp=%#x cr2=%#x cr3=%#x cr4=%#x cs=%#x frame=%x (regs_error=%v system_error=%v frame_error=%v)", err, regs.Rip, regs.Rsp, system.Cr2, system.Cr3, system.Cr4, system.Cs.Selector, stack, regsErr, systemErr, stackErr)
 		}
 		if err := vm.RunVCPUInterruptible(0, &exit); err != nil {
 			if errors.Is(err, unix.EINTR) {

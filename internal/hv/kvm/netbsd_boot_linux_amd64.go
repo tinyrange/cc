@@ -26,6 +26,17 @@ func BootNetBSDKernelWithNVMENetToSerial(ctx context.Context, kernel []byte, mem
 }
 
 func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint64, block *nvme.Controller, netdev *virtio.Net) (string, error) {
+	return bootNetBSDToCondition(ctx, kernel, memoryMB, block, netdev, nil, func(text string) bool { return strings.Contains(text, "root on ld0") || len(text) >= 16384 })
+}
+
+func BootNetBSDKernelToMarkerWithNVMeConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, block *nvme.Controller, input func(string) []byte) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootNetBSDToCondition(ctx, kernel, memoryMB, block, nil, input, func(text string) bool { return strings.Contains(text, marker) })
+}
+
+func bootNetBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, block *nvme.Controller, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -82,7 +93,10 @@ func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint6
 	acpiPM := NewACPIPM()
 	var exit Exit
 	for step := 0; ; step++ {
-		if text := serialOut.String(); strings.Contains(text, "root on ld0") || len(text) >= 16384 {
+		if serialOut.Len() >= 1<<20 {
+			return serialOut.String()[:1<<20], fmt.Errorf("BSD serial output exceeds 1 MiB")
+		}
+		if done(serialOut.String()) {
 			return serialOut.String(), nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -93,6 +107,14 @@ func bootNetBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint6
 				continue
 			}
 			return serialOut.String(), fmt.Errorf("run step %d: %w", step, err)
+		}
+		if done(serialOut.String()) {
+			return serialOut.String(), nil
+		}
+		if input != nil {
+			if data := input(serialOut.String()); len(data) != 0 {
+				go func(data []byte) { _ = uart.InjectRXBytes(data) }(append([]byte(nil), data...))
+			}
 		}
 		switch exit.Reason {
 		case ExitIO:

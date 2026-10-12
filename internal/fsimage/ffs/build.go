@@ -547,7 +547,7 @@ func (b *ffsBuilder) collectDir(dir imagefs.Directory, guestPath string, parent 
 	if err := b.ctx.Err(); err != nil {
 		return nil, err
 	}
-	mode := ifdir | uint16(dir.Stat().Perm())
+	mode := ifdir | ffsPermissions(dir.Stat())
 	uid, gid := dir.Owner()
 	depth := uint32(0)
 	if parent != nil {
@@ -586,7 +586,7 @@ func (b *ffsBuilder) collectEntry(entry imagefs.Entry, guestPath string, parent 
 	case entry.Symlink != nil:
 		uid, gid := entry.Symlink.Owner()
 		target := entry.Symlink.Target()
-		return &ffsNode{name: name, ino: b.allocIno(), mode: iflnk | uint16(entry.Symlink.Stat().Perm()), uid: uid, gid: gid, target: target, parent: parent, size: uint64(len(target)), modTime: entry.Symlink.ModTime()}, nil
+		return &ffsNode{name: name, ino: b.allocIno(), mode: iflnk | ffsPermissions(entry.Symlink.Stat()), uid: uid, gid: gid, target: target, parent: parent, size: uint64(len(target)), modTime: entry.Symlink.ModTime()}, nil
 	case entry.File != nil:
 		size, mode := entry.File.Stat()
 		uid, gid := entry.File.Owner()
@@ -1283,8 +1283,22 @@ func ffsDirType(mode uint16) uint8 {
 	}
 }
 
+func ffsPermissions(mode fs.FileMode) uint16 {
+	perm := uint16(mode & 07777)
+	if mode&fs.ModeSetuid != 0 {
+		perm |= 04000
+	}
+	if mode&fs.ModeSetgid != 0 {
+		perm |= 02000
+	}
+	if mode&fs.ModeSticky != 0 {
+		perm |= 01000
+	}
+	return perm
+}
+
 func goModeToFFS(mode fs.FileMode) uint16 {
-	perm := uint16(mode.Perm())
+	perm := ffsPermissions(mode)
 	switch {
 	case mode&fs.ModeDevice != 0 && mode&fs.ModeCharDevice != 0:
 		return ifchr | perm

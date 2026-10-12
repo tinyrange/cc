@@ -99,8 +99,12 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 	if len(pciDevices) > 0 {
 		pci = NewPCIBus(pciDevices...)
 	}
+	bootDev := uint32(0)
+	if len(blocks) != 0 && blocks[0] != nil {
+		bootDev = openbsdamd64.SCSIBootDev(0, 0)
+	}
 	plan, err := openbsdamd64.PrepareBoot(mem, kernel, openbsdamd64.BootOptions{
-		MemorySize: amd64vm.MemorySizeBytes(memoryMB),
+		MemorySize: amd64vm.MemorySizeBytes(memoryMB), BootDev: bootDev,
 	})
 	if err != nil {
 		return "", fmt.Errorf("prepare OpenBSD boot: %w", err)
@@ -126,6 +130,9 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 	kbc := NewI8042()
 	var exit Exit
 	for step := 0; ; step++ {
+		if serialOut.Len() >= 1<<20 {
+			return serialOut.String()[:1<<20], fmt.Errorf("BSD serial output exceeds 1 MiB")
+		}
 		if err := ctx.Err(); err != nil {
 			if done(serialOut.String()) {
 				return serialOut.String(), nil

@@ -44,6 +44,7 @@ type UART8250 struct {
 	rbr         byte
 	pendingIIR  byte
 	fifoEnabled bool
+	threPending bool
 	skipLF      bool
 }
 
@@ -231,7 +232,12 @@ func (u *UART8250) readRegister(reg uint16) byte {
 		}
 		return u.ier
 	case 2:
-		return u.pendingIIR
+		value := u.pendingIIR
+		if value == 0x02 {
+			u.threPending = false
+			u.updateInterrupts()
+		}
+		return value
 	case 3:
 		return u.lcr
 	case 4:
@@ -254,7 +260,7 @@ func (u *UART8250) updateInterrupts() {
 		interrupt = 0x06
 	case u.ier&0x01 != 0 && u.lsr&uartLSRDataReady != 0:
 		interrupt = 0x04
-	case u.ier&0x02 != 0 && u.lsr&uartLSRTHRE != 0:
+	case u.ier&0x02 != 0 && u.threPending:
 		interrupt = 0x02
 	case u.ier&0x08 != 0 && u.msrDelta != 0:
 		interrupt = 0x00
@@ -289,6 +295,7 @@ func (u *UART8250) transmit(value byte) {
 		}
 	}
 	u.lsr |= uartLSRTHRE | uartLSRTEMT
+	u.threPending = true
 	u.updateInterrupts()
 }
 
@@ -299,6 +306,9 @@ func (u *UART8250) clearRX() {
 }
 
 func (u *UART8250) setIER(value byte) {
+	if (u.ier^value)&0x02 != 0 {
+		u.threPending = value&0x02 != 0 && u.lsr&uartLSRTHRE != 0
+	}
 	u.ier = value & 0x0f
 	u.updateInterrupts()
 }
@@ -306,6 +316,10 @@ func (u *UART8250) setIER(value byte) {
 func (u *UART8250) setFCR(value byte) {
 	if value&0x02 != 0 {
 		u.clearRX()
+	}
+	if value&0x04 != 0 {
+		u.threPending = true
+		u.updateInterrupts()
 	}
 	u.fcr = value
 	u.fifoEnabled = value&0x01 != 0

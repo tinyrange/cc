@@ -66,6 +66,13 @@ func NewPCIBus(devices ...*PCIDevice) *PCIBus {
 	return &PCIBus{devices: devices}
 }
 
+// NewISABridgePCIDevice provides the legacy bus parent for real ISA devices
+// such as COM1. PIIX3 identity and PCI bridge/ISA class are architectural config;
+// the devices themselves remain implemented by the existing port handlers.
+func NewISABridgePCIDevice(dev uint8) *PCIDevice {
+	return &PCIDevice{Device: dev, VendorID: 0x8086, DeviceID: 0x7000, Class: 0x06, Subclass: 0x01, Command: 0x0001}
+}
+
 func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.Net) *PCIDevice {
 	if netdev != nil {
 		netdev.IRQ = uint32(irq)
