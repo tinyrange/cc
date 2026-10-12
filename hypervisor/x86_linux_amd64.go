@@ -16,6 +16,7 @@ type nativeX86 struct {
 	*kvm.VM
 	slot        uint32
 	allocations [][]byte
+	a20Disabled bool
 	mappings    []RAMRegion
 }
 
@@ -43,7 +44,37 @@ func (n *nativeX86) MapRAMRegions(size uint64, regions []RAMRegion) ([]byte, err
 			return nil, err
 		}
 	}
+	n.mappings = append([]RAMRegion(nil), regions...)
 	return ram, nil
+}
+
+// SetA20 changes native CPU address decoding, not the RAM contents.
+// The PC owner must serialize it with Run and reflect the same gate in MMIO.
+func (n *nativeX86) SetA20(enabled bool) error {
+	if n.a20Disabled == !enabled {
+		return nil
+	}
+	if len(n.allocations) != 1 {
+		return fmt.Errorf("A20 requires a shared RAM layout")
+	}
+	layout := n.mappings
+	var err error
+	if !enabled {
+		layout, err = A20Layout(layout)
+		if err != nil {
+			return err
+		}
+	}
+	ram := n.allocations[0]
+	regions := make([]kvm.SharedMemoryRegion, 0, len(layout))
+	for _, r := range layout {
+		regions = append(regions, kvm.SharedMemoryRegion{Address: r.Address, Memory: ram[r.Offset : r.Offset+r.Size]})
+	}
+	if err = n.ReplaceSharedMemory(regions); err != nil {
+		return err
+	}
+	n.a20Disabled = !enabled
+	return nil
 }
 
 func (n *nativeX86) Close() error {
