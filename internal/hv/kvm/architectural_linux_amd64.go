@@ -28,6 +28,12 @@ func (v *VM) CompleteIO() error {
 	if err != nil {
 		return err
 	}
+	// Completing an OUT under debugger single-step may surface its #DB
+	// before immediate_exit. This is still the completed instruction's
+	// stop, not permission to execute the following instruction.
+	if v.debugSingleStep && run.exitReason == 4 {
+		return nil
+	}
 	return fmt.Errorf("KVM did not stop after IO completion")
 }
 

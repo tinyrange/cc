@@ -17,5 +17,8 @@ func (v *VM) SetBreakpoint(address uint64) error {
 		debug.Registers[7] = 0x601 // fixed DR7 bits and local breakpoint 0
 	}
 	_, err := ioctlWithRetry(uintptr(v.vcpus[0].fd), 0x4048ae9b, uintptr(unsafe.Pointer(&debug)))
+	if err == nil {
+		v.debugSingleStep = false
+	}
 	return err
 }

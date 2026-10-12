@@ -50,16 +50,17 @@ type MMIOExit struct {
 }
 
 type VM struct {
-	lifecycleMu   sync.RWMutex
-	kvm           *Bootstrap
-	vmfd          int
-	vcpufd        int
-	vcpus         []*VCPU
-	mem           []byte
-	lowMemLimit   uint64
-	regions       []memoryMapping
-	memoryDetach  []func()
-	memoryClosing bool
+	lifecycleMu     sync.RWMutex
+	kvm             *Bootstrap
+	vmfd            int
+	vcpufd          int
+	vcpus           []*VCPU
+	mem             []byte
+	lowMemLimit     uint64
+	regions         []memoryMapping
+	memoryDetach    []func()
+	memoryClosing   bool
+	debugSingleStep bool
 }
 
 type VCPU struct {
