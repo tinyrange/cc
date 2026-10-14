@@ -181,10 +181,12 @@ var (
 	hvVMConfigCreate          func() VMConfig
 	hvVMConfigGetEL2Supported func(el2Supported *bool) Return
 	hvVMConfigSetEL2Enabled   func(config VMConfig, el2Enabled bool) Return
+	hvVMConfigSetISA          func(config VMConfig, isa int32) Return
 	hvVMCreate                func(config VMConfig) Return
 	hvVMDestroy               func() Return
 	hvVMMap                   func(addr unsafe.Pointer, ipa IPA, size uintptr, flags MemoryFlags) Return
 	hvVMUnmap                 func(ipa IPA, size uintptr) Return
+	hvVMProtect               func(ipa IPA, size uintptr, flags MemoryFlags) Return
 
 	hvVcpuConfigCreate    func() VcpuConfig
 	hvVcpuCreate          func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
@@ -238,9 +240,11 @@ func load() error {
 		purego.RegisterLibFunc(&hvVMConfigCreate, hvLib, "hv_vm_config_create")
 		registerOptionalLibFunc(&hvVMConfigGetEL2Supported, hvLib, "hv_vm_config_get_el2_supported")
 		registerOptionalLibFunc(&hvVMConfigSetEL2Enabled, hvLib, "hv_vm_config_set_el2_enabled")
+		registerOptionalLibFunc(&hvVMConfigSetISA, hvLib, "_hv_vm_config_set_isa")
 		purego.RegisterLibFunc(&hvVMCreate, hvLib, "hv_vm_create")
 		purego.RegisterLibFunc(&hvVMDestroy, hvLib, "hv_vm_destroy")
 		purego.RegisterLibFunc(&hvVMMap, hvLib, "hv_vm_map")
+		purego.RegisterLibFunc(&hvVMProtect, hvLib, "hv_vm_protect")
 		purego.RegisterLibFunc(&hvVMUnmap, hvLib, "hv_vm_unmap")
 
 		purego.RegisterLibFunc(&hvVcpuConfigCreate, hvLib, "hv_vcpu_config_create")
@@ -347,6 +351,10 @@ func NewVMWithCPUs(ctx context.Context, cpus int) (*VM, error) {
 type VMOptions struct {
 	CPUs       int
 	NestedVirt bool
+	// PrivateAppleISA enables Apple's ISA level 3 and internal PAC services.
+	// Requires com.apple.private.hypervisor and a host permitting that entitlement.
+	PrivateAppleISA                  bool
+	GICDistributor, GICRedistributor IPA
 }
 
 func NestedVirtualizationSupported() (bool, error) {
@@ -418,17 +426,33 @@ func NewVMWithOptions(ctx context.Context, opts VMOptions) (*VM, error) {
 			timing.Since(ctx, "hvf.new_vm.vm_config_set_el2", start)
 		}
 		start = time.Now()
+		if opts.PrivateAppleISA {
+			if hvVMConfigSetISA == nil {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("private Apple ISA: _hv_vm_config_set_isa is unavailable")
+				return
+			}
+			if ret := hvVMConfigSetISA(vmCfg, 3); ret != hvSuccess {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("set private Apple ISA level 3: %w", ret)
+				return
+			}
+		}
 		ret := createVMWithRetry(vmCfg)
 		if ret != hvSuccess {
 			osRelease(uintptr(vmCfg))
-			errCh <- fmt.Errorf("create vm: %w", ret)
+			if opts.PrivateAppleISA {
+				errCh <- fmt.Errorf("create private Apple ISA level 3 VM (requires com.apple.private.hypervisor): %w", ret)
+			} else {
+				errCh <- fmt.Errorf("create vm: %w", ret)
+			}
 			return
 		}
 		timing.Since(ctx, "hvf.new_vm.vm_create", start)
 		start = time.Now()
 		osRelease(uintptr(vmCfg))
 
-		if err := createMinimalGIC(); err != nil {
+		if err := createMinimalGIC(opts.GICDistributor, opts.GICRedistributor); err != nil {
 			_ = hvVMDestroy()
 			errCh <- err
 			return
@@ -631,7 +655,7 @@ func getSysRegRaw(vcpu VCPU, reg SysReg) (uint64, Return) {
 	return value, ret
 }
 
-func createMinimalGIC() error {
+func createMinimalGIC(distributorBase, redistributorBase IPA) error {
 	if hvGICConfigCreate == nil ||
 		hvGICGetDistributorBaseAlignment == nil ||
 		hvGICGetRedistributorBaseAlignment == nil ||
@@ -650,8 +674,10 @@ func createMinimalGIC() error {
 		return fmt.Errorf("get gic redistributor alignment: %w", ret)
 	}
 
-	const distributorBase IPA = 0x08000000
-	const redistributorBase IPA = 0x080a0000
+	if distributorBase == 0 && redistributorBase == 0 {
+		distributorBase = 0x08000000
+		redistributorBase = 0x080a0000
+	}
 
 	if distAlign != 0 && uintptr(distributorBase)%distAlign != 0 {
 		return fmt.Errorf("gic distributor base %#x not aligned to %#x", distributorBase, distAlign)
@@ -698,6 +724,35 @@ func (v *VM) initMinimalGICCPUInterfaceFor(cpu *hvfVCPU) error {
 		return err
 	}
 	return nil
+}
+
+func (v *VM) ProtectMemory(ipa IPA, size uint64, flags MemoryFlags) error {
+	base := uint64(ipa)
+	if size == 0 || base+size < base || base&0x3fff != 0 || size&0x3fff != 0 || flags&^MemoryFlags(7) != 0 {
+		return fmt.Errorf("invalid memory protection range/flags")
+	}
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		v.mappingsMu.RLock()
+		mapped := false
+		for _, m := range v.mappings {
+			if base >= uint64(m.ipa) && base-uint64(m.ipa) <= uint64(m.size) && size <= uint64(m.size)-(base-uint64(m.ipa)) {
+				mapped = true
+				break
+			}
+		}
+		v.mappingsMu.RUnlock()
+		if !mapped {
+			errCh <- fmt.Errorf("protect memory: range is not mapped")
+			return
+		}
+		if ret := hvVMProtect(ipa, uintptr(size), flags); ret != hvSuccess {
+			errCh <- fmt.Errorf("protect memory: %w", ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
 }
 
 func (v *VM) MapMemory(mem []byte, ipa IPA, flags MemoryFlags) error {

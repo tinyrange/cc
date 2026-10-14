@@ -10,3 +10,6 @@ import (
 func NewARM64(context.Context) (ARM64, error) {
 	return nil, fmt.Errorf("ARM64 native continuation requires darwin/arm64")
 }
+func NewARM64WithConfiguration(context.Context, ARM64Configuration) (ARM64, error) {
+	return nil, fmt.Errorf("ARM64 native continuation requires darwin/arm64")
+}
