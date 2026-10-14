@@ -279,7 +279,8 @@ func (v *arm64VM) EmulateMMIOInstruction(ex Exit, word uint32, d MMIODevice) (bo
 	var base uint64
 	var spReg hvf.SysReg
 	if i.Base == 31 {
-		state, err := v.vm.GetReg(34)
+		var state uint64
+		state, err = v.vm.GetReg(34)
 		if err != nil {
 			return false, err
 		}
