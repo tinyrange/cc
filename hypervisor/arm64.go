@@ -34,6 +34,17 @@ type ARM64State struct {
 	System map[uint16]uint64
 }
 
+// ARM64Configuration locates the architectural interrupt controller. Both zero
+// selects the existing default map; platform-specific callers supply both.
+type ARM64Configuration struct {
+	GICDistributor, GICRedistributor uint64
+	// NestedVirtualization exposes a guest EL2 when supported by the host.
+	NestedVirtualization bool
+	// PrivateAppleISA selects HVF's private ISA level 3, independently of EL2.
+	// The executable must have the restricted com.apple.private.hypervisor entitlement.
+	PrivateAppleISA bool
+}
+
 type Exit struct {
 	Reason                                        uint32
 	PC, Syndrome, VirtualAddress, PhysicalAddress uint64
@@ -59,6 +70,8 @@ const (
 // ARM64 owns its mapped RAM and VCPU. Methods other than Cancel must be serialized.
 type ARM64 interface {
 	MapRAM(base, size uint64) ([]byte, error)
+	// ProtectRAM changes stage-2 permissions on a mapped, 16 KiB aligned range.
+	ProtectRAM(base, size uint64, read, write, execute bool) error
 	Restore(ARM64State) error
 	Run(context.Context) (Exit, error)
 	Register(index uint32) (uint64, error)
@@ -66,12 +79,16 @@ type ARM64 interface {
 	SystemRegister(encoding uint16) (uint64, error)
 	// Counter reads the native virtual counter and its frequency in Hz.
 	Counter() (ticks, frequency uint64, err error)
+	// SetSPI drives an architectural GIC shared peripheral interrupt ID.
+	SetSPI(id uint32, level bool) error
 	HandleSystemInstruction(syndrome uint64) (bool, error)
 	HandlePSCI() (bool, error)
 	SetDebugExceptionTrapping(bool) error
 	DeliverDebugException(Exit) error
 	NewNVMePCI(NVMePCIConfiguration, BlockDevice) (MMIODevice, error)
 	EmulateMMIO(Exit, MMIODevice) (bool, error)
+	// EmulateMMIOInstruction handles a scalar ISV=0 abort from fetched guest code.
+	EmulateMMIOInstruction(Exit, uint32, MMIODevice) (bool, error)
 	InterruptState() (map[string]uint64, error)
 	Advance() error
 	Cancel() error

@@ -9,22 +9,47 @@ import (
 	"sort"
 )
 
-type arm64VM struct{ vm *hvf.VM }
+type arm64VM struct {
+	vm                               *hvf.VM
+	gicDistributor, gicRedistributor uint64
+}
 
 func hostCounterFrequency() uint64
 
 func NewARM64(ctx context.Context) (ARM64, error) {
-	vm, err := hvf.NewVMWithContext(ctx)
+	return NewARM64WithConfiguration(ctx, ARM64Configuration{})
+}
+func NewARM64WithConfiguration(ctx context.Context, c ARM64Configuration) (ARM64, error) {
+	if (c.GICDistributor == 0) != (c.GICRedistributor == 0) {
+		return nil, fmt.Errorf("both GIC addresses must be supplied")
+	}
+	vm, err := hvf.NewVMWithOptions(ctx, hvf.VMOptions{CPUs: 1, GICDistributor: hvf.IPA(c.GICDistributor), GICRedistributor: hvf.IPA(c.GICRedistributor), NestedVirt: c.NestedVirtualization, PrivateAppleISA: c.PrivateAppleISA})
 	if err != nil {
 		return nil, err
 	}
-	return &arm64VM{vm}, nil
+	if c.GICDistributor == 0 {
+		c.GICDistributor, c.GICRedistributor = 0x08000000, 0x080a0000
+	}
+	return &arm64VM{vm: vm, gicDistributor: c.GICDistributor, gicRedistributor: c.GICRedistributor}, nil
 }
 func (v *arm64VM) MapRAM(base, size uint64) ([]byte, error) {
 	if size == 0 || size > 1<<40 || base+size < base || base&0x3fff != 0 || size&0x3fff != 0 {
 		return nil, fmt.Errorf("invalid RAM range")
 	}
 	return v.vm.MapAnonymousMemory(uintptr(size), hvf.IPA(base), 7)
+}
+func (v *arm64VM) ProtectRAM(base, size uint64, read, write, execute bool) error {
+	var flags hvf.MemoryFlags
+	if read {
+		flags |= 1
+	}
+	if write {
+		flags |= 2
+	}
+	if execute {
+		flags |= 4
+	}
+	return v.vm.ProtectMemory(hvf.IPA(base), size, flags)
 }
 func (v *arm64VM) Restore(s ARM64State) error {
 	for i, x := range s.X {
@@ -180,6 +205,12 @@ func (v *arm64VM) Counter() (uint64, uint64, error) {
 	}
 	return v.vm.CounterTicks() - offset, hostCounterFrequency(), nil
 }
+func (v *arm64VM) SetSPI(id uint32, level bool) error {
+	if id < 32 || id >= 1020 {
+		return fmt.Errorf("invalid GIC SPI %d", id)
+	}
+	return v.vm.SetIRQ(id-32, level)
+}
 
 func (v *arm64VM) NewNVMePCI(c NVMePCIConfiguration, d BlockDevice) (MMIODevice, error) {
 	return v.vm.NewNVMePCI(c.ConfigBase, c.ConfigSize, c.WindowBase, c.WindowSize, c.BAR, c.Device, c.Interrupt, d)
@@ -193,6 +224,9 @@ func (v *arm64VM) EmulateMMIO(ex Exit, d MMIODevice) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if gic := (*arm64GIC)(v); gic.Contains(ex.PhysicalAddress, info.SizeBytes) {
+		d = gic
+	}
 	if !d.Contains(ex.PhysicalAddress, info.SizeBytes) {
 		return false, nil
 	}
@@ -203,6 +237,9 @@ func (v *arm64VM) EmulateMMIO(ex Exit, d MMIODevice) (bool, error) {
 			if err != nil {
 				return false, err
 			}
+		}
+		if info.SizeBytes < 8 {
+			value &= uint64(1)<<(info.SizeBytes*8) - 1
 		}
 		if err := d.Write(ex.PhysicalAddress, info.SizeBytes, value); err != nil {
 			return false, err
@@ -226,6 +263,93 @@ func (v *arm64VM) EmulateMMIO(ex Exit, d MMIODevice) (bool, error) {
 		}
 	}
 	return true, v.vm.AdvanceProgramCounter()
+}
+
+func (v *arm64VM) EmulateMMIOInstruction(ex Exit, word uint32, d MMIODevice) (bool, error) {
+	if ex.Reason != ExitException || ex.Syndrome>>26 != 0x24 || ex.Syndrome&(1<<24) != 0 {
+		return false, nil
+	}
+	i, err := DecodeARM64MMIOInstruction(word)
+	if err != nil {
+		return false, err
+	}
+	if i.Write != (ex.Syndrome&(1<<6) != 0) {
+		return false, fmt.Errorf("MMIO instruction/abort direction mismatch")
+	}
+	var base uint64
+	var spReg hvf.SysReg
+	if i.Base == 31 {
+		state, err := v.vm.GetReg(34)
+		if err != nil {
+			return false, err
+		}
+		spReg = 0xc208
+		if state&15 == 5 {
+			spReg = 0xe208
+		}
+		base, err = v.vm.GetSysReg(spReg)
+	} else {
+		base, err = v.vm.GetReg(hvf.Reg(i.Base))
+	}
+	if err != nil {
+		return false, err
+	}
+	address := base + uint64(i.Offset)
+	if i.Mode == 1 {
+		address = base
+	}
+	if address != ex.VirtualAddress {
+		return false, fmt.Errorf("MMIO address mismatch: instruction=%#x fault=%#x", address, ex.VirtualAddress)
+	}
+	// Synthesize only architectural syndrome fields needed by the scalar
+	// emulator; fault addresses remain the original HVF-provided addresses.
+	ex.Syndrome &^= uint64(3<<22 | 1<<21 | 31<<16 | 1<<15)
+	ex.Syndrome |= 1<<24 | uint64(i.Target)<<16
+	for n := i.Size; n > 1; n >>= 1 {
+		ex.Syndrome += 1 << 22
+	}
+	if i.Signed {
+		ex.Syndrome |= 1 << 21
+	}
+	if i.Wide {
+		ex.Syndrome |= 1 << 15
+	}
+	handled, err := v.EmulateMMIO(ex, d)
+	if err != nil || !handled || i.Mode == 0 {
+		return handled, err
+	}
+	if i.Base == 31 {
+		err = v.vm.SetSysReg(spReg, base+uint64(i.Offset))
+	} else {
+		err = v.vm.SetReg(hvf.Reg(i.Base), base+uint64(i.Offset))
+	}
+	return true, err
+}
+
+// ISV=0 accesses cannot be decoded by HVF's built-in GIC path. Forward their
+// decoded register operations to the same native interrupt controller.
+type arm64GIC arm64VM
+
+func (g *arm64GIC) Contains(a uint64, n int) bool {
+	return (n == 4 || n == 8) && a%uint64(n) == 0 && (a >= g.gicDistributor && a-g.gicDistributor < 0x10000 || a >= g.gicRedistributor && a-g.gicRedistributor < 0x20000)
+}
+func (g *arm64GIC) Read(a uint64, n int) (uint64, error) {
+	if !g.Contains(a, n) {
+		return 0, fmt.Errorf("invalid GIC access")
+	}
+	if a >= g.gicDistributor && a-g.gicDistributor < 0x10000 {
+		return g.vm.GetGICDistributorReg(hvf.GICDistributorReg(a - g.gicDistributor))
+	}
+	return g.vm.GetGICRedistributorReg(hvf.GICRedistributorReg(a - g.gicRedistributor))
+}
+func (g *arm64GIC) Write(a uint64, n int, value uint64) error {
+	if !g.Contains(a, n) {
+		return fmt.Errorf("invalid GIC access")
+	}
+	if a >= g.gicDistributor && a-g.gicDistributor < 0x10000 {
+		return g.vm.SetGICDistributorReg(hvf.GICDistributorReg(a-g.gicDistributor), value)
+	}
+	return g.vm.SetGICRedistributorReg(hvf.GICRedistributorReg(a-g.gicRedistributor), value)
 }
 
 func (v *arm64VM) addInputPCI(bus MMIODevice, c InputPCIConfiguration) (InputDevice, error) {
