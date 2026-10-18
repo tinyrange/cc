@@ -208,15 +208,30 @@ func (c *Controller) WriteMMIO(offset uint64, size int, value uint64) error {
 		}
 		mps := (c.cc >> 7) & 0xf
 		c.pageSz = 4096 << mps
-		c.configureAdminQueueLocked()
+		if !wasEnabled {
+			c.configureAdminQueueLocked()
+		}
 		c.csts = 1
+		// Commands complete synchronously; after a shutdown notification no
+		// backend work remains in flight. Report shutdown complete, not busy.
+		if c.cc&(3<<14) != 0 {
+			c.csts |= 2 << 2
+		}
 	case regAQA:
 		c.aqa = uint32(value)
 	case regASQ:
+		if size == 8 {
+			c.asq = value
+			break
+		}
 		c.asq = (c.asq & 0xffffffff00000000) | uint64(uint32(value))
 	case regASQ + 4:
 		c.asq = (c.asq & 0xffffffff) | uint64(uint32(value))<<32
 	case regACQ:
+		if size == 8 {
+			c.acq = value
+			break
+		}
 		c.acq = (c.acq & 0xffffffff00000000) | uint64(uint32(value))
 	case regACQ + 4:
 		c.acq = (c.acq & 0xffffffff) | uint64(uint32(value))<<32
@@ -694,7 +709,10 @@ func (c *Controller) updateIRQLocked() error {
 			}
 		}
 	}
-	if high == c.irqHigh {
+	// INTx is a level, but MSI is a message. New completions can arrive
+	// while an older completion is still unacknowledged; suppressing messages
+	// until the entire controller becomes idle loses wakeups on busy queues.
+	if high == c.irqHigh && (!c.msi.enabled || !high) {
 		return nil
 	}
 	c.irqHigh = high

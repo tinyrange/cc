@@ -10,3 +10,7 @@ import (
 func NewX86(context.Context) (X86, error) {
 	return nil, fmt.Errorf("cc x86 native execution requires Linux/amd64 KVM")
 }
+
+func NewX86WithCPUs(context.Context, int) ([]X86, error) {
+	return nil, fmt.Errorf("cc x86 native execution requires Linux/amd64 KVM")
+}

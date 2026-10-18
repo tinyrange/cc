@@ -3,6 +3,7 @@
 package kvm
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -25,6 +26,8 @@ const (
 	ExitShutdown    ExitReason = 8
 	ExitInternal    ExitReason = 17
 	ExitSystemEvent ExitReason = 24
+	ExitRDMSR       ExitReason = 29
+	ExitWRMSR       ExitReason = 30
 )
 
 type Exit struct {
@@ -51,6 +54,7 @@ type MMIOExit struct {
 
 type VM struct {
 	lifecycleMu     sync.RWMutex
+	cpuExecutor     func(int, func() error) error
 	kvm             *Bootstrap
 	vmfd            int
 	vcpufd          int
@@ -61,13 +65,20 @@ type VM struct {
 	memoryDetach    []func()
 	memoryClosing   bool
 	debugSingleStep bool
+	fallbackMSRMu   sync.RWMutex
+	fallbackMSRs    map[uint32]uint64
 }
 
 type VCPU struct {
-	id  int
-	fd  int
-	run []byte
-	tid atomic.Int32
+	hypervSynIC                 bool
+	hyperv                      bool   // configured before execution; inspected only while paused
+	hypervCalls, hypervLastCall uint64 // owned by this vCPU
+
+	exitMu sync.Mutex // serializes Go writes to the KVM immediate-exit byte
+	id     int
+	fd     int
+	run    []byte
+	tid    atomic.Int32
 }
 
 type memoryMapping struct {
@@ -80,7 +91,12 @@ func NewVM() (*VM, error) {
 	return NewVMWithCPUs(1)
 }
 
-func NewVMWithCPUs(cpus int) (*VM, error) {
+func NewVMWithCPUs(cpus int) (*VM, error) { return NewVMWithCPUExecutor(cpus, nil) }
+
+// NewVMWithCPUExecutor lets the native adapter retain one locked thread per
+// vCPU, including initialization and teardown. The executor remains alive until
+// Close returns. Other callers retain the existing serialized-caller contract.
+func NewVMWithCPUExecutor(cpus int, execute func(int, func() error) error) (*VM, error) {
 	if cpus <= 0 {
 		cpus = 1
 	}
@@ -101,36 +117,45 @@ func NewVMWithCPUs(cpus int) (*VM, error) {
 		_ = k.CloseVM(vmfd)
 		return nil, fmt.Errorf("get kvm_run mmap size: %w", err)
 	}
-	vm := &VM{kvm: k, vmfd: vmfd}
+	vm := &VM{kvm: k, vmfd: vmfd, cpuExecutor: execute}
 	for id := 0; id < cpus; id++ {
-		vcpufd, err := k.CreateVCPU(vmfd, id)
+		var cpu *VCPU
+		err := vm.onCPU(id, func() error {
+			fd, err := k.CreateVCPU(vmfd, id)
+			if err != nil {
+				return fmt.Errorf("create: %w", err)
+			}
+			ok := false
+			defer func() {
+				if !ok {
+					_ = k.CloseVCPU(fd)
+				}
+			}()
+			if err := k.InitVCPUWithTopology(vmfd, fd, id, cpus); err != nil {
+				return err
+			}
+			if err := setVCPUMSR(fd, ia32MiscEnableMSR, ia32MiscEnableDefault); err != nil {
+				return err
+			}
+			if err := setVCPUMSR(fd, ia32BIOSSignIDMSR, uint64(0xffffffff)<<32); err != nil {
+				return err
+			}
+			run, err := unix.Mmap(fd, 0, mmapSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+			if err != nil {
+				return fmt.Errorf("mmap kvm_run: %w", err)
+			}
+			cpu = &VCPU{id: id, fd: fd, run: run}
+			ok = true
+			return nil
+		})
 		if err != nil {
-			_ = vm.Close()
-			return nil, fmt.Errorf("create vcpu %d: %w", id, err)
-		}
-		if err := k.InitVCPUWithTopology(vmfd, vcpufd, id, cpus); err != nil {
-			_ = k.CloseVCPU(vcpufd)
 			_ = vm.Close()
 			return nil, fmt.Errorf("init vcpu %d: %w", id, err)
 		}
-		run, err := unix.Mmap(vcpufd, 0, mmapSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-		if err != nil {
-			_ = k.CloseVCPU(vcpufd)
-			_ = vm.Close()
-			return nil, fmt.Errorf("mmap kvm_run vcpu %d: %w", id, err)
-		}
-		vm.vcpus = append(vm.vcpus, &VCPU{id: id, fd: vcpufd, run: run})
+		vm.vcpus = append(vm.vcpus, cpu)
 		if id == 0 {
-			vm.vcpufd = vcpufd
+			vm.vcpufd = cpu.fd
 		}
-	}
-	if err := vm.SetMiscEnable(); err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("set vcpu misc enable: %w", err)
-	}
-	if err := vm.SetMicrocodeSignature(0xffffffff); err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("set vcpu microcode signature: %w", err)
 	}
 	return vm, nil
 }
@@ -159,14 +184,17 @@ func (v *VM) Close() error {
 		if vcpu == nil {
 			continue
 		}
-		if len(vcpu.run) != 0 {
-			_ = unix.Munmap(vcpu.run)
-			vcpu.run = nil
-		}
-		if vcpu.fd >= 0 && v.kvm != nil {
-			_ = v.kvm.CloseVCPU(vcpu.fd)
-			vcpu.fd = -1
-		}
+		_ = v.onCPU(vcpu.id, func() error {
+			if len(vcpu.run) != 0 {
+				_ = unix.Munmap(vcpu.run)
+				vcpu.run = nil
+			}
+			if vcpu.fd >= 0 && v.kvm != nil {
+				_ = v.kvm.CloseVCPU(vcpu.fd)
+				vcpu.fd = -1
+			}
+			return nil
+		})
 	}
 	v.vcpus = nil
 	if len(v.mem) != 0 {
@@ -348,20 +376,44 @@ func (v *VM) RunVCPUInterruptible(index int, exit *Exit) error {
 	return v.vcpus[index].RunInterruptible(exit)
 }
 
+// RunVCPUContext checks cancellation after clearing the previous run's exit
+// flag. The caller must arrange RequestVCPUExit on ctx cancellation and join
+// that callback before reusing or closing this CPU.
+func (v *VM) RunVCPUContext(ctx context.Context, index int, exit *Exit) error {
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		return fmt.Errorf("vcpu %d out of range", index)
+	}
+	return v.vcpus[index].execute(exit, true, ctx)
+}
+
+func (c *VCPU) setImmediateExit(value uint8) {
+	c.exitMu.Lock()
+	defer c.exitMu.Unlock()
+	(*kvmRunData)(unsafe.Pointer(&c.run[0])).immediateExit = value
+}
+
 func (c *VCPU) Run(exit *Exit) error {
-	return c.execute(exit, false)
+	return c.execute(exit, false, nil)
 }
 
 func (c *VCPU) RunInterruptible(exit *Exit) error {
-	return c.execute(exit, true)
+	return c.execute(exit, true, nil)
 }
 
-func (c *VCPU) execute(exit *Exit, interruptible bool) error {
+func (c *VCPU) execute(exit *Exit, interruptible bool, ctx context.Context) error {
 	if exit == nil {
 		return fmt.Errorf("exit is nil")
 	}
 	run := (*kvmRunData)(unsafe.Pointer(&c.run[0]))
-	run.immediateExit = 0
+	c.setImmediateExit(0)
+	// Cancellation before the reset is observed here; cancellation after this
+	// check leaves immediateExit set through KVM entry, even if the kick signal
+	// arrives before ioctl. Never clear the flag again after checking ctx.
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	var err error
 	if interruptible {
 		_, err = ioctlRunVCPUInterruptible(uintptr(c.fd))
@@ -409,11 +461,28 @@ func (v *VM) RequestImmediateExit() {
 		if vcpu == nil || len(vcpu.run) == 0 {
 			continue
 		}
-		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
-		run.immediateExit = 1
+		vcpu.setImmediateExit(1)
 		if tid := vcpu.tid.Load(); tid > 0 {
 			_ = unix.Tgkill(pid, int(tid), unix.SIGURG)
 		}
+	}
+}
+
+// RequestVCPUExit interrupts only the selected CPU. Close must still follow
+// joining its execution owner, just as with RequestImmediateExit.
+func (v *VM) RequestVCPUExit(index int) {
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if index < 0 || index >= len(v.vcpus) {
+		return
+	}
+	cpu := v.vcpus[index]
+	if cpu == nil || len(cpu.run) == 0 {
+		return
+	}
+	cpu.setImmediateExit(1)
+	if tid := cpu.tid.Load(); tid > 0 {
+		_ = unix.Tgkill(unix.Getpid(), int(tid), unix.SIGURG)
 	}
 }
 
@@ -439,8 +508,7 @@ func (v *VM) CancelRun() error {
 		if vcpu == nil || len(vcpu.run) == 0 {
 			continue
 		}
-		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
-		run.immediateExit = 1
+		vcpu.setImmediateExit(1)
 	}
 	return nil
 }
@@ -1104,4 +1172,11 @@ func (v *VM) SetIRQ(line uint32, level bool) error {
 		return fmt.Errorf("set irq %d level=%v: %w", line, level, err)
 	}
 	return nil
+}
+
+func (v *VM) onCPU(index int, fn func() error) error {
+	if v.cpuExecutor != nil {
+		return v.cpuExecutor(index, fn)
+	}
+	return fn()
 }

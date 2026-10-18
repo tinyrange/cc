@@ -212,6 +212,13 @@ func TestControllerUsesMSIWhenConfigured(t *testing.T) {
 	if irq.msiAddr != 0x8080000 || irq.msiData != 3 {
 		t.Fatalf("MSI addr/data = %#x/%#x, want %#x/%#x", irq.msiAddr, irq.msiData, uint64(0x8080000), uint32(3))
 	}
+	// The prior CQ entry is deliberately still pending. MSI is a message,
+	// not an INTx edge: this new completion must wake the consumer again.
+	writeIOCommand(mem, ioSQ, 1, command{opcode: ioRead, cid: 4, nsid: 1, prp1: data, cdw12: 0})
+	mustWriteMMIO(t, ctrl, doorbellBase+8, 2)
+	if irq.msis != 2 {
+		t.Fatalf("second unacknowledged completion lost: %d messages", irq.msis)
+	}
 }
 
 func TestControllerPreservesAdminQueuesAcrossDisabledCCConfiguration(t *testing.T) {

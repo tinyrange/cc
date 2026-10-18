@@ -6,14 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/hv/kvm"
 )
 
 type nativeX86 struct {
-	*kvm.VM
+	vm          *kvm.VM
+	threads     []*x86Thread
 	slot        uint32
 	allocations [][]byte
 	a20Disabled bool
@@ -40,7 +40,7 @@ func (n *nativeX86) MapRAMRegions(size uint64, regions []RAMRegion) ([]byte, err
 	}
 	n.allocations = append(n.allocations, ram)
 	for _, r := range regions {
-		if err = n.MapSharedMemory(ram[r.Offset:r.Offset+r.Size], r.Address); err != nil {
+		if err = n.vm.MapSharedMemory(ram[r.Offset:r.Offset+r.Size], r.Address); err != nil {
 			return nil, err
 		}
 	}
@@ -70,7 +70,7 @@ func (n *nativeX86) SetA20(enabled bool) error {
 	for _, r := range layout {
 		regions = append(regions, kvm.SharedMemoryRegion{Address: r.Address, Memory: ram[r.Offset : r.Offset+r.Size]})
 	}
-	if err = n.ReplaceSharedMemory(regions); err != nil {
+	if err = n.vm.ReplaceSharedMemory(regions); err != nil {
 		return err
 	}
 	n.a20Disabled = !enabled
@@ -78,23 +78,56 @@ func (n *nativeX86) SetA20(enabled bool) error {
 }
 
 func (n *nativeX86) Close() error {
-	err := n.VM.Close()
+	err := n.vm.Close()
 	for _, ram := range n.allocations {
 		err = errors.Join(err, unix.Munmap(ram))
 	}
 	n.allocations = nil
+	for _, thread := range n.threads {
+		thread.close()
+	}
 	return err
 }
 
 func NewX86(ctx context.Context) (X86, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	vm, err := kvm.NewVM()
+	cpus, err := NewX86WithCPUs(ctx, 1)
 	if err != nil {
 		return nil, err
 	}
-	return &nativeX86{VM: vm}, nil
+	return cpus[0], nil
+}
+
+// NewX86WithCPUs creates one shared-memory machine. CPU0 owns memory and Close;
+// the remaining entries are borrowed CPU views. Each CPU's methods must be
+// serialized with its execution, but distinct CPUs may execute concurrently.
+// Each vCPU retains one locked OS thread through initialization, execution,
+// state access, completion and teardown (not physical-core affinity).
+// All CPUs and concurrent IRQ delivery must be joined before CPU0.Close.
+func NewX86WithCPUs(ctx context.Context, count int) ([]X86, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if count < 1 || count > 64 {
+		return nil, fmt.Errorf("CPU count must be 1..64")
+	}
+	root := &nativeX86{threads: make([]*x86Thread, count)}
+	for i := range root.threads {
+		root.threads[i] = newX86Thread()
+	}
+	vm, err := kvm.NewVMWithCPUExecutor(count, func(index int, fn func() error) error { return root.threads[index].call(fn) })
+	if err != nil {
+		for _, thread := range root.threads {
+			thread.close()
+		}
+		return nil, err
+	}
+	root.vm = vm
+	cpus := make([]X86, count)
+	cpus[0] = root
+	for i := 1; i < count; i++ {
+		cpus[i] = &nativeX86CPU{owner: root, index: i}
+	}
+	return cpus, nil
 }
 func (n *nativeX86) MapRAM(base, size uint64) ([]byte, error) {
 	if len(n.allocations) != 0 {
@@ -108,31 +141,33 @@ func (n *nativeX86) MapRAM(base, size uint64) ([]byte, error) {
 			return nil, fmt.Errorf("RAM mapping overlaps existing RAM")
 		}
 	}
-	ram, err := n.MapAnonymousMemorySlot(n.slot, size, base)
+	ram, err := n.vm.MapAnonymousMemorySlot(n.slot, size, base)
 	if err == nil {
 		n.slot++
 		n.mappings = append(n.mappings, RAMRegion{Address: base, Size: size})
 	}
 	return ram, err
 }
-func (n *nativeX86) Cancel() error { n.RequestImmediateExit(); return nil }
+func (n *nativeX86) Cancel() error { n.vm.RequestVCPUExit(0); return nil }
 func (n *nativeX86) Run(ctx context.Context) (X86Exit, error) {
 	return n.RunUntil(ctx, nil)
 }
 func (n *nativeX86) RunUntil(ctx context.Context, handle func(X86Exit) (bool, error)) (X86Exit, error) {
+	return n.runCPU(ctx, 0, handle)
+}
+
+func runX86CPU(ctx context.Context, n *kvm.VM, index int, handle func(X86Exit) (bool, error)) (X86Exit, error) {
 	if err := ctx.Err(); err != nil {
 		return X86Exit{}, err
 	}
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	n.SetVCPUTID(0, unix.Gettid())
-	defer n.SetVCPUTID(0, 0)
+	n.SetVCPUTID(index, unix.Gettid())
+	defer n.SetVCPUTID(index, 0)
 	// Most runs finish at an IO/MMIO exit long before cancellation. Starting
 	// and joining a goroutine for every VGA access forces scheduler handoffs
 	// in the hottest device path. AfterFunc runs a goroutine only if cancelled.
 	joined := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
-		n.RequestImmediateExit()
+		n.RequestVCPUExit(index)
 		close(joined)
 	})
 	defer func() {
@@ -146,12 +181,24 @@ func (n *nativeX86) RunUntil(ctx context.Context, handle func(X86Exit) (bool, er
 			return X86Exit{}, err
 		}
 		var ex kvm.Exit
-		err := n.RunVCPUInterruptible(0, &ex)
+		err := n.RunVCPUContext(ctx, index, &ex)
 		if errors.Is(err, unix.EINTR) {
 			return X86Exit{}, ctx.Err()
 		}
 		if err != nil {
 			return X86Exit{}, err
+		}
+		if ex.Reason == kvm.ExitRDMSR || ex.Reason == kvm.ExitWRMSR {
+			if err := n.CompleteFallbackMSR(index); err != nil {
+				return X86Exit{}, err
+			}
+			continue
+		}
+		if ex.Reason == 27 { // KVM_EXIT_HYPERV
+			if err := n.CompleteHyperVExit(index); err != nil {
+				return X86Exit{}, err
+			}
+			continue
 		}
 		ret := X86Exit{Reason: uint32(ex.Reason)}
 		if ex.Reason == kvm.ExitUnknown {

@@ -182,7 +182,11 @@ func (sb *tcpSendBuffer) oldest() (tcpSendSegment, bool) {
 	if len(sb.segments) == 0 {
 		return tcpSendSegment{}, false
 	}
-	return sb.segments[0], true
+	seg := sb.segments[0]
+	// ACK processing may release/reuse the queue buffer after this lock is
+	// dropped. Retransmission owns its snapshot until the send completes.
+	seg.payload = append([]byte(nil), seg.payload...)
+	return seg, true
 }
 
 // markRetransmittedN updates the retx count and timestamp for the oldest n segments.
@@ -207,7 +211,22 @@ func (sb *tcpSendBuffer) oldestCoalesced(maxSize int) (tcpSendSegment, int, bool
 		return tcpSendSegment{}, 0, false
 	}
 
-	return sb.segments[0], 1, true
+	if maxSize <= 0 {
+		return tcpSendSegment{}, 0, false
+	}
+	seg := sb.segments[0]
+	seg.payload = append([]byte(nil), seg.payload...)
+	count := 1
+	for _, next := range sb.segments[1:] {
+		if next.seqStart != seg.seqEnd || len(seg.payload)+len(next.payload) > maxSize {
+			break
+		}
+		seg.payload = append(seg.payload, next.payload...)
+		seg.seqEnd = next.seqEnd
+		seg.retxCount = max(seg.retxCount, next.retxCount)
+		count++
+	}
+	return seg, count, true
 }
 
 // len returns the number of segments in the buffer.
