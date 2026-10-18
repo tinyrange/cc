@@ -21,11 +21,19 @@ func (v *VM) SupportedCPUID() ([]x86state.CPUIDEntry, error) {
 	return result, nil
 }
 
-// SetCPUID configures the single CPU before its first execution. Feature and
+// SetCPUID configures the boot CPU before its first execution. Feature and
 // topology policy belongs to the machine model, not this accelerator boundary.
 func (v *VM) SetCPUID(entries []x86state.CPUIDEntry) error {
-	if len(v.vcpus) != 1 || len(entries) == 0 || len(entries) > cpuidMaxEntries {
-		return fmt.Errorf("invalid single-CPU CPUID table")
+	return v.SetVCPUCPUID(0, entries)
+}
+
+func (v *VM) SetVCPUCPUID(index int, entries []x86state.CPUIDEntry) error {
+	fd, err := v.vcpuFD(index)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 || len(entries) > cpuidMaxEntries {
+		return fmt.Errorf("invalid CPUID table")
 	}
 	table, err := getSupportedCPUID(v.kvm.fd)
 	if err != nil {
@@ -35,5 +43,14 @@ func (v *VM) SetCPUID(entries []x86state.CPUIDEntry) error {
 	for i, e := range entries {
 		cpuidStorage(table)[i] = kvmCPUIDEntry2{Function: e.Function, Index: e.Index, Flags: e.Flags, Eax: e.Eax, Ebx: e.Ebx, Ecx: e.Ecx, Edx: e.Edx}
 	}
-	return setVCPUID(v.vcpufd, table)
+	if err := setVCPUID(fd, table); err != nil {
+		return err
+	}
+	v.vcpus[index].hyperv = false
+	for _, e := range entries {
+		if e.Function == 0x40000001 && e.Eax == 0x31237648 {
+			v.vcpus[index].hyperv = true
+		}
+	}
+	return nil
 }

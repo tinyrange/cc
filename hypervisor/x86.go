@@ -31,7 +31,18 @@ const (
 	X86ExitShutdown uint32 = 8
 )
 
-// X86 owns its RAM and one CPU. All methods except Cancel and SetIRQ must be serialized.
+// X86ReadOnlyFallbackMSRs is an optional machine-owner capability for registers
+// unknown to the accelerator. Configure before any CPU runs. Values are copied
+// and shared by all CPUs; known registers remain accelerator-owned, and unknown
+// writes or unlisted reads still fault. This machine policy is not CPU snapshot
+// state and must be configured separately on a newly created restore target.
+type X86ReadOnlyFallbackMSRs interface {
+	SetReadOnlyFallbackMSRs(map[uint32]uint64) error
+}
+
+// X86 is one CPU execution view. NewX86 owns its machine; NewX86WithCPUs
+// gives CPU0 ownership and borrowed secondary views. Methods except Cancel and
+// SetIRQ must be serialized for each CPU; memory mapping requires all CPUs idle.
 // The PC interrupt controllers and interval timer are provided by the backend.
 // Firmware, disk and display device semantics belong to the caller.
 type X86 interface {
@@ -59,6 +70,8 @@ type X86 interface {
 	// SetIRQ may run concurrently with Run/RunUntil. The caller must join
 	// pending IRQ delivery before Close.
 	SetIRQ(line uint32, level bool) error
+	// InterruptState inspects VM-wide controllers and per-CPU LAPIC state.
+	// Pause and join all CPUs before calling; it is not a RunUntil callback API.
 	InterruptState() (map[string]uint64, error)
 	Cancel() error
 	Close() error

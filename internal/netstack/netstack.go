@@ -161,7 +161,9 @@ type udpEndpoint interface {
 
 // NetStack implements the ns.NetStack interface for our raw stack.
 type NetStack struct {
-	log *slog.Logger
+	// maxTCPConnections is configured before attaching an interface; zero is unlimited.
+	maxTCPConnections int
+	log               *slog.Logger
 
 	// MAC and addressing state.
 	hostMAC          atomic.Uint64 // MAC of this stack ("host")
@@ -253,8 +255,17 @@ func (ns *NetStack) defaultOutboundTCPDial(ctx context.Context, addr *net.TCPAdd
 	return d.DialContext(ctx, "tcp", addr.String())
 }
 
-// SetOutboundTCPDialer overrides how outbound TCP connections are created for
-// transparent proxying. If dial is nil, the default dialer is restored.
+// SetTCPConnectionLimit bounds accepted and half-open connections. Configure
+// before attaching the network interface. Zero preserves the unrestricted mode.
+func (ns *NetStack) SetTCPConnectionLimit(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	ns.maxTCPConnections = limit
+}
+
+// SetOutboundTCPDialer overrides outbound TCP proxy creation. A nil dialer
+// restores the default host dialer. Configure before attaching an interface.
 func (ns *NetStack) SetOutboundTCPDialer(dial func(ctx context.Context, addr *net.TCPAddr) (net.Conn, error)) {
 	if dial == nil {
 		ns.tcpDial = ns.defaultOutboundTCPDial
@@ -306,7 +317,7 @@ func (ns *NetStack) Close() error {
 		// touching guest memory.
 		ns.mu.Lock()
 		if ns.iface != nil {
-			ns.iface.backend = nil
+			ns.iface.AttachVirtioBackend(nil)
 		}
 		ns.iface = nil
 		ns.mu.Unlock()
@@ -546,8 +557,9 @@ func (ns *NetStack) writePacketCapture(data []byte) {
 // NetworkInterface is the concrete virtio-like interface that the guest uses
 // to deliver and receive frames. It satisfies ns.NetworkInterface.
 type NetworkInterface struct {
-	stack   *NetStack
-	backend func(frame []byte) error // Provided by VirtIO backend driver
+	backendMu sync.RWMutex
+	stack     *NetStack
+	backend   func(frame []byte) error // Provided by VirtIO backend driver
 }
 
 // AttachNetworkInterface binds a new interface to the stack.
@@ -587,7 +599,9 @@ func (ns *NetStack) AttachNetworkInterface() (*NetworkInterface, error) {
 // returning. Keeping this ownership boundary here lets the stack build packets
 // directly into pooled buffers without hidden per-packet copies.
 func (nic *NetworkInterface) AttachVirtioBackend(handler func(frame []byte) error) {
+	nic.backendMu.Lock()
 	nic.backend = handler
+	nic.backendMu.Unlock()
 	tracef("netstack.AttachVirtioBackend", "attached=%t", handler != nil)
 }
 
@@ -620,7 +634,10 @@ func (nic *NetworkInterface) DeliverGuestPacket(
 
 // sendFrame transmits a frame back to the guest via the backend.
 func (nic *NetworkInterface) sendFrame(frame []byte) error {
-	if nic.backend == nil {
+	nic.backendMu.RLock()
+	backend := nic.backend
+	nic.backendMu.RUnlock()
+	if backend == nil {
 		tracef("netstack.sendFrame(nic) drop backend=nil", "len=%d", len(frame))
 		return fmt.Errorf("virtio backend not attached")
 	}
@@ -640,7 +657,7 @@ func (nic *NetworkInterface) sendFrame(frame []byte) error {
 	// Ownership/lifetime: `frame` is only valid for the duration of this call.
 	// Backends must not retain the slice; if they need to keep it (e.g. queue
 	// asynchronously), they must make their own copy.
-	return nic.backend(frame)
+	return backend(frame)
 }
 
 // sendFrame transmits a prebuilt Ethernet frame to the attached NIC backend.
@@ -1733,11 +1750,13 @@ type tcpConn struct {
 	writeClosed    bool
 
 	// Retransmission support
-	sendBuf     *tcpSendBuffer   // segments awaiting ACK
-	rttEst      *tcpRTTEstimator // RTT estimation for RTO
-	retxTimer   *time.Timer      // retransmission timer
-	retxTimerMu sync.Mutex       // protects retxTimer
-	retxCount   int              // total retransmissions on this conn
+	sendBuf        *tcpSendBuffer   // segments awaiting ACK
+	rttEst         *tcpRTTEstimator // RTT estimation for RTO
+	retxTimer      *time.Timer      // retransmission timer
+	retxTimerMu    sync.Mutex       // protects retxTimer
+	retxCount      int              // total retransmissions on this conn
+	recoveryActive bool             // ACK-clock retransmission of a lost flight
+	recoveryEnd    uint32           // last sequence sent when recovery began
 
 	// Out-of-order receive buffering
 	oooRecvBuf *tcpRecvBuffer // out-of-order segments
@@ -1864,6 +1883,10 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			return nil
 		}
 
+		if ns.maxTCPConnections > 0 && len(ns.tcpConns) >= ns.maxTCPConnections {
+			ns.tcpMu.Unlock()
+			return nil // Drop like a full SYN backlog; do not allocate per-attempt state.
+		}
 		// Parse TCP options from SYN
 		opts := parseTCPOptions(hdr.options)
 		dstIP := h.dst.To4()
@@ -1948,6 +1971,16 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 }
 
 func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
+	// Send after dropping c.mu: a packet backend may synchronously deliver an
+	// ACK. One retransmission per advancing ACK repairs a lost flight without
+	// waiting for a new, exponentially backed-off timeout for each segment.
+	var recovery *tcpSendSegment
+	var recoveryAck uint32
+	defer func() {
+		if recovery != nil {
+			_ = c.stack.sendTCPPacket(c.localIPv4, c.key, recovery.seqStart, recoveryAck, tcpFlagACK, recovery.payload)
+		}
+	}()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -1967,10 +2000,14 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		oldWnd := c.peerWnd
 		c.peerWnd = hdr.window
 		windowOpened := oldWnd == 0 && hdr.window > 0
-		if hdr.ack > c.sendAcked {
+		if seqLT(c.sendAcked, hdr.ack) {
 			// Calculate bytes acknowledged for congestion control
 			bytesAcked := hdr.ack - c.sendAcked
 			c.sendAcked = hdr.ack
+
+			if c.retxCount > 0 {
+				tracef("netstack.tcpConn recovery ack", "acked=%d sent=%d received=%d", hdr.ack, c.hostSeq, c.guestSeq)
+			}
 
 			// Reset duplicate ACK counter on new ACK
 			c.dupAcks = 0
@@ -1983,6 +2020,20 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			// Free acknowledged segments from send buffer and get RTT sample
 			if c.sendBuf != nil {
 				_, rttSample, hasRTT := c.sendBuf.ack(hdr.ack)
+				if c.recoveryActive {
+					if !seqLT(hdr.ack, c.recoveryEnd) {
+						c.recoveryActive = false
+					} else {
+						mss := int(c.mss)
+						if mss == 0 {
+							mss = defaultMSS
+						}
+						if seg, n, ok := c.sendBuf.oldestCoalesced(mss); ok {
+							c.sendBuf.markRetransmittedN(n)
+							recovery, recoveryAck = &seg, c.guestSeq
+						}
+					}
+				}
 				// Update RTT estimator with sample from non-retransmitted segment
 				if hasRTT && c.rttEst != nil {
 					c.rttEst.update(rttSample)
@@ -2029,6 +2080,11 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				// 3 duplicate ACKs - trigger fast retransmit
 				seg, ok := c.sendBuf.oldest()
 				if ok {
+					if !c.recoveryActive {
+						c.recoveryActive, c.recoveryEnd = true, c.hostSeq
+					}
+					// Karn's rule also applies to fast retransmits.
+					c.sendBuf.markRetransmittedN(1)
 					ack := c.guestSeq
 					c.mu.Unlock()
 					c.stack.sendTCPPacket(c.localIPv4, c.key, seg.seqStart, ack, tcpFlagACK, seg.payload)
@@ -2038,7 +2094,7 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		}
 		// If the peer ACKs beyond what we think we've sent, resync to avoid
 		// stalling due to mismatched sequence tracking.
-		if hdr.ack > c.hostSeq {
+		if seqLT(c.hostSeq, hdr.ack) {
 			c.hostSeq = hdr.ack
 			c.sendAcked = hdr.ack
 			if c.sendCond != nil {
@@ -2098,6 +2154,9 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				case listener.incoming <- c:
 				case <-listener.closeCh:
 					c.Close()
+				default:
+					// Never block the packet pump behind an unconsumed accept backlog.
+					c.Close()
 				}
 			} else if cb != nil {
 				go cb(c)
@@ -2126,6 +2185,14 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				return nil
 			}
 
+			// Reserve enough queue slots for this segment, all bounded OOO
+			// segments it may release, and an optional EOF. Never advance the
+			// receive sequence for bytes the application queue cannot retain.
+			if cap(c.recvBuf)-len(c.recvBuf) < maxOOOSegments+2 {
+				c.mu.Unlock()
+				c.sendAck()
+				return nil
+			}
 			// In-order segment: deliver it
 			c.guestSeq += uint32(len(hdr.payload))
 			data := retainPayload(hdr.payload)
@@ -2145,15 +2212,16 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				c.guestSeq++
 				c.state = tcpStateFinWait
 			}
-			c.mu.Unlock()
-
-			// Deliver all data to application
-			c.enqueueData(data)
+			// Keep delivery ordered under c.mu, including concurrent packet callers.
+			c.enqueueDataLocked(data)
 			for _, seg := range contiguous {
-				c.enqueueData(seg)
+				c.enqueueDataLocked(seg)
 			}
 			if peerClosed {
-				c.enqueueData(nil) // signal EOF after the final payload
+				c.enqueueDataLocked(nil)
+			}
+			c.mu.Unlock()
+			if peerClosed {
 				c.sendAckImmediate()
 				if !writeClosed {
 					c.sendFin()
@@ -2165,11 +2233,16 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			return nil
 		}
 		if hdr.flags&tcpFlagFIN != 0 {
+			if len(c.recvBuf) == cap(c.recvBuf) {
+				c.mu.Unlock()
+				c.sendAck()
+				return nil
+			}
+			c.enqueueDataLocked(nil)
 			c.guestSeq++
 			c.state = tcpStateFinWait
 			writeClosed := c.writeClosed
 			c.mu.Unlock()
-			c.enqueueData(nil) // signal EOF to readers
 			// Send ACK immediately for FIN
 			c.sendAckImmediate()
 			if !writeClosed {
@@ -2206,17 +2279,21 @@ func (c *tcpConn) enqueueData(data []byte) {
 	// Synchronize with Close() (which closes recvBuf) to avoid sending on a
 	// closed channel.
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enqueueDataLocked(data)
+}
+
+// The receive path reserves queue capacity before advancing guestSeq.
+func (c *tcpConn) enqueueDataLocked(data []byte) {
 	if c.closed {
-		c.mu.Unlock()
+		releasePayload(data)
 		return
 	}
-	// Avoid blocking the network path if readers are slow.
 	select {
 	case c.recvBuf <- data:
 	default:
 		releasePayload(data)
 	}
-	c.mu.Unlock()
 }
 
 // applyPeerOptions stores the peer's TCP options from the SYN segment.
@@ -2817,16 +2894,20 @@ func (c *tcpConn) onRetxTimeout() {
 		c.congCtrl.onTimeout()
 	}
 
+	tracef("netstack.tcpConn recovery timeout", "oldest=%d bytes=%d coalesced=%d sent=%d acked=%d received=%d rto=%s retry=%d", seg.seqStart, len(seg.payload), coalescedCount, c.hostSeq, c.sendAcked, c.guestSeq, rto, seg.retxCount)
+
 	// Exponential backoff
 	c.rttEst.backoff()
 
+	if !c.recoveryActive {
+		c.recoveryActive, c.recoveryEnd = true, c.hostSeq
+	}
+	// Mark while ACK processing is excluded, before exposing the packet.
+	c.sendBuf.markRetransmittedN(coalescedCount)
 	ack := c.guestSeq
 	c.retxCount++
 	rto = c.rttEst.getRTO() // Get updated RTO after backoff
 	c.mu.Unlock()
-
-	// Mark coalesced segments as retransmitted
-	c.sendBuf.markRetransmittedN(coalescedCount)
 
 	tracef("netstack.tcpConn retransmitting segment", "seq=%d len=%d retxCount=%d coalesced=%d", seg.seqStart, len(seg.payload), seg.retxCount+1, coalescedCount)
 
@@ -3911,8 +3992,13 @@ func itoa(v int) string {
 
 var netstackTraceEnabled = os.Getenv("CC_NETSTACK_TRACE") != ""
 
+// Optional event-name substring restricts a packet trace to one observation
+// point. This avoids dumping every Ethernet, IP, TCP and application event
+// when investigating a single transport transition.
+var netstackTraceFilter = os.Getenv("CC_NETSTACK_TRACE_FILTER")
+
 func tracef(event string, format string, args ...any) {
-	if !netstackTraceEnabled {
+	if !netstackTraceEnabled || (netstackTraceFilter != "" && !strings.Contains(event, netstackTraceFilter)) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, event+": "+format+"\n", args...)
