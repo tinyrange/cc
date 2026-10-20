@@ -97,6 +97,10 @@ func (n *Isolated) dhcp(ip []byte, header int) {
 	option(54, hostIP[:])
 	if replyKind != 6 {
 		option(1, []byte{255, 255, 255, 0})
+		if n.internet {
+			option(3, hostIP[:])
+			option(6, hostIP[:])
+		}
 		if kind != 8 {
 			option(51, []byte{0, 1, 81, 128})
 		} // 86400 seconds.
