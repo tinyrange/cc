@@ -1893,7 +1893,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		allowServiceProxy := ns.serviceProxyAllowed(dstIP, hdr.dstPort)
 
 		// Local listener present? Create a conn and complete handshake.
-		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
+		if listener, ok := ns.tcpListen[hdr.dstPort]; ok && ipEqual(dstIP, ns.hostIPv4[:]) {
 			tracef("netstack.handleTCP new connection", "dstPort=%d", hdr.dstPort)
 			conn = newTCPConn(ns, listener, key, hdr.seq, hdr.window, ns.hostIPv4, nil)
 			conn.applyPeerOptions(opts)

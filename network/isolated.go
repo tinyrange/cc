@@ -1,5 +1,6 @@
 // Package network exposes an isolated, packet-only endpoint for guest services.
-// It never binds a host socket, resolves a name, or forwards guest traffic.
+// By default it never binds a host socket, resolves names, or forwards traffic.
+// NewInternet explicitly enables outbound IPv4 TCP and DNS, not host/LAN access.
 package network
 
 import (
@@ -23,7 +24,8 @@ const maxQueuedFrames = 256
 const maxFrameSize = 1514
 
 // Isolated connects a single guest (10.42.0.2/24) to internal services on
-// 10.42.0.1. DHCP supplies only that address and subnet: no router or DNS.
+// 10.42.0.1. NewIsolated supplies only address/subnet via DHCP; NewInternet
+// also supplies router/DNS and explicitly enables public IPv4 TCP proxying.
 // Receive and Poll exchange Ethernet frames without an FCS. Poll transfers
 // ownership; Receive borrows input only for the duration of the call.
 // Close unblocks listener/connection operations. The zero value is not usable.
@@ -36,22 +38,38 @@ type Isolated struct {
 	queueMu      sync.Mutex
 	queue        [][]byte
 	outputClosed bool
+	internet     bool
 }
 
 func NewIsolated(guest, host [6]byte) (*Isolated, error) {
+	return newEndpoint(guest, host, false)
+}
+
+// NewInternet enables outbound public IPv4 TCP and DNS. It does not bind host
+// listeners or allow access to host/LAN addresses. UDP other than DNS is dropped.
+func NewInternet(guest, host [6]byte) (*Isolated, error) {
+	return newEndpoint(guest, host, true)
+}
+
+func newEndpoint(guest, host [6]byte, internet bool) (*Isolated, error) {
 	if guest[0]&1 != 0 || host[0]&1 != 0 || guest == host || guest == [6]byte{} || host == [6]byte{} {
 		return nil, errors.New("isolated network requires distinct unicast MACs")
 	}
 	ns := netstack.New(nil)
 	ns.SetServiceProxyEnabled(false)
 	ns.SetHostAccessEnabled(false)
-	ns.SetInternetAccessEnabled(false)
+	ns.SetInternetAccessEnabled(internet)
 	ns.SetAllowedServiceProxyPorts(nil)
 	ns.SetChecksumValidationEnabled(true)
 	ns.SetTCPConnectionLimit(64)
-	ns.SetOutboundTCPDialer(func(context.Context, *net.TCPAddr) (net.Conn, error) {
-		return nil, errors.New("isolated network cannot dial")
-	})
+	if !internet {
+		ns.SetOutboundTCPDialer(func(context.Context, *net.TCPAddr) (net.Conn, error) {
+			return nil, errors.New("isolated network cannot dial")
+		})
+	} else if err := ns.StartDNSServer(); err != nil {
+		ns.Close()
+		return nil, err
+	}
 	if err := ns.SetGuestMAC(net.HardwareAddr(guest[:])); err != nil {
 		ns.Close()
 		return nil, err
@@ -65,7 +83,7 @@ func NewIsolated(guest, host [6]byte) (*Isolated, error) {
 		ns.Close()
 		return nil, err
 	}
-	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host}
+	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host, internet: internet}
 	nic.AttachVirtioBackend(n.enqueue)
 	return n, nil
 }
@@ -160,9 +178,12 @@ func (n *Isolated) Receive(frame []byte) error {
 			if bytes.Equal(ip[16:20], hostIP[:]) || bytes.Equal(ip[16:20], broadcastIP[:]) {
 				n.dhcp(ip, header)
 			}
+			if n.internet && bytes.Equal(ip[12:16], guestIP[:]) && bytes.Equal(ip[16:20], hostIP[:]) && len(ip) >= header+8 && binary.BigEndian.Uint16(ip[header+2:]) == 53 {
+				_ = n.nic.DeliverGuestPacket(frame[:14+size], true)
+			}
 			return nil
 		}
-		if !bytes.Equal(ip[12:16], guestIP[:]) || !bytes.Equal(ip[16:20], hostIP[:]) {
+		if !bytes.Equal(ip[12:16], guestIP[:]) || (!n.internet && !bytes.Equal(ip[16:20], hostIP[:])) {
 			return nil
 		}
 		if ip[9] != 6 && ip[9] != 1 {
