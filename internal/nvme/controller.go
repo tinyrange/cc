@@ -188,10 +188,10 @@ func (c *Controller) WriteMMIO(offset uint64, size int, value uint64) error {
 	switch offset {
 	case regINTMS:
 		c.intMask |= uint32(value)
-		return c.updateIRQLocked()
+		return c.updateIRQLocked(false)
 	case regINTMC:
 		c.intMask &^= uint32(value)
-		return c.updateIRQLocked()
+		return c.updateIRQLocked(false)
 	case regCC:
 		wasEnabled := c.cc&1 != 0
 		c.cc = uint32(value)
@@ -296,10 +296,11 @@ func (c *Controller) writeDoorbellLocked(offset uint64, value uint32) error {
 		return c.processSubmissionQueueLocked(q)
 	}
 	q.advanceCompletionHeadLocked(uint16(value))
-	return c.updateIRQLocked()
+	return c.updateIRQLocked(false)
 }
 
 func (c *Controller) processSubmissionQueueLocked(q *queue) error {
+	completed := false
 	for q.sqHead != q.sqTail {
 		raw := c.queueSubmissionEntry(q, q.sqHead)
 		if raw == nil {
@@ -329,8 +330,9 @@ func (c *Controller) processSubmissionQueueLocked(q *queue) error {
 		if err := c.writeCompletionLocked(cq, q.id, q.sqHead, cmd.cid, result, status); err != nil {
 			return fmt.Errorf("write nvme completion for sq%d cq%d opcode=%#x cid=%d: %w", q.id, cq.id, cmd.opcode, cmd.cid, err)
 		}
+		completed = true
 	}
-	return c.updateIRQLocked()
+	return c.updateIRQLocked(completed)
 }
 
 func parseCommand(raw []byte) command {
@@ -699,7 +701,7 @@ func (c *Controller) writeCompletionLocked(q *queue, sqid uint16, sqHead uint16,
 	return nil
 }
 
-func (c *Controller) updateIRQLocked() error {
+func (c *Controller) updateIRQLocked(completed bool) error {
 	high := false
 	if c.intMask&1 == 0 {
 		for _, q := range c.queues {
@@ -712,7 +714,10 @@ func (c *Controller) updateIRQLocked() error {
 	// INTx is a level, but MSI is a message. New completions can arrive
 	// while an older completion is still unacknowledged; suppressing messages
 	// until the entire controller becomes idle loses wakeups on busy queues.
-	if high == c.irqHigh && (!c.msi.enabled || !high) {
+	// A CQ-head acknowledgement or unchanged SQ-tail is not a new completion:
+	// repeating MSI there creates redundant interrupts while draining a queue.
+	// A masked-to-unmasked transition still delivers pending work.
+	if high == c.irqHigh && (!c.msi.enabled || !high || !completed) {
 		return nil
 	}
 	c.irqHigh = high

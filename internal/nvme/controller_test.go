@@ -219,6 +219,23 @@ func TestControllerUsesMSIWhenConfigured(t *testing.T) {
 	if irq.msis != 2 {
 		t.Fatalf("second unacknowledged completion lost: %d messages", irq.msis)
 	}
+	// A partial acknowledgement leaves a completion pending, but must not
+	// manufacture another message. Neither may ringing an unchanged SQ tail.
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 1)
+	mustWriteMMIO(t, ctrl, doorbellBase+8, 2)
+	if irq.msis != 2 {
+		t.Fatalf("acknowledgement/empty submission sent redundant MSI: %d", irq.msis)
+	}
+	mustWriteMMIO(t, ctrl, regINTMS, 1)
+	mustWriteMMIO(t, ctrl, regINTMC, 1)
+	if irq.msis != 3 {
+		t.Fatalf("unmask lost pending completion: %d messages", irq.msis)
+	}
+	mustWriteMMIO(t, ctrl, regINTMC, 1)
+	mustWriteMMIO(t, ctrl, doorbellBase+12, 2)
+	if irq.msis != 3 {
+		t.Fatalf("unchanged mask/drained queue sent redundant MSI: %d", irq.msis)
+	}
 }
 
 func TestControllerPreservesAdminQueuesAcrossDisabledCCConfiguration(t *testing.T) {
