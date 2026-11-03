@@ -56,3 +56,30 @@ The entitled integration test exercises general/SIMD state restoration, the
 native cycle counter and debug exception delivery. Build the test executable
 with cgo disabled, sign with `tools/entitlements.xml`, and run
 `CC_HVF_TEST=1 <test-executable> -test.run TestARM64Restore`.
+
+# Caller-constructed x86 PCs
+
+`NewX86` and `NewX86WithCPUs` provide native Linux/amd64 KVM and Windows/amd64
+WHP execution. The caller supplies RAM layout, architectural CPU state, CPUID
+policy, firmware and devices. The accelerator backend supplies PIC, PIT,
+IOAPIC and LAPIC semantics. Windows requires Windows Hypervisor Platform.
+
+CPU0 owns the partition and RAM; secondary CPUs borrow that ownership. Join
+all CPU runs and interrupt delivery before closing CPU0. RAM slices and borrowed
+exit data become invalid when their owner closes. `Cancel` targets one CPU;
+`SetIRQ` can run concurrently with execution.
+
+Complete a pending device operation before changing architectural state.
+`CompleteIO` commits that operation without executing the next guest
+instruction. A multi-access instruction can expose another device exit on the
+next `Run` call. `CompleteMMIORead` supplies its read value. The WHP bridge keeps
+instruction emulation suspended at device callbacks, including read/modify/write
+operations, so the caller never needs a second guest-memory image.
+
+CPUID tables use `CPUIDEntry.Flags & 1` to identify significant subleaf indices.
+Other leaves ignore the incoming ECX. WHP supplies Intel-compatible
+MISC_ENABLE fast-string and CPUID-limit controls when an AMD host faults those
+Intel MSR accesses. Unrelated faults retain their architectural behavior.
+
+On a Windows x64 host, `CC_WHP_TEST=1 go test ./hypervisor -run TestWHP -v`
+executes the native CPU, I/O, interrupt and four-CPU startup regression tests.
