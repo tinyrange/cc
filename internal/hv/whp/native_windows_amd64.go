@@ -33,6 +33,7 @@ type NativeCPU struct {
 	workerDone chan struct{}
 	queued     *x86state.Exit
 	miscEnable uint64
+	exitCounts map[runVPExitReason]uint64
 }
 type nativeRequest struct{ exit x86state.Exit }
 type nativeMachine struct {
@@ -47,6 +48,7 @@ type nativeMachine struct {
 	fallback          map[uint32]uint64
 	regions           []x86state.RAMRegion
 	a20Disabled       bool
+	hyperVFeatures    uint64
 }
 
 func NewNativeCPUs(ctx context.Context, count int) ([]*NativeCPU, error) {
@@ -61,7 +63,13 @@ func NewNativeCPUs(ctx context.Context, count int) ([]*NativeCPU, error) {
 	}
 	// Processor policy must be installed before WHvSetupPartition. Allocate
 	// caller-owned RAM later, using the caller's physical layout.
+	var hyperVFeatures uint64
 	vm, err := newVMConfigured(0, true, false, count, nil, func(part partitionHandle) error {
+		var err error
+		hyperVFeatures, err = configureNativeHyperV(part)
+		if err != nil {
+			return err
+		}
 		if err := setPartitionProperty(part, partitionPropertyCodeExtendedVMExits, uint64(7)); err != nil {
 			return err
 		}
@@ -75,7 +83,7 @@ func NewNativeCPUs(ctx context.Context, count int) ([]*NativeCPU, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &nativeMachine{vm: vm}
+	m := &nativeMachine{vm: vm, hyperVFeatures: hyperVFeatures}
 	m.ioapic.init()
 	m.pic.master.vectorBase, m.pic.slave.vectorBase = 8, 0x70
 	m.pic.master.mask, m.pic.slave.mask = 0xff, 0xff
@@ -526,6 +534,10 @@ func (c *NativeCPU) RunUntil(ctx context.Context, handle func(x86state.Exit) (bo
 		if err != nil {
 			return x86state.Exit{}, err
 		}
+		if c.exitCounts == nil {
+			c.exitCounts = make(map[runVPExitReason]uint64)
+		}
+		c.exitCounts[c.raw.ExitReason]++
 		switch c.raw.ExitReason {
 		case runVPExitReasonCanceled:
 			return x86state.Exit{}, ctx.Err()

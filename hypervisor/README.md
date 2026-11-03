@@ -83,3 +83,17 @@ Intel MSR accesses. Unrelated faults retain their architectural behavior.
 
 On a Windows x64 host, `CC_WHP_TEST=1 go test ./hypervisor -run TestWHP -v`
 executes the native CPU, I/O, interrupt and four-CPU startup regression tests.
+
+WHP also implements `X86HyperV` and `X86HyperVSynIC`. Before partition setup,
+it activates capability-backed reference time/TSC, hypercall, SynIC and synthetic
+timer facilities, including direct timers when supported. Machine policy still
+filters the advertised CPUID features. The platform owns these facilities;
+the backend does not approximate their clocks with host timer callbacks.
+`CC_WHP_TEST=1 go test ./hypervisor -run 'TestWHP|TestX86HyperV'` also exercises
+guest reference-clock reads, the reference TSC page and actual timer delivery.
+WHP overlays the reference page's GPA: its contents must be observed by guest
+reads, rather than inspecting the original caller-owned RAM backing.
+
+The optional `ExecutionCounters() (map[string]uint64, error)` observation reports
+cumulative native exit counts and WHP execution/hypervisor time in nanoseconds.
+Stop and join the CPU before reading it, as with architectural registers.
