@@ -9,19 +9,11 @@ import (
 // X86Exit exposes architectural exits. IO.Data is borrowed until execution
 // resumes (including after a RunUntil handler returns true); fill it for input
 // instructions. CompleteMMIORead completes MMIO reads.
-type X86Exit struct {
-	Reason  uint32
-	Port    uint16
-	Size    uint8
-	Count   uint32
-	Write   bool
-	Data    []byte
-	Address uint64
-}
+type X86Exit = x86state.Exit
 
 // RAMRegion maps a page-aligned range of a shared backing allocation.
 // Unmapped ranges remain device apertures and generate MMIO exits.
-type RAMRegion struct{ Address, Offset, Size uint64 }
+type RAMRegion = x86state.RAMRegion
 
 const (
 	X86ExitIO       uint32 = 2
