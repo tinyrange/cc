@@ -66,6 +66,7 @@ type Controller struct {
 	queues  map[uint16]*queue
 	scratch []byte
 	prps    []byte
+	async   *asyncIO
 
 	msi msiConfig
 
@@ -198,6 +199,9 @@ func (c *Controller) WriteMMIO(offset uint64, size int, value uint64) error {
 		if c.cc&1 == 0 {
 			c.csts = 0
 			if wasEnabled {
+				if c.async != nil {
+					c.async.generation++
+				}
 				c.queues = make(map[uint16]*queue)
 				c.irqHigh = false
 				if c.irq != nil {
@@ -207,15 +211,23 @@ func (c *Controller) WriteMMIO(offset uint64, size int, value uint64) error {
 			return nil
 		}
 		mps := (c.cc >> 7) & 0xf
+		if c.async != nil && mps != 0 {
+			c.csts = 2
+			return nil
+		} // CAP permits only 4 KiB pages.
 		c.pageSz = 4096 << mps
 		if !wasEnabled {
 			c.configureAdminQueueLocked()
 		}
 		c.csts = 1
-		// Commands complete synchronously; after a shutdown notification no
-		// backend work remains in flight. Report shutdown complete, not busy.
+		// Async shutdown is complete only after submitted backing work drains.
 		if c.cc&(3<<14) != 0 {
-			c.csts |= 2 << 2
+			if c.async == nil {
+				c.csts |= 2 << 2
+			} else {
+				c.csts |= 1 << 2
+				return c.scheduleIOLocked()
+			}
 		}
 	case regAQA:
 		c.aqa = uint32(value)
@@ -292,14 +304,23 @@ func (c *Controller) writeDoorbellLocked(offset uint64, value uint32) error {
 		return nil
 	}
 	if index%2 == 0 {
+		if q.size == 0 || value >= uint32(q.size) {
+			return fmt.Errorf("invalid nvme sq%d tail %d", qid, value)
+		}
 		q.sqTail = uint16(value)
 		return c.processSubmissionQueueLocked(q)
 	}
 	q.advanceCompletionHeadLocked(uint16(value))
+	if err := c.scheduleIOLocked(); err != nil {
+		return err
+	}
 	return c.updateIRQLocked(false)
 }
 
 func (c *Controller) processSubmissionQueueLocked(q *queue) error {
+	if c.async != nil && q.id != adminQueueID {
+		return c.scheduleIOLocked()
+	}
 	completed := false
 	for q.sqHead != q.sqTail {
 		raw := c.queueSubmissionEntry(q, q.sqHead)
