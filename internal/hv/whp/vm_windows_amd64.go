@@ -79,7 +79,11 @@ func newVM(memorySize uint64, localAPIC bool) (*VM, error) {
 }
 
 func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory bool, cpus int, mem *allocation) (*VM, error) {
-	if memorySize == 0 {
+	return newVMConfigured(memorySize, localAPIC, splitAMD64Memory, cpus, mem, nil)
+}
+
+func newVMConfigured(memorySize uint64, localAPIC bool, splitAMD64Memory bool, cpus int, mem *allocation, configure func(partitionHandle) error) (*VM, error) {
+	if memorySize == 0 && configure == nil {
 		return nil, fmt.Errorf("memory size must be non-zero")
 	}
 	if cpus <= 0 {
@@ -117,19 +121,26 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory boo
 			return nil, fmt.Errorf("set local APIC emulation mode: %w", err)
 		}
 	}
+	if configure != nil {
+		if err := configure(part); err != nil {
+			cleanupMem()
+			_ = vm.Close()
+			return nil, err
+		}
+	}
 	if err := setupPartition(part); err != nil {
 		cleanupMem()
 		_ = vm.Close()
 		return nil, fmt.Errorf("setup partition: %w", err)
 	}
-	if mem == nil {
+	if mem == nil && memorySize != 0 {
 		var err error
 		mem, err = virtualAlloc(uintptr(memorySize))
 		if err != nil {
 			_ = vm.Close()
 			return nil, fmt.Errorf("allocate guest memory: %w", err)
 		}
-	} else if uint64(mem.size) < memorySize {
+	} else if mem != nil && uint64(mem.size) < memorySize {
 		_ = mem.free()
 		_ = vm.Close()
 		return nil, fmt.Errorf("guest memory allocation size %d is smaller than VM memory %d", mem.size, memorySize)
@@ -137,6 +148,9 @@ func newVMWithAllocation(memorySize uint64, localAPIC bool, splitAMD64Memory boo
 	vm.mem = mem
 	vm.memSize = memorySize
 	regions := []guestMemoryRegion{{size: memorySize}}
+	if memorySize == 0 {
+		regions = nil
+	}
 	if splitAMD64Memory {
 		regions = amd64GuestMemoryRegions(memorySize)
 	}

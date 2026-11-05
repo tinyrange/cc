@@ -50,6 +50,10 @@ func (hr hresult) Err() error {
 	return fmt.Errorf("HRESULT 0x%08x: %s", uint32(hr), syscall.Errno(hr))
 }
 
+// Pointer-valued syscall arguments must escape before entering this wrapper:
+// LazyProc resolution and stack growth can otherwise invalidate their addresses.
+//
+//go:uintptrescapes
 func callHRESULT(proc *syscall.LazyProc, args ...uintptr) error {
 	r1, _, callErr := proc.Call(args...)
 	if callErr != syscall.Errno(0) && r1 == 0 {
