@@ -291,6 +291,14 @@ func TestAsyncNVMeInvalidPRPAndLBA(t *testing.T) {
 		if binary.LittleEndian.Uint16(m.data[0x200e:])>>1 != 1 {
 			t.Fatal("overflow LBA succeeded")
 		}
+		stats := c.IOStatistics()
+		if stats.FailedCompletions != 1 || len(stats.RecentFailures) != 1 || stats.RecentFailures[0] != (CompletionFailure{SQID: 1, Status: 1}) {
+			t.Fatalf("missing guest-visible error completion: %+v", stats)
+		}
+		stats.RecentFailures[0].Status = 99
+		if c.IOStatistics().RecentFailures[0].Status != 1 {
+			t.Fatal("snapshot aliases controller state")
+		}
 		select {
 		case <-d.entered:
 			t.Fatal("overflow LBA reached disk")
