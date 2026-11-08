@@ -70,11 +70,13 @@ type Controller struct {
 
 	msi msiConfig
 
-	readOps    uint64
-	readBytes  uint64
-	writeOps   uint64
-	writeBytes uint64
-	lastTrace  time.Time
+	readOps           uint64
+	readBytes         uint64
+	writeOps          uint64
+	writeBytes        uint64
+	lastTrace         time.Time
+	failedCompletions uint64
+	recentFailures    []CompletionFailure
 }
 
 type queue struct {
@@ -711,6 +713,14 @@ func (c *Controller) writeCompletionLocked(q *queue, sqid uint16, sqHead uint16,
 		copy(q.cqMem[offset:offset+16], raw[:])
 	} else if err := c.mem.WriteIPA(q.cqAddr+uint64(q.cqTail)*16, raw[:]); err != nil {
 		return fmt.Errorf("write cq%d entry tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
+	}
+	if status != 0 {
+		c.failedCompletions++
+		if len(c.recentFailures) == 16 {
+			copy(c.recentFailures, c.recentFailures[1:])
+			c.recentFailures = c.recentFailures[:15]
+		}
+		c.recentFailures = append(c.recentFailures, CompletionFailure{SQID: sqid, CID: cid, Status: status})
 	}
 	q.cqTail = (q.cqTail + 1) % q.size
 	if q.cqPending < q.size {
