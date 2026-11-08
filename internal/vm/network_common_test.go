@@ -79,8 +79,10 @@ func TestNetworkRuntimeCloseTerminatesIdleActiveForward(t *testing.T) {
 	}
 	handlerDone := make(chan struct{})
 	go func() {
-		defer close(handlerDone)
+		// Publish completion before releasing Close's wait group; otherwise
+		// Close can return before the test observes its own completion marker.
 		defer runtime.wg.Done()
+		defer close(handlerDone)
 		defer runtime.unregisterPortForwardConn(runtimeConn)
 		_, _ = io.Copy(io.Discard, runtimeConn)
 	}()
