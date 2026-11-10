@@ -4,7 +4,8 @@ package hypervisor
 // before controller enable. wake may wake native execution but must not access
 // guest memory or call back into this controller. The owner must PollIO on
 // IOReady, and CloseIO before destroying RAM, the disk, or the wake target.
-// At most one 32 MiB transfer is in flight, preserving write/flush ordering.
+// Backends may opt into up to four parallel reads with ConcurrentReads() bool.
+// Active transfers total at most 32 MiB; writes and flushes remain serialized.
 func (c *NVMeController) EnableAsyncIO(wake func()) { c.controller.EnableAsyncIO(wake) }
 
 // IOReady returns nil when idle, or an event closed when backing I/O is ready.

@@ -4,15 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
-// Async I/O has one backing operation in flight, shared by all submission
-// queues. This bounds memory to one maximum NVMe transfer (32 MiB), preserves
-// write/flush ordering, and leaves queue, DMA and IRQ ownership with the caller.
+// Async I/O permits up to four reads for backends explicitly supporting it.
+// Writes and flushes remain global barriers. Active buffers total at most
+// 32 MiB. Queue, DMA and IRQ ownership stays with the caller.
 // The worker never holds the controller lock or accesses guest memory.
 type asyncIO struct {
 	wake       func()
-	active     *backingIO
+	active     []*backingIO
+	notify     chan struct{}
+	notifyMu   sync.Mutex
+	notified   bool
+	limit      int
 	buffer     []byte
 	generation uint64
 	closed     bool
@@ -26,7 +31,6 @@ type dmaSpan struct {
 type backingIO struct {
 	ready, done chan struct{}
 	sq, cq      *queue
-	head        uint16
 	cmd         command
 	generation  uint64
 	spans       []dmaSpan
@@ -43,18 +47,24 @@ func (c *Controller) EnableAsyncIO(wake func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.async == nil {
-		c.async = &asyncIO{wake: wake}
+		limit := 1
+		if b, ok := c.backend.(interface{ ConcurrentReads() bool }); ok && b.ConcurrentReads() {
+			limit = 4
+		}
+		c.async = &asyncIO{wake: wake, notify: make(chan struct{}), limit: limit}
 	}
 }
 
-// IOReady is nil when idle; closure means backing I/O is ready for owner delivery.
+// IOReady is nil when idle; closure means backing I/O is ready for delivery.
 func (c *Controller) IOReady() <-chan struct{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.async == nil || c.async.active == nil {
+	if c.async == nil || len(c.async.active) == 0 {
 		return nil
 	}
-	return c.async.active.ready
+	c.async.notifyMu.Lock()
+	defer c.async.notifyMu.Unlock()
+	return c.async.notify
 }
 
 // CloseIO prevents further dispatch, joins backing I/O and its wake, and discards
@@ -67,10 +77,10 @@ func (c *Controller) CloseIO() {
 	}
 	c.async.closed = true
 	c.async.generation++
-	if j := c.async.active; j != nil {
+	for _, j := range c.async.active {
 		<-j.done
-		c.async.active = nil
 	}
+	c.async.active = nil
 	c.async.buffer = nil
 }
 
@@ -84,28 +94,45 @@ func (c *Controller) PollIO(wait bool) error {
 		return nil
 	}
 	for {
-		j := a.active
-		if j == nil {
+		// Consume the notification before scanning: a concurrent completion
+		// either appears in this scan or closes the next wait channel.
+		a.notifyMu.Lock()
+		if a.notified {
+			a.notify = make(chan struct{})
+			a.notified = false
+		}
+		notify := a.notify
+		a.notifyMu.Unlock()
+		index := -1
+		for i, j := range a.active {
+			select {
+			case <-j.ready:
+				index = i
+			default:
+			}
+			if index >= 0 {
+				break
+			}
+		}
+		if index < 0 {
 			if err := c.scheduleIOLocked(); err != nil {
 				return err
 			}
-			j = a.active
-			if j == nil || !wait {
+			if !wait || len(a.active) == 0 {
 				return nil
 			}
+			<-notify
+			continue
 		}
-		if !wait {
-			select {
-			case <-j.ready:
-			default:
-				return nil
-			}
-		}
-		<-j.done // Join the wake too, before allowing teardown of its native target.
-		a.active = nil
-		if cap(j.data) != 0 {
+		j := a.active[index]
+		<-j.done // Join wake before releasing its native target.
+		copy(a.active[index:], a.active[index+1:])
+		a.active[len(a.active)-1] = nil
+		a.active = a.active[:len(a.active)-1]
+		if cap(j.data) > cap(a.buffer) {
 			a.buffer = j.data
 		}
+
 		if j.generation == a.generation && c.queues[j.sq.id] == j.sq && c.queues[j.cq.id] == j.cq {
 			if j.status == 0 {
 				if j.cmd.opcode == ioRead {
@@ -121,7 +148,7 @@ func (c *Controller) PollIO(wait bool) error {
 					c.recordIOLocked("write", len(j.data))
 				}
 			}
-			if err := c.writeCompletionLocked(j.cq, j.sq.id, j.head, j.cmd.cid, 0, j.status); err != nil {
+			if err := c.writeCompletionLocked(j.cq, j.sq.id, j.sq.sqHead, j.cmd.cid, 0, j.status); err != nil {
 				return err
 			}
 			if err := c.updateIRQLocked(true); err != nil {
@@ -131,19 +158,23 @@ func (c *Controller) PollIO(wait bool) error {
 		if err := c.scheduleIOLocked(); err != nil {
 			return err
 		}
-		if !wait || a.active == nil {
-			return nil
-		}
 	}
 }
 
 func (c *Controller) scheduleIOLocked() error {
 	a := c.async
-	if a == nil || a.closed || a.active != nil || c.cc&1 == 0 {
+	if a == nil || a.closed || len(a.active) >= a.limit || c.cc&1 == 0 {
 		return nil
 	}
-	// Round-robin ready queues. Only one reservation is needed because there is
-	// only one backing job, and admin completions use their own CQ.
+	// A reset must join the old generation before dispatching new work.
+	used := 0
+	for _, j := range a.active {
+		if j.generation != a.generation || j.cmd.opcode != ioRead {
+			return nil
+		}
+		used += cap(j.data)
+	}
+	// Round-robin ready queues, counting undelivered jobs as CQ reservations.
 	var chosen *queue
 	pending := false
 	for id, q := range c.queues {
@@ -155,7 +186,13 @@ func (c *Controller) scheduleIOLocked() error {
 		if cq == nil {
 			return fmt.Errorf("nvme completion queue %d missing", q.cqID)
 		}
-		if cq.cqPending >= cq.size {
+		reserved := int(cq.cqPending)
+		for _, j := range a.active {
+			if j.cq == cq {
+				reserved++
+			}
+		}
+		if reserved >= int(cq.size) {
 			continue
 		}
 		if chosen == nil || uint16(id-a.nextQueue) < uint16(chosen.id-a.nextQueue) {
@@ -163,7 +200,7 @@ func (c *Controller) scheduleIOLocked() error {
 		}
 	}
 	if chosen == nil {
-		if !pending && c.cc&(3<<14) != 0 {
+		if !pending && len(a.active) == 0 && c.cc&(3<<14) != 0 {
 			c.csts = (c.csts &^ (3 << 2)) | 2<<2
 		}
 		return nil
@@ -180,6 +217,14 @@ func (c *Controller) scheduleIOLocked() error {
 	j := &backingIO{ready: make(chan struct{}), done: make(chan struct{}), sq: q,
 		cq: c.queues[q.cqID], cmd: parseCommand(raw), generation: a.generation}
 	cmd := j.cmd
+	// Never let reads pass a consumed write/flush, or a queue's barrier head.
+	if len(a.active) != 0 && cmd.opcode != ioRead {
+		return nil
+	}
+	count := int((cmd.cdw12&0xffff)+1) * blockSize
+	if cmd.opcode == ioRead && used+count > 32<<20 {
+		return nil
+	}
 	if c.backend == nil || cmd.nsid != 1 {
 		j.status = 1
 	} else if cmd.opcode != ioFlush {
@@ -198,10 +243,11 @@ func (c *Controller) scheduleIOLocked() error {
 				if err != nil {
 					return err
 				}
-				if cap(a.buffer) < count {
+				if cap(a.buffer) < count || used+cap(a.buffer) > 32<<20 {
 					a.buffer = make([]byte, count)
 				}
 				j.data = a.buffer[:count]
+				a.buffer = nil
 				if cmd.opcode == ioWrite {
 					off := 0
 					for _, span := range j.spans {
@@ -215,9 +261,8 @@ func (c *Controller) scheduleIOLocked() error {
 		}
 	}
 	q.sqHead = (q.sqHead + 1) % q.size
-	j.head = q.sqHead
 	a.nextQueue = q.id + 1
-	a.active = j
+	a.active = append(a.active, j)
 	backend, wake := c.backend, a.wake
 	go func() {
 		defer close(j.done)
@@ -241,11 +286,17 @@ func (c *Controller) scheduleIOLocked() error {
 			}
 		}
 		close(j.ready)
+		a.notifyMu.Lock()
+		if !a.notified {
+			close(a.notify)
+			a.notified = true
+		}
+		a.notifyMu.Unlock()
 		if wake != nil {
 			wake()
 		}
 	}()
-	return nil
+	return c.scheduleIOLocked()
 }
 
 func (c *Controller) snapshotPRPLocked(prp1, prp2 uint64, count int) ([]dmaSpan, error) {
