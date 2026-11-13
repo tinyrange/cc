@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"j5.nz/cc/internal/virtio"
 )
@@ -710,9 +712,29 @@ func (c *Controller) writeCompletionLocked(q *queue, sqid uint16, sqHead uint16,
 	binary.LittleEndian.PutUint16(raw[14:16], statusField)
 	offset := int(q.cqTail) * 16
 	if len(q.cqMem) >= offset+16 {
-		copy(q.cqMem[offset:offset+16], raw[:])
-	} else if err := c.mem.WriteIPA(q.cqAddr+uint64(q.cqTail)*16, raw[:]); err != nil {
-		return fmt.Errorf("write cq%d entry tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
+		entry := q.cqMem[offset : offset+16]
+		last := unsafe.Pointer(&entry[12])
+		if uintptr(last)%4 != 0 {
+			return fmt.Errorf("cq%d host mapping is not aligned for completion publication", q.id)
+		}
+		// A guest can poll the phase without waiting for an interrupt. Copy
+		// the body first, then release-publish CID/status as one aligned word.
+		// This also orders preceding read-data DMA before ownership changes.
+		copy(entry[:12], raw[:12])
+		atomic.StoreUint32((*uint32)(last), binary.NativeEndian.Uint32(raw[12:]))
+	} else {
+		addr := q.cqAddr + uint64(q.cqTail)*16
+		// Opaque transports complete writes in call order, but a bulk copy
+		// need not be atomic. Keep the phase invalid while writing all body
+		// and status bits, then publish just the ownership byte.
+		published := raw[14]
+		raw[14] ^= 1
+		if err := c.mem.WriteIPA(addr, raw[:]); err != nil {
+			return fmt.Errorf("write cq%d body tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
+		}
+		if err := c.mem.WriteIPA(addr+14, []byte{published}); err != nil {
+			return fmt.Errorf("publish cq%d status tail=%d addr=%#x: %w", q.id, q.cqTail, q.cqAddr, err)
+		}
 	}
 	if status != 0 {
 		c.failedCompletions++
