@@ -39,6 +39,7 @@ type Isolated struct {
 	queue        [][]byte
 	outputClosed bool
 	internet     bool
+	guestIP      [4]byte // the guest's address; 10.42.0.2 unless set
 }
 
 func NewIsolated(guest, host [6]byte) (*Isolated, error) {
@@ -83,7 +84,7 @@ func newEndpoint(guest, host [6]byte, internet bool) (*Isolated, error) {
 		ns.Close()
 		return nil, err
 	}
-	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host, internet: internet}
+	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host, internet: internet, guestIP: guestIP}
 	nic.AttachVirtioBackend(n.enqueue)
 	return n, nil
 }
@@ -171,19 +172,19 @@ func (n *Isolated) Receive(frame []byte) error {
 			return nil
 		}
 		ip = ip[:size]
-		if !bytes.Equal(ip[12:16], guestIP[:]) && !bytes.Equal(ip[12:16], []byte{0, 0, 0, 0}) {
+		if !bytes.Equal(ip[12:16], n.guestIP[:]) && !bytes.Equal(ip[12:16], []byte{0, 0, 0, 0}) {
 			return nil
 		}
 		if ip[9] == 17 {
 			if bytes.Equal(ip[16:20], hostIP[:]) || bytes.Equal(ip[16:20], broadcastIP[:]) {
 				n.dhcp(ip, header)
 			}
-			if n.internet && bytes.Equal(ip[12:16], guestIP[:]) && bytes.Equal(ip[16:20], hostIP[:]) && len(ip) >= header+8 && binary.BigEndian.Uint16(ip[header+2:]) == 53 {
+			if n.internet && bytes.Equal(ip[12:16], n.guestIP[:]) && bytes.Equal(ip[16:20], hostIP[:]) && len(ip) >= header+8 && binary.BigEndian.Uint16(ip[header+2:]) == 53 {
 				_ = n.nic.DeliverGuestPacket(frame[:14+size], true)
 			}
 			return nil
 		}
-		if !bytes.Equal(ip[12:16], guestIP[:]) || (!n.internet && !bytes.Equal(ip[16:20], hostIP[:])) {
+		if !bytes.Equal(ip[12:16], n.guestIP[:]) || (!n.internet && !bytes.Equal(ip[16:20], hostIP[:])) {
 			return nil
 		}
 		if ip[9] != 6 && ip[9] != 1 {
@@ -207,4 +208,31 @@ func checksum(b []byte) uint16 {
 		sum = (sum & 65535) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+// SetGuestIPv4 replaces the guest address (10.42.0.2 by default), for a
+// guest configured with a static address of its own.
+func (n *Isolated) SetGuestIPv4(ip net.IP) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return net.ErrClosed
+	}
+	if err := n.stack.SetGuestIPv4(ip); err != nil {
+		return err
+	}
+	copy(n.guestIP[:], ip.To4())
+	return nil
+}
+
+// DialGuest opens a TCP connection from the host side of the network to a
+// port on the guest, for host port forwarding.
+func (n *Isolated) DialGuest(ctx context.Context, port uint16) (net.Conn, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return nil, net.ErrClosed
+	}
+	return n.stack.DialInternalContext(ctx, "tcp4", ":"+strconv.Itoa(int(port)))
 }

@@ -67,13 +67,13 @@ func (n *Isolated) dhcp(ip []byte, header int) {
 		if requested == nil {
 			requested = b[12:16]
 		}
-		if !bytes.Equal(requested, guestIP[:]) {
+		if !bytes.Equal(requested, n.guestIP[:]) {
 			replyKind = 6
 		} else {
 			replyKind = 5
 		}
 	case 8: // INFORM: address already configured; return configuration only.
-		if !bytes.Equal(b[12:16], guestIP[:]) {
+		if !bytes.Equal(b[12:16], n.guestIP[:]) {
 			return
 		}
 		replyKind = 5
@@ -87,7 +87,7 @@ func (n *Isolated) dhcp(ip []byte, header int) {
 	if replyKind != 6 {
 		copy(out[12:16], b[12:16])
 		if kind != 8 {
-			copy(out[16:20], guestIP[:])
+			copy(out[16:20], n.guestIP[:])
 		}
 	}
 	copy(out[28:34], n.guest[:])
