@@ -305,3 +305,40 @@ func TestX86GuestTimingObservations(t *testing.T) {
 		t.Fatal("observation started guest execution")
 	}
 }
+
+func TestX86InitialSyscallRegisters(t *testing.T) {
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Skip("KVM unavailable")
+	}
+	cpu, err := NewX86(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cpu.Close()
+	state, ok := cpu.(interface {
+		SetSyscallRegisters(x86state.SyscallRegisters) error
+		ReadMSR(uint32) (uint64, error)
+	})
+	if !ok {
+		t.Fatal("native x86 lacks initial syscall register support")
+	}
+	want := x86state.SyscallRegisters{
+		STAR: 0x0023001000000000, LSTAR: 0xffffffff81234000,
+		SFMASK: 0x257fd5, KernelGSBase: 0xffff888006900000,
+	}
+	before, err := cpu.Registers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = state.SetSyscallRegisters(want); err != nil {
+		t.Fatal(err)
+	}
+	for index, value := range map[uint32]uint64{0xc0000081: want.STAR, 0xc0000082: want.LSTAR, 0xc0000084: want.SFMASK, 0xc0000102: want.KernelGSBase} {
+		if got, err := state.ReadMSR(index); err != nil || got != value {
+			t.Fatalf("MSR %#x = %#x, %v; want %#x", index, got, err, value)
+		}
+	}
+	if after, err := cpu.Registers(); err != nil || after != before {
+		t.Fatalf("general registers changed during MSR setup: %+v, %v", after, err)
+	}
+}
