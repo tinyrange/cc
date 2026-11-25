@@ -111,7 +111,20 @@ func (p *imageFS) markPersistentNodeLocked(node *imageNode) {
 	}
 }
 
+func (p *imageFS) updateDirectoryLinksLocked(parent *imageNode, before, after uint64) {
+	if parent.directoryLinks == 0 || before == after {
+		return
+	}
+	if child := p.imageNodeLocked(before); child != nil && child.isDir() {
+		parent.directoryLinks--
+	}
+	if child := p.imageNodeLocked(after); child != nil && child.isDir() {
+		parent.directoryLinks++
+	}
+}
+
 func (p *imageFS) setPersistentDirentLocked(parent *imageNode, name string, inode uint64) {
+	p.updateDirectoryLinksLocked(parent, parent.entries[name], inode)
 	parent.entries[name] = inode
 	if p.persistent != nil {
 		p.persistent.markDirent(parent.id, name, inode, true)
@@ -120,6 +133,7 @@ func (p *imageFS) setPersistentDirentLocked(parent *imageNode, name string, inod
 
 func (p *imageFS) deletePersistentDirentLocked(parent *imageNode, name string) {
 	inode := parent.entries[name]
+	p.updateDirectoryLinksLocked(parent, inode, 0)
 	delete(parent.entries, name)
 	if p.persistent != nil {
 		p.persistent.markDirent(parent.id, name, inode, false)

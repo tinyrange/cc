@@ -100,17 +100,19 @@ type imageHandle struct {
 }
 
 type imageNode struct {
-	id                uint64
-	inode             uint64
-	parent            uint64
-	name              string
-	mode              fs.FileMode
-	rawMode           uint32
-	uid               uint32
-	gid               uint32
-	rdev              uint32
-	size              uint64
-	nlink             uint32
+	id      uint64
+	inode   uint64
+	parent  uint64
+	name    string
+	mode    fs.FileMode
+	rawMode uint32
+	uid     uint32
+	gid     uint32
+	rdev    uint32
+	size    uint64
+	nlink   uint32
+	// Zero means the directory link count has not been initialized.
+	directoryLinks    uint32
 	data              sparseImageData
 	symlinkTarget     string
 	entries           map[string]uint64
@@ -555,6 +557,9 @@ func (p *imageFS) mutableImageNodeLocked(id uint64) *imageNode {
 	node.xattrs = cloneXattrMap(base.xattrs)
 	node.data.extents = append([]imageDataExtent(nil), base.data.extents...)
 	node.baseDirEntries = nil
+	if base.baseDirEntries != nil {
+		node.directoryLinks = base.nlink
+	}
 	node.retainedEntries = len(node.entries)
 	node.retainedWhiteouts = len(node.whiteouts)
 	node.accountedMetadata = 0
@@ -2210,16 +2215,17 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 	parentNode = p.mutableImageNodeLocked(parent)
 	now := time.Now()
 	node := &imageNode{
-		id:      p.nextNodeID,
-		parent:  parent,
-		name:    name,
-		mode:    fs.ModeDir | fs.FileMode(mode&linuxPermMask),
-		uid:     uid,
-		gid:     gid,
-		entries: map[string]uint64{},
-		atime:   now,
-		modTime: now,
-		ctime:   now,
+		id:             p.nextNodeID,
+		parent:         parent,
+		name:           name,
+		mode:           fs.ModeDir | fs.FileMode(mode&linuxPermMask),
+		directoryLinks: 2,
+		uid:            uid,
+		gid:            gid,
+		entries:        map[string]uint64{},
+		atime:          now,
+		modTime:        now,
+		ctime:          now,
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node
@@ -3070,6 +3076,8 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	if isDir {
 		if node.baseDirEntries != nil {
 			nlink = node.nlink
+		} else if node.directoryLinks != 0 {
+			nlink = node.directoryLinks
 		} else {
 			nlink = 2
 			for _, childID := range node.entries {
@@ -3582,6 +3590,7 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 	p.nodes[node.id] = node
 	p.noteImageNodeAddedLocked(node)
 	p.registerImageNodeLinkLocked(node)
+	p.updateDirectoryLinksLocked(parent, parent.entries[name], node.id)
 	parent.entries[name] = node.id
 	p.noteImageEntryAddedLocked(parent)
 	return node, 0
