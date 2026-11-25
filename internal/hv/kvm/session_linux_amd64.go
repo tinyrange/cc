@@ -42,6 +42,36 @@ type ManagedSession struct {
 	inlineExec        bool
 }
 
+// A guest can close an accepted connection when its connect attempt times out.
+// Wait for the boot protocol on a connection before committing to it.
+func acceptReadyManagedControl(listener virtio.VsockListener, transcript *vmruntime.SerialTranscript, ready chan<- virtio.VsockConn, failed chan<- error) {
+	var buffer [512]byte
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			failed <- err
+			return
+		}
+		start := transcript.Len()
+		for {
+			count, err := conn.Read(buffer[:])
+			if count != 0 {
+				_, _ = transcript.Write(buffer[:count])
+				text, _ := transcript.ReadFrom(start)
+				if strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text) {
+					ready <- conn
+					_, _ = io.Copy(transcript, conn)
+					return
+				}
+			}
+			if err != nil {
+				_ = conn.Close()
+				break
+			}
+		}
+	}
+}
+
 type ManagedSessionOptions struct {
 	SnapshotDir     string
 	RestoreSnapshot string
@@ -124,15 +154,7 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
+	go acceptReadyManagedControl(listener, controlTranscript, connCh, acceptErrCh)
 
 	vm, err := NewVMWithCPUs(cpus)
 	if err != nil {
@@ -276,18 +298,6 @@ func StartManagedSessionWithNetOptions(ctx context.Context, kernel []byte, initr
 		return nil, transcriptError(ctx.Err(), serialOut.String(), controlTranscript.String())
 	}
 
-	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
-		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
-	}); err != nil {
-		cancel()
-		_ = control.Close()
-		_ = listener.Close()
-		vsock.Close()
-		if bootWriter != nil {
-			_ = bootWriter.Close()
-		}
-		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
-	}
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		cancel()
 		_ = control.Close()

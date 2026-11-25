@@ -399,15 +399,7 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			acceptErrCh <- err
-			return
-		}
-		connCh <- conn
-		_, _ = io.Copy(controlTranscript, conn)
-	}()
+	go acceptReadyManagedControl(listener, controlTranscript, connCh, acceptErrCh)
 
 	var bootWriter *vmruntime.BootEventWriter
 	var serialWriter io.Writer
@@ -478,18 +470,6 @@ func StartManagedSessionFromSnapshot(ctx context.Context, snapshotPath string, m
 		return nil, transcriptError(ctx.Err(), serialOut.String(), controlTranscript.String())
 	}
 
-	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
-		return strings.Contains(text, vmruntime.InstanceReadyMarker) || vmruntime.HasFatalBootText(text)
-	}); err != nil {
-		cancel()
-		_ = control.Close()
-		_ = listener.Close()
-		vsock.Close()
-		if bootWriter != nil {
-			_ = bootWriter.Close()
-		}
-		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
-	}
 	if vmruntime.HasFatalBootText(controlTranscript.String()) {
 		cancel()
 		_ = control.Close()

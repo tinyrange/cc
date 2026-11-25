@@ -62,9 +62,13 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
-	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
-	if err != nil {
-		return nil, err
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
+	var kernel []byte
+	if restoreSnapshot == "" {
+		kernel, err = readRuntimeKernel(b.kernel, req.Kernel)
+		if err != nil {
+			return nil, err
+		}
 	}
 	image, err := b.images.Open(req.Image)
 	if err != nil {
@@ -74,13 +78,16 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withLinuxRuntimeMountDirsForUser(image, req.DefaultUser)
-	configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
-	if req.Display != nil {
-		configVars = append(configVars, linuxDisplayConfigVars...)
-	}
-	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
-	if err != nil {
-		return nil, err
+	var modules []alpine.Module
+	if restoreSnapshot == "" {
+		configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
+		if req.Display != nil {
+			configVars = append(configVars, linuxDisplayConfigVars...)
+		}
+		modules, err = planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
+		if err != nil {
+			return nil, err
+		}
 	}
 	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
@@ -111,33 +118,37 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			closeVirtioFSDevices(fsdevs)
 		}
 	}()
-	initOverride := sandboxInitFromContext(ctx)
-	initBin := initOverride.payload
-	if len(initBin) == 0 {
-		initBin, err = guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("build guest init: %w", err)
-	}
 	workDir := image.Config.WorkingDir
 	if workDir == "" {
 		workDir = "/"
 	}
-	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
-	initCfg.Protocol = initOverride.protocol
-	initCfg.InitSystem = req.InitSystem
-	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
-	initCfg.WorkDir = workDir
-	if strings.TrimSpace(req.SnapshotDir) != "" {
-		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
-	}
-	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
-		return nil, fmt.Errorf("read kernel metadata: %w", err)
-	}
-	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build initramfs: %w", err)
+	// KVM restores the running kernel and guest init from the snapshot.
+	var initrd []byte
+	if restoreSnapshot == "" {
+		initOverride := sandboxInitFromContext(ctx)
+		initBin := initOverride.payload
+		if len(initBin) == 0 {
+			initBin, err = guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("build guest init: %w", err)
+		}
+		initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
+		initCfg.Protocol = initOverride.protocol
+		initCfg.InitSystem = req.InitSystem
+		initCfg.RootFSTag = vmruntime.RootFSTag
+		initCfg.Env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
+		initCfg.WorkDir = workDir
+		if strings.TrimSpace(req.SnapshotDir) != "" {
+			initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
+		}
+		if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+			return nil, fmt.Errorf("read kernel metadata: %w", err)
+		}
+		initrd, err = vmruntime.BuildInitramfs(initBin, modules, initCfg)
+		if err != nil {
+			return nil, fmt.Errorf("build initramfs: %w", err)
+		}
 	}
 	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
 		Profile:  managedguest.LinuxProfile,
@@ -151,7 +162,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 			DisplayWidth:    displayWidth(req.Display),
 			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
-			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+			RestoreSnapshot: restoreSnapshot,
 			SharedMemory:    shmem.FromContext(ctx),
 		},
 	}, onEvent)
@@ -223,9 +234,14 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
-	kernel, err := readRuntimeKernel(b.kernel, req.Kernel)
-	if err != nil {
-		return nil, err
+	restoreSnapshot := strings.TrimSpace(req.RestoreSnapshot)
+	var kernel []byte
+	var err error
+	if restoreSnapshot == "" {
+		kernel, err = readRuntimeKernel(b.kernel, req.Kernel)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var image *oci.Image
 	imageName := strings.TrimSpace(req.Image)
@@ -239,13 +255,16 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		}
 		image = withLinuxRuntimeMountDirs(image)
 	}
-	configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
-	if req.Display != nil {
-		configVars = append(configVars, linuxDisplayConfigVars...)
-	}
-	modules, err := planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
-	if err != nil {
-		return nil, err
+	var modules []alpine.Module
+	if restoreSnapshot == "" {
+		configVars := linuxRuntimeConfigVars(image, req.KernelModules...)
+		if req.Display != nil {
+			configVars = append(configVars, linuxDisplayConfigVars...)
+		}
+		modules, err = planRuntimeKernelModules(b.kernel, req.Kernel, configVars, linuxRuntimeModuleMap())
+		if err != nil {
+			return nil, err
+		}
 	}
 	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network, b.networkSwitch)
 	if err != nil {
@@ -266,23 +285,27 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
-	if err != nil {
-		return nil, fmt.Errorf("build guest init: %w", err)
-	}
-	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
-	initCfg.RootFSTag = vmruntime.RootFSTag
-	initCfg.Env = vmruntime.WithDefaultEnv(req.Env)
-	initCfg.WorkDir = "/"
-	if strings.TrimSpace(req.SnapshotDir) != "" {
-		initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
-	}
-	if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
-		return nil, fmt.Errorf("read kernel metadata: %w", err)
-	}
-	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build initramfs: %w", err)
+	var initrd []byte
+	if restoreSnapshot == "" {
+		var initBin []byte
+		initBin, err = guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+		if err != nil {
+			return nil, fmt.Errorf("build guest init: %w", err)
+		}
+		initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
+		initCfg.RootFSTag = vmruntime.RootFSTag
+		initCfg.Env = vmruntime.WithDefaultEnv(req.Env)
+		initCfg.WorkDir = "/"
+		if strings.TrimSpace(req.SnapshotDir) != "" {
+			initCfg.SnapshotMMIOBase = amd64vm.SnapshotBase
+		}
+		if err := applyRuntimeKernelMetadata(&initCfg, b.kernel, req.Kernel); err != nil {
+			return nil, fmt.Errorf("read kernel metadata: %w", err)
+		}
+		initrd, err = vmruntime.BuildInitramfs(initBin, modules, initCfg)
+		if err != nil {
+			return nil, fmt.Errorf("build initramfs: %w", err)
+		}
 	}
 	started, err := (managedruntime.Service{}).Start(ctx, managedruntime.StartRequest{
 		Profile:  managedguest.LinuxProfile,
@@ -296,7 +319,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			DisplayWidth:    displayWidth(req.Display),
 			DisplayHeight:   displayHeight(req.Display),
 			SnapshotDir:     strings.TrimSpace(req.SnapshotDir),
-			RestoreSnapshot: strings.TrimSpace(req.RestoreSnapshot),
+			RestoreSnapshot: restoreSnapshot,
 			SharedMemory:    shmem.FromContext(ctx),
 		},
 	}, onEvent)
