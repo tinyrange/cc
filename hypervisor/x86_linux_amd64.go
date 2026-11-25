@@ -14,6 +14,7 @@ import (
 type nativeX86 struct {
 	vm          *kvm.VM
 	threads     []*x86Thread
+	borrowed    bool
 	slot        uint32
 	allocations [][]byte
 	a20Disabled bool
@@ -83,8 +84,10 @@ func (n *nativeX86) Close() error {
 		err = errors.Join(err, unix.Munmap(ram))
 	}
 	n.allocations = nil
-	for _, thread := range n.threads {
-		thread.close()
+	if !n.borrowed {
+		for _, thread := range n.threads {
+			thread.close()
+		}
 	}
 	return err
 }

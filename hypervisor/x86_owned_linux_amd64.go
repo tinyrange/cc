@@ -63,6 +63,12 @@ func (n *nativeX86) ReadMSR(index uint32) (out uint64, err error) {
 	return
 }
 
+// SetSyscallRegisters writes the initial long-mode syscall MSRs on vCPU 0.
+// Like other register methods, it must be serialized with execution.
+func (n *nativeX86) SetSyscallRegisters(registers x86state.SyscallRegisters) error {
+	return n.threads[0].call(func() error { return n.vm.SetSyscallRegisters(registers) })
+}
+
 // VM-wide operations do not load vCPU state. IRQ delivery and cancellation
 // must remain out of band so they can wake a CPU blocked in KVM_RUN.
 func (n *nativeX86) SetIRQ(line uint32, level bool) error       { return n.vm.SetIRQ(line, level) }
@@ -72,4 +78,8 @@ func (n *nativeX86) SetLegacyTimerReplacement(enabled bool) error {
 }
 func (n *nativeX86) SetReadOnlyFallbackMSRs(values map[uint32]uint64) error {
 	return n.vm.SetReadOnlyFallbackMSRs(values)
+}
+
+func (n *nativeX86) ExecutionCounters() (map[string]uint64, error) {
+	return n.vm.ExecutionCounters(0)
 }

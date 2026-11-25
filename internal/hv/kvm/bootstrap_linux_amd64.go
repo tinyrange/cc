@@ -141,14 +141,20 @@ func (b *Bootstrap) CreateVCPU(vmfd int, id int) (int, error) {
 }
 
 func (b *Bootstrap) InitVM(vmfd int) error {
+	return b.initVM(vmfd, true)
+}
+
+func (b *Bootstrap) initVM(vmfd int, pit bool) error {
 	if err := setTSSAddr(vmfd, 0xfffbd000); err != nil {
 		return err
 	}
 	if err := createIRQChip(vmfd); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
-	if err := createPIT(vmfd); err != nil && !errors.Is(err, unix.EEXIST) {
-		return err
+	if pit {
+		if err := createPIT(vmfd); err != nil && !errors.Is(err, unix.EEXIST) {
+			return err
+		}
 	}
 	return nil
 }

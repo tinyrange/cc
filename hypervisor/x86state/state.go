@@ -57,3 +57,8 @@ type SystemRegisters struct {
 	ApicBase               uint64
 	InterruptBitmap        [4]uint64
 }
+
+// SyscallRegisters holds the x86-64 SYSCALL/SYSRET MSRs for a vCPU.
+type SyscallRegisters struct {
+	STAR, LSTAR, SFMASK, KernelGSBase uint64
+}

@@ -23,12 +23,13 @@ type x86Thread struct {
 	mu     sync.Mutex
 	jobs   chan x86ThreadRequest
 	done   chan struct{}
+	slot   chan struct{}
 	tid    atomic.Int32
 	closed bool
 }
 
 func newX86Thread() *x86Thread {
-	t := &x86Thread{jobs: make(chan x86ThreadRequest), done: make(chan struct{})}
+	t := &x86Thread{jobs: make(chan x86ThreadRequest), done: make(chan struct{}), slot: make(chan struct{}, 1)}
 	ready := make(chan struct{})
 	go func() {
 		runtime.LockOSThread()

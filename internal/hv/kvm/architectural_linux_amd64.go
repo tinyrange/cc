@@ -76,6 +76,9 @@ func (v *VM) InterruptState() (map[string]uint64, error) {
 			result[fmt.Sprintf("lapic%d.irr%d", id, i)] = uint64(binary.LittleEndian.Uint32(lapic.Regs[0x200+i*16:]))
 		}
 	}
+	if v.noPIT {
+		return result, nil
+	}
 	pit, err := getPIT2(v.vmfd)
 	if err != nil {
 		return nil, err
