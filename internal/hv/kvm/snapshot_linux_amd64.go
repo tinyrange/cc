@@ -817,10 +817,30 @@ func snapshotKVMMSRs(vcpuFd int) []kvmMSREntry {
 }
 
 func restoreKVMMSRs(vcpuFd int, entries []kvmMSREntry) error {
-	for _, entry := range entries {
-		if err := setVCPUMSR(vcpuFd, entry.Index, entry.Data); err != nil {
-			return fmt.Errorf("restore KVM msr %s: %w", strconv.FormatUint(uint64(entry.Index), 16), err)
+	if len(entries) == 0 {
+		return nil
+	}
+	// The ioctl takes a header followed by a flexible array of entries.
+	// Snapshots generated here contain at most len(kvmSnapshotMSRs) entries.
+	// Chunk externally supplied snapshots to keep the ioctl buffer bounded.
+	var request struct {
+		count, padding uint32
+		entries        [32]kvmMSREntry
+	}
+	for len(entries) > 0 {
+		n := copy(request.entries[:], entries)
+		request.count = uint32(n)
+		written, err := ioctlWithRetry(uintptr(vcpuFd), kvmSetMSRS, uintptr(unsafe.Pointer(&request)))
+		if err != nil {
+			return fmt.Errorf("restore KVM MSRs: %w", err)
 		}
+		if written > uintptr(n) {
+			return fmt.Errorf("KVM reported %d writes for %d MSRs", written, n)
+		}
+		if written != uintptr(n) {
+			return fmt.Errorf("restore KVM MSR %#x: kernel accepted %d of %d entries", entries[written].Index, written, n)
+		}
+		entries = entries[n:]
 	}
 	return nil
 }

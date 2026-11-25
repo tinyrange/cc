@@ -53,6 +53,7 @@ type MMIOExit struct {
 }
 
 type VM struct {
+	noPIT           bool
 	lifecycleMu     sync.RWMutex
 	cpuExecutor     func(int, func() error) error
 	kvm             *Bootstrap
@@ -97,6 +98,15 @@ func NewVMWithCPUs(cpus int) (*VM, error) { return NewVMWithCPUExecutor(cpus, ni
 // vCPU, including initialization and teardown. The executor remains alive until
 // Close returns. Other callers retain the existing serialized-caller contract.
 func NewVMWithCPUExecutor(cpus int, execute func(int, func() error) error) (*VM, error) {
+	return newVMWithCPUExecutor(cpus, execute, true)
+}
+
+// NewDirectVM creates a single CPU for a direct handoff without the legacy PIT.
+func NewDirectVM(execute func(int, func() error) error) (*VM, error) {
+	return newVMWithCPUExecutor(1, execute, false)
+}
+
+func newVMWithCPUExecutor(cpus int, execute func(int, func() error) error, pit bool) (*VM, error) {
 	if cpus <= 0 {
 		cpus = 1
 	}
@@ -108,7 +118,7 @@ func NewVMWithCPUExecutor(cpus int, execute func(int, func() error) error) (*VM,
 	if err != nil {
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
-	if err := k.InitVM(vmfd); err != nil {
+	if err := k.initVM(vmfd, pit); err != nil {
 		_ = k.CloseVM(vmfd)
 		return nil, fmt.Errorf("init vm: %w", err)
 	}
@@ -117,7 +127,7 @@ func NewVMWithCPUExecutor(cpus int, execute func(int, func() error) error) (*VM,
 		_ = k.CloseVM(vmfd)
 		return nil, fmt.Errorf("get kvm_run mmap size: %w", err)
 	}
-	vm := &VM{kvm: k, vmfd: vmfd, cpuExecutor: execute}
+	vm := &VM{kvm: k, vmfd: vmfd, cpuExecutor: execute, noPIT: !pit}
 	for id := 0; id < cpus; id++ {
 		var cpu *VCPU
 		err := vm.onCPU(id, func() error {

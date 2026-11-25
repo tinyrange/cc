@@ -55,3 +55,7 @@ func (c *nativeX86CPU) InterruptState() (map[string]uint64, error) { return c.ow
 
 // SetA20 is a machine-wide operation: all CPU execution must be joined.
 func (c *nativeX86CPU) SetA20(enabled bool) error { return c.owner.SetA20(enabled) }
+
+func (c *nativeX86CPU) ExecutionCounters() (map[string]uint64, error) {
+	return c.owner.vm.ExecutionCounters(c.index)
+}

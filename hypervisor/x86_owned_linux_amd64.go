@@ -79,3 +79,7 @@ func (n *nativeX86) SetLegacyTimerReplacement(enabled bool) error {
 func (n *nativeX86) SetReadOnlyFallbackMSRs(values map[uint32]uint64) error {
 	return n.vm.SetReadOnlyFallbackMSRs(values)
 }
+
+func (n *nativeX86) ExecutionCounters() (map[string]uint64, error) {
+	return n.vm.ExecutionCounters(0)
+}
