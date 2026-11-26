@@ -802,9 +802,6 @@ func runStage2() error {
 }
 
 func prepareSnapshotStage2(cfg config) error {
-	if err := copyCurrentExecutable(snapshotStage2Path); err != nil {
-		return err
-	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("encode snapshot stage2 config: %w", err)
@@ -838,7 +835,7 @@ func stageSnapshotModules(modules []modulePayload) ([]string, error) {
 
 func execSnapshotStage2() error {
 	env := append(os.Environ(), "CCX3_STAGE2_CONFIG="+snapshotStage2ConfigPath)
-	if err := syscall.Exec(snapshotStage2Path, []string{snapshotStage2Path, stage2Mode}, env); err != nil {
+	if err := syscall.Exec("/proc/self/exe", []string{snapshotStage2Path, stage2Mode}, env); err != nil {
 		return fmt.Errorf("exec snapshot stage2: %w", err)
 	}
 	return fmt.Errorf("snapshot stage2 returned unexpectedly")

@@ -1374,6 +1374,7 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 		}
 		name := path.Base(guestPath)
 		node.parent, node.name = parent.id, name
+		parent.directoryLinks = 0
 		parent.entries[name] = node.id
 	}
 
@@ -1395,6 +1396,7 @@ func (p *imageFS) restorePersistentState(state *persistentImageState) error {
 				// inode while leaving its directory entry in the checkpoint.
 				// The inode data is already absent, so retain the rest of the
 				// filesystem and hide the unrecoverable name.
+				node.directoryLinks = 0
 				delete(node.entries, name)
 				node.whiteouts[name] = true
 				recoveryErr := fmt.Errorf("discarded dangling directory entry %q from inode %d (missing inode %d)", name, id, childID)
@@ -1451,6 +1453,7 @@ func (p *imageFS) ensurePersistentRestoreDirectory(directoryPath string, savedBy
 	node := imageNodeFromEntry(p.nextNodeID, parent.id, path.Base(directoryPath), entry)
 	p.nextNodeID++
 	p.nodes[node.id] = node
+	parent.directoryLinks = 0
 	parent.entries[node.name] = node.id
 	return node, nil
 }
@@ -1466,6 +1469,7 @@ func restorePersistentNode(node *imageNode, saved persistentImageNode) error {
 	node.rdev = saved.RDev
 	node.size = saved.Size
 	node.nlink = saved.NLink
+	node.directoryLinks = 0
 	node.symlinkTarget = string(saved.SymlinkTarget)
 	node.entriesDone = saved.EntriesDone
 	node.lowerSize = saved.LowerSize
