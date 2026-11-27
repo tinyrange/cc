@@ -440,6 +440,11 @@ func (ns *NetStack) SetGuestIPv4(ip net.IP) error {
 	return nil
 }
 
+// SetHostIPv4 configures the local address before any interface is attached.
+func (ns *NetStack) SetHostIPv4(ip [4]byte) {
+	ns.hostIPv4 = ip
+}
+
 // SetServiceProxyEnabled toggles the localhost proxy feature for TCP flows
 // addressed to serviceIPv4.
 func (ns *NetStack) SetServiceProxyEnabled(enabled bool) {
