@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 
@@ -23,8 +24,8 @@ var broadcastIP = [4]byte{255, 255, 255, 255}
 const maxQueuedFrames = 256
 const maxFrameSize = 1514
 
-// Isolated connects a single guest (10.42.0.2/24) to internal services on
-// 10.42.0.1. NewIsolated supplies only address/subnet via DHCP; NewInternet
+// Isolated connects a single Ethernet peer to internal services.
+// NewIsolated uses 10.42.0.1 and supplies 10.42.0.2/24 via DHCP. NewInternet
 // also supplies router/DNS and explicitly enables public IPv4 TCP proxying.
 // Receive and Poll exchange Ethernet frames without an FCS. Poll transfers
 // ownership; Receive borrows input only for the duration of the call.
@@ -39,24 +40,44 @@ type Isolated struct {
 	queue        [][]byte
 	outputClosed bool
 	internet     bool
-	guestIP      [4]byte // the guest's address; 10.42.0.2 unless set
+	dhcpEnabled  bool
+	guestIP      [4]byte
+	hostIP       [4]byte
 }
 
 func NewIsolated(guest, host [6]byte) (*Isolated, error) {
-	return newEndpoint(guest, host, false)
+	return newEndpoint(guest, host, guestIP, hostIP, false, true)
 }
 
 // NewInternet enables outbound public IPv4 TCP and DNS. It does not bind host
 // listeners or allow access to host/LAN addresses. UDP other than DNS is dropped.
 func NewInternet(guest, host [6]byte) (*Isolated, error) {
-	return newEndpoint(guest, host, true)
+	return newEndpoint(guest, host, guestIP, hostIP, true, true)
 }
 
-func newEndpoint(guest, host [6]byte, internet bool) (*Isolated, error) {
+// NewStaticPeer creates a packet-only TCP endpoint for one known Ethernet
+// peer. Only addresses in this pair are accepted, and the endpoint provides
+// no DHCP, DNS, internet access, or host socket service.
+func NewStaticPeer(peer, local [6]byte, peerIP, localIP netip.Addr) (*Isolated, error) {
+	unicast := func(ip netip.Addr) bool {
+		return ip.Is4() && (ip.IsGlobalUnicast() || ip.IsLinkLocalUnicast())
+	}
+	if !unicast(peerIP) || !unicast(localIP) || peerIP == localIP {
+		return nil, errors.New("static endpoint requires distinct unicast IPv4 addresses")
+	}
+	return newEndpoint(peer, local, peerIP.As4(), localIP.As4(), false, false)
+}
+
+func newEndpoint(guest, host [6]byte, peerAddress, localAddress [4]byte, internet, dhcp bool) (*Isolated, error) {
 	if guest[0]&1 != 0 || host[0]&1 != 0 || guest == host || guest == [6]byte{} || host == [6]byte{} {
 		return nil, errors.New("isolated network requires distinct unicast MACs")
 	}
 	ns := netstack.New(nil)
+	ns.SetHostIPv4(localAddress)
+	if err := ns.SetGuestIPv4(net.IP(peerAddress[:])); err != nil {
+		ns.Close()
+		return nil, err
+	}
 	ns.SetServiceProxyEnabled(false)
 	ns.SetHostAccessEnabled(false)
 	ns.SetInternetAccessEnabled(internet)
@@ -84,7 +105,7 @@ func newEndpoint(guest, host [6]byte, internet bool) (*Isolated, error) {
 		ns.Close()
 		return nil, err
 	}
-	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host, internet: internet, guestIP: guestIP}
+	n := &Isolated{stack: ns, nic: nic, guest: guest, host: host, internet: internet, dhcpEnabled: dhcp, guestIP: peerAddress, hostIP: localAddress}
 	nic.AttachVirtioBackend(n.enqueue)
 	return n, nil
 }
@@ -125,7 +146,7 @@ func (n *Isolated) ListenTCP(port uint16) (net.Listener, error) {
 	if port == 0 {
 		return nil, errors.New("isolated TCP port must be nonzero")
 	}
-	return n.stack.ListenInternal("tcp4", "10.42.0.1:"+strconv.Itoa(int(port)))
+	return n.stack.ListenInternal("tcp4", ":"+strconv.Itoa(int(port)))
 }
 func (n *Isolated) Close() error {
 	n.mu.Lock()
@@ -157,7 +178,7 @@ func (n *Isolated) Receive(frame []byte) error {
 	}
 	switch binary.BigEndian.Uint16(frame[12:]) {
 	case 0x0806:
-		if len(frame) < 42 || !bytes.Equal(frame[38:42], hostIP[:]) {
+		if len(frame) < 42 || !bytes.Equal(frame[38:42], n.hostIP[:]) {
 			return nil
 		}
 		_ = n.nic.DeliverGuestPacket(frame, true)
@@ -176,15 +197,15 @@ func (n *Isolated) Receive(frame []byte) error {
 			return nil
 		}
 		if ip[9] == 17 {
-			if bytes.Equal(ip[16:20], hostIP[:]) || bytes.Equal(ip[16:20], broadcastIP[:]) {
+			if n.dhcpEnabled && (bytes.Equal(ip[16:20], n.hostIP[:]) || bytes.Equal(ip[16:20], broadcastIP[:])) {
 				n.dhcp(ip, header)
 			}
-			if n.internet && bytes.Equal(ip[12:16], n.guestIP[:]) && bytes.Equal(ip[16:20], hostIP[:]) && len(ip) >= header+8 && binary.BigEndian.Uint16(ip[header+2:]) == 53 {
+			if n.internet && bytes.Equal(ip[12:16], n.guestIP[:]) && bytes.Equal(ip[16:20], n.hostIP[:]) && len(ip) >= header+8 && binary.BigEndian.Uint16(ip[header+2:]) == 53 {
 				_ = n.nic.DeliverGuestPacket(frame[:14+size], true)
 			}
 			return nil
 		}
-		if !bytes.Equal(ip[12:16], n.guestIP[:]) || (!n.internet && !bytes.Equal(ip[16:20], hostIP[:])) {
+		if !bytes.Equal(ip[12:16], n.guestIP[:]) || (!n.internet && !bytes.Equal(ip[16:20], n.hostIP[:])) {
 			return nil
 		}
 		if ip[9] != 6 && ip[9] != 1 {
