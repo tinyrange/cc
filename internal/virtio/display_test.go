@@ -83,7 +83,7 @@ func TestGPUScanoutUsesGuestModeAfterHostWindowResize(t *testing.T) {
 	}
 }
 
-func TestGPURejectsResourceLargerThanConfiguredDisplay(t *testing.T) {
+func TestGPU2DResourcesAreIndependentOfTheDisplaySize(t *testing.T) {
 	framebuffer, err := NewFramebuffer(800, 600)
 	if err != nil {
 		t.Fatal(err)
@@ -92,9 +92,15 @@ func TestGPURejectsResourceLargerThanConfiguredDisplay(t *testing.T) {
 	create := gpuTestRequest(gpuCmdResourceCreate2D, 40)
 	binary.LittleEndian.PutUint32(create[24:28], 1)
 	binary.LittleEndian.PutUint32(create[28:32], gpuFormatB8G8R8X8)
-	binary.LittleEndian.PutUint32(create[32:36], 801)
-	binary.LittleEndian.PutUint32(create[36:40], 600)
-	requireGPUResponse(t, gpu.dispatchLocked(create, gpuQueueControl), gpuRespErrInvalidParameter)
+	binary.LittleEndian.PutUint32(create[32:36], 1024)
+	binary.LittleEndian.PutUint32(create[36:40], 768)
+	requireGPUResponse(t, gpu.dispatchLocked(create, gpuQueueControl), gpuRespOKNoData)
+	if width, height := framebuffer.Size(); width != 800 || height != 600 {
+		t.Fatalf("display changed on allocation to %dx%d", width, height)
+	}
+	binary.LittleEndian.PutUint32(create[24:28], 2)
+	binary.LittleEndian.PutUint32(create[32:36], 1<<30)
+	requireGPUResponse(t, gpu.dispatchLocked(create, gpuQueueControl), gpuRespErrOutOfMemory)
 }
 
 func TestGPUResizePublishesDisplayEvent(t *testing.T) {
