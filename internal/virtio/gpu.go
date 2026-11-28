@@ -55,6 +55,8 @@ const (
 
 	gpuControlHeaderSize = 24
 	gpuMaxScanouts       = 16
+	gpuMax2DResourceSize = 64 << 20
+	gpuMax2DStorage      = 256 << 20
 )
 
 type gpuMemoryEntry struct {
@@ -97,6 +99,7 @@ type GPU struct {
 	eventsRead       uint32
 	queues           [2]queue
 	resources        map[uint32]*gpuResource
+	resource2DBytes  int
 	contexts         map[uint32]*gpuContext
 	scanoutResource  uint32
 	scanoutRect      image.Rectangle
@@ -412,17 +415,14 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 		width := binary.LittleEndian.Uint32(request[32:36])
 		height := binary.LittleEndian.Uint32(request[36:40])
 		if id == 0 || !supportedGPUFormat(format) || width == 0 || height == 0 {
+			g.reportGPUErrorLocked(fmt.Errorf("invalid 2D resource %dx%d with format %d", width, height, format))
 			return gpuResponse(request, gpuRespErrInvalidParameter, nil)
 		}
 		if g.resources[id] != nil {
 			return gpuResponse(request, gpuRespErrInvalidResourceID, nil)
 		}
-		fbWidth, fbHeight := g.framebuffer.Size()
-		if width > uint32(fbWidth) || height > uint32(fbHeight) {
-			return gpuResponse(request, gpuRespErrInvalidParameter, nil)
-		}
 		size, ok := checkedPixelBytes(int(width), int(height))
-		if !ok {
+		if !ok || size > gpuMax2DResourceSize || size > gpuMax2DStorage-g.resource2DBytes {
 			return gpuResponse(request, gpuRespErrOutOfMemory, nil)
 		}
 		g.resources[id] = &gpuResource{
@@ -432,6 +432,7 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 			height: height,
 			pixels: make([]byte, size),
 		}
+		g.resource2DBytes += size
 		return gpuResponse(request, gpuRespOKNoData, nil)
 
 	case gpuCmdResourceUnref:
@@ -452,6 +453,7 @@ func (g *GPU) dispatchLocked(request []byte, queueIndex int) []byte {
 			}
 		}
 		delete(g.resources, id)
+		g.resource2DBytes -= len(resource.pixels)
 		if g.cursorResource == id {
 			g.cursorResource = 0
 			g.cursor.Hide()
@@ -1107,6 +1109,7 @@ func (g *GPU) resetLocked() {
 	g.irqHigh = false
 	g.eventsRead = 0
 	g.resources = make(map[uint32]*gpuResource)
+	g.resource2DBytes = 0
 	g.contexts = make(map[uint32]*gpuContext)
 	g.scanoutResource = 0
 	g.scanoutRect = image.Rectangle{}
